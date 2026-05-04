@@ -1,0 +1,25 @@
+# Interpolation : docker compose --env-file server/.env up -d
+# Si 3306 est déjà pris (MySQL local) : MARIADB_PORT=3307 et DB_PORT=3307 dans server/.env
+services:
+  mariadb:
+    image: mariadb:11.4
+    container_name: velocity-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-root_dev_change_me}
+      MARIADB_DATABASE: ${DB_NAME:-velocity}
+      MARIADB_USER: ${DB_USER:-velocity}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-velocity_dev}
+    ports:
+      - "${MARIADB_PORT:-3306}:3306"
+    volumes:
+      - velocity_mariadb_data:/var/lib/mysql
+      - ./docker/mariadb/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  velocity_mariadb_data:

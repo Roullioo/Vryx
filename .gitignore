@@ -1,0 +1,37 @@
+# Dépendances
+**/node_modules/
+
+# Builds
+**/dist/
+**/target/
+**/.vite/
+**/__pycache__/
+*.egg-info/
+
+# Secrets & env
+.env
+.env.*
+**/.env
+**/server/.env
+
+# Python
+**/venv/
+**/.venv/
+
+# OS / éditeurs
+.DS_Store
+._*
+.idea/
+.vscode/
+
+# Logs & exécution locale
+*.log
+**/local-worker-logs/
+worker_daemon.log
+
+# Electron / releases
+AppMacos/release/
+
+# Artefacts divers
+*.local
+*.tar.gz

@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package vryx;
+
+// Inférence locale (VPS ou worker via gRPC).
+service InferenceService {
+  rpc Process(TensorData) returns (ProcessedTensorData);
+  // Capacités déclarées par le worker (RAM, device) pour le scheduler tensor-parallèle.
+  rpc ReportCapabilities(WorkerCapabilities) returns (CapabilitiesAck);
+  // Vérification / warmup du runtime shard éphémère (sans persistance disque).
+  rpc PingShardRuntime(ShardInit) returns (ProcessedTensorData);
+}
+
+message TensorData {
+  bytes data = 1;
+  repeated int64 shape = 2;
+  string dtype = 3;
+}
+
+message ProcessedTensorData {
+  bytes data = 1;
+  repeated int64 shape = 2;
+  uint64 compute_time_ns = 3;
+  uint64 serialization_time_ns = 4;
+  // Métriques LLM (Ollama / délégation VPS), distinctes des messages P2P.
+  uint64 prompt_tokens = 5;
+  uint64 completion_tokens = 6;
+  uint64 total_tokens = 7;
+  uint64 vps_delegate_ms = 8;
+  // Contexte shard (optionnel, pour traces UI).
+  string shard_session_id = 9;
+  uint32 shard_layer_id = 10;
+}
+
+// --- Tensor parallel éphémère (metadata + futures charges RAM) ---
+
+message WorkerCapabilities {
+  uint64 ram_available_mb = 1;
+  string backend_device = 2;
+  string runtime_version = 3;
+  uint32 max_ephemeral_shard_mb = 4;
+  double network_mbps_estimate = 5;
+}
+
+message CapabilitiesAck {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ShardInit {
+  string session_id = 1;
+  uint32 ttl_sec = 2;
+  uint32 layer_start = 3;
+  uint32 layer_end = 4;
+  string model_tag = 5;
+}
+
+message ShardLoad {
+  string session_id = 1;
+  uint32 chunk_index = 2;
+  uint32 chunk_total = 3;
+  bytes payload = 4;
+}
+
+message ForwardPass {
+  string session_id = 1;
+  uint32 layer_id = 2;
+  TensorData activation = 3;
+}
+
+message ActivationTensor {
+  bytes data = 1;
+  repeated int64 shape = 2;
+  string dtype = 3;
+}
+
+message ShardUnload {
+  string session_id = 1;
+}
