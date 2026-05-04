@@ -2,6 +2,8 @@
 
 Monorepo : site web et API (`website/`), application desktop (`AppMacos/`), nœuds P2P et inférence (`nodeAndWorker/`).
 
+**Documentation complète (vision, architecture, glossaire)** : [`VRYX.md`](./VRYX.md).
+
 ## Dépôt GitHub privé
 
 Après installation de [GitHub CLI](https://cli.github.com/), connectez-vous au compte **Roullioo** :
