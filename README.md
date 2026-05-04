@@ -4,7 +4,7 @@ Monorepo : site web et API (`website/`), application desktop (`AppMacos/`), nœu
 
 ## Dépôt GitHub privé
 
-Après installation de [GitHub CLI](https://cli.github.com/) :
+Après installation de [GitHub CLI](https://cli.github.com/), connectez-vous au compte **Roullioo** :
 
 ```bash
 gh auth login
@@ -16,4 +16,4 @@ Le script crée le dépôt privé `Roullioo/Vryx`, pousse la branche `main` et i
 
 ## Admins application
 
-Les e-mails administrateurs par défaut sont définis dans `website/server/src/index.js` (variable `ADMIN_EMAILS` possible dans `server/.env`).
+Les e-mails administrateurs par défaut sont définis dans `website/server/src/index.js`. Pour la prod, surchargez avec `ADMIN_EMAILS` dans `website/server/.env` (voir `website/server/env.example`).
