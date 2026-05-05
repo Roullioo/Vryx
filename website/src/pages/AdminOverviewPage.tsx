@@ -88,70 +88,38 @@ export function AdminOverviewPage() {
   }, [site])
 
   return (
-    <AdminShell>
+    <AdminShell title="Vue d'ensemble" subtitle="Supervision Vryx en temps réel">
       {error && (
-        <div
-          className="mb-6 rounded-lg border border-alert/50 bg-alert/10 px-4 py-3 text-sm text-alert"
-          role="alert"
-        >
+        <div className="mb-5 rounded-xl border border-alert/40 bg-alert/8 px-4 py-3 text-sm text-alert" role="alert">
           {error}
         </div>
       )}
 
-      <section className="space-y-4">
-        <h2 className="font-display text-xl font-bold text-fg">Site Vryx</h2>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <MetricCard
-            label="Utilisateurs totaux"
-            value={site ? site.stats.totalUsers.toLocaleString('fr-FR') : '—'}
-            hint={
-              site ? `${site.stats.totalAdmins} administrateur(s)` : undefined
-            }
-          />
-          <MetricCard
-            label="Inscriptions (24 h)"
-            value={site ? `+${site.stats.newUsers24h}` : '—'}
-            hint={site ? `+${site.stats.newUsers7d} sur 7 j` : undefined}
-            tone="success"
-          />
-          <MetricCard
-            label="Connexions actives (24 h)"
-            value={site ? site.stats.activeUsers24h.toLocaleString('fr-FR') : '—'}
-            hint={site ? `${site.stats.activeUsers7d} sur 7 j` : undefined}
-            tone="electric"
-          />
-          <MetricCard
-            label="Workers détectés"
-            value={node ? String(node.workers.length) : '—'}
-            hint={
-              node
-                ? `${node.workers.filter((w) => w.status === 'online').length} en ligne`
-                : undefined
-            }
-          />
-        </div>
-
-        <div className="panel p-5 sm:p-6">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-fg">Inscriptions sur 30 jours</h3>
-            <Link to="/admin/utilisateurs" className="text-xs font-medium text-accent hover:underline">
-              Gérer les utilisateurs →
-            </Link>
+      <div className="space-y-6">
+        {/* Métriques site */}
+        <section>
+          <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Site</h2>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <MetricCard label="Utilisateurs totaux" value={site ? site.stats.totalUsers.toLocaleString('fr-FR') : '—'} hint={site ? `${site.stats.totalAdmins} admin(s)` : undefined} />
+            <MetricCard label="Inscriptions 24 h" value={site ? `+${site.stats.newUsers24h}` : '—'} hint={site ? `+${site.stats.newUsers7d} sur 7 j` : undefined} tone="success" />
+            <MetricCard label="Connexions 24 h" value={site ? site.stats.activeUsers24h.toLocaleString('fr-FR') : '—'} hint={site ? `${site.stats.activeUsers7d} sur 7 j` : undefined} tone="electric" />
+            <MetricCard label="Workers (gRPC)" value={node ? String(node.workers.length) : '—'} hint={node ? `${node.workers.filter((w) => w.status === 'online').length} en ligne` : undefined} />
           </div>
-          <div className="mt-4 flex h-32 items-end gap-1">
+        </section>
+
+        {/* Graphe inscriptions */}
+        <section className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-fg">Inscriptions — 30 jours</h3>
+            <Link to="/admin/utilisateurs" className="text-xs font-medium text-accent hover:underline">Gérer →</Link>
+          </div>
+          <div className="mt-4 flex h-28 items-end gap-1">
             {site?.registrationsLast30d.length ? (
               site.registrationsLast30d.map((p) => {
-                const h = Math.max(4, Math.round((p.count / maxReg) * 120))
+                const h = Math.max(4, Math.round((p.count / maxReg) * 108))
                 return (
-                  <div
-                    key={p.day}
-                    className="group relative flex-1"
-                    title={`${p.day} · ${p.count} inscription(s)`}
-                  >
-                    <div
-                      className="w-full rounded-sm bg-fg/80 transition-colors group-hover:bg-electric"
-                      style={{ height: `${h}px` }}
-                    />
+                  <div key={p.day} className="group relative flex-1" title={`${p.day} · ${p.count}`}>
+                    <div className="w-full rounded-sm bg-fg/80 transition-colors group-hover:bg-accent" style={{ height: `${h}px` }} />
                   </div>
                 )
               })
@@ -159,48 +127,36 @@ export function AdminOverviewPage() {
               <p className="text-xs text-muted">Aucune inscription sur la période.</p>
             )}
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="mt-10 space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="font-display text-xl font-bold text-fg">Nœud Vryx</h2>
-          <Link to="/admin/noeud" className="text-xs font-medium text-accent hover:underline">
-            Tableau de bord nœud →
-          </Link>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <MetricCard
-            label="CPU"
-            value={node ? `${node.system.cpu.usagePercent} %` : '—'}
-            hint={node ? `${node.system.cpu.cores} cœurs · ${node.system.cpu.model}` : undefined}
-            tone={
-              node && node.system.cpu.usagePercent > 80 ? 'warning' : 'default'
-            }
-          />
-          <MetricCard
-            label="Mémoire"
-            value={
-              node
-                ? `${Math.round(node.system.memory.usedMB / 1024)} / ${Math.round(node.system.memory.totalMB / 1024)} Go`
-                : '—'
-            }
-            hint={node ? `${node.system.memory.percent} %` : undefined}
-            tone={node && node.system.memory.percent > 85 ? 'warning' : 'default'}
-          />
-          <MetricCard
-            label="VRAM totale"
-            value={node ? `${Math.round(node.system.vram.totalMB / 1024)} Go` : '—'}
-            hint={node ? `${node.system.vram.count} GPU(s)` : undefined}
-          />
-          <MetricCard
-            label="Requêtes traitées"
-            value={node ? node.cumulativeRequests.toLocaleString('fr-FR') : '—'}
-            hint="depuis le démarrage de l'API"
-            tone="electric"
-          />
-        </div>
-      </section>
+        {/* Métriques nœud */}
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-muted">Nœud Vryx</h2>
+            <Link to="/admin/noeud" className="text-xs font-medium text-accent hover:underline">Tableau de bord →</Link>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <MetricCard label="CPU" value={node ? `${node.system.cpu.usagePercent} %` : '—'} hint={node ? `${node.system.cpu.cores} cœurs` : undefined} tone={node && node.system.cpu.usagePercent > 80 ? 'warning' : 'default'} />
+            <MetricCard label="Mémoire" value={node ? `${Math.round(node.system.memory.usedMB / 1024)} / ${Math.round(node.system.memory.totalMB / 1024)} Go` : '—'} hint={node ? `${node.system.memory.percent} %` : undefined} tone={node && node.system.memory.percent > 85 ? 'warning' : 'default'} />
+            <MetricCard label="VRAM" value={node ? `${Math.round(node.system.vram.totalMB / 1024)} Go` : '—'} hint={node ? `${node.system.vram.count} GPU(s)` : undefined} />
+            <MetricCard label="Requêtes traitées" value={node ? node.cumulativeRequests.toLocaleString('fr-FR') : '—'} hint="depuis le démarrage" tone="electric" />
+          </div>
+        </section>
+
+        {/* Raccourcis */}
+        <section className="grid gap-3 sm:grid-cols-3">
+          {[
+            { to: '/admin/workers', label: 'Workers', desc: 'Liste et détail de chaque nœud' },
+            { to: '/admin/sessions', label: 'Sessions', desc: 'Historique des traitements P2P' },
+            { to: '/admin/noeud', label: 'Chat P2P', desc: 'Tester le réseau en direct' },
+          ].map((l) => (
+            <Link key={l.to} to={l.to} className="rounded-2xl border border-border bg-white p-5 shadow-sm transition-shadow hover:shadow-md">
+              <p className="font-semibold text-fg">{l.label}</p>
+              <p className="mt-1 text-xs text-muted">{l.desc}</p>
+            </Link>
+          ))}
+        </section>
+      </div>
     </AdminShell>
   )
 }

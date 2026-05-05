@@ -723,7 +723,7 @@ adminRouter.get('/workers/registered', async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT peer_id, mode, grpc_port, p2p_port, public_ip, version,
-              p2p_peers, tokens_generated, model,
+              p2p_peers, tokens_generated, tokens_in, tokens_out, model,
               last_heartbeat_at AS lastHeartbeatAt, first_seen_at AS firstSeenAt,
               TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
        FROM workers ORDER BY last_heartbeat_at DESC LIMIT :limit`,
@@ -741,6 +741,8 @@ adminRouter.get('/workers/registered', async (req, res) => {
         version: r.version,
         p2pPeers: Number(r.p2p_peers || 0),
         tokensGenerated: Number(r.tokens_generated || 0),
+        tokensIn: Number(r.tokens_in ?? 0),
+        tokensOut: Number(r.tokens_out ?? 0),
         model: r.model ?? null,
         lastHeartbeatAt: r.lastHeartbeatAt,
         firstSeenAt: r.firstSeenAt,
@@ -766,7 +768,7 @@ adminRouter.get('/p2p/shard-runtime', (_req, res) => {
     mode: 'ephemeral_ram',
     tensorParallel: true,
     description:
-      'Les workers exécutent des dtypes vryx.shard.* en RAM via le serveur gRPC Python ; le modèle complet reste sur le VPS (Ollama + délégation).',
+      'Pipeline TP réel : stage 1 peut enchaîner vryx.tp.* via POST /api/p2p/relay (daemon initiateur) vers les workers ; calcul numpy sur poids éphémères. Ollama reste sur le VPS pour le texte.',
   })
 })
 
@@ -834,6 +836,14 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     const schedulerWarmupSent = Number(data.scheduler_warmup_sent ?? data.schedulerWarmupSent ?? 0) || 0
     const schedulerWorkersUsed = Number(data.scheduler_workers_used ?? data.schedulerWorkersUsed ?? 0) || 0
     const shardSessionId = String(data.shard_session_id ?? data.shardSessionId ?? '') || null
+    const primaryWorkerPeerId =
+      String(data.primary_worker_peer_id ?? data.primaryWorkerPeerId ?? '') || workerPeerId || null
+    const pipelineTrace = data.pipeline_trace ?? data.pipelineTrace ?? null
+    const pipelineWorkers = data.pipeline_workers ?? data.pipelineWorkers ?? null
+    const traceLayout =
+      pipelineTrace && typeof pipelineTrace === 'object' && pipelineTrace.layout
+        ? String(pipelineTrace.layout)
+        : ''
     let worker = null
     if (workerPeerId) {
       const [rows] = await pool.query(
@@ -885,6 +895,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     send({
       done: true,
       workerPeerId,
+      primaryWorkerPeerId,
       latencyMs,
       tokensIn,
       tokensOut,
@@ -898,7 +909,12 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       schedulerWarmupSent,
       schedulerWorkersUsed,
       shardSessionId,
-      mode: 'P2P / Ollama (VPS)',
+      pipelineTrace,
+      pipelineWorkers,
+      mode:
+        traceLayout === 'worker_only_pipeline'
+          ? 'Worker-only P2P (calcul sur les pairs)'
+          : 'P2P / Ollama (VPS)',
       worker,
     })
   } catch (e) {
@@ -976,6 +992,38 @@ adminRouter.post('/node/stress', async (req, res) => {
 })
 
 app.use('/api/admin', adminRouter)
+
+/**
+ * Endpoint interne : renvoie les peer IDs des workers actifs (récents).
+ * Accessible UNIQUEMENT en localhost (127.0.0.1 / ::1), pas de JWT requis.
+ * Utilisé par inference_server.py pour la découverte auto des pairs TP.
+ */
+app.get('/api/internal/live-peers', async (req, res) => {
+  const ip = req.socket.remoteAddress || req.ip || ''
+  const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+  if (!isLocal) {
+    return res.status(403).json({ ok: false, error: 'Réservé localhost' })
+  }
+  const token = req.headers['x-internal-token'] || ''
+  if (token !== 'vryx-internal-localhost') {
+    return res.status(403).json({ ok: false, error: 'Token interne requis' })
+  }
+  try {
+    const recentSec = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE_SEC) || 30))
+    const [rows] = await pool.query(
+      `SELECT peer_id
+       FROM workers
+       WHERE last_heartbeat_at >= DATE_SUB(NOW(), INTERVAL :sec SECOND)
+       ORDER BY last_heartbeat_at DESC
+       LIMIT 16`,
+      { sec: recentSec }
+    )
+    const peers = (rows || []).map((r) => r.peer_id).filter(Boolean)
+    return res.json({ ok: true, peers, count: peers.length, liveSec: recentSec })
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) })
+  }
+})
 
 async function start() {
   console.log('Attente de la base de données…')

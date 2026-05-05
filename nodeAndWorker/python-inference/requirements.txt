@@ -1,2 +1,6 @@
 grpcio
 grpcio-tools
+numpy>=1.24
+gguf>=0.10.0
+# Optionnel sur les workers GPU : installer PyTorch CUDA séparément, par exemple :
+# pip install torch --index-url https://download.pytorch.org/whl/cu124

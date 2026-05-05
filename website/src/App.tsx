@@ -13,6 +13,8 @@ import { WorkersPage } from './pages/WorkersPage'
 import { AdminOverviewPage } from './pages/AdminOverviewPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
 import { AdminNodePage } from './pages/AdminNodePage'
+import { AdminWorkersPage, AdminWorkerDetailPage } from './pages/AdminWorkersPage'
+import { AdminSessionsPage, AdminSessionDetailPage } from './pages/AdminSessionsPage'
 
 export default function App() {
   return (
@@ -29,6 +31,10 @@ export default function App() {
         <Route path="/admin" element={<AdminOverviewPage />} />
         <Route path="/admin/utilisateurs" element={<AdminUsersPage />} />
         <Route path="/admin/noeud" element={<AdminNodePage />} />
+        <Route path="/admin/workers" element={<AdminWorkersPage />} />
+        <Route path="/admin/workers/:peerId" element={<AdminWorkerDetailPage />} />
+        <Route path="/admin/sessions" element={<AdminSessionsPage />} />
+        <Route path="/admin/sessions/:sessionId" element={<AdminSessionDetailPage />} />
         <Route path="/connexion" element={<LoginPage />} />
         <Route path="/inscription" element={<RegisterPage />} />
       </Route>

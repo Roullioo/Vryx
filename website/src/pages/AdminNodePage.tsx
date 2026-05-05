@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AdminShell } from '../components/admin/AdminShell'
+import {
+  WorkerComputeReport,
+  isFallbackMetricsUsable,
+  type WorkerRoundMetrics,
+} from '../components/admin/WorkerComputeReport'
 import { apiJson } from '../lib/api'
+import { buildSession, saveSession } from '../lib/sessions'
 
 type Worker = {
   pid: number
@@ -35,6 +41,40 @@ type RegisteredWorker = {
   firstSeenAt: string | null
   online: boolean
   secondsSinceHeartbeat: number
+}
+
+/** Premier pair listé dans `pipeline_trace.peers` (utile si `worker_peer_id` est vide). */
+/** Construit les métriques agrégées pour les graphiques (mode Ollama / P2P). */
+function roundMetricsFromAiTrace(t: {
+  latencyMs?: number
+  vpsDelegateMs?: number
+  workerComputeMs?: number
+  promptTokens?: number
+  completionTokens?: number
+  totalTokens?: number
+  p2pMessagesIn?: number
+  p2pMessagesOut?: number
+  mode?: string
+}): WorkerRoundMetrics {
+  return {
+    latencyMs: Number(t.latencyMs ?? 0) || 0,
+    vpsDelegateMs: Number(t.vpsDelegateMs ?? 0) || 0,
+    workerComputeMs: Number(t.workerComputeMs ?? 0) || 0,
+    promptTokens: t.promptTokens,
+    completionTokens: t.completionTokens,
+    totalTokens: t.totalTokens,
+    p2pMessagesIn: t.p2pMessagesIn,
+    p2pMessagesOut: t.p2pMessagesOut,
+    mode: t.mode,
+  }
+}
+
+function firstPeerIdFromPipelineTrace(trace: unknown): string {
+  if (!trace || typeof trace !== 'object' || Array.isArray(trace)) return ''
+  const peers = (trace as Record<string, unknown>).peers
+  if (!Array.isArray(peers)) return ''
+  const hit = peers.find((p): p is string => typeof p === 'string' && p.length > 0)
+  return hit ?? ''
 }
 
 /** Workers avec heartbeat récent (route admin `/workers/live`). */
@@ -194,7 +234,14 @@ function AdminChat({
 }: {
   liveWorkers: LiveWorker[]
   activeChatPeerId: string | null
-  onP2pRoundComplete?: (workerPeerId: string) => void
+  onP2pRoundComplete?: (
+    workerPeerId: string,
+    meta?: {
+      pipelineTrace?: unknown
+      pipelineWorkers?: unknown
+      roundMetrics?: WorkerRoundMetrics
+    },
+  ) => void
 }) {
   const [prompt, setPrompt] = useState('')
   const [messages, setMessages] = useState<{
@@ -216,6 +263,9 @@ function AdminChat({
       schedulerWarmupSent?: number
       schedulerWorkersUsed?: number
       shardSessionId?: string | null
+      primaryWorkerPeerId?: string
+      pipelineTrace?: unknown
+      pipelineWorkers?: unknown
       workerInfo?: LiveWorker & { online?: boolean }
     }
   }[]>([])
@@ -276,6 +326,9 @@ function AdminChat({
               schedulerWarmupSent?: number
               schedulerWorkersUsed?: number
               shardSessionId?: string | null
+              primaryWorkerPeerId?: string
+              pipelineTrace?: unknown
+              pipelineWorkers?: unknown
               mode?: string
               worker?: LiveWorker & { online?: boolean }
             }
@@ -303,9 +356,57 @@ function AdminChat({
             }
             if (data.done) {
               const wid = data.workerPeerId || ''
-              const matchW = data.worker || (wid ? liveWorkers.find((x) => x.peerId === wid) : undefined)
-              const label = matchW ? workerLabel(matchW) : wid ? `Peer ${wid.slice(0, 16)}…` : 'Réseau P2P'
-              if (wid) onP2pRoundComplete?.(wid)
+              const primary =
+                typeof data.primaryWorkerPeerId === 'string' && data.primaryWorkerPeerId.length > 0
+                  ? data.primaryWorkerPeerId
+                  : ''
+              const tracePeer = firstPeerIdFromPipelineTrace(data.pipelineTrace)
+              const sidebarPeerId = wid || primary || tracePeer
+              const matchW =
+                data.worker ||
+                (sidebarPeerId ? liveWorkers.find((x) => x.peerId === sidebarPeerId) : undefined)
+              const label = matchW
+                ? workerLabel(matchW)
+                : sidebarPeerId
+                  ? `Peer ${sidebarPeerId.slice(0, 16)}…`
+                  : 'Réseau P2P'
+              const roundMetrics: WorkerRoundMetrics = {
+                latencyMs: Number(data.latencyMs ?? 0) || 0,
+                vpsDelegateMs: Number(data.vpsDelegateMs ?? 0) || 0,
+                workerComputeMs: Number(data.workerComputeMs ?? 0) || 0,
+                promptTokens: data.promptTokens,
+                completionTokens: data.completionTokens,
+                totalTokens: data.totalTokens,
+                p2pMessagesIn: data.p2pMessagesIn,
+                p2pMessagesOut: data.p2pMessagesOut,
+                mode: data.mode,
+              }
+              onP2pRoundComplete?.(sidebarPeerId, {
+                pipelineTrace: data.pipelineTrace,
+                pipelineWorkers: data.pipelineWorkers,
+                roundMetrics,
+              })
+              // Enregistrer la session pour la page Sessions
+              let currentResponse = ''
+              setMessages((prev) => { currentResponse = prev[prev.length - 1]?.content ?? ''; return prev })
+              const workerInfoForSession = data.worker ? {
+                peerId: data.worker.peerId,
+                publicIp: data.worker.publicIp ?? null,
+                grpcPort: data.worker.grpcPort ?? null,
+                p2pPort: data.worker.p2pPort ?? null,
+                model: data.worker.model ?? null,
+                ownerEmail: data.worker.ownerEmail ?? null,
+                online: data.worker.online ?? false,
+                secondsSinceHeartbeat: data.worker.secondsSinceHeartbeat ?? 0,
+              } : undefined
+              saveSession(buildSession({
+                prompt: userMsg,
+                response: currentResponse,
+                data: data as Record<string, unknown>,
+                pipelineTrace: data.pipelineTrace,
+                pipelineWorkers: data.pipelineWorkers,
+                workerInfo: workerInfoForSession,
+              }))
               setMessages((prev) => {
                 const last = prev[prev.length - 1]
                 const rest = prev.slice(0, -1)
@@ -329,6 +430,9 @@ function AdminChat({
                       schedulerWarmupSent: data.schedulerWarmupSent,
                       schedulerWorkersUsed: data.schedulerWorkersUsed,
                       shardSessionId: data.shardSessionId,
+                      primaryWorkerPeerId: data.primaryWorkerPeerId,
+                      pipelineTrace: data.pipelineTrace,
+                      pipelineWorkers: data.pipelineWorkers,
                       workerInfo: data.worker,
                     },
                   },
@@ -358,8 +462,6 @@ function AdminChat({
     }
   }
 
-  const candidate = liveWorkers.find((w) => w.mode === 'worker') ?? liveWorkers[0] ?? null
-
   return (
     <div className="panel flex h-full min-h-[22rem] flex-col overflow-hidden border-accent/20 bg-accent/[0.02] xl:max-h-[calc(100svh-10rem)]">
       <div className="border-b border-border bg-surface/50 px-4 py-3 sm:px-5">
@@ -368,9 +470,13 @@ function AdminChat({
           Chat P2P (initiateur local)
         </h3>
         <p className="mt-1 text-[10px] leading-relaxed text-muted">
-          Le modèle et Ollama restent sur le VPS. Les workers ne stockent pas Gemma sur disque ; le scheduler peut
-          envoyer des shards éphémères en RAM (protocole <span className="font-mono">vryx.shard.*</span>) en parallèle
-          de la délégation LLM.
+          Par défaut, Ollama sur le VPS produit le texte. Avec <span className="font-mono">VRYX_WORKER_ONLY_LLM</span>, les
+          workers exécutent le tour via <span className="font-mono">vryx.dist.*</span>.
+        </p>
+        <p className="mt-1.5 rounded-md border border-accent/20 bg-accent/5 px-2 py-1.5 text-[10px] leading-relaxed text-fg">
+          Après chaque réponse, ouvrez « Détails du traitement » sous la bulle : vous y trouverez les graphiques (temps
+          VPS / worker, P2P, tokens) même en mode Ollama, et les courbes détaillées par token si le backend envoie une
+          trace pipeline. À droite, « Dernier tour » reprend le dernier message.
         </p>
         {ollamaStatus && !ollamaStatus.ok && (
           <p className="mt-1 text-[10px] text-alert">Ollama (VPS) : {ollamaStatus.error}</p>
@@ -385,8 +491,8 @@ function AdminChat({
                 d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
               />
             </svg>
-            {candidate
-              ? `Traitement via le réseau (candidat : ${workerLabel(candidate)})…`
+            {liveWorkers.length > 0
+              ? 'Routage côté initiateur (pair P2P choisi dynamiquement)…'
               : '[Recherche d’un worker P2P actif…]'}
           </p>
         )}
@@ -417,6 +523,14 @@ function AdminChat({
               >
                 {m.content || (loading && i === messages.length - 1 ? '…' : '')}
               </div>
+
+              {m.role === 'ai' && m.trace && (
+                <WorkerComputeReport
+                  trace={m.trace.pipelineTrace}
+                  pipelineWorkers={m.trace.pipelineWorkers}
+                  roundMetrics={roundMetricsFromAiTrace(m.trace)}
+                />
+              )}
 
               {m.role === 'ai' && m.trace && (
                 <details className="mt-1 group">
@@ -459,12 +573,26 @@ function AdminChat({
                     </div>
                     {(m.trace.schedulerWorkersUsed ?? 0) > 0 && (
                       <div className="flex justify-between">
-                        <span className="text-muted">Scheduler</span>
+                        <span className="text-muted">Réseau</span>
                         <span className="text-fg">
-                          {m.trace.schedulerWorkersUsed} worker(s), warmup {m.trace.schedulerWarmupSent ?? 0}
+                          {Array.isArray(m.trace.pipelineWorkers) && m.trace.pipelineWorkers.length > 0
+                            ? `${m.trace.pipelineWorkers.length} étape(s) TP P2P · LLM sur worker principal`
+                            : `${m.trace.schedulerWorkersUsed} worker(s) contacté(s)`}
+                          {(m.trace.schedulerWarmupSent ?? 0) > 0
+                            ? ` · warmup historique ${m.trace.schedulerWarmupSent}`
+                            : ''}
                         </span>
                       </div>
                     )}
+                    {m.trace.primaryWorkerPeerId ? (
+                      <div className="flex justify-between">
+                        <span className="text-muted">Worker principal (LLM)</span>
+                        <span className="max-w-[58%] truncate text-right text-fg" title={m.trace.primaryWorkerPeerId}>
+                          {m.trace.primaryWorkerPeerId.slice(0, 18)}…
+                        </span>
+                      </div>
+                    ) : null}
+                    
                     {m.trace.shardSessionId ? (
                       <div className="flex justify-between">
                         <span className="text-muted">Session shard</span>
@@ -551,8 +679,11 @@ export function AdminNodePage() {
   const [history, setHistory] = useState<HistoryPayload | null>(null)
   const [registeredWorkers, setRegisteredWorkers] = useState<RegisteredWorker[]>([])
   const [liveWorkers, setLiveWorkers] = useState<LiveWorker[]>([])
-  const [liveSec, setLiveSec] = useState(30)
+  const [liveSec, _setLiveSec] = useState(30)
+  void liveSec; void _setLiveSec
   const [lastP2pPeer, setLastP2pPeer] = useState<string | null>(null)
+  const [lastPipelineTrace, setLastPipelineTrace] = useState<Record<string, unknown> | null>(null)
+  const [lastRoundMetrics, setLastRoundMetrics] = useState<WorkerRoundMetrics | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [hint, setHint] = useState<string | null>(null)
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(5)
@@ -594,7 +725,7 @@ export function AdminNodePage() {
     const r = await apiJson<{ workers: LiveWorker[]; liveSec?: number }>('/api/admin/workers/live')
     if (r.ok && r.data) {
       setLiveWorkers(r.data.workers)
-      if (typeof r.data.liveSec === 'number') setLiveSec(r.data.liveSec)
+      if (typeof r.data.liveSec === 'number') _setLiveSec(r.data.liveSec)
     }
   }, [])
 
@@ -666,60 +797,9 @@ export function AdminNodePage() {
     ) / 100
   }, [onlineWorkers, lastReport, aggregateStats.gpuCount])
 
-  const sidebar = (
-    <div className="space-y-5">
-      <div>
-        <h2 className="font-display text-sm font-bold uppercase tracking-widest text-muted">Réseau live</h2>
-        <p className="mt-1 text-[10px] leading-relaxed text-muted">
-          Workers avec heartbeat récent (moins de {liveSec} s). Mis à jour toutes les 3 s.
-        </p>
-      </div>
-      {liveWorkers.length === 0 ? (
-        <p className="rounded-lg border border-border bg-surface/50 p-3 text-xs text-muted">
-          Aucun worker actif sur cette fenêtre. Lancez un client avec{' '}
-          <code className="rounded bg-bg px-1 font-mono text-[10px]">--api-url https://vryx.eu</code>.
-        </p>
-      ) : (
-        <ul className="space-y-2">
-          {liveWorkers.map((w) => {
-            const active = lastP2pPeer === w.peerId
-            return (
-              <li
-                key={w.peerId}
-                className={`rounded-xl border p-3 text-xs transition-colors ${
-                  active ? 'border-accent bg-accent/10 ring-1 ring-accent/25' : 'border-border bg-surface/60'
-                }`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="truncate font-semibold text-fg">{workerLabel(w)}</p>
-                    <p className="mt-0.5 font-mono text-[10px] text-muted">{w.publicIp || 'IP —'}</p>
-                  </div>
-                  <span
-                    className={`inline-flex h-2 w-2 shrink-0 rounded-full ${active ? 'bg-accent' : 'bg-success'} mt-1 ${!active ? 'animate-pulse' : ''}`}
-                    aria-hidden
-                  />
-                </div>
-                <p className="mt-2 text-[10px] text-muted">
-                  {w.model || 'Modèle inconnu'} · il y a {w.secondsSinceHeartbeat}s
-                </p>
-                <p className="mt-1 font-mono text-[10px] text-muted">
-                  {w.tokensIn} in / {w.tokensOut} out · {w.tokensGenerated} gén.
-                </p>
-              </li>
-            )
-          })}
-        </ul>
-      )}
-      <div className="rounded-lg border border-border bg-bg/60 p-3">
-        <p className="text-[10px] font-bold uppercase tracking-wide text-muted">Dernier pair P2P (chat)</p>
-        <p className="mt-1 break-all font-mono text-[10px] text-fg">{lastP2pPeer ?? '—'}</p>
-      </div>
-    </div>
-  )
 
   return (
-    <AdminShell aside={sidebar}>
+    <AdminShell title="Nœud Vryx" subtitle="Supervision et chat P2P en temps réel">
       <div className="flex flex-col gap-8 xl:flex-row xl:items-start">
         <div className="min-w-0 flex-1 space-y-8">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
@@ -788,12 +868,18 @@ export function AdminNodePage() {
               Tokens P2P Générés
             </p>
             <p className="mt-1 font-display text-2xl font-bold text-success">
-              {(totalTokens + aggregateStats.totalTokens).toLocaleString()}
+              {totalTokens.toLocaleString()}
             </p>
             <div className="mt-2 flex gap-3 text-[10px] font-mono uppercase tracking-tighter">
-              <span className="text-muted">In: <span className="text-fg">{aggregateStats.totalIn.toLocaleString()}</span></span>
-              <span className="text-muted">Out: <span className="text-fg">{aggregateStats.totalOut.toLocaleString()}</span></span>
+              <span className="text-muted">
+                Online (agrégé) in/out :{' '}
+                <span className="text-fg">{aggregateStats.totalIn.toLocaleString()}</span> /{' '}
+                <span className="text-fg">{aggregateStats.totalOut.toLocaleString()}</span>
+              </span>
             </div>
+            <p className="mt-1 text-[10px] text-muted">
+              Total base : somme <span className="font-mono">tokens_generated</span> enregistrée (pas de double comptage avec les workers en ligne).
+            </p>
           </div>
           <div className="panel p-5">
             <p className="text-xs font-medium uppercase tracking-wide text-muted">
@@ -1270,11 +1356,43 @@ export function AdminNodePage() {
         </section>
         </div>
 
-        <div className="w-full shrink-0 xl:sticky xl:top-28 xl:w-[min(100%,26rem)] xl:self-start">
+        <div className="w-full shrink-0 space-y-4 xl:sticky xl:top-28 xl:w-[min(100%,26rem)] xl:self-start">
+          {(lastPipelineTrace && Object.keys(lastPipelineTrace).length > 0) ||
+          isFallbackMetricsUsable(lastRoundMetrics ?? undefined) ? (
+            <div className="panel border-accent/25 bg-accent/[0.04] p-4 sm:p-5">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">
+                Dernier tour (chat P2P)
+              </h3>
+              <p className="mt-1 text-[10px] leading-relaxed text-muted">
+                Trace pipeline détaillée si le mode worker-only / TP la fournit ; sinon graphiques agrégés (temps VPS /
+                worker, P2P, tokens).
+              </p>
+              <div className="mt-3">
+                <WorkerComputeReport
+                  trace={lastPipelineTrace}
+                  roundMetrics={lastRoundMetrics ?? undefined}
+                />
+              </div>
+            </div>
+          ) : null}
           <AdminChat
             liveWorkers={liveWorkers}
             activeChatPeerId={lastP2pPeer}
-            onP2pRoundComplete={(id) => setLastP2pPeer(id)}
+            onP2pRoundComplete={(id, meta) => {
+              if (id) setLastP2pPeer(id)
+              const tr = meta?.pipelineTrace
+              if (
+                tr &&
+                typeof tr === 'object' &&
+                !Array.isArray(tr) &&
+                Object.keys(tr as object).length > 0
+              ) {
+                setLastPipelineTrace(tr as Record<string, unknown>)
+              } else {
+                setLastPipelineTrace(null)
+              }
+              setLastRoundMetrics(meta?.roundMetrics ?? null)
+            }}
           />
         </div>
       </div>

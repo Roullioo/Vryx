@@ -99,32 +99,25 @@ export function AdminUsersPage() {
   }
 
   return (
-    <AdminShell>
-      <div className="space-y-6">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <h2 className="font-display text-xl font-bold text-fg">Utilisateurs</h2>
-            <p className="mt-1 text-sm text-muted">
-              Promouvez un compte en administrateur ou supprimez-le. Les actions sont
-              immédiatement appliquées en base.
-            </p>
-          </div>
-          <form onSubmit={onSearch} className="flex w-full gap-2 sm:w-80">
+    <AdminShell
+      title="Utilisateurs"
+      subtitle="Gérez les comptes et les droits administrateur"
+      actions={
+        <form onSubmit={onSearch} className="flex w-60 gap-2">
             <input
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Rechercher par e-mail"
-              className="w-full rounded-lg border border-border bg-surface px-3 py-2.5 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent/30"
+              placeholder="Rechercher…"
+              className="w-full rounded-lg border border-border bg-white px-3 py-1.5 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent/20"
             />
-            <button
-              type="submit"
-              className="btn-primary shrink-0 rounded-lg px-4 py-2.5 text-sm font-semibold"
-            >
-              Filtrer
+            <button type="submit" className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent/90">
+              OK
             </button>
           </form>
-        </div>
+      }
+    >
+      <div className="space-y-5">
 
         {error && (
           <div

@@ -30,6 +30,8 @@ message ProcessedTensorData {
   // Contexte shard (optionnel, pour traces UI).
   string shard_session_id = 9;
   uint32 shard_layer_id = 10;
+  // Trace JSON du pipeline tensor-parallel (étapes P2P, pairs, latences) pour l'admin.
+  string pipeline_trace_json = 11;
 }
 
 // --- Tensor parallel éphémère (metadata + futures charges RAM) ---

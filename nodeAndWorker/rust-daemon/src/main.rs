@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::time;
+use axum::http::StatusCode;
 use axum::{routing::{get, post}, Json, Router};
 use tower_http::cors::CorsLayer;
 
@@ -218,6 +220,7 @@ struct LlmMetrics {
     vps_delegate_ms: u64,
     shard_session_id: String,
     shard_layer_id: u32,
+    pipeline_trace_json: String,
 }
 
 async fn call_local_inference(
@@ -245,6 +248,7 @@ async fn call_local_inference(
         vps_delegate_ms: response.vps_delegate_ms,
         shard_session_id: response.shard_session_id,
         shard_layer_id: response.shard_layer_id,
+        pipeline_trace_json: response.pipeline_trace_json.clone(),
     };
     if m.total_tokens == 0 && (m.prompt_tokens > 0 || m.completion_tokens > 0) {
         m.total_tokens = m.prompt_tokens.saturating_add(m.completion_tokens);
@@ -437,10 +441,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ── État ──────────────────────────────────────────────────────────────
     let mut discovered_peers: HashSet<PeerId> = HashSet::new();
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     enum PendingMeta {
         Chat { retries: u32, target_peer: PeerId },
-        ShardWarmup,
+        P2pRelayReply(tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>),
     }
 
     let mut pending_requests: HashMap<
@@ -462,6 +466,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             request_started: Instant,
             scheduler_warmup_sent: u32,
             scheduler_workers_used: u32,
+            pipeline_trace_json: String,
         },
     }
     let mut chat_state = ChatState::Idle;
@@ -476,6 +481,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Channel pour envoyer des commandes chat via l'API (initiator seulement)
     // (Prompt, Response Sender)
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Option<ChatApiTx>)>();
+    let (p2p_relay_tx, mut p2p_relay_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        PeerId,
+        TensorRequest,
+        tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>,
+    )>();
+
+    let boot_for_tp_api = bootstrap_peer_id;
 
     // ── Lancement de l'API Axum (Dashboard local) ─────────────────────────
     {
@@ -486,7 +498,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let last_shard_trace_axum = Arc::clone(&last_shard_trace);
         let my_peer_id_str = my_peer_id.to_string();
         let cmd_tx_axum = cmd_tx.clone();
-        let mode = args.mode.clone();
+        let p2p_relay_axum = p2p_relay_tx.clone();
+        let mode_chat = args.mode.clone();
+        let mode_relay = args.mode.clone();
+        let mode_tp_peers = args.mode.clone();
+        let active_tp_peers = Arc::clone(&active_peers);
 
         let app = Router::new()
             .route("/api/status", get(move || {
@@ -509,15 +525,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Json(j)
                 }
             }))
+            .route(
+                "/api/tp-peers",
+                get({
+                    let active = Arc::clone(&active_tp_peers);
+                    let mode = mode_tp_peers.clone();
+                    let boot = boot_for_tp_api;
+                    let me = my_peer_id;
+                    move || async move {
+                        if mode != "initiator" {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "peers": serde_json::Value::Array(vec![]),
+                                    "count": 0,
+                                    "error": "Réservé au mode initiateur.",
+                                })),
+                            );
+                        }
+                        let mut ids: Vec<String> = active
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .copied()
+                            .filter(|p| Some(*p) != boot && *p != me)
+                            .map(|p| p.to_string())
+                            .collect();
+                        ids.sort();
+                        let n = ids.len();
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "ok": true,
+                                "peers": ids,
+                                "count": n,
+                                "layout_hint": "row_split_tensor_parallel",
+                            })),
+                        )
+                    }
+                }),
+            )
             .route("/api/chat", post(move |Json(payload): Json<serde_json::Value>| async move {
-                if mode != "initiator" {
+                if mode_chat != "initiator" {
                     return (axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Node not in initiator mode"})));
                 }
                 if let Some(prompt) = payload["prompt"].as_str() {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let _ = cmd_tx_axum.send((prompt.to_string(), Some(tx)));
                     
-                    match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(240), rx).await {
                         Ok(Ok(response)) => {
                             if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
                                 (axum::http::StatusCode::BAD_REQUEST, Json(response))
@@ -536,6 +593,84 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 } else {
                     (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing prompt"})))
+                }
+            }))
+            .route("/api/p2p/relay", post(move |Json(payload): Json<serde_json::Value>| async move {
+                use base64::{Engine as _, engine::general_purpose};
+                if mode_relay != "initiator" {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({"ok": false, "error": "Relais P2P : mode initiateur requis."})),
+                    );
+                }
+                let peer_str = payload.get("target_peer").and_then(|v| v.as_str()).unwrap_or("");
+                let peer: PeerId = match PeerId::from_str(peer_str) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"ok": false, "error": "target_peer libp2p invalide."})),
+                        );
+                    }
+                };
+                let dtype = payload
+                    .get("dtype")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let data_b64 = payload.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+                let data = match general_purpose::STANDARD.decode(data_b64) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"ok": false, "error": format!("data_b64 : {}", e)})),
+                        );
+                    }
+                };
+                let req = TensorRequest {
+                    kind: String::new(),
+                    data,
+                    dtype,
+                    compute_time_ns: 0,
+                    serialization_time_ns: 0,
+                };
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if p2p_relay_axum.send((peer, req, tx)).is_err() {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"ok": false, "error": "Canal relais indisponible."})),
+                    );
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+                    Ok(Ok(Ok(resp))) => {
+                        let data_b64 = general_purpose::STANDARD.encode(&resp.data);
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({
+                                "ok": true,
+                                "data_b64": data_b64,
+                                "prompt_tokens": resp.prompt_tokens_llm,
+                                "completion_tokens": resp.completion_tokens_llm,
+                                "total_tokens": resp.total_tokens_llm,
+                                "vps_delegate_ms": resp.vps_delegate_ms,
+                                "worker_compute_ms": resp.worker_compute_ms,
+                                "shard_session_id": resp.shard_session_id,
+                            })),
+                        )
+                    }
+                    Ok(Ok(Err(e))) => (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({"ok": false, "error": e})),
+                    ),
+                    Ok(Err(_)) => (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"ok": false, "error": "Réponse relais annulée."})),
+                    ),
+                    Err(_) => (
+                        axum::http::StatusCode::GATEWAY_TIMEOUT,
+                        Json(serde_json::json!({"ok": false, "error": "Délai relais P2P dépassé."})),
+                    ),
                 }
             }))
             .layer(CorsLayer::permissive());
@@ -585,6 +720,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             continuation_response_tx: Option<ChatApiTx>,
             generated_text: String,
             request_started: Instant,
+            pipeline_trace_json: String,
         },
         Stage2 {
             channel: request_response::ResponseChannel<TensorResponse>,
@@ -607,6 +743,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ── Boucle principale ─────────────────────────────────────────────────
     loop {
         tokio::select! {
+            // ── Relais HTTP → P2P (orchestrateur Python stage 1) ─────────
+            relay_cmd = p2p_relay_rx.recv(), if args.mode == "initiator" => {
+                let Some((peer, req, reply_tx)) = relay_cmd else { continue };
+                let req_clone = req.clone();
+                let req_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer, req);
+                pending_requests.insert(req_id, (req_clone, PendingMeta::P2pRelayReply(reply_tx)));
+            }
+
             // ── stdin : chat initiator ──────────────────────────────────
             maybe_line = cmd_rx.recv(), if args.mode == "initiator" => {
                 let (line, resp_tx) = match maybe_line {
@@ -615,8 +762,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
                 if line.is_empty() { continue }
 
+                // Auto-reset si le ChatState est bloqué en Generating depuis plus de 95s
+                // (le timeout Axum est 90s, donc response_tx est déjà mort).
+                if let ChatState::Generating { request_started, .. } = &chat_state {
+                    if request_started.elapsed().as_secs() > 95 {
+                        eprintln!("[!] ChatState::Generating expiré (>95s), reset à Idle.");
+                        chat_state = ChatState::Idle;
+                    }
+                }
+
                 if !matches!(chat_state, ChatState::Idle) {
                     println!("[!] Génération en cours, patientez…");
+                    if let Some(resp_tx) = resp_tx {
+                        let _ = resp_tx.send(serde_json::json!({
+                            "ok": false,
+                            "error": "Inférence précédente encore en cours, réessayez dans quelques secondes."
+                        }));
+                    }
                     continue;
                 }
 
@@ -637,55 +799,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     print!("> Assistant : ");
                     tokio::io::stdout().flush().await?;
 
-                    // Warmup multi-workers : shard_init éphémère vers d'autres pairs actifs (scheduler).
-                    let mut scheduler_warmup_sent: u32 = 0;
-                    let secondaries: Vec<PeerId> = discovered_peers
-                        .iter()
-                        .filter(|p| Some(**p) != bootstrap_peer_id && **p != peer)
-                        .filter(|p| active_snapshot.contains(*p))
-                        .take(2)
-                        .copied()
-                        .collect();
-                    for (i, sp) in secondaries.iter().enumerate() {
-                        let session_id = format!(
-                            "warm-{}-{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0),
-                            i
-                        );
-                        let body = serde_json::json!({
-                            "session_id": session_id,
-                            "ttl_sec": 120_u32,
-                            "layer_start": 0_u32,
-                            "layer_end": 0_u32,
-                            "model_tag": "ephemeral",
-                        });
-                        let req = TensorRequest {
-                            kind: String::new(),
-                            data: serde_json::to_vec(&body).unwrap_or_default(),
-                            dtype: "vryx.shard.init".to_string(),
-                            compute_time_ns: 0,
-                            serialization_time_ns: 0,
-                        };
-                        let req_id = swarm
-                            .behaviour_mut()
-                            .request_response
-                            .send_request(sp, req.clone());
-                        pending_requests.insert(req_id, (req, PendingMeta::ShardWarmup));
-                        scheduler_warmup_sent += 1;
-                        println!("[P2P] Warmup shard_init -> {}", sp);
-                    }
-                    let scheduler_workers_used = 1_u32 + scheduler_warmup_sent;
-
                     let request_started = Instant::now();
                     let tx_stage1 = tx.clone();
                     let grpc_port = args.grpc_port;
                     let p_clone = prompt.clone();
                     tokio::spawn(async move {
                         match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string()).await {
-                            Ok((data, c, s, _m)) => {
+                            Ok((data, c, s, m)) => {
+                                let pipe = m.pipeline_trace_json.clone();
                                 let _ = tx_stage1.send(InferenceResult::Stage1 {
                                     peer_id: peer,
                                     data,
@@ -695,6 +816,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     continuation_response_tx: None,
                                     generated_text: String::new(),
                                     request_started,
+                                    pipeline_trace_json: pipe,
                                 });
                             }
                             Err(e) => {
@@ -712,8 +834,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         generated_text: String::new(),
                         response_tx: resp_tx,
                         request_started,
-                        scheduler_warmup_sent,
-                        scheduler_workers_used,
+                        scheduler_warmup_sent: 0,
+                        scheduler_workers_used: 1,
+                        pipeline_trace_json: String::new(),
                     };
                 } else {
                     println!(
@@ -735,15 +858,94 @@ async fn main() -> Result<(), Box<dyn Error>> {
             res = rx.recv() => {
                 if let Some(result) = res {
                     match result {
-                        InferenceResult::Stage1 { peer_id, data, c, s, full_prompt, continuation_response_tx, generated_text, request_started } => {
-                            let (sched_warm, sched_workers) = match &chat_state {
-                                ChatState::Generating {
-                                    scheduler_warmup_sent,
-                                    scheduler_workers_used,
-                                    ..
-                                } => (*scheduler_warmup_sent, *scheduler_workers_used),
-                                _ => (0_u32, 1_u32),
-                            };
+                        InferenceResult::Stage1 { peer_id, data, c, s, full_prompt, continuation_response_tx, generated_text, request_started, pipeline_trace_json } => {
+                            let sched_warm = 0_u32;
+                            let mut sched_workers = 1_u32;
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pipeline_trace_json) {
+                                if let Some(arr) = v.get("steps").and_then(|s| s.as_array()) {
+                                    sched_workers = (arr.len() as u32).max(1);
+                                }
+                                if let Some(arr) = v.get("peers").and_then(|s| s.as_array()) {
+                                    sched_workers = (arr.len() as u32).max(sched_workers);
+                                }
+                            }
+
+                            // Inférence terminée côté Python (worker-only ou tensor-parallel réussi) :
+                            // pas de warmup P2P nécessaire, on répond directement.
+                            let pipeline_val_parsed = serde_json::from_str::<serde_json::Value>(&pipeline_trace_json).ok();
+                            let worker_only_skip = pipeline_val_parsed.as_ref().map(|v| {
+                                let layout = v.get("layout").and_then(|x| x.as_str()).unwrap_or("");
+                                let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                                // Court-circuiter le warmup P2P si Python a déjà géré la computation
+                                let skip_layouts = ["worker_only_pipeline", "row_split_tensor_parallel", "distributed_fanout"];
+                                ok && skip_layouts.contains(&layout)
+                            }).unwrap_or(false);
+
+                            if worker_only_skip {
+                                let final_text = String::from_utf8_lossy(&data).to_string();
+                                let (pt, ct, tt, vps_ms) = pipeline_val_parsed.as_ref()
+                                    .and_then(|v| v.get("metrics").cloned())
+                                    .map(|m| {
+                                        let pt = m.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                                        let ct = m.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                                        let tt = m
+                                            .get("total_tokens")
+                                            .and_then(|x| x.as_u64())
+                                            .unwrap_or(pt.saturating_add(ct));
+                                        let vps_ms = m.get("vps_delegate_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                                        (pt, ct, tt, vps_ms)
+                                    })
+                                    .unwrap_or((0, 0, 0, 0));
+
+                                let response_tx = continuation_response_tx.or_else(|| {
+                                    match &mut chat_state {
+                                        ChatState::Generating { response_tx, .. } => response_tx.take(),
+                                        _ => None,
+                                    }
+                                });
+                                let pipeline_value: serde_json::Value =
+                                    serde_json::from_str(&pipeline_trace_json)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let pipeline_steps = pipeline_value
+                                    .get("generation_steps")
+                                    .cloned()
+                                    .or_else(|| pipeline_value.get("steps").cloned())
+                                    .unwrap_or(serde_json::Value::Array(vec![]));
+                                let peer_str = peer_id.to_string();
+                                let latency_ms = request_started.elapsed().as_millis() as u64;
+                                if let Some(tx) = response_tx {
+                                    let _ = tx.send(serde_json::json!({
+                                        "ok": true,
+                                        "response": final_text,
+                                        "worker_peer_id": peer_str,
+                                        "primary_worker_peer_id": peer_str,
+                                        "latency_ms": latency_ms,
+                                        "prompt_tokens": pt,
+                                        "completion_tokens": ct,
+                                        "total_tokens": tt,
+                                        "vps_delegate_ms": vps_ms,
+                                        "worker_compute_ms": 0,
+                                        "p2p_messages_in": 0_u64,
+                                        "p2p_messages_out": 0_u64,
+                                        "tokens_in": 0,
+                                        "tokens_out": 0,
+                                        "tokens_generated": ct.max(1),
+                                        "cumulative_tokens_in": tokens_in.load(Ordering::Relaxed),
+                                        "cumulative_tokens_out": tokens_out.load(Ordering::Relaxed),
+                                        "cumulative_tokens_generated": tokens_generated.load(Ordering::Relaxed),
+                                        "shard_session_id": "",
+                                        "scheduler_warmup_sent": sched_warm,
+                                        "scheduler_workers_used": sched_workers,
+                                        "pipeline_trace": pipeline_value,
+                                        "pipeline_workers": pipeline_steps,
+                                    }));
+                                }
+                                chat_state = ChatState::Idle;
+                                print!("> Vous : ");
+                                let _ = tokio::io::stdout().flush().await;
+                                continue;
+                            }
+
                             let response_tx = continuation_response_tx.or_else(|| {
                                 match &mut chat_state {
                                     ChatState::Generating { response_tx, .. } => response_tx.take(),
@@ -775,6 +977,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 request_started,
                                 scheduler_warmup_sent: sched_warm,
                                 scheduler_workers_used: sched_workers,
+                                pipeline_trace_json,
                             };
                             tokens_out.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1023,7 +1226,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     tokio::spawn(async move {
                         match call_local_inference(grpc_port, request.data, request.dtype).await {
                             Ok((data, c, s, metrics)) => {
-                                if dtype_in.starts_with("vryx.shard.") {
+                                if dtype_in.starts_with("vryx.shard.")
+                                    || dtype_in.starts_with("vryx.tp.")
+                                    || dtype_in.starts_with("vryx.dist.")
+                                {
                                     let _ = trace_shard.lock().unwrap().replace(serde_json::json!({
                                         "dtype": dtype_in,
                                         "shard_session_id": metrics.shard_session_id,
@@ -1060,13 +1266,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         ..
                     },
                 )) => {
-                    match pending_requests.remove(&request_id) {
-                        Some((_, PendingMeta::ShardWarmup)) => {
-                            println!("[P2P] Réponse warmup shard de {}", peer);
-                            continue;
+                    let pending_chat = match pending_requests.remove(&request_id) {
+                        Some((_, PendingMeta::P2pRelayReply(reply_tx))) => {
+                            let _ = reply_tx.send(Ok(response.clone()));
+                            false
                         }
-                        Some((_, PendingMeta::Chat { .. })) => {}
-                        None => continue,
+                        Some((_, PendingMeta::Chat { .. })) => true,
+                        None => false,
+                    };
+                    if !pending_chat {
+                        continue;
                     }
 
                     let mut maybe_next: Option<(String, PeerId, Option<ChatApiTx>, String, Instant)> = None;
@@ -1080,82 +1289,98 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         request_started,
                         scheduler_warmup_sent: _,
                         scheduler_workers_used: _,
+                        ..
                     } = chat_state
                     {
                         if peer == *target_peer {
-                            // Sécurité : on ne print que si c'est du texte lisible
-                            if response.data.iter().all(|&b| b == 10 || b == 13 || (b >= 32 && b <= 126) || b >= 128) {
-                                let token_final = String::from_utf8_lossy(&response.data);
-                                print!("{}", token_final);
-                                let _ = tokio::io::stdout().flush().await;
-                                full_prompt.push_str(&token_final);
-                                generated_text.push_str(&token_final);
+                            let token_final = String::from_utf8_lossy(&response.data).to_string();
+                            print!("{}", token_final);
+                            let _ = tokio::io::stdout().flush().await;
+                            full_prompt.push_str(&token_final);
+                            generated_text.push_str(&token_final);
 
-                                // Ollama renvoie une réponse complète dès le premier tour P2P.
-                                // On s'arrête après le 1er aller-retour (ou sur marqueur de fin).
-                                let done = true;
-                                if !done {
-                                    *token_count += 1;
-                                    let next_resp_tx = response_tx.take();
-                                    let next_gen_text = generated_text.clone();
-                                    maybe_next = Some((
-                                        full_prompt.clone(),
-                                        *target_peer,
-                                        next_resp_tx,
-                                        next_gen_text,
-                                        request_started,
-                                    ));
-                                } else {
-                                    println!("\n");
-                                    let peer_str = target_peer.to_string();
-                                    let started = request_started;
-                                    let (sched_w, sched_u) = match &chat_state {
-                                        ChatState::Generating {
-                                            scheduler_warmup_sent,
-                                            scheduler_workers_used,
-                                            ..
-                                        } => (*scheduler_warmup_sent, *scheduler_workers_used),
-                                        _ => (0_u32, 1_u32),
-                                    };
-                                    if let ChatState::Generating { response_tx, generated_text, .. } =
-                                        std::mem::replace(&mut chat_state, ChatState::Idle)
-                                    {
-                                        if let Some(tx) = response_tx {
-                                            let latency_ms = started.elapsed().as_millis() as u64;
-                                            tokens_generated.fetch_add(1, Ordering::Relaxed);
-                                            let pt = response.prompt_tokens_llm;
-                                            let ct = response.completion_tokens_llm;
-                                            let tt = if response.total_tokens_llm > 0 {
-                                                response.total_tokens_llm
-                                            } else {
-                                                pt.saturating_add(ct)
-                                            };
-                                            let _ = tx.send(serde_json::json!({
-                                                "ok": true,
-                                                "response": generated_text,
-                                                "worker_peer_id": peer_str,
-                                                "latency_ms": latency_ms,
-                                                "prompt_tokens": pt,
-                                                "completion_tokens": ct,
-                                                "total_tokens": tt,
-                                                "vps_delegate_ms": response.vps_delegate_ms,
-                                                "worker_compute_ms": response.worker_compute_ms,
-                                                "p2p_messages_in": 1_u64,
-                                                "p2p_messages_out": 1_u64,
-                                                "tokens_in": 1,
-                                                "tokens_out": 1,
-                                                "tokens_generated": 1,
-                                                "cumulative_tokens_in": tokens_in.load(Ordering::Relaxed),
-                                                "cumulative_tokens_out": tokens_out.load(Ordering::Relaxed),
-                                                "cumulative_tokens_generated": tokens_generated.load(Ordering::Relaxed),
-                                                "shard_session_id": response.shard_session_id,
-                                                "scheduler_warmup_sent": sched_w,
-                                                "scheduler_workers_used": sched_u,
-                                            }));
-                                        }
+                            let done = true;
+                            if !done {
+                                *token_count += 1;
+                                let next_resp_tx = response_tx.take();
+                                let next_gen_text = generated_text.clone();
+                                maybe_next = Some((
+                                    full_prompt.clone(),
+                                    *target_peer,
+                                    next_resp_tx,
+                                    next_gen_text,
+                                    request_started,
+                                ));
+                            } else {
+                                println!("\n");
+                                let peer_str = target_peer.to_string();
+                                let started = request_started;
+                                let (sched_w, sched_u, pipeline_trace_json) = match &chat_state {
+                                    ChatState::Generating {
+                                        scheduler_warmup_sent,
+                                        scheduler_workers_used,
+                                        pipeline_trace_json,
+                                        ..
+                                    } => (
+                                        *scheduler_warmup_sent,
+                                        *scheduler_workers_used,
+                                        pipeline_trace_json.clone(),
+                                    ),
+                                    _ => (0_u32, 1_u32, String::new()),
+                                };
+                                let pipeline_value: serde_json::Value =
+                                    serde_json::from_str(&pipeline_trace_json)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let pipeline_steps = pipeline_value
+                                    .get("steps")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Array(vec![]));
+                                if let ChatState::Generating { response_tx, generated_text, .. } =
+                                    std::mem::replace(&mut chat_state, ChatState::Idle)
+                                {
+                                    if let Some(tx) = response_tx {
+                                        let latency_ms = started.elapsed().as_millis() as u64;
+                                        tokens_generated.fetch_add(1, Ordering::Relaxed);
+                                        let pt = response.prompt_tokens_llm;
+                                        let ct = response.completion_tokens_llm;
+                                        let tt = if response.total_tokens_llm > 0 {
+                                            response.total_tokens_llm
+                                        } else {
+                                            pt.saturating_add(ct)
+                                        };
+                                        let _ = tx.send(serde_json::json!({
+                                            "ok": true,
+                                            "response": generated_text,
+                                            "worker_peer_id": peer_str,
+                                            "primary_worker_peer_id": peer_str,
+                                            "latency_ms": latency_ms,
+                                            "prompt_tokens": pt,
+                                            "completion_tokens": ct,
+                                            "total_tokens": tt,
+                                            "vps_delegate_ms": response.vps_delegate_ms,
+                                            "worker_compute_ms": response.worker_compute_ms,
+                                            "p2p_messages_in": 1_u64,
+                                            "p2p_messages_out": 1_u64,
+                                            "tokens_in": 1,
+                                            "tokens_out": 1,
+                                            "tokens_generated": 1,
+                                            "cumulative_tokens_in": tokens_in.load(Ordering::Relaxed),
+                                            "cumulative_tokens_out": tokens_out.load(Ordering::Relaxed),
+                                            "cumulative_tokens_generated": tokens_generated.load(Ordering::Relaxed),
+                                            "shard_session_id": response.shard_session_id,
+                                            "scheduler_warmup_sent": sched_w,
+                                            "scheduler_workers_used": sched_u,
+                                            "pipeline_trace": pipeline_value,
+                                            "pipeline_workers": pipeline_steps,
+                                        }));
                                     }
                                 }
                             }
+                        } else {
+                            eprintln!(
+                                "[P2P] Réponse reçue d'un pair inattendu (attendu {}), ignorée.",
+                                target_peer
+                            );
                         }
                     }
 
@@ -1165,7 +1390,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let p_clone = prompt.clone();
                         tokio::spawn(async move {
                             match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string()).await {
-                                Ok((data, c, s, _m)) => {
+                                Ok((data, c, s, m)) => {
+                                    let pipe = m.pipeline_trace_json.clone();
                                     let _ = tx_next.send(InferenceResult::Stage1 {
                                         peer_id: target,
                                         data,
@@ -1175,6 +1401,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         continuation_response_tx: resp_tx,
                                         generated_text: gen_text,
                                         request_started: req_started,
+                                        pipeline_trace_json: pipe,
                                     });
                                 }
                                 Err(e) => {
@@ -1185,10 +1412,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         });
-                    } else if !matches!(chat_state, ChatState::Idle) {
-                        chat_state = ChatState::Idle;
-                        print!("> Vous : ");
-                        let _ = tokio::io::stdout().flush().await;
                     }
                 }
 
@@ -1201,8 +1424,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     eprintln!("[!] Échec envoi vers {} : {}", peer, error);
                     if let Some((req, meta)) = pending_requests.remove(&request_id) {
                         let (retries, _target_peer) = match meta {
-                            PendingMeta::ShardWarmup => {
-                                eprintln!("[P2P] Warmup shard échoué vers {}", peer);
+                            PendingMeta::P2pRelayReply(reply_tx) => {
+                                let _ = reply_tx.send(Err(format!("{:?}", error)));
                                 continue;
                             }
                             PendingMeta::Chat {
@@ -1248,7 +1471,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         }));
                                     }
                                 }
-                                chat_state = ChatState::Idle;
                                 print!("> Vous : ");
                                 tokio::io::stdout().flush().await?;
                             }
@@ -1263,7 +1485,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }));
                                 }
                             }
-                            chat_state = ChatState::Idle;
                             print!("> Vous : ");
                             tokio::io::stdout().flush().await?;
                         }

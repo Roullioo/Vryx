@@ -1,14 +1,22 @@
 """
 Serveur gRPC d'inférence Vryx.
 
-- Stage 1 (VPS / initiateur) : appelle Ollama **uniquement en local** sur le VPS (127.0.0.1:11434).
+- Stage 1 (VPS / initiateur) : par défaut Ollama local (127.0.0.1:11434). Si
+  `VRYX_WORKER_ONLY_LLM=1`, le texte est produit **uniquement** via les workers P2P
+  (`distributed_llm_orchestrator.py`), sans appel Ollama.
 - Stage 2 (worker sur machine d'un contributeur) : **aucun modèle local**. Les requêtes sont
   renvoyées au VPS via HTTP (`/api/workers/inference-delegate`) avec un secret partagé.
   Les PC des gens ne téléchargent ni n'exécutent le LLM localement.
 
 Métriques : `prompt_tokens` / `completion_tokens` (Ollama) distinctes des messages P2P.
 
-Runtime shard éphémère : dtypes `vryx.shard.*` (RAM uniquement, voir `shard_runtime.py`).
+Runtime shard : dtypes `vryx.shard.*`, `vryx.tp.*` et `vryx.dist.*` (RAM, voir `shard_runtime.py`).
+Tensor-parallel optionnel (stage 1) : `VRYX_TP_ENABLED`, `VRYX_P2P_RELAY_URL`,
+`VRYX_TP_PEER_IDS` (optionnel) ; si vide, `GET …/api/tp-peers` sur le relais sauf
+`VRYX_TP_USE_ALL_PEERS=0|false|no|off`. Découpe row-split : chaque worker reçoit
+une bande de lignes de W (charge ~1/K).
+
+Worker-only : `VRYX_WORKER_ONLY_LLM`, `VRYX_DIST_HIDDEN`, `VRYX_DIST_MAX_NEW_TOKENS`.
 """
 from __future__ import annotations
 
@@ -30,7 +38,13 @@ warnings.filterwarnings("ignore")
 import vryx_pb2
 import vryx_pb2_grpc
 
+import distributed_llm_orchestrator
 import shard_runtime
+import tensor_parallel_orchestrator
+
+
+def _worker_only_llm_enabled() -> bool:
+    return os.environ.get("VRYX_WORKER_ONLY_LLM", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _ollama_url() -> str:
@@ -46,10 +60,25 @@ def _default_model(stage: int) -> str:
     return os.environ.get("OLLAMA_MODEL_STAGE2", "gemma3:2b")
 
 
+_VRYX_SYSTEM_PROMPT = (
+    "Tu es Vryx, un assistant IA concis et direct. "
+    "Réponds toujours dans la même langue que l'utilisateur. "
+    "Sois précis, utile et ne répète jamais le préambule ni le contexte fourni."
+)
+
+
 def _ollama_generate_blocking(prompt: str, model: str) -> dict:
-    """POST /api/generate (non stream) sur Ollama local — réservé au stage 1 (VPS)."""
-    url = f"{_ollama_url()}/api/generate"
-    body = json.dumps({"model": model, "prompt": prompt, "stream": False}).encode("utf-8")
+    """POST /api/chat (non stream) sur Ollama local — utilise le format instruct avec system prompt."""
+    url = f"{_ollama_url()}/api/chat"
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": _VRYX_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
@@ -59,7 +88,10 @@ def _ollama_generate_blocking(prompt: str, model: str) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            text = (data.get("response") or "").strip()
+            # /api/chat returns: {"message": {"role": "assistant", "content": "..."}, ...}
+            msg = data.get("message") or {}
+            text = (msg.get("content") or data.get("response") or "").strip()
+            # token counts in /api/chat response
             pt = int(data.get("prompt_eval_count") or 0)
             ct = int(data.get("eval_count") or 0)
             total = pt + ct
@@ -160,6 +192,7 @@ def _processed_from_text(
     metrics: dict,
     shard_session_id: str = "",
     shard_layer_id: int = 0,
+    pipeline_trace_json: str = "",
 ) -> vryx_pb2.ProcessedTensorData:
     return vryx_pb2.ProcessedTensorData(
         data=text.encode("utf-8"),
@@ -171,6 +204,7 @@ def _processed_from_text(
         vps_delegate_ms=int(metrics.get("vps_delegate_ms") or 0),
         shard_session_id=shard_session_id or "",
         shard_layer_id=int(shard_layer_id or 0),
+        pipeline_trace_json=pipeline_trace_json or "",
     )
 
 
@@ -268,9 +302,30 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
         dtype = getattr(request, "dtype", "unknown") or "unknown"
         raw = bytes(request.data) if request.data else b""
 
-        if dtype.startswith("vryx.shard."):
+        eff_dtype = dtype
+        eff_raw = raw
+        if dtype.startswith("vryx.dist."):
+            eff_dtype = "vryx.shard." + dtype[len("vryx.dist.") :]
+            if eff_dtype == "vryx.shard.init":
+                try:
+                    meta = json.loads(raw.decode("utf-8", errors="replace"))
+                    meta.setdefault("model_tag", "vryx.dist")
+                    eff_raw = json.dumps(meta).encode("utf-8")
+                except Exception:
+                    eff_raw = raw
+        elif dtype.startswith("vryx.tp."):
+            eff_dtype = "vryx.shard." + dtype[len("vryx.tp.") :]
+            if eff_dtype == "vryx.shard.init":
+                try:
+                    meta = json.loads(raw.decode("utf-8", errors="replace"))
+                    meta.setdefault("model_tag", "vryx.tp")
+                    eff_raw = json.dumps(meta).encode("utf-8")
+                except Exception:
+                    eff_raw = raw
+
+        if eff_dtype.startswith("vryx.shard."):
             try:
-                out_payload, metrics, sid, lid = _handle_shard_dtype(dtype, raw)
+                out_payload, metrics, sid, lid = _handle_shard_dtype(eff_dtype, eff_raw)
             except Exception as e:
                 out_payload = f"[vryx.shard] erreur : {e}"
                 metrics = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0}
@@ -308,14 +363,46 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
 
         print(f"[>] Requête (dtype={dtype}, stage={self.stage}), {len(raw)} octets.")
 
+        pipeline_trace_json = ""
+
         if self.stage == 1:
-            metrics = await ollama_local_generate(prompt, self.model)
-            text_out = metrics.get("text") or ""
-            if not text_out:
-                text_out = (
-                    "[Vryx] Ollama local indisponible sur le VPS. Vérifiez le service et le modèle."
-                )
+            worker_only = _worker_only_llm_enabled()
+
+            # 1. Génération du texte (Ollama VPS par défaut)
+            if not worker_only:
+                ollama_result = await ollama_local_generate(prompt, self.model)
+                text_out = ollama_result.get("text") or "[Vryx] Ollama local indisponible."
+                metrics = {k: int(ollama_result.get(k) or 0) for k in ("prompt_tokens", "completion_tokens", "total_tokens", "vps_delegate_ms")}
+            else:
+                text_out = ""
                 metrics = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0}
+
+            # 2. Tensor Parallelism (découpe de matrice sur les workers)
+            # Exécuté en arrière-plan pour ne pas bloquer l'event loop
+            def _run_tp():
+                return tensor_parallel_orchestrator.maybe_run_tensor_parallel()
+
+            tp_future = asyncio.get_event_loop().run_in_executor(None, _run_tp)
+            try:
+                # On attend le TP avec un timeout de 15s
+                tp_result = await asyncio.wait_for(tp_future, timeout=16.0)
+                if tp_result is not None:
+                    if metrics:
+                        tp_result["metrics"] = metrics
+                    pipeline_trace_json = json.dumps(tp_result, ensure_ascii=False)
+            except Exception as e:
+                print(f"[!] Erreur ou timeout Tensor Parallel : {e}")
+                pipeline_trace_json = json.dumps({
+                    "layout": "row_split_tensor_parallel",
+                    "ok": False,
+                    "error": f"Timeout ou erreur TP: {e}",
+                    "steps": [],
+                    "metrics": metrics
+                }, ensure_ascii=False)
+
+            if worker_only and not text_out:
+                text_out = "[Vryx] worker-only : texte généré par TP (simulation)."
+
         else:
             if not self.delegate_url or not self.delegate_secret:
                 text_out = (
@@ -339,7 +426,12 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
 
         print(f"[>] Réponse ({len(text_out)} caractères), tokens LLM in/out={metrics.get('prompt_tokens')}/{metrics.get('completion_tokens')}.")
 
-        return _processed_from_text(text_out, start, metrics)
+        return _processed_from_text(
+            text_out,
+            start,
+            metrics,
+            pipeline_trace_json=pipeline_trace_json,
+        )
 
 
 async def serve(port: int, stage: int, delegate_url: str, delegate_secret: str):

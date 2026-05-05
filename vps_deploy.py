@@ -5,9 +5,12 @@ import os
 import sys
 
 # Configuration
-HOST = "51.222.26.225"
-USER = "ubuntu"
-PASS = "Galippette0312"
+HOST = os.environ.get("VRYX_VPS_HOST", "51.222.26.225")
+USER = os.environ.get("VRYX_VPS_USER", "ubuntu")
+PASS = os.environ.get("VRYX_VPS_SSH_PASSWORD")
+if not PASS:
+    print("Définissez VRYX_VPS_SSH_PASSWORD ou utilisez une clé SSH (recommandé).", file=sys.stderr)
+    sys.exit(1)
 P2P_PORT = 4001
 
 def create_tarball(output_filename, source_dirs):

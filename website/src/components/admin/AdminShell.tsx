@@ -1,93 +1,278 @@
-import { NavLink, Navigate } from 'react-router-dom'
+import { NavLink, Navigate, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '../../context/AuthContext'
 
-const tabs = [
-  { to: '/admin', label: "Vue d'ensemble", end: true },
-  { to: '/admin/utilisateurs', label: 'Utilisateurs', end: false },
-  { to: '/admin/noeud', label: 'Nœud Vryx', end: false },
-] as const
-
-type AdminShellProps = {
-  children: ReactNode
-  /** Barre latérale gauche (ex. workers live). Mobile : au-dessus du contenu. */
-  aside?: ReactNode
+/* ─── Icons ───────────────────────────────────────────────────────────────── */
+function IconGrid() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" />
+      <rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" />
+    </svg>
+  )
+}
+function IconServer() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <rect x="2" y="3" width="20" height="6" rx="1" /><rect x="2" y="15" width="20" height="6" rx="1" />
+      <line x1="6" y1="6" x2="6.01" y2="6" /><line x1="6" y1="18" x2="6.01" y2="18" />
+    </svg>
+  )
+}
+function IconWorkers() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <circle cx="9" cy="7" r="3" /><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2" />
+      <path d="M16 11a3 3 0 1 1 0-6" /><path d="M21 21v-2a4 4 0 0 0-3-3.87" />
+    </svg>
+  )
+}
+function IconSessions() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 2 14 8 20 8" /><line x1="9" y1="13" x2="15" y2="13" /><line x1="9" y1="17" x2="13" y2="17" />
+    </svg>
+  )
+}
+function IconUsers() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" />
+      <path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  )
+}
+function IconChat() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </svg>
+  )
+}
+function IconMenu() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="h-5 w-5">
+      <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+  )
+}
+function IconClose() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="h-5 w-5">
+      <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  )
+}
+function IconLogout() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
+    </svg>
+  )
 }
 
-export function AdminShell({ children, aside }: AdminShellProps) {
+/* ─── Navigation ──────────────────────────────────────────────────────────── */
+type NavItem = { to: string; label: string; icon: ReactNode; end?: boolean }
+
+const navItems: NavItem[] = [
+  { to: '/admin', label: "Vue d'ensemble", icon: <IconGrid />, end: true },
+  { to: '/admin/noeud', label: 'Nœud Vryx', icon: <IconServer /> },
+  { to: '/admin/workers', label: 'Workers', icon: <IconWorkers /> },
+  { to: '/admin/sessions', label: 'Sessions', icon: <IconSessions /> },
+  { to: '/admin/utilisateurs', label: 'Utilisateurs', icon: <IconUsers /> },
+  { to: '/admin/noeud', label: 'Chat P2P', icon: <IconChat /> },
+]
+
+const SIDEBAR_W = 220 // px
+
+/* ─── Sidebar ─────────────────────────────────────────────────────────────── */
+function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { user, logout } = useAuth() as { user: { email: string } | null; logout?: () => void }
+  const loc = useLocation()
+
+  // Fermer sidebar mobile au changement de route
+  useEffect(() => { onClose() }, [loc.pathname, onClose])
+
+  return (
+    <>
+      {/* Overlay mobile */}
+      {open && (
+        <div
+          className="fixed inset-0 z-40 bg-black/60 lg:hidden"
+          onClick={onClose}
+          aria-hidden
+        />
+      )}
+
+      {/* Sidebar */}
+      <aside
+        style={{ width: SIDEBAR_W }}
+        className={`fixed inset-y-0 left-0 z-50 flex flex-col bg-[#0c0c0c] transition-transform duration-300 lg:translate-x-0 ${
+          open ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        {/* Logo */}
+        <div className="flex h-14 items-center gap-3 border-b border-white/8 px-5">
+          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white">
+            <span className="font-display text-[11px] font-bold leading-none text-black">VX</span>
+          </div>
+          <span className="font-display text-[15px] font-semibold text-white">Vryx Admin</span>
+          <button
+            className="ml-auto text-white/40 hover:text-white lg:hidden"
+            onClick={onClose}
+            aria-label="Fermer"
+          >
+            <IconClose />
+          </button>
+        </div>
+
+        {/* Nav */}
+        <nav className="flex-1 overflow-y-auto px-3 py-4">
+          <p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-widest text-white/25">
+            Navigation
+          </p>
+          <ul className="space-y-0.5">
+            {navItems.slice(0, -1).map((item) => (
+              <li key={`${item.to}-${item.label}`}>
+                <NavLink
+                  to={item.to}
+                  end={item.end}
+                  className={({ isActive }) =>
+                    `flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors ${
+                      isActive
+                        ? 'bg-white/10 text-white'
+                        : 'text-white/50 hover:bg-white/5 hover:text-white/80'
+                    }`
+                  }
+                >
+                  {item.icon}
+                  {item.label}
+                </NavLink>
+              </li>
+            ))}
+          </ul>
+
+          <p className="mb-2 mt-5 px-2 text-[10px] font-semibold uppercase tracking-widest text-white/25">
+            Interface
+          </p>
+          <NavLink
+            to="/admin/noeud"
+            className={({ isActive }) =>
+              `flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors ${
+                isActive
+                  ? 'bg-white/10 text-white'
+                  : 'text-white/50 hover:bg-white/5 hover:text-white/80'
+              }`
+            }
+          >
+            <IconChat />
+            Chat P2P
+          </NavLink>
+        </nav>
+
+        {/* User footer */}
+        <div className="border-t border-white/8 p-3">
+          <div className="flex items-center gap-2 rounded-lg px-2 py-2">
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/10 text-[11px] font-bold text-white/80">
+              {(user?.email?.[0] ?? 'A').toUpperCase()}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[11px] font-medium text-white/80">{user?.email ?? ''}</p>
+              <p className="text-[10px] text-white/30">Administrateur</p>
+            </div>
+            {logout && (
+              <button
+                onClick={logout}
+                className="text-white/30 hover:text-white/70"
+                title="Se déconnecter"
+              >
+                <IconLogout />
+              </button>
+            )}
+          </div>
+        </div>
+      </aside>
+    </>
+  )
+}
+
+/* ─── AdminShell ─────────────────────────────────────────────────────────── */
+type AdminShellProps = {
+  children: ReactNode
+  title: string
+  subtitle?: string
+  actions?: ReactNode
+}
+
+export function AdminShell({ children, title, subtitle, actions }: AdminShellProps) {
   const { user, loading } = useAuth()
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const closeSidebar = useRef(() => setSidebarOpen(false)).current
 
   if (loading) {
     return (
-      <div className="bg-bg min-h-[calc(100svh-4.25rem)] px-4 py-12">
-        <div className="mx-auto max-w-6xl animate-pulse space-y-4">
-          <div className="h-10 w-1/3 rounded-lg border border-border bg-card" />
-          <div className="h-40 panel" />
-        </div>
+      <div className="flex min-h-dvh items-center justify-center bg-[#f8f8f8]">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-border border-t-accent" />
       </div>
     )
   }
+
   if (!user) return <Navigate to="/connexion" replace state={{ from: '/admin' }} />
+
   if (!user.isAdmin) {
     return (
-      <div className="bg-bg min-h-[calc(100svh-4.25rem)] px-4 py-16">
-        <div className="mx-auto max-w-xl panel p-8 text-center">
-          <h1 className="font-display text-2xl font-bold text-fg">Accès refusé</h1>
-          <p className="mt-3 text-sm text-muted">
-            Cette zone est réservée aux administrateurs Vryx. Connectez-vous avec un compte disposant des droits
-            requis.
-          </p>
+      <div className="flex min-h-dvh items-center justify-center bg-[#f8f8f8] px-4">
+        <div className="w-full max-w-sm rounded-2xl border border-border bg-white p-8 text-center shadow-sm">
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-alert/10">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-6 w-6 text-alert">
+              <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+          </div>
+          <h1 className="font-display text-xl font-bold text-fg">Accès refusé</h1>
+          <p className="mt-2 text-sm text-muted">Zone réservée aux administrateurs Vryx.</p>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="bg-bg min-h-[calc(100svh-4.25rem)] px-4 py-8 sm:px-6 lg:px-8 lg:py-10">
-      <div className={aside ? 'mx-auto max-w-[100rem]' : 'mx-auto max-w-6xl'}>
-        <header className="border-b border-border pb-6">
-          <p className="text-xs font-medium uppercase tracking-wider text-accent">Console interne Vryx</p>
-          <h1 className="mt-1 font-display text-3xl font-bold tracking-tight text-fg sm:text-4xl">
-            Panel administrateur
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm text-muted sm:text-base">
-            Pilotage du site, gestion des utilisateurs et supervision en temps réel du nœud d'inférence distribuée.
-          </p>
-          <p className="mt-2 font-mono text-xs text-muted">Connecté en tant que {user.email}</p>
+    <div className="flex min-h-dvh bg-[#f4f4f5]">
+      <Sidebar open={sidebarOpen} onClose={closeSidebar} />
+
+      {/* Main */}
+      <div
+        className="flex min-w-0 flex-1 flex-col lg:pl-[220px]"
+      >
+        {/* Top bar mobile */}
+        <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-white/90 px-4 backdrop-blur-md lg:hidden">
+          <button
+            onClick={() => setSidebarOpen(true)}
+            className="rounded-lg p-1.5 text-muted hover:bg-surface hover:text-fg"
+            aria-label="Ouvrir menu"
+          >
+            <IconMenu />
+          </button>
+          <span className="font-display text-[15px] font-semibold text-fg">{title}</span>
         </header>
 
-        <nav
-          className="scrollbar-thin sticky top-[4.25rem] z-30 -mx-4 mt-4 flex gap-2 overflow-x-auto border-b border-border bg-bg/95 px-4 py-3 backdrop-blur-md sm:-mx-6 sm:px-6 lg:top-[4.5rem]"
-          aria-label="Sections admin"
-        >
-          {tabs.map((t) => (
-            <NavLink
-              key={t.to}
-              to={t.to}
-              end={t.end}
-              className={({ isActive }) =>
-                `shrink-0 rounded-full border px-4 py-2 text-xs font-medium transition-colors sm:text-sm ${
-                  isActive
-                    ? 'border-accent bg-accent text-white'
-                    : 'border-border bg-surface text-fg hover:border-accent/40 hover:text-accent'
-                }`
-              }
-            >
-              {t.label}
-            </NavLink>
-          ))}
-        </nav>
-
-        {aside ? (
-          <div className="mt-8 flex flex-col gap-6 lg:flex-row lg:items-start">
-            <aside className="w-full shrink-0 border border-border bg-surface/80 lg:sticky lg:top-28 lg:max-h-[calc(100svh-8rem)] lg:w-64 lg:overflow-y-auto lg:rounded-xl lg:p-4">
-              {aside}
-            </aside>
-            <div className="min-w-0 flex-1">{children}</div>
+        {/* Page header */}
+        <div className="border-b border-border bg-white px-6 py-5 lg:px-8">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h1 className="font-display text-xl font-bold text-fg lg:text-2xl">{title}</h1>
+              {subtitle && <p className="mt-0.5 text-sm text-muted">{subtitle}</p>}
+            </div>
+            {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
           </div>
-        ) : (
-          <div className="mt-8">{children}</div>
-        )}
+        </div>
+
+        {/* Content */}
+        <main className="flex-1 overflow-auto p-4 lg:p-6">
+          {children}
+        </main>
       </div>
     </div>
   )
