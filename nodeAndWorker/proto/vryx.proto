@@ -15,6 +15,8 @@ message TensorData {
   bytes data = 1;
   repeated int64 shape = 2;
   string dtype = 3;
+  repeated string routing_path = 4;
+  string session_id = 5;
 }
 
 message ProcessedTensorData {
@@ -32,6 +34,7 @@ message ProcessedTensorData {
   uint32 shard_layer_id = 10;
   // Trace JSON du pipeline tensor-parallel (étapes P2P, pairs, latences) pour l'admin.
   string pipeline_trace_json = 11;
+  uint64 compute_time_ms = 12;
 }
 
 // --- Tensor parallel éphémère (metadata + futures charges RAM) ---

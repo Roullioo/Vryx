@@ -193,6 +193,7 @@ def _processed_from_text(
     shard_session_id: str = "",
     shard_layer_id: int = 0,
     pipeline_trace_json: str = "",
+    compute_time_ms: int = 0,
 ) -> vryx_pb2.ProcessedTensorData:
     return vryx_pb2.ProcessedTensorData(
         data=text.encode("utf-8"),
@@ -205,6 +206,7 @@ def _processed_from_text(
         shard_session_id=shard_session_id or "",
         shard_layer_id=int(shard_layer_id or 0),
         pipeline_trace_json=pipeline_trace_json or "",
+        compute_time_ms=compute_time_ms,
     )
 
 
@@ -233,18 +235,43 @@ def _handle_shard_dtype(dtype: str, raw: bytes) -> tuple[str | bytes, dict, str,
         msg = shard_runtime.shard_load_chunk(session_id, chunk_i, chunk_tot, payload)
         return msg, metrics, session_id, 0
     if dtype == "vryx.shard.forward":
-        meta = json.loads(raw.decode("utf-8", errors="replace"))
-        session_id = str(meta.get("session_id") or "")
-        layer_id = int(meta.get("layer_id") or 0)
-        act = base64.b64decode(meta.get("activation_b64") or "")
-        out = shard_runtime.ephemeral_layer_forward(act, layer_id, session_id)
-        return out, metrics, session_id, layer_id
+        # Utilisation de session_id du proto
+        sid = session_id or str(json.loads(raw.decode("utf-8", errors="replace")).get("session_id") or "")
+        lid = int(json.loads(raw.decode("utf-8", errors="replace")).get("layer_id") or 0)
+        try:
+            act = base64.b64decode(json.loads(raw.decode("utf-8", errors="replace")).get("activation_b64") or "")
+        except Exception:
+            act = raw # Fallback si raw bytes
+        
+        out, compute_ms = shard_runtime.ephemeral_layer_forward(act, lid, sid)
+        return out, metrics, sid, lid, compute_ms
     if dtype == "vryx.shard.unload":
         meta = json.loads(raw.decode("utf-8", errors="replace"))
         session_id = str(meta.get("session_id") or "")
         msg = shard_runtime.shard_unload(session_id)
-        return msg, metrics, session_id, 0
-    return "", metrics, "", 0
+        return msg, metrics, session_id, 0, 0
+    return "", metrics, "", 0, 0
+
+def _handle_shard_dtype(dtype: str, raw: bytes, session_id: str = "") -> tuple[str | bytes, dict, str, int, int]:
+    """Retourne (payload, metrics, sid, lid, compute_ms)."""
+    metrics = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0}
+    if dtype == "vryx.shard.init":
+        meta = json.loads(raw.decode("utf-8", errors="replace"))
+        sid = session_id or str(meta.get("session_id") or "")
+        msg = shard_runtime.shard_init(
+            sid,
+            int(meta.get("ttl_sec") or 120),
+            int(meta.get("layer_start") or 0),
+            int(meta.get("layer_end") or 0),
+            str(meta.get("model_tag") or ""),
+        )
+        return msg, metrics, sid, 0, 0
+    if dtype == "vryx.shard.forward" or dtype == "vryx.pipeline.forward":
+        sid = session_id
+        lid = 0
+        out, compute_ms = shard_runtime.ephemeral_layer_forward(raw, lid, sid)
+        return out, metrics, sid, lid, compute_ms
+    return "", metrics, "", 0, 0
 
 
 class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
@@ -323,14 +350,17 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                 except Exception:
                     eff_raw = raw
 
-        if eff_dtype.startswith("vryx.shard."):
+        if eff_dtype.startswith("vryx.shard.") or eff_dtype == "vryx.pipeline.forward":
             try:
-                out_payload, metrics, sid, lid = _handle_shard_dtype(eff_dtype, eff_raw)
+                sid_input = request.session_id or ""
+                out_payload, metrics, sid, lid, compute_ms = _handle_shard_dtype(eff_dtype, eff_raw, session_id=sid_input)
             except Exception as e:
                 out_payload = f"[vryx.shard] erreur : {e}"
                 metrics = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0}
-                sid, lid = "", 0
-            print(f"[>] Shard dtype={dtype} session={sid!r} layer={lid}")
+                sid, lid, compute_ms = "", 0, 0
+            
+            print(f"[>] Shard dtype={dtype} session={sid!r} compute={compute_ms}ms")
+            
             if isinstance(out_payload, bytes):
                 return vryx_pb2.ProcessedTensorData(
                     data=out_payload,
@@ -342,8 +372,9 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                     vps_delegate_ms=0,
                     shard_session_id=sid or "",
                     shard_layer_id=int(lid or 0),
+                    compute_time_ms=compute_ms,
                 )
-            return _processed_from_text(str(out_payload), start, metrics, shard_session_id=sid, shard_layer_id=lid)
+            return _processed_from_text(str(out_payload), start, metrics, shard_session_id=sid, shard_layer_id=lid, compute_time_ms=compute_ms)
 
         if dtype == "text":
             try:

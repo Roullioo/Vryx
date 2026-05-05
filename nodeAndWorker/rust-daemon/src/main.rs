@@ -87,8 +87,14 @@ struct TensorRequest {
     #[serde(with = "base64_vec")]
     data: Vec<u8>,
     dtype: String,
+    #[serde(default)]
     compute_time_ns: u64,
+    #[serde(default)]
     serialization_time_ns: u64,
+    #[serde(default)]
+    routing_path: Vec<String>,
+    #[serde(default)]
+    session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +123,8 @@ struct TensorResponse {
     scheduler_workers_used: u32,
     #[serde(default)]
     shard_warmup_sent: u32,
+    #[serde(default)]
+    compute_time_ms: u64,
 }
 
 impl Default for TensorResponse {
@@ -135,6 +143,7 @@ impl Default for TensorResponse {
             shard_session_id: String::new(),
             scheduler_workers_used: 0,
             shard_warmup_sent: 0,
+            compute_time_ms: 0,
         }
     }
 }
@@ -227,17 +236,21 @@ async fn call_local_inference(
     port: u16,
     data: Vec<u8>,
     dtype: String,
-) -> Result<(Vec<u8>, u64, u64, LlmMetrics), Box<dyn Error>> {
+    routing_path: Vec<String>,
+    session_id: String,
+) -> Result<(Vec<u8>, u64, u64, LlmMetrics, u64), Box<dyn Error>> {
     let mut client = InferenceServiceClient::connect(format!("http://127.0.0.1:{}", port))
         .await?
         .max_decoding_message_size(100 * 1024 * 1024)
         .max_encoding_message_size(100 * 1024 * 1024);
 
     let response = client
-        .process(tonic::Request::new(TensorData {
+        .process(tonic::Request::new(vryx::TensorData {
             data,
             shape: vec![],
             dtype,
+            routing_path,
+            session_id,
         }))
         .await?
         .into_inner();
@@ -258,6 +271,7 @@ async fn call_local_inference(
         response.compute_time_ns,
         response.serialization_time_ns,
         m,
+        response.compute_time_ms,
     ))
 }
 
@@ -445,6 +459,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     enum PendingMeta {
         Chat { retries: u32, target_peer: PeerId },
         P2pRelayReply(tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>),
+        Forwarded { original_channel: request_response::ResponseChannel<TensorResponse> },
     }
 
     let mut pending_requests: HashMap<
@@ -628,12 +643,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         );
                     }
                 };
+                let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let routing_path = payload.get("routing_path").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                }).unwrap_or_default();
+                
                 let req = TensorRequest {
                     kind: String::new(),
                     data,
                     dtype,
                     compute_time_ns: 0,
                     serialization_time_ns: 0,
+                    routing_path,
+                    session_id,
                 };
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 if p2p_relay_axum.send((peer, req, tx)).is_err() {
@@ -721,6 +743,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             generated_text: String,
             request_started: Instant,
             pipeline_trace_json: String,
+            compute_time_ms: u64,
         },
         Stage2 {
             channel: request_response::ResponseChannel<TensorResponse>,
@@ -728,10 +751,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             c: u64,
             s: u64,
             metrics: LlmMetrics,
+            compute_time_ms: u64,
         },
         Stage2Error {
             channel: request_response::ResponseChannel<TensorResponse>,
             message: String,
+        },
+        PipelineForward {
+            target_peer: PeerId,
+            request: TensorRequest,
+            original_channel: request_response::ResponseChannel<TensorResponse>,
         },
         Error { 
             context: String, 
@@ -804,8 +833,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let grpc_port = args.grpc_port;
                     let p_clone = prompt.clone();
                     tokio::spawn(async move {
-                        match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string()).await {
-                            Ok((data, c, s, m)) => {
+                        match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string(), vec![], String::new()).await {
+                            Ok((data, c, s, m, c_ms)) => {
                                 let pipe = m.pipeline_trace_json.clone();
                                 let _ = tx_stage1.send(InferenceResult::Stage1 {
                                     peer_id: peer,
@@ -817,6 +846,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     generated_text: String::new(),
                                     request_started,
                                     pipeline_trace_json: pipe,
+                                    compute_time_ms: c_ms,
                                 });
                             }
                             Err(e) => {
@@ -858,7 +888,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             res = rx.recv() => {
                 if let Some(result) = res {
                     match result {
-                        InferenceResult::Stage1 { peer_id, data, c, s, full_prompt, continuation_response_tx, generated_text, request_started, pipeline_trace_json } => {
+                        InferenceResult::Stage1 { peer_id, data, c, s, full_prompt, continuation_response_tx, generated_text, request_started, pipeline_trace_json, compute_time_ms } => {
                             let sched_warm = 0_u32;
                             let mut sched_workers = 1_u32;
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pipeline_trace_json) {
@@ -938,6 +968,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "scheduler_workers_used": sched_workers,
                                         "pipeline_trace": pipeline_value,
                                         "pipeline_workers": pipeline_steps,
+                                        "worker_compute_ms": compute_time_ms,
                                     }));
                                 }
                                 chat_state = ChatState::Idle;
@@ -956,9 +987,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let req = TensorRequest {
                                 kind: String::new(),
                                 data,
-                                dtype: "hidden_states".to_string(),
+                                dtype: "vryx.pipeline.forward".to_string(),
                                 compute_time_ns: c,
                                 serialization_time_ns: s,
+                                routing_path: vec![], // Initiator simple start
+                                session_id: format!("sess-{}", Instant::now().elapsed().as_nanos()),
                             };
                             let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, req.clone());
                             pending_requests.insert(
@@ -981,8 +1014,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             };
                             tokens_out.fetch_add(1, Ordering::Relaxed);
                         }
-                        InferenceResult::Stage2 { channel, data, c, s, metrics } => {
-                            let w_ms = c.saturating_div(1_000_000).max(1);
+                        InferenceResult::Stage2 { channel, data, c, s, metrics, compute_time_ms } => {
+                            let w_ms = compute_time_ms;
                             let _ = swarm.behaviour_mut().request_response.send_response(
                                 channel,
                                 TensorResponse {
@@ -994,6 +1027,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     total_tokens_llm: metrics.total_tokens,
                                     vps_delegate_ms: metrics.vps_delegate_ms,
                                     worker_compute_ms: w_ms,
+                                    compute_time_ms,
                                     ..Default::default()
                                 },
                             );
@@ -1010,6 +1044,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     ..Default::default()
                                 },
                             );
+                        }
+                        InferenceResult::PipelineForward { target_peer, request, original_channel } => {
+                            let req_id = swarm.behaviour_mut().request_response.send_request(&target_peer, request.clone());
+                            pending_requests.insert(req_id, (request, PendingMeta::Forwarded { original_channel }));
                         }
                         InferenceResult::Error { context, message } => {
                             eprintln!("\n[!] Inférence {} échouée : {}", context, message);
@@ -1223,29 +1261,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let grpc_port = args.grpc_port;
                     let dtype_in = request.dtype.clone();
                     let trace_shard = Arc::clone(&last_shard_trace);
+                    let mut routing_path = request.routing_path.clone();
+                    let session_id = request.session_id.clone();
+
                     tokio::spawn(async move {
-                        match call_local_inference(grpc_port, request.data, request.dtype).await {
-                            Ok((data, c, s, metrics)) => {
+                        match call_local_inference(grpc_port, request.data, request.dtype, routing_path.clone(), session_id.clone()).await {
+                            Ok((data, c, s, metrics, c_ms)) => {
                                 if dtype_in.starts_with("vryx.shard.")
                                     || dtype_in.starts_with("vryx.tp.")
                                     || dtype_in.starts_with("vryx.dist.")
+                                    || dtype_in == "vryx.pipeline.forward"
                                 {
                                     let _ = trace_shard.lock().unwrap().replace(serde_json::json!({
                                         "dtype": dtype_in,
                                         "shard_session_id": metrics.shard_session_id,
                                         "shard_layer_id": metrics.shard_layer_id,
+                                        "compute_ms": c_ms,
                                         "ts_ms": std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .map(|d| d.as_millis())
                                             .unwrap_or(0),
                                     }));
                                 }
+
+                                if !routing_path.is_empty() {
+                                    let next_peer_str = routing_path.remove(0);
+                                    if let Ok(next_peer) = PeerId::from_str(&next_peer_str) {
+                                        let _ = tx_stage2.send(InferenceResult::PipelineForward {
+                                            target_peer: next_peer,
+                                            request: TensorRequest {
+                                                kind: String::new(),
+                                                data,
+                                                dtype: "vryx.pipeline.forward".to_string(),
+                                                compute_time_ns: c,
+                                                serialization_time_ns: s,
+                                                routing_path,
+                                                session_id,
+                                            },
+                                            original_channel: channel,
+                                        });
+                                        return;
+                                    }
+                                }
+
                                 let _ = tx_stage2.send(InferenceResult::Stage2 {
                                     channel,
                                     data,
                                     c,
                                     s,
                                     metrics,
+                                    compute_time_ms: c_ms,
                                 });
                             }
                             Err(e) => {
@@ -1269,6 +1334,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let pending_chat = match pending_requests.remove(&request_id) {
                         Some((_, PendingMeta::P2pRelayReply(reply_tx))) => {
                             let _ = reply_tx.send(Ok(response.clone()));
+                            false
+                        }
+                        Some((_, PendingMeta::Forwarded { original_channel })) => {
+                            let _ = swarm.behaviour_mut().request_response.send_response(original_channel, response.clone());
                             false
                         }
                         Some((_, PendingMeta::Chat { .. })) => true,
@@ -1389,8 +1458,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let grpc_port = args.grpc_port;
                         let p_clone = prompt.clone();
                         tokio::spawn(async move {
-                            match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string()).await {
-                                Ok((data, c, s, m)) => {
+                            match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string(), vec![], String::new()).await {
+                                Ok((data, c, s, m, _c_ms)) => {
                                     let pipe = m.pipeline_trace_json.clone();
                                     let _ = tx_next.send(InferenceResult::Stage1 {
                                         peer_id: target,
@@ -1402,6 +1471,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         generated_text: gen_text,
                                         request_started: req_started,
                                         pipeline_trace_json: pipe,
+                                        compute_time_ms: _c_ms,
                                     });
                                 }
                                 Err(e) => {
@@ -1432,6 +1502,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 retries,
                                 target_peer,
                             } => (retries, target_peer),
+                            PendingMeta::Forwarded { original_channel } => {
+                                let _ = swarm.behaviour_mut().request_response.send_response(
+                                    original_channel,
+                                    TensorResponse {
+                                        data: format!("ERROR: Pipeline hop failed at {}", peer).into_bytes(),
+                                        ..Default::default()
+                                    },
+                                );
+                                continue;
+                            }
                         };
                         if retries < 2 {
                             discovered_peers.remove(&peer);
