@@ -132,7 +132,7 @@ export function ModelsPanelPage() {
           />
         </div>
         <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-slate-950/60 sm:bg-slate-950/55"
+          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
           aria-hidden
         />
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-8 text-center sm:pb-16 sm:pt-10">

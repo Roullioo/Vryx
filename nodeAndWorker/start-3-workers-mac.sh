@@ -2,10 +2,7 @@
 # Lance 3 workers Vryx sur macOS (Python stage 2 + daemon Rust chacun).
 # Ports distincts : gRPC 50052–50054, API Axum 3031–3033, libp2p 4021–4023.
 #
-# Prérequis :
-#   export VRYX_INFERENCE_DELEGATE_SECRET="..."   # même valeur que sur le VPS (min. 16 caractères)
 # Optionnel :
-#   export VRYX_INFERENCE_DELEGATE_URL="https://vryx.eu/api/workers/inference-delegate"
 #   export VRYX_WORKER_MODEL="unsloth/gemma-2-9b-it"
 
 set -euo pipefail
@@ -17,23 +14,8 @@ DAEMON_BIN="${SCRIPT_DIR}/target/release/rust-daemon"
 KEYS_DIR="${SCRIPT_DIR}/.vryx-keys-mac"
 
 BOOTSTRAP_NODE="${VRYX_BOOTSTRAP_NODE:-/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz}"
-DELEGATE_URL="${VRYX_INFERENCE_DELEGATE_URL:-https://vryx.eu/api/workers/inference-delegate}"
-DELEGATE_SECRET="${VRYX_INFERENCE_DELEGATE_SECRET:-}"
 MODEL_ID="${VRYX_WORKER_MODEL:-unsloth/gemma-2-9b-it}"
 API_URL="${VRYX_WORKER_API_URL:-https://vryx.eu}"
-
-# Sans secret VPS : uniquement pour faire monter les pairs P2P / gRPC (la délégation LLM échouera).
-if [[ "${VRYX_MAC_DUMMY_DELEGATE:-}" == "1" ]] && [[ -z "${DELEGATE_SECRET}" ]]; then
-  DELEGATE_SECRET="vryx-mac-local-not-for-prod!!"
-  echo "[!] Mode VRYX_MAC_DUMMY_DELEGATE=1 : secret factice — utilisez VRYX_INFERENCE_DELEGATE_SECRET pour la prod."
-fi
-
-if [[ -z "${DELEGATE_SECRET}" ]] || [[ "${#DELEGATE_SECRET}" -lt 16 ]]; then
-  echo "[!] Définissez VRYX_INFERENCE_DELEGATE_SECRET (minimum 16 caractères), comme pour ./start-worker.sh"
-  echo "    Exemple : export VRYX_INFERENCE_DELEGATE_SECRET='...' && $0"
-  echo "    Ou test local P2P uniquement : VRYX_MAC_DUMMY_DELEGATE=1 $0"
-  exit 1
-fi
 
 if [[ ! -f "${DAEMON_BIN}" ]]; then
   echo "[*] Compilation du daemon Rust…"
@@ -81,8 +63,6 @@ start_one() {
     --port "${grpc}" \
     --stage 2 \
     --model "${MODEL_ID}" \
-    --delegate-url "${DELEGATE_URL}" \
-    --delegate-secret "${DELEGATE_SECRET}" \
     >> "${log_py}" 2>&1 &
   echo "$!" >> "${PIDS_FILE}"
 

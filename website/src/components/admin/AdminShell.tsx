@@ -1,6 +1,6 @@
 import { NavLink, Navigate, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useAuth } from '../../context/AuthContext'
 
 /* ─── Icons ───────────────────────────────────────────────────────────────── */
@@ -80,10 +80,10 @@ type NavItem = { to: string; label: string; icon: ReactNode; end?: boolean }
 const navItems: NavItem[] = [
   { to: '/admin', label: "Vue d'ensemble", icon: <IconGrid />, end: true },
   { to: '/admin/noeud', label: 'Nœud Vryx', icon: <IconServer /> },
+  { to: '/admin/chat-p2p', label: 'Chat P2P', icon: <IconChat /> },
   { to: '/admin/workers', label: 'Workers', icon: <IconWorkers /> },
   { to: '/admin/sessions', label: 'Sessions', icon: <IconSessions /> },
   { to: '/admin/utilisateurs', label: 'Utilisateurs', icon: <IconUsers /> },
-  { to: '/admin/noeud', label: 'Chat P2P', icon: <IconChat /> },
 ]
 
 const SIDEBAR_W = 220 // px
@@ -110,14 +110,14 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
       {/* Sidebar */}
       <aside
         style={{ width: SIDEBAR_W }}
-        className={`fixed inset-y-0 left-0 z-50 flex flex-col bg-[#0c0c0c] transition-transform duration-300 lg:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-50 flex flex-col bg-admin-sidebar transition-transform duration-300 lg:translate-x-0 ${
           open ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
         {/* Logo */}
         <div className="flex h-14 items-center gap-3 border-b border-white/8 px-5">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white">
-            <span className="font-display text-[11px] font-bold leading-none text-black">VX</span>
+          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-zinc-100">
+            <span className="font-display text-[11px] font-bold leading-none text-zinc-950">VX</span>
           </div>
           <span className="font-display text-[15px] font-semibold text-white">Vryx Admin</span>
           <button
@@ -135,7 +135,7 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
             Navigation
           </p>
           <ul className="space-y-0.5">
-            {navItems.slice(0, -1).map((item) => (
+            {navItems.map((item) => (
               <li key={`${item.to}-${item.label}`}>
                 <NavLink
                   to={item.to}
@@ -154,23 +154,6 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
               </li>
             ))}
           </ul>
-
-          <p className="mb-2 mt-5 px-2 text-[10px] font-semibold uppercase tracking-widest text-white/25">
-            Interface
-          </p>
-          <NavLink
-            to="/admin/noeud"
-            className={({ isActive }) =>
-              `flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors ${
-                isActive
-                  ? 'bg-white/10 text-white'
-                  : 'text-white/50 hover:bg-white/5 hover:text-white/80'
-              }`
-            }
-          >
-            <IconChat />
-            Chat P2P
-          </NavLink>
         </nav>
 
         {/* User footer */}
@@ -210,11 +193,10 @@ type AdminShellProps = {
 export function AdminShell({ children, title, subtitle, actions }: AdminShellProps) {
   const { user, loading } = useAuth()
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const closeSidebar = useRef(() => setSidebarOpen(false)).current
 
   if (loading) {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-[#f8f8f8]">
+      <div className="flex min-h-dvh items-center justify-center bg-admin-canvas">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-border border-t-accent" />
       </div>
     )
@@ -224,8 +206,8 @@ export function AdminShell({ children, title, subtitle, actions }: AdminShellPro
 
   if (!user.isAdmin) {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-[#f8f8f8] px-4">
-        <div className="w-full max-w-sm rounded-2xl border border-border bg-white p-8 text-center shadow-sm">
+      <div className="flex min-h-dvh items-center justify-center bg-admin-canvas px-4">
+        <div className="w-full max-w-sm rounded-2xl border border-border bg-card p-8 text-center shadow-sm">
           <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-alert/10">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-6 w-6 text-alert">
               <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
@@ -239,15 +221,15 @@ export function AdminShell({ children, title, subtitle, actions }: AdminShellPro
   }
 
   return (
-    <div className="flex min-h-dvh bg-[#f4f4f5]">
-      <Sidebar open={sidebarOpen} onClose={closeSidebar} />
+    <div className="flex min-h-dvh bg-admin-canvas">
+      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
       {/* Main */}
       <div
         className="flex min-w-0 flex-1 flex-col lg:pl-[220px]"
       >
         {/* Top bar mobile */}
-        <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-white/90 px-4 backdrop-blur-md lg:hidden">
+        <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-[var(--color-admin-mobile-header)] px-4 backdrop-blur-md lg:hidden">
           <button
             onClick={() => setSidebarOpen(true)}
             className="rounded-lg p-1.5 text-muted hover:bg-surface hover:text-fg"
@@ -259,7 +241,7 @@ export function AdminShell({ children, title, subtitle, actions }: AdminShellPro
         </header>
 
         {/* Page header */}
-        <div className="border-b border-border bg-white px-6 py-5 lg:px-8">
+        <div className="border-b border-border bg-card px-6 py-5 lg:px-8">
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="font-display text-xl font-bold text-fg lg:text-2xl">{title}</h1>

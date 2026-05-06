@@ -59,7 +59,10 @@ export function AdminUsersPage() {
   }, [])
 
   useEffect(() => {
-    void load('')
+    const tid = window.setTimeout(() => {
+      void load('')
+    }, 0)
+    return () => window.clearTimeout(tid)
   }, [load])
 
   const onSearch = (e: React.FormEvent) => {
@@ -109,7 +112,7 @@ export function AdminUsersPage() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Rechercher…"
-              className="w-full rounded-lg border border-border bg-white px-3 py-1.5 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent/20"
+              className="w-full rounded-lg border border-border bg-card px-3 py-1.5 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent/20"
             />
             <button type="submit" className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-white hover:bg-accent/90">
               OK

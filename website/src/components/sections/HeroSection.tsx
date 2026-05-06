@@ -16,7 +16,10 @@ export function HeroSection() {
           style={{ backgroundImage: "url('/bgcolor.png')" }}
         />
       </div>
-      <div className="absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-slate-950/55 sm:bg-slate-950/50" aria-hidden />
+      <div
+        className="hero-overlay absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
+        aria-hidden
+      />
 
       <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-4 pb-16 text-center sm:pb-20">
         <motion.div

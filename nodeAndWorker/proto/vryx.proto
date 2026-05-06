@@ -24,7 +24,7 @@ message ProcessedTensorData {
   repeated int64 shape = 2;
   uint64 compute_time_ns = 3;
   uint64 serialization_time_ns = 4;
-  // Métriques LLM (Ollama / délégation VPS), distinctes des messages P2P.
+  // Métriques de génération distribuée renvoyées par les workers, distinctes des messages P2P.
   uint64 prompt_tokens = 5;
   uint64 completion_tokens = 6;
   uint64 total_tokens = 7;

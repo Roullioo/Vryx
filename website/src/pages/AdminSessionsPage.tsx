@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
 import { loadSessions, deleteSession, clearSessions, type WorkSession } from '../lib/sessions'
@@ -20,9 +20,14 @@ function relativeTime(ts: number) {
 function FlowDiagram({ session: s }: { session: WorkSession }) {
   const totalMs = Math.max(1, s.latencyMs)
   const vps = s.vpsDelegateMs
-  const wrk = s.workerComputeMs
+  const wrk = Math.max(s.workerComputeMs, s.computeTimeMs ?? 0)
   const net = Math.max(0, totalMs - vps - wrk)
   const peers = s.peers.length > 0 ? s.peers : s.workerSteps.length > 0 ? s.workerSteps.map(w => w.peerId) : s.workerPeerId ? [s.workerPeerId] : []
+  const isDaisyChain =
+    s.pipelineLayout === 'pipeline_relay_daisy_chain' ||
+    (Array.isArray(s.routingPath) && s.routingPath.length > 1)
+  const chainPeers =
+    isDaisyChain && s.routingPath && s.routingPath.length > 0 ? s.routingPath : peers
 
   return (
     <div className="space-y-4">
@@ -85,7 +90,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
           <div className="flex min-w-max items-center gap-0">
             {/* Client */}
             <div className="flex flex-col items-center">
-              <div className="flex h-12 w-28 items-center justify-center rounded-xl border-2 border-border bg-white shadow-sm">
+              <div className="flex h-12 w-28 items-center justify-center rounded-xl border-2 border-border bg-card shadow-sm">
                 <div className="text-center">
                   <p className="text-[11px] font-bold text-fg">Client</p>
                   <p className="text-[9px] text-muted">HTTP</p>
@@ -116,61 +121,81 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
                 <div className="flex flex-col items-center px-2">
                   <div className="h-0.5 w-10 bg-success/50" />
                   <p className="text-[9px] text-muted whitespace-nowrap">
-                    {s.pipelineLayout === 'row_split_tensor_parallel' ? 'découpe matrice' : 'P2P'}
+                    {isDaisyChain
+                      ? 'relais séquentiel'
+                      : s.pipelineLayout === 'row_split_tensor_parallel'
+                        ? 'ancien TP'
+                        : 'P2P'}
                   </p>
                 </div>
 
-                {/* Workers */}
-                <div className="relative flex flex-col gap-2 rounded-xl border border-success/20 bg-success/5 p-2">
-                  <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-success/20 px-2 py-0.5 text-[8px] font-bold uppercase text-success">
-                    Calcul en parallèle
-                  </span>
-                  {peers.map((p, i) => {
-                    const step = s.workerSteps.find(w => w.peerId === p)
-                    return (
-                      <div key={p} className="flex h-12 w-40 items-center justify-center rounded-xl border-2 border-success/30 bg-white shadow-sm">
-                        <div className="text-center">
-                          <p className="text-[10px] font-bold text-success">Worker #{i + 1}</p>
-                          <p className="font-mono text-[9px] text-muted">{shortId(p, 14)}</p>
-                          {step ? (
-                            <p className="text-[9px] font-mono text-success/70">{ms(step.latencyMs)}</p>
-                          ) : s.workerComputeMs > 0 ? (
-                            <p className="text-[9px] font-mono text-success/70">{ms(Math.round(s.workerComputeMs / Math.max(1, peers.length)))}</p>
+                {/* Workers : parallèle (TP) ou chaîne Daisy (pipeline) */}
+                {isDaisyChain ? (
+                  <div className="flex flex-wrap items-center gap-1 rounded-xl border border-success/20 bg-success/5 px-3 py-2">
+                    <span className="mr-1 whitespace-nowrap rounded-full bg-success/20 px-2 py-0.5 text-[8px] font-bold uppercase text-success">
+                      Chaîne de relais
+                    </span>
+                    {chainPeers.map((p, i) => {
+                      const step = s.workerSteps.find(w => w.peerId === p)
+                      const hopMs =
+                        step?.latencyMs ??
+                        (wrk > 0 ? Math.round(wrk / Math.max(1, chainPeers.length)) : 0)
+                      return (
+                        <Fragment key={`${p}-${i}`}>
+                          {i > 0 ? (
+                            <span className="px-0.5 text-[11px] font-semibold text-success" aria-hidden>
+                              →
+                            </span>
                           ) : null}
+                          <div className="flex h-12 min-w-28 max-w-36 items-center justify-center rounded-xl border-2 border-success/30 bg-card px-2 shadow-sm">
+                            <div className="text-center">
+                              <p className="text-[10px] font-bold text-success">Nœud {i + 1}</p>
+                              <p className="font-mono text-[9px] text-muted">{shortId(p, 12)}</p>
+                              {hopMs > 0 ? (
+                                <p className="text-[9px] font-mono text-success/70">{ms(hopMs)}</p>
+                              ) : null}
+                            </div>
+                          </div>
+                        </Fragment>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className="relative flex flex-col gap-2 rounded-xl border border-success/20 bg-success/5 p-2">
+                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-success/20 px-2 py-0.5 text-[8px] font-bold uppercase text-success">
+                      Calcul en parallèle
+                    </span>
+                    {peers.map((p, i) => {
+                      const step = s.workerSteps.find(w => w.peerId === p)
+                      return (
+                        <div key={p} className="flex h-12 w-40 items-center justify-center rounded-xl border-2 border-success/30 bg-card shadow-sm">
+                          <div className="text-center">
+                            <p className="text-[10px] font-bold text-success">Worker #{i + 1}</p>
+                            <p className="font-mono text-[9px] text-muted">{shortId(p, 14)}</p>
+                            {step ? (
+                              <p className="text-[9px] font-mono text-success/70">{ms(step.latencyMs)}</p>
+                            ) : s.workerComputeMs > 0 ? (
+                              <p className="text-[9px] font-mono text-success/70">
+                                {ms(Math.round(s.workerComputeMs / Math.max(1, peers.length)))}
+                              </p>
+                            ) : null}
+                          </div>
                         </div>
-                      </div>
-                    )
-                  })}
-                </div>
+                      )
+                    })}
+                  </div>
+                )}
 
                 {/* Flèche retour */}
                 <div className="flex flex-col items-center px-2">
                   <div className="h-0.5 w-10 bg-success/50" />
                   <p className="text-[9px] text-muted whitespace-nowrap">
-                    {s.pipelineLayout === 'row_split_tensor_parallel' ? 'concaténation' : 'réponse'}
+                    {s.pipelineLayout === 'row_split_tensor_parallel' ? 'sortie TP' : 'réponse'}
                   </p>
                 </div>
               </>
             )}
 
-            {/* Ollama si P2P + Ollama */}
-            {s.mode.toLowerCase().includes('ollama') && (
-              <>
-                {peers.length === 0 && (
-                  <div className="flex flex-col items-center px-2">
-                    <div className="h-0.5 w-10 bg-border" />
-                  </div>
-                )}
-                <div className="flex flex-col items-center">
-                  <div className="flex h-12 w-28 items-center justify-center rounded-xl border-2 border-warning/30 bg-warning/5 shadow-sm">
-                    <div className="text-center">
-                      <p className="text-[11px] font-bold text-warning">Ollama</p>
-                      <p className="text-[9px] text-muted">LLM local VPS</p>
-                    </div>
-                  </div>
-                </div>
-              </>
-            )}
           </div>
         </div>
       </div>
@@ -181,7 +206,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
           <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
             Étapes pipeline ({s.workerSteps.length})
           </p>
-          <div className="overflow-x-auto rounded-xl border border-border bg-white">
+          <div className="overflow-x-auto rounded-xl border border-border bg-card">
             <table className="w-full min-w-[400px] text-left text-[11px]">
               <thead>
                 <tr className="border-b border-border bg-surface/80 text-muted">
@@ -263,7 +288,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
 /* ─── Carte session ──────────────────────────────────────────────────────── */
 function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete: () => void }) {
   return (
-    <div className="group rounded-2xl border border-border bg-white shadow-sm transition-shadow hover:shadow-md">
+    <div className="group rounded-2xl border border-border bg-card shadow-sm transition-shadow hover:shadow-md">
       <div className="flex items-start justify-between gap-3 p-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2 text-[11px] text-muted">
@@ -337,7 +362,7 @@ export function AdminSessionsPage() {
         sessions.length > 0 ? (
           <button
             onClick={handleClear}
-            className="rounded-lg border border-border bg-white px-3 py-1.5 text-xs font-medium text-muted hover:border-alert/40 hover:text-alert"
+            className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted hover:border-alert/40 hover:text-alert"
           >
             Tout effacer
           </button>
@@ -345,7 +370,7 @@ export function AdminSessionsPage() {
       }
     >
       {sessions.length === 0 ? (
-        <div className="rounded-2xl border border-border bg-white p-12 text-center">
+        <div className="rounded-2xl border border-border bg-card p-12 text-center">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} className="mx-auto mb-4 h-10 w-10 text-muted/40">
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
             <polyline points="14 2 14 8 20 8" />
@@ -376,7 +401,7 @@ export function AdminSessionDetailPage() {
 
   if (!session) return (
     <AdminShell title="Détail session">
-      <div className="rounded-2xl border border-border bg-white p-12 text-center">
+      <div className="rounded-2xl border border-border bg-card p-12 text-center">
         <p className="text-sm text-muted">Session introuvable (peut-être effacée).</p>
         <Link to="/admin/sessions" className="mt-3 inline-block text-sm text-accent hover:underline">
           Retour aux sessions
@@ -390,7 +415,7 @@ export function AdminSessionDetailPage() {
       title="Détail de session"
       subtitle={new Date(session.timestamp).toLocaleString('fr-FR', { weekday: 'long', day: '2-digit', month: 'long', hour: '2-digit', minute: '2-digit' })}
       actions={
-        <Link to="/admin/sessions" className="rounded-lg border border-border bg-white px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface">
+        <Link to="/admin/sessions" className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface">
           ← Retour
         </Link>
       }
@@ -398,11 +423,11 @@ export function AdminSessionDetailPage() {
       <div className="space-y-5">
         {/* Prompt / réponse */}
         <div className="grid gap-4 sm:grid-cols-2">
-          <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">Prompt</p>
             <p className="text-sm leading-relaxed text-fg">{session.prompt}</p>
           </div>
-          <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">Réponse</p>
             <p className="text-sm leading-relaxed text-fg">{session.response}</p>
           </div>
@@ -416,7 +441,7 @@ export function AdminSessionDetailPage() {
             { label: 'Worker (calcul)', value: ms(session.workerComputeMs) },
             { label: 'Tokens générés', value: fmt(session.completionTokens) },
           ].map((m) => (
-            <div key={m.label} className="rounded-2xl border border-border bg-white p-4 shadow-sm">
+            <div key={m.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
               <p className="text-xs text-muted">{m.label}</p>
               <p className="mt-1 font-display text-xl font-bold text-fg">{m.value}</p>
             </div>
@@ -427,11 +452,16 @@ export function AdminSessionDetailPage() {
         <div className="rounded-2xl border border-accent/20 bg-accent/5 p-5">
           <h3 className="text-sm font-semibold text-fg">Comprendre ce traitement</h3>
           <p className="mt-2 text-xs leading-relaxed text-muted">
-            {session.pipelineLayout === 'row_split_tensor_parallel' ? (
+            {session.pipelineLayout === 'pipeline_relay_daisy_chain' ? (
               <>
-                <strong>Tensor Parallelism (TP) :</strong> Les workers ont collaboré pour générer cette réponse. 
-                La matrice de poids a été découpée en bandes (row-split). Chaque worker a calculé une fraction des mathématiques 
-                en parallèle, puis le VPS a rassemblé les résultats. C'est ce qui permet d'utiliser la puissance combinée de plusieurs machines.
+                <strong>Pipeline Parallelism (Daisy Chain) :</strong> Les tenseurs ont traversé les nœuds dans l&apos;ordre du{' '}
+                <span className="font-mono">routing_path</span> : chaque pair calcule son segment puis passe au suivant (relais séquentiel), 
+                sans passer par une API Web2 centralisée.
+              </>
+            ) : session.pipelineLayout === 'row_split_tensor_parallel' ? (
+              <>
+                <strong>Ancienne trace Tensor Parallelism :</strong> ce layout row-split est conservé seulement pour lire les anciennes sessions.
+                Le chat admin actuel utilise la chaîne de relais Daisy Chain via <span className="font-mono">routing_path</span>.
               </>
             ) : session.pipelineLayout === 'distributed_fanout' ? (
               <>
@@ -440,22 +470,22 @@ export function AdminSessionDetailPage() {
               </>
             ) : (
               <>
-                <strong>Mode Standard (Ollama) :</strong> Le texte a été généré intégralement par le modèle local sur le VPS. 
-                Aucun découpage Tensor Parallel n'a été appliqué sur ce tour.
+                <strong>Pipeline P2P natif :</strong> L&apos;initiateur Rust orchestre l&apos;inférence via gRPC et libp2p ; les segments peuvent transiter en{' '}
+                <strong>chaîne de relais</strong> (Daisy Chain, <span className="font-mono">routing_path</span>) ou en parallèle selon le layout du tour.
               </>
             )}
           </p>
         </div>
 
         {/* Diagramme complet */}
-        <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+        <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
           <p className="mb-4 text-sm font-semibold text-fg">Analyse détaillée</p>
           <FlowDiagram session={session} />
         </div>
 
         {/* Infos worker */}
         {(session.primaryWorkerPeerId || session.workerPeerId) && (
-          <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-3 text-sm font-semibold text-fg">Informations worker</p>
             <dl className="space-y-2">
               {[
@@ -482,7 +512,7 @@ export function AdminSessionDetailPage() {
 
         {/* Pairs */}
         {session.peers.length > 0 && (
-          <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-3 text-sm font-semibold text-fg">Pairs impliqués ({session.peers.length})</p>
             <ul className="space-y-1">
               {session.peers.map((p, i) => (

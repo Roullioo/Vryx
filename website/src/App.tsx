@@ -13,6 +13,7 @@ import { WorkersPage } from './pages/WorkersPage'
 import { AdminOverviewPage } from './pages/AdminOverviewPage'
 import { AdminUsersPage } from './pages/AdminUsersPage'
 import { AdminNodePage } from './pages/AdminNodePage'
+import { AdminP2PChatPage } from './pages/AdminP2PChatPage'
 import { AdminWorkersPage, AdminWorkerDetailPage } from './pages/AdminWorkersPage'
 import { AdminSessionsPage, AdminSessionDetailPage } from './pages/AdminSessionsPage'
 
@@ -31,6 +32,7 @@ export default function App() {
         <Route path="/admin" element={<AdminOverviewPage />} />
         <Route path="/admin/utilisateurs" element={<AdminUsersPage />} />
         <Route path="/admin/noeud" element={<AdminNodePage />} />
+        <Route path="/admin/chat-p2p" element={<AdminP2PChatPage />} />
         <Route path="/admin/workers" element={<AdminWorkersPage />} />
         <Route path="/admin/workers/:peerId" element={<AdminWorkerDetailPage />} />
         <Route path="/admin/sessions" element={<AdminSessionsPage />} />

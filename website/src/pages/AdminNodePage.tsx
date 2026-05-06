@@ -1,12 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
-import {
-  WorkerComputeReport,
-  isFallbackMetricsUsable,
-  type WorkerRoundMetrics,
-} from '../components/admin/WorkerComputeReport'
+import { workerLabel, type LiveWorker } from '../components/admin/AdminP2PChatPanel'
 import { apiJson } from '../lib/api'
-import { buildSession, saveSession } from '../lib/sessions'
 
 type Worker = {
   pid: number
@@ -41,62 +37,8 @@ type RegisteredWorker = {
   firstSeenAt: string | null
   online: boolean
   secondsSinceHeartbeat: number
-}
-
-/** Premier pair listé dans `pipeline_trace.peers` (utile si `worker_peer_id` est vide). */
-/** Construit les métriques agrégées pour les graphiques (mode Ollama / P2P). */
-function roundMetricsFromAiTrace(t: {
-  latencyMs?: number
-  vpsDelegateMs?: number
-  workerComputeMs?: number
-  promptTokens?: number
-  completionTokens?: number
-  totalTokens?: number
-  p2pMessagesIn?: number
-  p2pMessagesOut?: number
-  mode?: string
-}): WorkerRoundMetrics {
-  return {
-    latencyMs: Number(t.latencyMs ?? 0) || 0,
-    vpsDelegateMs: Number(t.vpsDelegateMs ?? 0) || 0,
-    workerComputeMs: Number(t.workerComputeMs ?? 0) || 0,
-    promptTokens: t.promptTokens,
-    completionTokens: t.completionTokens,
-    totalTokens: t.totalTokens,
-    p2pMessagesIn: t.p2pMessagesIn,
-    p2pMessagesOut: t.p2pMessagesOut,
-    mode: t.mode,
-  }
-}
-
-function firstPeerIdFromPipelineTrace(trace: unknown): string {
-  if (!trace || typeof trace !== 'object' || Array.isArray(trace)) return ''
-  const peers = (trace as Record<string, unknown>).peers
-  if (!Array.isArray(peers)) return ''
-  const hit = peers.find((p): p is string => typeof p === 'string' && p.length > 0)
-  return hit ?? ''
-}
-
-/** Workers avec heartbeat récent (route admin `/workers/live`). */
-type LiveWorker = {
-  peerId: string
-  mode: string
-  grpcPort: number | null
-  p2pPort: number | null
-  publicIp: string | null
-  version: string | null
-  p2pPeers: number
-  tokensGenerated: number
-  tokensIn: number
-  tokensOut: number
-  /** Métriques LLM pour le dernier message (injectées par l’API chat P2P). */
-  llmPromptTokens?: number
-  llmCompletionTokens?: number
-  llmTotalTokens?: number
-  model: string | null
-  lastHeartbeatAt: string | null
-  secondsSinceHeartbeat: number
-  ownerEmail: string | null
+  gpuName?: string | null
+  gpuVramMb?: number | null
 }
 
 type NodeStatus = {
@@ -221,458 +163,6 @@ function MiniSparkline({
   )
 }
 
-function workerLabel(w: LiveWorker) {
-  const short = w.peerId.length > 14 ? `${w.peerId.slice(0, 12)}…` : w.peerId
-  if (w.ownerEmail) return `${w.ownerEmail.split('@')[0]} · ${short}`
-  return `${w.mode} · ${short}`
-}
-
-function AdminChat({
-  liveWorkers,
-  activeChatPeerId,
-  onP2pRoundComplete,
-}: {
-  liveWorkers: LiveWorker[]
-  activeChatPeerId: string | null
-  onP2pRoundComplete?: (
-    workerPeerId: string,
-    meta?: {
-      pipelineTrace?: unknown
-      pipelineWorkers?: unknown
-      roundMetrics?: WorkerRoundMetrics
-    },
-  ) => void
-}) {
-  const [prompt, setPrompt] = useState('')
-  const [messages, setMessages] = useState<{
-    role: 'user' | 'ai'
-    content: string
-    trace?: {
-      worker: string
-      latencyMs: number
-      mode: string
-      tokensIn?: number
-      tokensOut?: number
-      promptTokens?: number
-      completionTokens?: number
-      totalTokens?: number
-      p2pMessagesIn?: number
-      p2pMessagesOut?: number
-      vpsDelegateMs?: number
-      workerComputeMs?: number
-      schedulerWarmupSent?: number
-      schedulerWorkersUsed?: number
-      shardSessionId?: string | null
-      primaryWorkerPeerId?: string
-      pipelineTrace?: unknown
-      pipelineWorkers?: unknown
-      workerInfo?: LiveWorker & { online?: boolean }
-    }
-  }[]>([])
-  const [loading, setLoading] = useState(false)
-  const [ollamaStatus, setOllamaStatus] = useState<{ ok: boolean; modelReady: boolean; error?: string } | null>(null)
-
-  useEffect(() => {
-    void apiJson('/api/admin/node/ollama').then((r) => {
-      if (r.ok) setOllamaStatus(r.data as { ok: boolean; modelReady: boolean; error?: string })
-    })
-  }, [])
-
-  async function send() {
-    if (!prompt.trim() || loading) return
-    const userMsg = prompt.trim()
-    setPrompt('')
-    setMessages((prev) => [...prev, { role: 'user', content: userMsg }, { role: 'ai', content: '' }])
-    setLoading(true)
-
-    try {
-      const response = await fetch('/api/admin/p2p/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ prompt: userMsg }),
-      })
-
-      if (!response.ok) throw new Error('Erreur chat P2P')
-      const reader = response.body?.getReader()
-      if (!reader) throw new Error('Flux illisible')
-
-      const decoder = new TextDecoder()
-      let buf = ''
-      while (true) {
-        const { value, done } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
-        const parts = buf.split('\n\n')
-        buf = parts.pop() ?? ''
-        for (const line of parts) {
-          if (!line.startsWith('data: ')) continue
-          try {
-            const data = JSON.parse(line.slice(6)) as {
-              token?: string
-              error?: string
-              done?: boolean
-              workerPeerId?: string
-              latencyMs?: number | null
-              tokensIn?: number
-              tokensOut?: number
-              promptTokens?: number
-              completionTokens?: number
-              totalTokens?: number
-              p2pMessagesIn?: number
-              p2pMessagesOut?: number
-              vpsDelegateMs?: number
-              workerComputeMs?: number
-              schedulerWarmupSent?: number
-              schedulerWorkersUsed?: number
-              shardSessionId?: string | null
-              primaryWorkerPeerId?: string
-              pipelineTrace?: unknown
-              pipelineWorkers?: unknown
-              mode?: string
-              worker?: LiveWorker & { online?: boolean }
-            }
-            if (data.error) {
-              setMessages((prev) => {
-                const last = prev[prev.length - 1]
-                const rest = prev.slice(0, -1)
-                return [
-                  ...rest,
-                  {
-                    ...last,
-                    content: last.content || data.error || 'Erreur P2P.',
-                    trace: { worker: '—', latencyMs: 0, mode: 'Erreur' },
-                  },
-                ]
-              })
-              continue
-            }
-            if (data.token) {
-              setMessages((prev) => {
-                const last = prev[prev.length - 1]
-                const rest = prev.slice(0, -1)
-                return [...rest, { ...last, content: last.content + data.token }]
-              })
-            }
-            if (data.done) {
-              const wid = data.workerPeerId || ''
-              const primary =
-                typeof data.primaryWorkerPeerId === 'string' && data.primaryWorkerPeerId.length > 0
-                  ? data.primaryWorkerPeerId
-                  : ''
-              const tracePeer = firstPeerIdFromPipelineTrace(data.pipelineTrace)
-              const sidebarPeerId = wid || primary || tracePeer
-              const matchW =
-                data.worker ||
-                (sidebarPeerId ? liveWorkers.find((x) => x.peerId === sidebarPeerId) : undefined)
-              const label = matchW
-                ? workerLabel(matchW)
-                : sidebarPeerId
-                  ? `Peer ${sidebarPeerId.slice(0, 16)}…`
-                  : 'Réseau P2P'
-              const roundMetrics: WorkerRoundMetrics = {
-                latencyMs: Number(data.latencyMs ?? 0) || 0,
-                vpsDelegateMs: Number(data.vpsDelegateMs ?? 0) || 0,
-                workerComputeMs: Number(data.workerComputeMs ?? 0) || 0,
-                promptTokens: data.promptTokens,
-                completionTokens: data.completionTokens,
-                totalTokens: data.totalTokens,
-                p2pMessagesIn: data.p2pMessagesIn,
-                p2pMessagesOut: data.p2pMessagesOut,
-                mode: data.mode,
-              }
-              onP2pRoundComplete?.(sidebarPeerId, {
-                pipelineTrace: data.pipelineTrace,
-                pipelineWorkers: data.pipelineWorkers,
-                roundMetrics,
-              })
-              // Enregistrer la session pour la page Sessions
-              let currentResponse = ''
-              setMessages((prev) => { currentResponse = prev[prev.length - 1]?.content ?? ''; return prev })
-              const workerInfoForSession = data.worker ? {
-                peerId: data.worker.peerId,
-                publicIp: data.worker.publicIp ?? null,
-                grpcPort: data.worker.grpcPort ?? null,
-                p2pPort: data.worker.p2pPort ?? null,
-                model: data.worker.model ?? null,
-                ownerEmail: data.worker.ownerEmail ?? null,
-                online: data.worker.online ?? false,
-                secondsSinceHeartbeat: data.worker.secondsSinceHeartbeat ?? 0,
-              } : undefined
-              saveSession(buildSession({
-                prompt: userMsg,
-                response: currentResponse,
-                data: data as Record<string, unknown>,
-                pipelineTrace: data.pipelineTrace,
-                pipelineWorkers: data.pipelineWorkers,
-                workerInfo: workerInfoForSession,
-              }))
-              setMessages((prev) => {
-                const last = prev[prev.length - 1]
-                const rest = prev.slice(0, -1)
-                return [
-                  ...rest,
-                  {
-                    ...last,
-                    trace: {
-                      worker: label,
-                      latencyMs: data.latencyMs ?? 0,
-                      mode: data.mode || 'P2P / worker distant',
-                      tokensIn: data.tokensIn ?? data.worker?.tokensIn,
-                      tokensOut: data.tokensOut ?? data.worker?.tokensOut,
-                      promptTokens: data.promptTokens,
-                      completionTokens: data.completionTokens,
-                      totalTokens: data.totalTokens,
-                      p2pMessagesIn: data.p2pMessagesIn,
-                      p2pMessagesOut: data.p2pMessagesOut,
-                      vpsDelegateMs: data.vpsDelegateMs,
-                      workerComputeMs: data.workerComputeMs,
-                      schedulerWarmupSent: data.schedulerWarmupSent,
-                      schedulerWorkersUsed: data.schedulerWorkersUsed,
-                      shardSessionId: data.shardSessionId,
-                      primaryWorkerPeerId: data.primaryWorkerPeerId,
-                      pipelineTrace: data.pipelineTrace,
-                      pipelineWorkers: data.pipelineWorkers,
-                      workerInfo: data.worker,
-                    },
-                  },
-                ]
-              })
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-    } catch {
-      setMessages((prev) => {
-        const last = prev[prev.length - 1]
-        const rest = prev.slice(0, -1)
-        return [
-          ...rest,
-          {
-            ...last,
-            content: 'Erreur lors de la génération P2P.',
-            trace: { worker: '—', latencyMs: 0, mode: 'Erreur' },
-          },
-        ]
-      })
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div className="panel flex h-full min-h-[22rem] flex-col overflow-hidden border-accent/20 bg-accent/[0.02] xl:max-h-[calc(100svh-10rem)]">
-      <div className="border-b border-border bg-surface/50 px-4 py-3 sm:px-5">
-        <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
-          <span className={`flex h-2 w-2 rounded-full ${loading ? 'animate-pulse bg-accent' : 'bg-success'}`} />
-          Chat P2P (initiateur local)
-        </h3>
-        <p className="mt-1 text-[10px] leading-relaxed text-muted">
-          Par défaut, Ollama sur le VPS produit le texte. Avec <span className="font-mono">VRYX_WORKER_ONLY_LLM</span>, les
-          workers exécutent le tour via <span className="font-mono">vryx.dist.*</span>.
-        </p>
-        <p className="mt-1.5 rounded-md border border-accent/20 bg-accent/5 px-2 py-1.5 text-[10px] leading-relaxed text-fg">
-          Après chaque réponse, ouvrez « Détails du traitement » sous la bulle : vous y trouverez les graphiques (temps
-          VPS / worker, P2P, tokens) même en mode Ollama, et les courbes détaillées par token si le backend envoie une
-          trace pipeline. À droite, « Dernier tour » reprend le dernier message.
-        </p>
-        {ollamaStatus && !ollamaStatus.ok && (
-          <p className="mt-1 text-[10px] text-alert">Ollama (VPS) : {ollamaStatus.error}</p>
-        )}
-        {loading && (
-          <p className="mt-2 flex items-center gap-2 text-[11px] font-medium text-accent">
-            <svg className="h-3.5 w-3.5 shrink-0 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path
-                className="opacity-90"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-              />
-            </svg>
-            {liveWorkers.length > 0
-              ? 'Routage côté initiateur (pair P2P choisi dynamiquement)…'
-              : '[Recherche d’un worker P2P actif…]'}
-          </p>
-        )}
-        {!loading && activeChatPeerId && (
-          <p className="mt-2 text-[10px] text-muted">
-            Dernier pair actif :{' '}
-            <span className="font-mono text-fg">{activeChatPeerId.slice(0, 20)}…</span>
-          </p>
-        )}
-      </div>
-
-      <div className="min-h-[200px] flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
-        {messages.length === 0 ? (
-          <div className="flex h-full min-h-[160px] flex-col items-center justify-center text-center">
-            <p className="text-sm text-muted">
-              Écrivez un message : il sera routé vers le réseau P2P (Gemma / Ollama sur les nœuds).
-            </p>
-          </div>
-        ) : (
-          messages.map((m, i) => (
-            <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
-              <div
-                className={`max-w-[90%] rounded-2xl px-4 py-2 text-sm ${
-                  m.role === 'user'
-                    ? 'bg-accent text-white'
-                    : 'bg-surface border border-border text-fg shadow-sm'
-                }`}
-              >
-                {m.content || (loading && i === messages.length - 1 ? '…' : '')}
-              </div>
-
-              {m.role === 'ai' && m.trace && (
-                <WorkerComputeReport
-                  trace={m.trace.pipelineTrace}
-                  pipelineWorkers={m.trace.pipelineWorkers}
-                  roundMetrics={roundMetricsFromAiTrace(m.trace)}
-                />
-              )}
-
-              {m.role === 'ai' && m.trace && (
-                <details className="mt-1 group">
-                  <summary className="flex cursor-pointer list-none items-center gap-1 text-[10px] text-muted hover:text-accent [&::-webkit-details-marker]:hidden">
-                    <svg className="h-3 w-3 transition-transform group-open:rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                    </svg>
-                    Détails du traitement
-                  </summary>
-                  <div className="mt-1 ml-4 space-y-1 rounded-md border border-border/50 bg-surface/50 p-2 font-mono text-[10px]">
-                    <div className="flex justify-between gap-2">
-                      <span className="text-muted">Worker</span>
-                      <span className="max-w-[60%] text-right text-accent">{m.trace.worker}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-muted">Latence</span>
-                      <span className="text-fg">{m.trace.latencyMs} ms</span>
-                    </div>
-                    <div className="flex justify-between border-t border-white/5 pt-1">
-                      <span className="text-muted">Tokens LLM (Ollama)</span>
-                      <span className="text-primary">
-                        prompt {m.trace.promptTokens ?? 0} / compl. {m.trace.completionTokens ?? 0}
-                        {m.trace.totalTokens != null && m.trace.totalTokens > 0 ? (
-                          <span className="text-muted"> (total {m.trace.totalTokens})</span>
-                        ) : null}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-muted">Messages P2P (tour)</span>
-                      <span className="text-fg">
-                        {m.trace.p2pMessagesIn ?? m.trace.tokensIn ?? 0} in /{' '}
-                        {m.trace.p2pMessagesOut ?? m.trace.tokensOut ?? 0} out
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-muted">Temps VPS / worker</span>
-                      <span className="text-fg">
-                        {m.trace.vpsDelegateMs ?? 0} ms / {m.trace.workerComputeMs ?? 0} ms
-                      </span>
-                    </div>
-                    {(m.trace.schedulerWorkersUsed ?? 0) > 0 && (
-                      <div className="flex justify-between">
-                        <span className="text-muted">Réseau</span>
-                        <span className="text-fg">
-                          {Array.isArray(m.trace.pipelineWorkers) && m.trace.pipelineWorkers.length > 0
-                            ? `${m.trace.pipelineWorkers.length} étape(s) TP P2P · LLM sur worker principal`
-                            : `${m.trace.schedulerWorkersUsed} worker(s) contacté(s)`}
-                          {(m.trace.schedulerWarmupSent ?? 0) > 0
-                            ? ` · warmup historique ${m.trace.schedulerWarmupSent}`
-                            : ''}
-                        </span>
-                      </div>
-                    )}
-                    {m.trace.primaryWorkerPeerId ? (
-                      <div className="flex justify-between">
-                        <span className="text-muted">Worker principal (LLM)</span>
-                        <span className="max-w-[58%] truncate text-right text-fg" title={m.trace.primaryWorkerPeerId}>
-                          {m.trace.primaryWorkerPeerId.slice(0, 18)}…
-                        </span>
-                      </div>
-                    ) : null}
-                    
-                    {m.trace.shardSessionId ? (
-                      <div className="flex justify-between">
-                        <span className="text-muted">Session shard</span>
-                        <span className="max-w-[55%] truncate text-fg" title={m.trace.shardSessionId}>
-                          {m.trace.shardSessionId}
-                        </span>
-                      </div>
-                    ) : null}
-                    <div className="flex justify-between">
-                      <span className="text-muted">Méthode</span>
-                      <span className="text-fg">{m.trace.mode}</span>
-                    </div>
-                    {m.trace.workerInfo && (
-                      <>
-                        <div className="flex justify-between border-t border-white/5 pt-1">
-                          <span className="text-muted">Peer ID</span>
-                          <span className="max-w-[62%] truncate text-right text-fg" title={m.trace.workerInfo.peerId}>
-                            {m.trace.workerInfo.peerId}
-                          </span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-muted">IP publique</span>
-                          <span className="text-fg">{m.trace.workerInfo.publicIp || '—'}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-muted">Ports</span>
-                          <span className="text-fg">
-                            gRPC {m.trace.workerInfo.grpcPort || '—'} / P2P {m.trace.workerInfo.p2pPort || '—'}
-                          </span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-muted">Modèle</span>
-                          <span className="text-fg">{m.trace.workerInfo.model || '—'}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-muted">Propriétaire</span>
-                          <span className="text-fg">{m.trace.workerInfo.ownerEmail || 'Non lié'}</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-muted">Heartbeat</span>
-                          <span className={m.trace.workerInfo.online ? 'text-success' : 'text-warning'}>
-                            il y a {m.trace.workerInfo.secondsSinceHeartbeat}s
-                          </span>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </details>
-              )}
-            </div>
-          ))
-        )}
-      </div>
-
-      <div className="border-t border-border p-3">
-        <div className="relative flex items-center">
-          <input
-            type="text"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && send()}
-            placeholder="Message au réseau P2P…"
-            className="w-full rounded-full border border-border bg-surface py-2 pl-4 pr-12 text-sm text-fg focus:border-accent/50 focus:ring-1 focus:ring-accent/20"
-          />
-          <button
-            type="button"
-            onClick={send}
-            disabled={loading || !prompt.trim()}
-            className="absolute right-1.5 flex h-8 w-8 items-center justify-center rounded-full bg-accent text-white transition-opacity disabled:opacity-50"
-            aria-label="Envoyer"
-          >
-            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-            </svg>
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 export function AdminNodePage() {
   const [status, setStatus] = useState<NodeStatus | null>(null)
@@ -681,9 +171,6 @@ export function AdminNodePage() {
   const [liveWorkers, setLiveWorkers] = useState<LiveWorker[]>([])
   const [liveSec, _setLiveSec] = useState(30)
   void liveSec; void _setLiveSec
-  const [lastP2pPeer, setLastP2pPeer] = useState<string | null>(null)
-  const [lastPipelineTrace, setLastPipelineTrace] = useState<Record<string, unknown> | null>(null)
-  const [lastRoundMetrics, setLastRoundMetrics] = useState<WorkerRoundMetrics | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [hint, setHint] = useState<string | null>(null)
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(5)
@@ -693,6 +180,8 @@ export function AdminNodePage() {
   const [testRunning, setTestRunning] = useState<'unit' | 'stress' | null>(null)
   const [lastReport, setLastReport] = useState<TestReport | null>(null)
   const [totalTokens, setTotalTokens] = useState(0)
+  /** Horloge locale pour afficher l’âge du dernier échantillon sans appeler Date.now() au rendu. */
+  const [clockMs, setClockMs] = useState(() => Date.now())
 
   const refresh = useCallback(async () => {
     const [s, h, w] = await Promise.all([
@@ -700,14 +189,14 @@ export function AdminNodePage() {
       apiJson<HistoryPayload>('/api/admin/node/history?limit=120'),
       apiJson<{ workers: RegisteredWorker[]; totalTokensGenerated: number }>('/api/admin/workers/registered'),
     ])
-    if (s.ok) {
+    if (s.ok === true) {
       setStatus(s.data)
       setError(null)
     } else {
       setError(s.error)
     }
-    if (h.ok) setHistory(h.data)
-    if (w.ok) {
+    if (h.ok === true) setHistory(h.data)
+    if (w.ok === true) {
       setRegisteredWorkers(w.data.workers)
       // On calcule les tokens cumulés en temps réel si besoin, 
       // mais on fait confiance à totalTokensGenerated du backend
@@ -716,23 +205,38 @@ export function AdminNodePage() {
   }, [])
 
   useEffect(() => {
-    void refresh()
+    const timerBoot = window.setTimeout(() => {
+      void refresh()
+    }, 0)
     const id = window.setInterval(refresh, refreshIntervalSec * 1000)
-    return () => window.clearInterval(id)
+    return () => {
+      window.clearTimeout(timerBoot)
+      window.clearInterval(id)
+    }
   }, [refresh, refreshIntervalSec])
+
+  useEffect(() => {
+    const id = window.setInterval(() => setClockMs(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [])
 
   const refreshLive = useCallback(async () => {
     const r = await apiJson<{ workers: LiveWorker[]; liveSec?: number }>('/api/admin/workers/live')
-    if (r.ok && r.data) {
+    if (r.ok === true && r.data) {
       setLiveWorkers(r.data.workers)
       if (typeof r.data.liveSec === 'number') _setLiveSec(r.data.liveSec)
     }
   }, [])
 
   useEffect(() => {
-    void refreshLive()
+    const timerBoot = window.setTimeout(() => {
+      void refreshLive()
+    }, 0)
     const id = window.setInterval(refreshLive, 3000)
-    return () => window.clearInterval(id)
+    return () => {
+      window.clearTimeout(timerBoot)
+      window.clearInterval(id)
+    }
   }, [refreshLive])
 
   async function runTest(stress: boolean) {
@@ -745,7 +249,7 @@ export function AdminNodePage() {
       },
     )
     setTestRunning(null)
-    if (r.ok) {
+    if (r.ok === true) {
       setLastReport(r.data.report)
       setHint(
         `Test ${stress ? 'de charge' : 'unitaire'} terminé : ${r.data.report.successCalls}/${r.data.report.totalCalls} appels réussis`,
@@ -766,19 +270,34 @@ export function AdminNodePage() {
     }
   }, [status])
 
-  const onlineWorkers = status?.workers.filter((w) => w.status === 'online') ?? []
+  const onlineWorkers = useMemo(
+    () => status?.workers.filter((w) => w.status === 'online') ?? [],
+    [status],
+  )
   const onlineRegistered = registeredWorkers.filter(w => w.online)
 
   const aggregateStats = useMemo(() => {
-    return onlineRegistered.reduce((acc, w) => {
-      // Pour le test, on estime 8Go par worker s'il est Online (plus tard on remontera la vraie info via heartbeat)
-      acc.vramTotalMB += 8192; 
-      acc.gpuCount += 1;
-      acc.totalTokens += w.tokensGenerated;
-      acc.totalIn += (w.tokensIn || 0);
-      acc.totalOut += (w.tokensOut || 0);
-      return acc;
-    }, { vramTotalMB: 0, gpuCount: 0, totalTokens: 0, totalIn: 0, totalOut: 0 })
+    return onlineRegistered.reduce(
+      (acc, w) => {
+        acc.gpuCount += 1
+        acc.totalTokens += w.tokensGenerated
+        acc.totalIn += w.tokensIn || 0
+        acc.totalOut += w.tokensOut || 0
+        if (w.gpuVramMb != null && w.gpuVramMb > 0) {
+          acc.vramTotalMB += w.gpuVramMb
+          acc.gpuWithInventory += 1
+        }
+        return acc
+      },
+      {
+        vramTotalMB: 0,
+        gpuCount: 0,
+        gpuWithInventory: 0,
+        totalTokens: 0,
+        totalIn: 0,
+        totalOut: 0,
+      },
+    )
   }, [onlineRegistered])
 
   const uniqueWorkers = useMemo(() => {
@@ -791,18 +310,56 @@ export function AdminNodePage() {
   const avgWorkerLatency = useMemo(() => {
     if (lastReport?.metrics.avgP2pMs) return lastReport.metrics.avgP2pMs;
     const list = onlineWorkers.filter((w) => w.lastLatencyMs != null)
-    if (list.length === 0) return aggregateStats.gpuCount > 0 ? 124 : null
+    if (list.length === 0) return null
     return Math.round(
       (list.reduce((s, w) => s + (w.lastLatencyMs || 0), 0) / list.length) * 100,
     ) / 100
   }, [onlineWorkers, lastReport, aggregateStats.gpuCount])
 
 
+  const navSections = [
+    { id: 'synthese', label: 'Synthèse' },
+    { id: 'live-reseau', label: 'Réseau live' },
+    { id: 'systeme-gpu', label: 'Système et GPU' },
+    { id: 'workers', label: 'Workers' },
+    { id: 'tests', label: 'Tests' },
+  ] as const
+
   return (
-    <AdminShell title="Nœud Vryx" subtitle="Supervision et chat P2P en temps réel">
-      <div className="flex flex-col gap-8 xl:flex-row xl:items-start">
-        <div className="min-w-0 flex-1 space-y-8">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+    <AdminShell title="Nœud Vryx" subtitle="Supervision du daemon et du réseau (heartbeats, métriques hôte)">
+      <div className="mx-auto max-w-6xl space-y-6 pb-10">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <Link
+            to="/admin/chat-p2p"
+            className="inline-flex items-center justify-center gap-2 rounded-xl border border-accent/35 bg-accent/10 px-4 py-3 text-sm font-semibold text-accent transition-colors hover:bg-accent/15 sm:order-2 sm:shrink-0"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} className="h-4 w-4" aria-hidden>
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+            </svg>
+            Ouvrir le Chat P2P dédié
+          </Link>
+          <p className="text-xs leading-relaxed text-muted sm:order-1 sm:max-w-xl">
+            Le chat temps réel et les traces détaillées du pipeline (Daisy Chain,{' '}
+            <span className="font-mono text-fg/90">compute_time_ms</span>) sont sur la page Chat P2P.
+          </p>
+        </div>
+
+        <nav
+          className="-mx-1 flex gap-1 overflow-x-auto pb-1 scrollbar-thin sm:mx-0"
+          aria-label="Sections du nœud"
+        >
+          {navSections.map((s) => (
+            <a
+              key={s.id}
+              href={`#${s.id}`}
+              className="shrink-0 rounded-lg border border-border/80 bg-surface px-3 py-2 text-[11px] font-medium text-muted transition-colors hover:border-accent/40 hover:text-fg"
+            >
+              {s.label}
+            </a>
+          ))}
+        </nav>
+
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between" id="synthese">
           <div>
             <h2 className="font-display text-xl font-bold text-fg">
               Vryx Control Center — LIVE
@@ -850,6 +407,57 @@ export function AdminNodePage() {
           </div>
         )}
 
+        <section id="live-reseau" className="scroll-mt-24 space-y-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-fg">Workers réseau (heartbeat rapide)</h3>
+              <p className="text-[11px] text-muted">
+                Rafraîchissement toutes les 3 s · fenêtre « live » {liveSec} s · hors fenêtre : voir le tableau
+                enregistré plus bas.
+              </p>
+            </div>
+            <span className="shrink-0 rounded-md border border-accent/25 bg-accent/5 px-2 py-1 text-[11px] font-medium text-accent">
+              {liveWorkers.length} pair(s) récent(s)
+            </span>
+          </div>
+          {liveWorkers.length === 0 ? (
+            <div className="rounded-xl border border-border/80 bg-surface/40 px-4 py-6 text-center text-sm text-muted">
+              Aucun heartbeat récent dans la fenêtre live. Les workers avec{' '}
+              <span className="font-mono text-fg/90">--api-url</span> vers ce serveur apparaîtront ici.
+            </div>
+          ) : (
+            <div className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-2">
+              {liveWorkers.map((w) => (
+                <article
+                  key={w.peerId}
+                  className="min-w-[min(100%,17rem)] shrink-0 rounded-xl border border-border bg-surface p-4 shadow-sm"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="font-mono text-[11px] font-semibold leading-snug text-fg">{workerLabel(w)}</p>
+                    <span className="flex h-2 w-2 shrink-0 animate-pulse rounded-full bg-success" aria-hidden />
+                  </div>
+                  <p className="mt-2 text-[10px] uppercase tracking-wide text-muted">
+                    {w.model || 'Modèle inconnu'} · {w.mode}
+                  </p>
+                  <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px]">
+                    <dt className="text-muted">Pairs P2P</dt>
+                    <dd className="text-right font-mono text-fg">{w.p2pPeers}</dd>
+                    <dt className="text-muted">Heartbeat</dt>
+                    <dd className="text-right text-fg">il y a {w.secondsSinceHeartbeat}s</dd>
+                    <dt className="text-muted">GPU</dt>
+                    <dd className="text-right text-fg">
+                      {w.gpuName || '—'}
+                      {w.gpuVramMb != null && w.gpuVramMb > 0 ? (
+                        <span className="text-muted"> · {w.gpuVramMb} Mo</span>
+                      ) : null}
+                    </dd>
+                  </dl>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
         <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <div className="panel p-5">
             <p className="text-xs font-medium uppercase tracking-wide text-muted">
@@ -894,15 +502,18 @@ export function AdminNodePage() {
           </div>
           <div className="panel p-5">
             <p className="text-xs font-medium uppercase tracking-wide text-muted">
-              VRAM totale
+              VRAM réseau (inventaire)
             </p>
             <p className="mt-1 font-display text-2xl font-bold text-fg">
-              {aggregateStats.vramTotalMB > 0 
+              {aggregateStats.vramTotalMB > 0
                 ? `${(aggregateStats.vramTotalMB / 1024).toFixed(1)} Go`
-                : '—'}
+                : aggregateStats.gpuCount > 0
+                  ? 'Non rapportée'
+                  : '—'}
             </p>
             <p className="mt-2 text-xs text-muted">
-              {aggregateStats.gpuCount} GPU(s) réseau disponible(s)
+              {aggregateStats.gpuWithInventory}/{aggregateStats.gpuCount} worker(s) avec{' '}
+              <span className="font-mono">gpu_vram_mb</span> dans le heartbeat
             </p>
           </div>
           <div className="panel p-5">
@@ -918,7 +529,7 @@ export function AdminNodePage() {
           </div>
         </section>
 
-        <section className="grid gap-4 lg:grid-cols-2">
+        <section id="systeme-gpu" className="scroll-mt-24 grid gap-4 lg:grid-cols-2">
           <div className="panel p-5 sm:p-6">
             <h3 className="text-sm font-semibold text-fg">Système hôte</h3>
             {status ? (
@@ -964,13 +575,13 @@ export function AdminNodePage() {
             {uniqueWorkers.filter(w => w.online).length > 0 ? (
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 {uniqueWorkers.filter(w => w.online).map((w) => (
-                  <div key={w.peerId} className="group relative overflow-hidden rounded-xl border border-white/5 bg-surface-dark p-4 transition-all hover:border-primary/30">
+                  <div key={w.peerId} className="group relative overflow-hidden rounded-xl border border-border bg-elevated p-4 transition-all hover:border-electric/35">
                     <div className="flex items-start justify-between">
                       <div>
                         <h4 className="font-mono text-[11px] font-bold text-fg">
                           {w.peerId.slice(0, 15)}...
                         </h4>
-                        <p className="text-[10px] text-muted uppercase tracking-widest">{w.model || 'Gemma-2-9B-P2P'}</p>
+                        <p className="text-[10px] text-muted uppercase tracking-widest">{w.model || '—'}</p>
                       </div>
                       <div className="flex h-5 items-center rounded bg-success/10 px-2 text-[9px] font-bold text-success uppercase">
                         Online
@@ -980,11 +591,18 @@ export function AdminNodePage() {
                     <div className="mt-4 flex items-end justify-between">
                       <div className="space-y-1">
                         <p className="text-[9px] uppercase text-muted font-medium">Mode</p>
-                        <p className="text-xs font-bold text-primary">{w.mode.toUpperCase()}</p>
+                        <p className="text-xs font-bold text-electric">{w.mode.toUpperCase()}</p>
                       </div>
                       <div className="text-right">
-                        <p className="text-[9px] uppercase text-muted font-medium">VRAM Est.</p>
-                        <p className="text-xs font-bold text-fg">8.0 Go</p>
+                        <p className="text-[9px] uppercase text-muted font-medium">GPU / VRAM</p>
+                        <p className="max-w-[10rem] truncate text-xs font-bold text-fg" title={w.gpuName || undefined}>
+                          {w.gpuName || 'Non rapporté'}
+                        </p>
+                        <p className="text-[10px] text-muted">
+                          {w.gpuVramMb != null && w.gpuVramMb > 0
+                            ? `${(w.gpuVramMb / 1024).toFixed(1)} Go`
+                            : '—'}
+                        </p>
                       </div>
                     </div>
 
@@ -993,7 +611,7 @@ export function AdminNodePage() {
                         <span className="text-muted">Contribution Réseau</span>
                         <span className="text-success font-bold">{w.tokensGenerated} tokens</span>
                       </div>
-                      <div className="h-1 w-full overflow-hidden rounded-full bg-white/5">
+                      <div className="h-1 w-full overflow-hidden rounded-full bg-fg/10">
                         <div 
                           className="h-full bg-gradient-to-r from-primary via-accent to-success transition-all duration-1000" 
                           style={{ width: `${Math.min(100, (w.tokensGenerated / 1000) * 100)}%` }}
@@ -1017,7 +635,7 @@ export function AdminNodePage() {
             <MiniSparkline
               points={history?.points ?? []}
               field="cpuPercent"
-              color="#0f172a"
+              color="var(--color-fg)"
             />
             <p className="mt-1 text-xs text-muted">
               {(history?.points.length ?? 0)} point(s) ·{' '}
@@ -1029,7 +647,7 @@ export function AdminNodePage() {
             <MiniSparkline
               points={history?.points ?? []}
               field="avgComputeMs"
-              color="#2563eb"
+              color="var(--color-electric)"
             />
             <p className="mt-1 text-xs text-muted">
               Moyenne actuelle : {formatMs(avgWorkerLatency)}
@@ -1037,13 +655,14 @@ export function AdminNodePage() {
           </div>
         </section>
 
-        <section className="space-y-3">
+        <section id="workers" className="scroll-mt-24 space-y-6">
+          <div className="space-y-3">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-semibold text-fg">Workers temps réel</h3>
             <span className="text-xs text-muted">
               Mis à jour il y a&nbsp;
               {status
-                ? Math.max(0, Math.round((Date.now() - status.sampledAt) / 1000))
+                ? Math.max(0, Math.round((clockMs - status.sampledAt) / 1000))
                 : '—'}
               &nbsp;s
             </span>
@@ -1108,9 +727,9 @@ export function AdminNodePage() {
               </tbody>
             </table>
           </div>
-        </section>
+          </div>
 
-        <section className="space-y-3">
+          <div className="space-y-3">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-semibold text-fg">Workers enregistrés (heartbeat DB)</h3>
             <span className="rounded bg-accent/10 px-2 py-1 text-xs font-semibold text-accent">
@@ -1135,6 +754,7 @@ export function AdminNodePage() {
                   <th className="px-4 py-3">Mode</th>
                   <th className="px-4 py-3 text-center">Pairs P2P</th>
                   <th className="px-4 py-3 text-center">Tokens (In / Out)</th>
+                  <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-widest text-muted">GPU</th>
                   <th className="px-4 py-3">IP / Ports</th>
                   <th className="px-4 py-3">Dernier heartbeat</th>
                   <th className="px-4 py-3 pr-5">Version</th>
@@ -1143,7 +763,7 @@ export function AdminNodePage() {
               <tbody>
                 {registeredWorkers.length === 0 ? (
                   <tr>
-                    <td className="px-5 py-6 text-muted" colSpan={9}>
+                    <td className="px-5 py-6 text-muted" colSpan={10}>
                       Aucun worker enregistré. Lancez{' '}
                       <code className="font-mono">start-worker.sh</code> avec{' '}
                       <code className="font-mono">--api-url https://vryx.eu</code>.
@@ -1190,6 +810,12 @@ export function AdminNodePage() {
                           <span className="text-[10px] text-muted">{w.tokensIn || 0} in / {w.tokensOut || 0} out</span>
                         </div>
                       </td>
+                      <td className="px-4 py-3 align-top text-[10px] leading-snug text-fg">
+                        <span className="line-clamp-2">{w.gpuName || '—'}</span>
+                        {w.gpuVramMb != null && w.gpuVramMb > 0 ? (
+                          <span className="block text-muted">{w.gpuVramMb} Mo</span>
+                        ) : null}
+                      </td>
                       <td className="px-4 py-4">
                         <div className="flex flex-col">
                           <span className="font-mono text-xs text-fg">{w.publicIp || '—'}</span>
@@ -1212,9 +838,10 @@ export function AdminNodePage() {
               </tbody>
             </table>
           </div>
+          </div>
         </section>
 
-        <section className="panel p-5 sm:p-6">
+        <section id="tests" className="scroll-mt-24 panel p-5 sm:p-6">
           <h3 className="text-sm font-semibold text-fg">
             Communication & tests des workers
           </h3>
@@ -1354,47 +981,6 @@ export function AdminNodePage() {
             </table>
           </div>
         </section>
-        </div>
-
-        <div className="w-full shrink-0 space-y-4 xl:sticky xl:top-28 xl:w-[min(100%,26rem)] xl:self-start">
-          {(lastPipelineTrace && Object.keys(lastPipelineTrace).length > 0) ||
-          isFallbackMetricsUsable(lastRoundMetrics ?? undefined) ? (
-            <div className="panel border-accent/25 bg-accent/[0.04] p-4 sm:p-5">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">
-                Dernier tour (chat P2P)
-              </h3>
-              <p className="mt-1 text-[10px] leading-relaxed text-muted">
-                Trace pipeline détaillée si le mode worker-only / TP la fournit ; sinon graphiques agrégés (temps VPS /
-                worker, P2P, tokens).
-              </p>
-              <div className="mt-3">
-                <WorkerComputeReport
-                  trace={lastPipelineTrace}
-                  roundMetrics={lastRoundMetrics ?? undefined}
-                />
-              </div>
-            </div>
-          ) : null}
-          <AdminChat
-            liveWorkers={liveWorkers}
-            activeChatPeerId={lastP2pPeer}
-            onP2pRoundComplete={(id, meta) => {
-              if (id) setLastP2pPeer(id)
-              const tr = meta?.pipelineTrace
-              if (
-                tr &&
-                typeof tr === 'object' &&
-                !Array.isArray(tr) &&
-                Object.keys(tr as object).length > 0
-              ) {
-                setLastPipelineTrace(tr as Record<string, unknown>)
-              } else {
-                setLastPipelineTrace(null)
-              }
-              setLastRoundMetrics(meta?.roundMetrics ?? null)
-            }}
-          />
-        </div>
       </div>
     </AdminShell>
   )

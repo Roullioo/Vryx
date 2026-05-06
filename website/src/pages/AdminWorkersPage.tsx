@@ -51,7 +51,7 @@ function WorkerCard({ w }: { w: RegisteredWorker }) {
   return (
     <Link
       to={`/admin/workers/${encodeURIComponent(w.peerId)}`}
-      className="block rounded-2xl border border-border bg-white p-5 shadow-sm transition-shadow hover:shadow-md"
+      className="block rounded-2xl border border-border bg-card p-5 shadow-sm transition-shadow hover:shadow-md"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -113,11 +113,16 @@ export function AdminWorkersPage() {
 
   const refresh = useCallback(async () => {
     const r = await apiJson<{ workers: RegisteredWorker[] }>('/api/admin/workers/registered')
-    if (r.ok) setWorkers(r.data.workers)
+    if (r.ok === true) setWorkers(r.data.workers)
     setLoading(false)
   }, [])
 
-  useEffect(() => { void refresh() }, [refresh])
+  useEffect(() => {
+    const tid = window.setTimeout(() => {
+      void refresh()
+    }, 0)
+    return () => window.clearTimeout(tid)
+  }, [refresh])
   useEffect(() => {
     const id = setInterval(refresh, 10_000)
     return () => clearInterval(id)
@@ -134,7 +139,7 @@ export function AdminWorkersPage() {
       actions={
         <button
           onClick={refresh}
-          className="flex items-center gap-1.5 rounded-lg border border-border bg-white px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface"
+          className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-3.5 w-3.5">
             <path d="M23 4v6h-6" /><path d="M1 20v-6h6" />
@@ -152,7 +157,7 @@ export function AdminWorkersPage() {
           { label: 'Hors ligne', value: String(offline.length) },
           { label: 'Tokens générés', value: fmt(totalTokens) },
         ].map((s) => (
-          <div key={s.label} className="rounded-2xl border border-border bg-white p-4 shadow-sm">
+          <div key={s.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
             <p className="text-xs text-muted">{s.label}</p>
             <p className={`mt-1 font-display text-2xl font-bold ${s.accent ? 'text-success' : 'text-fg'}`}>
               {s.value}
@@ -164,11 +169,11 @@ export function AdminWorkersPage() {
       {loading ? (
         <div className="space-y-3">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="h-36 animate-pulse rounded-2xl border border-border bg-white" />
+            <div key={i} className="h-36 animate-pulse rounded-2xl border border-border bg-card" />
           ))}
         </div>
       ) : workers.length === 0 ? (
-        <div className="rounded-2xl border border-border bg-white p-12 text-center">
+        <div className="rounded-2xl border border-border bg-card p-12 text-center">
           <p className="text-sm text-muted">Aucun worker enregistré.</p>
         </div>
       ) : (
@@ -216,14 +221,14 @@ export function AdminWorkerDetailPage() {
   if (loading) return (
     <AdminShell title="Détail worker">
       <div className="space-y-4">
-        {[1,2,3].map((i) => <div key={i} className="h-24 animate-pulse rounded-2xl border border-border bg-white" />)}
+        {[1,2,3].map((i) => <div key={i} className="h-24 animate-pulse rounded-2xl border border-border bg-card" />)}
       </div>
     </AdminShell>
   )
 
   if (!worker) return (
     <AdminShell title="Détail worker">
-      <div className="rounded-2xl border border-border bg-white p-12 text-center">
+      <div className="rounded-2xl border border-border bg-card p-12 text-center">
         <p className="text-sm text-muted">Worker introuvable.</p>
         <Link to="/admin/workers" className="mt-3 inline-block text-sm text-accent hover:underline">
           Retour à la liste
@@ -254,7 +259,7 @@ export function AdminWorkerDetailPage() {
       title={`Worker · ${worker.peerId.slice(0, 20)}…`}
       subtitle={`${worker.online ? 'En ligne' : `Hors ligne depuis ${timeAgo(worker.secondsSinceHeartbeat)}`} · ${worker.publicIp ?? '—'}`}
       actions={
-        <Link to="/admin/workers" className="rounded-lg border border-border bg-white px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface">
+        <Link to="/admin/workers" className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface">
           ← Retour
         </Link>
       }
@@ -268,7 +273,7 @@ export function AdminWorkerDetailPage() {
             { label: 'Tokens in', value: fmt(worker.tokensIn) },
             { label: 'Tokens out', value: fmt(worker.tokensOut) },
           ].map((s) => (
-            <div key={s.label} className="rounded-2xl border border-border bg-white p-4 shadow-sm">
+            <div key={s.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
               <p className="text-xs text-muted">{s.label}</p>
               <p className={`mt-1 font-display text-xl font-bold ${s.ok === false ? 'text-warning' : s.ok === true ? 'text-success' : 'text-fg'}`}>
                 {s.value}
@@ -278,7 +283,7 @@ export function AdminWorkerDetailPage() {
         </div>
 
         {/* Ratio tokens */}
-        <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+        <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
           <p className="mb-3 text-sm font-semibold text-fg">Répartition tokens</p>
           <div className="space-y-3">
             <div>
@@ -303,7 +308,7 @@ export function AdminWorkerDetailPage() {
         </div>
 
         {/* Infos techniques */}
-        <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+        <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
           <p className="mb-3 text-sm font-semibold text-fg">Informations techniques</p>
           <dl className="space-y-2">
             {statRows.map((r) => (
@@ -318,7 +323,7 @@ export function AdminWorkerDetailPage() {
         </div>
 
         {/* Note sessions */}
-        <div className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+        <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
           <p className="text-sm font-semibold text-fg">Sessions associées</p>
           <p className="mt-2 text-[12px] text-muted">
             Les sessions enregistrées impliquant ce worker sont visibles sur la page{' '}

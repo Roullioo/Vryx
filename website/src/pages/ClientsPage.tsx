@@ -43,7 +43,10 @@ export function ClientsPage() {
             style={{ backgroundImage: "url('/ClientsHero.png')" }}
           />
         </div>
-        <div className="absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-slate-950/55 sm:bg-slate-950/50" aria-hidden />
+        <div
+          className="hero-overlay absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
+          aria-hidden
+        />
 
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-6 text-center sm:pb-16 sm:pt-8">
           <motion.div
@@ -63,7 +66,7 @@ export function ClientsPage() {
             </p>
             <Link
               to="/simulateur"
-              className="mt-8 inline-flex min-h-11 w-full max-w-xs items-center justify-center rounded-xl bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 sm:mt-9 sm:w-auto sm:px-8 sm:text-base"
+              className="mt-8 inline-flex min-h-11 w-full max-w-xs items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:mt-9 sm:w-auto sm:px-8 sm:text-base"
             >
               Simuler vos coûts
             </Link>
@@ -137,7 +140,7 @@ export function ClientsPage() {
           style={{ backgroundImage: "url('/mid.png')" }}
           aria-hidden
         />
-        <div className="absolute inset-0 bg-slate-950/78" aria-hidden />
+        <div className="hero-overlay absolute inset-0" aria-hidden />
         <div className="relative z-10 mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
           <div className="grid gap-10 lg:grid-cols-2 lg:items-center">
             <div>

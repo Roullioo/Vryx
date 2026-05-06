@@ -43,8 +43,6 @@ const nodeAndWorkerDir = isPackaged
   : path.resolve(__dirname, '../../nodeAndWorker');
 
 let workerProcess = null;
-const WORKER_DELEGATE_SECRET = process.env.VRYX_INFERENCE_DELEGATE_SECRET || '239bbddc233f8f97e1d60b84b4380d16735fb1a745746529c0123a3c5db6761d';
-const WORKER_DELEGATE_URL = process.env.VRYX_INFERENCE_DELEGATE_URL || 'https://vryx.eu/api/workers/inference-delegate';
 
 // Heuristics for Mac GPUs (TFlops and TDP approximations since Mac GPUs share memory and TDP with CPU)
 function getMacGpuStats(model) {
@@ -138,8 +136,6 @@ app.whenReady().then(() => {
 
     const env = Object.assign({}, process.env);
     env.PATH = `/opt/homebrew/bin:/usr/local/bin:/Users/julien/.cargo/bin:${env.PATH}`;
-    env.VRYX_INFERENCE_DELEGATE_SECRET = WORKER_DELEGATE_SECRET;
-    env.VRYX_INFERENCE_DELEGATE_URL = WORKER_DELEGATE_URL;
     env.VELOCITY_ROLE = 'worker';
 
     // Pass user ID as argument if available

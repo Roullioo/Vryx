@@ -18,12 +18,14 @@ import {
   IconShield,
   IconTerminal,
 } from '../components/icons/Icons'
+import { ThemeToggle } from '../components/layout/ThemeToggle'
 
 const navAnchors = [
   { id: 'resume', label: 'Synthèse' },
   { id: 'usage', label: 'Usage & quotas' },
   { id: 'cles', label: 'Clés API' },
   { id: 'facturation', label: 'Facturation' },
+  { id: 'apparence', label: 'Apparence' },
   { id: 'securite', label: 'Sécurité' },
   { id: 'organisation', label: 'Organisation' },
 ] as const
@@ -397,6 +399,22 @@ export function AccountPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          </section>
+
+          <section className="space-y-6" aria-labelledby="apparence">
+            <SectionTitle icon={IconTerminal} title="Apparence" id="apparence" />
+            <div className="panel flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+              <div>
+                <h3 className="text-sm font-semibold text-fg">Thème d&apos;affichage</h3>
+                <p className="mt-1 max-w-md text-xs text-muted">
+                  Clair, sombre ou automatique selon les réglages du système. Votre choix est enregistré sur cet
+                  appareil.
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-3">
+                <ThemeToggle />
+              </div>
             </div>
           </section>
 

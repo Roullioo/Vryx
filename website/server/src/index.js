@@ -9,7 +9,6 @@ import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { z } from 'zod'
 import { nodeMonitor } from './node-monitor.js'
-import { handleChatStream, ollamaChatComplete, ollamaGenerate, ollamaHealth } from './chat.js'
 
 const PORT = Number(process.env.PORT) || 4000
 /** URL de l'API Axum du daemon initiateur (chat P2P). */
@@ -161,6 +160,10 @@ async function ensureWorkersTable() {
   if (!present.has('tokens_generated')) await pool.query(`ALTER TABLE workers ADD COLUMN tokens_generated BIGINT UNSIGNED NOT NULL DEFAULT 0`)
   if (!present.has('model'))            await pool.query(`ALTER TABLE workers ADD COLUMN model VARCHAR(100) NULL`)
   if (!present.has('user_id'))          await pool.query(`ALTER TABLE workers ADD COLUMN user_id BIGINT UNSIGNED NULL`)
+  if (!present.has('tokens_in'))        await pool.query(`ALTER TABLE workers ADD COLUMN tokens_in BIGINT UNSIGNED NOT NULL DEFAULT 0`)
+  if (!present.has('tokens_out'))       await pool.query(`ALTER TABLE workers ADD COLUMN tokens_out BIGINT UNSIGNED NOT NULL DEFAULT 0`)
+  if (!present.has('gpu_name'))         await pool.query(`ALTER TABLE workers ADD COLUMN gpu_name VARCHAR(120) NULL`)
+  if (!present.has('gpu_vram_mb'))      await pool.query(`ALTER TABLE workers ADD COLUMN gpu_vram_mb INT UNSIGNED NULL`)
 }
 
 async function ensureForcedAdmins() {
@@ -401,6 +404,8 @@ const heartbeatBodySchema = z.object({
   user_id: z.number().int().min(0).nullable().optional().default(0),
   tokens_in: z.number().int().min(0).optional().default(0),
   tokens_out: z.number().int().min(0).optional().default(0),
+  gpu_name: z.string().max(120).nullable().optional(),
+  gpu_vram_mb: z.number().int().min(0).max(262144).nullable().optional(),
 })
 
 const workerLimiter = rateLimit({
@@ -411,72 +416,29 @@ const workerLimiter = rateLimit({
   message: { error: 'Trop de heartbeats.' },
 })
 
-const delegateBodySchema = z.object({
-  prompt: z.string().min(1).max(500_000),
-  model: z.string().max(120).optional(),
-})
-
-const delegateLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de requêtes de délégation.' },
-})
-
-/**
- * Les workers (PC des contributeurs) appellent cette route : l’inférence Ollama
- * s’exécute uniquement sur ce serveur (VPS). Aucun modèle n’est requis sur la machine du worker.
- * Authentification : en-tête X-Vryx-Inference-Delegate = WORKER_INFERENCE_DELEGATE_SECRET (serveur).
- */
-app.post('/api/workers/inference-delegate', delegateLimiter, async (req, res) => {
-  const expected = process.env.WORKER_INFERENCE_DELEGATE_SECRET
-  if (!expected || String(expected).length < 16) {
-    return res.status(503).json({
-      error:
-        'Délégation inférence désactivée : définissez WORKER_INFERENCE_DELEGATE_SECRET (≥ 16 caractères) sur le VPS.',
-    })
-  }
-  const got = String(req.headers['x-vryx-inference-delegate'] || '')
-  if (got !== expected) {
-    return res.status(403).json({ error: 'Refusé.' })
-  }
-  const parsed = delegateBodySchema.safeParse(req.body || {})
-  if (!parsed.success) {
-    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Corps invalide.'
-    return res.status(400).json({ error: first })
-  }
-  try {
-    const r = await ollamaChatComplete(parsed.data.prompt, {
-      // Le modèle est imposé côté VPS (OLLAMA_MODEL). Les workers ne choisissent
-      // jamais le modèle, afin d'éviter tout téléchargement ou 404 côté Ollama.
-      timeout: 300_000,
-    })
-    const promptTokens = r.promptEvalCount
-    const completionTokens = r.evalCount
-    const totalTokens =
-      promptTokens + completionTokens > 0 ? promptTokens + completionTokens : 0
-    return res.json({
-      ok: true,
-      response: r.text ?? '',
-      promptTokens,
-      completionTokens,
-      totalTokens,
-      vpsOllamaDurationNs: r.totalDurationNs,
-    })
-  } catch (e) {
-    console.error('workers/inference-delegate', e)
-    return res.status(502).json({ ok: false, error: e.message || 'Ollama indisponible.' })
-  }
-})
-
 app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
   const parsed = heartbeatBodySchema.safeParse(req.body)
   if (!parsed.success) {
     const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
     return res.status(400).json({ error: first })
   }
-  const { peer_id, mode, grpc_port, p2p_port, version, p2p_peers, tokens_generated, model, user_id } = parsed.data
+  const {
+    peer_id,
+    mode,
+    grpc_port,
+    p2p_port,
+    version,
+    p2p_peers,
+    tokens_generated,
+    model,
+    user_id,
+    tokens_in,
+    tokens_out,
+    gpu_name,
+    gpu_vram_mb,
+  } = parsed.data
+  const hasGpuName = gpu_name !== undefined
+  const hasGpuVram = gpu_vram_mb !== undefined
   const public_ip =
     req.headers['x-real-ip'] ||
     req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
@@ -484,8 +446,10 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
     null
   try {
     await pool.query(
-      `INSERT INTO workers (peer_id, mode, grpc_port, p2p_port, public_ip, version, p2p_peers, tokens_generated, model, user_id)
-       VALUES (:peer_id, :mode, :grpc_port, :p2p_port, :public_ip, :version, :p2p_peers, :tokens_generated, :model, :user_id)
+      `INSERT INTO workers (peer_id, mode, grpc_port, p2p_port, public_ip, version, p2p_peers, tokens_generated,
+                            tokens_in, tokens_out, model, user_id, gpu_name, gpu_vram_mb)
+       VALUES (:peer_id, :mode, :grpc_port, :p2p_port, :public_ip, :version, :p2p_peers, :tokens_generated,
+               :tokens_in, :tokens_out, :model, :user_id, :gpu_name_ins, :gpu_vram_ins)
        ON DUPLICATE KEY UPDATE
          mode = VALUES(mode),
          grpc_port = VALUES(grpc_port),
@@ -494,13 +458,31 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
          version = VALUES(version),
          p2p_peers = VALUES(p2p_peers),
          tokens_generated = tokens_generated + VALUES(tokens_generated),
+         tokens_in = VALUES(tokens_in),
+         tokens_out = VALUES(tokens_out),
          model = VALUES(model),
          user_id = IF(VALUES(user_id) > 0, VALUES(user_id), user_id),
+         gpu_name = IF(:has_gpu_name, VALUES(gpu_name), gpu_name),
+         gpu_vram_mb = IF(:has_gpu_vram, VALUES(gpu_vram_mb), gpu_vram_mb),
          last_heartbeat_at = CURRENT_TIMESTAMP`,
-      { peer_id, mode, grpc_port: grpc_port ?? null, p2p_port: p2p_port ?? null,
-        public_ip, version: version ?? null,
-        p2p_peers: p2p_peers ?? 0, tokens_generated: tokens_generated ?? 0, model: model ?? null,
-        user_id: user_id && user_id > 0 ? user_id : null },
+      {
+        peer_id,
+        mode,
+        grpc_port: grpc_port ?? null,
+        p2p_port: p2p_port ?? null,
+        public_ip,
+        version: version ?? null,
+        p2p_peers: p2p_peers ?? 0,
+        tokens_generated: tokens_generated ?? 0,
+        tokens_in: tokens_in ?? 0,
+        tokens_out: tokens_out ?? 0,
+        model: model ?? null,
+        user_id: user_id && user_id > 0 ? user_id : null,
+        gpu_name_ins: gpu_name ?? null,
+        gpu_vram_ins: gpu_vram_mb ?? null,
+        has_gpu_name: hasGpuName ? 1 : 0,
+        has_gpu_vram: hasGpuVram ? 1 : 0,
+      },
     )
     return res.json({ ok: true })
   } catch (e) {
@@ -509,14 +491,8 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
   }
 })
 
-// ── Public SSE chat endpoint (used by WorkersPage demo) ──────────────────────
+// Limiteur partagé par le chat P2P admin (rate-limit côté initiateur).
 const chatLimiter = rateLimit({ windowMs: 60_000, max: 20, message: { error: 'Trop de requêtes.' } })
-app.post('/api/chat/stream', chatLimiter, handleChatStream)
-
-app.get('/api/chat/health', async (_req, res) => {
-  const h = await ollamaHealth()
-  res.json(h)
-})
 
 app.get('/api/workers/status', async (_req, res) => {
   try {
@@ -683,7 +659,8 @@ adminRouter.get('/workers/live', async (_req, res) => {
       `SELECT w.peer_id AS peerId, w.mode, w.grpc_port AS grpcPort, w.p2p_port AS p2pPort,
               w.public_ip AS publicIp, w.version, w.p2p_peers AS p2pPeers,
               w.tokens_generated AS tokensGenerated, w.tokens_in AS tokensIn, w.tokens_out AS tokensOut,
-              w.model, w.last_heartbeat_at AS lastHeartbeatAt,
+              w.model, w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
+              w.last_heartbeat_at AS lastHeartbeatAt,
               TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
               u.email AS ownerEmail
        FROM workers w
@@ -707,6 +684,8 @@ adminRouter.get('/workers/live', async (_req, res) => {
         tokensIn: Number(r.tokensIn || 0),
         tokensOut: Number(r.tokensOut || 0),
         model: r.model ?? null,
+        gpuName: r.gpuName ?? null,
+        gpuVramMb: r.gpuVramMb != null ? Number(r.gpuVramMb) : null,
         lastHeartbeatAt: r.lastHeartbeatAt,
         secondsSinceHeartbeat: Number(r.secondsSinceHeartbeat),
         ownerEmail: r.ownerEmail ?? null,
@@ -724,6 +703,7 @@ adminRouter.get('/workers/registered', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT peer_id, mode, grpc_port, p2p_port, public_ip, version,
               p2p_peers, tokens_generated, tokens_in, tokens_out, model,
+              gpu_name AS gpuName, gpu_vram_mb AS gpuVramMb,
               last_heartbeat_at AS lastHeartbeatAt, first_seen_at AS firstSeenAt,
               TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
        FROM workers ORDER BY last_heartbeat_at DESC LIMIT :limit`,
@@ -744,6 +724,8 @@ adminRouter.get('/workers/registered', async (req, res) => {
         tokensIn: Number(r.tokens_in ?? 0),
         tokensOut: Number(r.tokens_out ?? 0),
         model: r.model ?? null,
+        gpuName: r.gpuName ?? null,
+        gpuVramMb: r.gpuVramMb != null ? Number(r.gpuVramMb) : null,
         lastHeartbeatAt: r.lastHeartbeatAt,
         firstSeenAt: r.firstSeenAt,
         online: Number(r.secondsSinceHeartbeat) <= WORKER_OFFLINE_SEC,
@@ -756,19 +738,14 @@ adminRouter.get('/workers/registered', async (req, res) => {
   }
 })
 
-adminRouter.get('/node/ollama', async (_req, res) => {
-  const h = await ollamaHealth()
-  res.json(h)
-})
-
 /** Visibilité scheduler / runtime shard éphémère (stub documenté côté API). */
 adminRouter.get('/p2p/shard-runtime', (_req, res) => {
   res.json({
     ok: true,
     mode: 'ephemeral_ram',
-    tensorParallel: true,
+    pipelineParallel: true,
     description:
-      'Pipeline TP réel : stage 1 peut enchaîner vryx.tp.* via POST /api/p2p/relay (daemon initiateur) vers les workers ; calcul numpy sur poids éphémères. Ollama reste sur le VPS pour le texte.',
+      'Pipeline parallel (Daisy Chain) : l’initiateur Rust enchaîne vryx.dist.* / vryx.tp.* via gRPC sur les workers selon routing_path ; chaque nœud calcule son segment et passe au suivant.',
   })
 })
 
@@ -794,9 +771,17 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     if (typeof res.flush === 'function') res.flush()
   }
   const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 120_000)
+  const timer = setTimeout(() => ctrl.abort(), 600_000) // 10 minutes max
+  
+  // Keep-alive pour éviter le timeout Nginx (proxy_read_timeout = 60s par défaut)
+  const keepAliveInterval = setInterval(() => {
+    res.write(': keepalive\n\n')
+    if (typeof res.flush === 'function') res.flush()
+  }, 15000)
+
   req.on('close', () => {
     clearTimeout(timer)
+    clearInterval(keepAliveInterval)
     ctrl.abort()
   })
   try {
@@ -815,7 +800,15 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       return res.end()
     }
     if (!r.ok) {
-      send({ error: data?.error || `HTTP ${r.status}` })
+      send({
+        error: data?.error || `HTTP ${r.status}`,
+        computeTimeMs: Number(data?.compute_time_ms ?? data?.computeTimeMs ?? 0) || 0,
+        workerComputeMs: Number(data?.worker_compute_ms ?? data?.workerComputeMs ?? 0) || 0,
+        routingPath: Array.isArray(data?.routing_path)
+          ? data.routing_path.filter((s) => typeof s === 'string' && s.length > 0)
+          : [],
+        pipelineTrace: data?.pipeline_trace ?? data?.pipelineTrace ?? null,
+      })
       return res.end()
     }
     const reply = typeof data.response === 'string' ? data.response : ''
@@ -840,6 +833,35 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       String(data.primary_worker_peer_id ?? data.primaryWorkerPeerId ?? '') || workerPeerId || null
     const pipelineTrace = data.pipeline_trace ?? data.pipelineTrace ?? null
     const pipelineWorkers = data.pipeline_workers ?? data.pipelineWorkers ?? null
+    // `compute_time_ms` : proto `ProcessedTensorData` champ 12 ; secours depuis `pipeline_trace`.
+    let computeTimeMs = Number(data.compute_time_ms ?? data.computeTimeMs ?? 0) || 0
+    if (
+      computeTimeMs <= 0 &&
+      pipelineTrace &&
+      typeof pipelineTrace === 'object' &&
+      pipelineTrace !== null &&
+      !Array.isArray(pipelineTrace)
+    ) {
+      const cm = pipelineTrace.compute_time_ms ?? pipelineTrace.computeTimeMs
+      if (typeof cm === 'number' && cm > 0) computeTimeMs = cm
+    }
+    // Chaîne de relais : top-level ou embarquée dans la trace pipeline (Daisy Chain).
+    const rawRoutingPath = data.routing_path ?? data.routingPath ?? []
+    let routingPath = Array.isArray(rawRoutingPath)
+      ? rawRoutingPath.filter((s) => typeof s === 'string' && s.length > 0)
+      : []
+    if (
+      routingPath.length === 0 &&
+      pipelineTrace &&
+      typeof pipelineTrace === 'object' &&
+      pipelineTrace !== null &&
+      !Array.isArray(pipelineTrace)
+    ) {
+      const rp = pipelineTrace.routing_path ?? pipelineTrace.routingPath
+      if (Array.isArray(rp)) {
+        routingPath = rp.filter((s) => typeof s === 'string' && s.length > 0)
+      }
+    }
     const traceLayout =
       pipelineTrace && typeof pipelineTrace === 'object' && pipelineTrace.layout
         ? String(pipelineTrace.layout)
@@ -850,7 +872,8 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
         `SELECT w.peer_id AS peerId, w.mode, w.grpc_port AS grpcPort, w.p2p_port AS p2pPort,
                 w.public_ip AS publicIp, w.version, w.p2p_peers AS p2pPeers,
                 w.tokens_generated AS tokensGenerated, w.tokens_in AS tokensIn, w.tokens_out AS tokensOut,
-                w.model, w.last_heartbeat_at AS lastHeartbeatAt,
+                w.model, w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
+                w.last_heartbeat_at AS lastHeartbeatAt,
                 TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
                 u.email AS ownerEmail
          FROM workers w
@@ -873,6 +896,8 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
           tokensIn: Number(row.tokensIn || 0),
           tokensOut: Number(row.tokensOut || 0),
           model: row.model ?? null,
+          gpuName: row.gpuName ?? null,
+          gpuVramMb: row.gpuVramMb != null ? Number(row.gpuVramMb) : null,
           lastHeartbeatAt: row.lastHeartbeatAt,
           secondsSinceHeartbeat: Number(row.secondsSinceHeartbeat),
           ownerEmail: row.ownerEmail ?? null,
@@ -906,21 +931,30 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       p2pMessagesOut,
       vpsDelegateMs,
       workerComputeMs,
+      computeTimeMs,
+      routingPath,
       schedulerWarmupSent,
       schedulerWorkersUsed,
       shardSessionId,
       pipelineTrace,
       pipelineWorkers,
       mode:
-        traceLayout === 'worker_only_pipeline'
-          ? 'Worker-only P2P (calcul sur les pairs)'
-          : 'P2P / Ollama (VPS)',
+        routingPath.length > 1
+          ? `Pipeline Daisy Chain (${routingPath.length} nœuds)`
+          : traceLayout === 'worker_only_pipeline'
+            ? 'Pipeline P2P natif (worker)'
+            : 'Pipeline P2P natif',
       worker,
     })
   } catch (e) {
-    if (e.name !== 'AbortError') send({ error: e.message || 'Erreur initiateur P2P.' })
+    if (e.name === 'AbortError') {
+      send({ error: 'Timeout P2P (600s)' })
+    } else {
+      send({ error: e.message || 'Erreur initiateur P2P.' })
+    }
   } finally {
     clearTimeout(timer)
+    clearInterval(keepAliveInterval)
   }
   res.end()
 })
@@ -998,6 +1032,20 @@ app.use('/api/admin', adminRouter)
  * Accessible UNIQUEMENT en localhost (127.0.0.1 / ::1), pas de JWT requis.
  * Utilisé par inference_server.py pour la découverte auto des pairs TP.
  */
+/**
+ * Endpoint interne : sert les fichiers de poids de modèle (shard) pour le Pipeline Parallelism.
+ * Les workers téléchargent leurs couches directement depuis le VPS via HTTPS, sans passer par le relay P2P.
+ * Accessible uniquement depuis localhost (Python VPS).
+ */
+app.use('/api/internal/shard-serve', express.static('/tmp/vryx-shards', {
+  dotfiles: 'deny',
+  maxAge: 0,
+  setHeaders(res) {
+    res.setHeader('Content-Type', 'application/json')
+    res.setHeader('Cache-Control', 'no-store')
+  },
+}))
+
 app.get('/api/internal/live-peers', async (req, res) => {
   const ip = req.socket.remoteAddress || req.ip || ''
   const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
@@ -1013,7 +1061,8 @@ app.get('/api/internal/live-peers', async (req, res) => {
     const [rows] = await pool.query(
       `SELECT peer_id
        FROM workers
-       WHERE last_heartbeat_at >= DATE_SUB(NOW(), INTERVAL :sec SECOND)
+       WHERE mode = 'worker'
+         AND last_heartbeat_at >= DATE_SUB(NOW(), INTERVAL :sec SECOND)
        ORDER BY last_heartbeat_at DESC
        LIMIT 16`,
       { sec: recentSec }

@@ -108,7 +108,7 @@ export function AdminOverviewPage() {
         </section>
 
         {/* Graphe inscriptions */}
-        <section className="rounded-2xl border border-border bg-white p-5 shadow-sm">
+        <section className="rounded-2xl border border-border bg-card p-5 shadow-sm">
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-semibold text-fg">Inscriptions — 30 jours</h3>
             <Link to="/admin/utilisateurs" className="text-xs font-medium text-accent hover:underline">Gérer →</Link>
@@ -150,7 +150,7 @@ export function AdminOverviewPage() {
             { to: '/admin/sessions', label: 'Sessions', desc: 'Historique des traitements P2P' },
             { to: '/admin/noeud', label: 'Chat P2P', desc: 'Tester le réseau en direct' },
           ].map((l) => (
-            <Link key={l.to} to={l.to} className="rounded-2xl border border-border bg-white p-5 shadow-sm transition-shadow hover:shadow-md">
+            <Link key={l.to} to={l.to} className="rounded-2xl border border-border bg-card p-5 shadow-sm transition-shadow hover:shadow-md">
               <p className="font-semibold text-fg">{l.label}</p>
               <p className="mt-1 text-xs text-muted">{l.desc}</p>
             </Link>

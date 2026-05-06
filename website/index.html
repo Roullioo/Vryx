@@ -5,7 +5,30 @@
     <link rel="icon" type="image/png" href="/logo-withoutbg.png" />
     <link rel="apple-touch-icon" href="/logo-withoutbg.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#f7f8fb" />
+    <meta name="theme-color" content="#fafafa" />
+    <script>
+      (function () {
+        var k = 'vryx-theme'
+        var raw = null
+        try {
+          raw = localStorage.getItem(k)
+        } catch (e) {}
+        var pref = raw === 'light' || raw === 'dark' || raw === 'system' ? raw : 'system'
+        var dark =
+          pref === 'dark' ||
+          (pref === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        var r = document.documentElement
+        if (dark) {
+          r.classList.add('dark')
+          r.style.colorScheme = 'dark'
+        } else {
+          r.classList.remove('dark')
+          r.style.colorScheme = 'light'
+        }
+        var m = document.querySelector('meta[name="theme-color"]')
+        if (m) m.setAttribute('content', dark ? '#0c0c0c' : '#fafafa')
+      })()
+    </script>
     <meta
       name="description"
       content="Vryx : inférence IA européenne en euros. Alternative aux datacenters centralisés : API compatible OpenAI, workers rémunérés en SEPA."

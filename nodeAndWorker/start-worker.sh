@@ -8,9 +8,6 @@ GRPC_PORT=50052
 API_PORT=3031
 BOOTSTRAP_NODE="/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz"
 API_URL="https://vryx.eu"
-# Inférence LLM uniquement sur le VPS : URL de délégation (secret obligatoire, voir doc serveur).
-INFERENCE_DELEGATE_URL="${VRYX_INFERENCE_DELEGATE_URL:-https://vryx.eu/api/workers/inference-delegate}"
-INFERENCE_DELEGATE_SECRET="${VRYX_INFERENCE_DELEGATE_SECRET:-}"
 
 USER_ID=""
 
@@ -54,19 +51,11 @@ fi
 
 echo "[+] Environnement Python prêt."
 
-# 2. Pont gRPC léger : les calculs LLM sont délégués au VPS (aucun modèle sur ce Mac).
-if [ -z "$INFERENCE_DELEGATE_SECRET" ] || [ "${#INFERENCE_DELEGATE_SECRET}" -lt 16 ]; then
-  echo "[!] Secret de delegation VPS manquant (VRYX_INFERENCE_DELEGATE_SECRET, minimum 16 caracteres)."
-  echo "    Lancez le worker depuis l'application Vryx ou exportez la variable avant ./start-worker.sh."
-  exit 1
-fi
-
-echo "[*] Lancement du pont d'inférence (délégation VPS, pas de modèle local)..."
+# 2. Serveur gRPC worker : segments de pipeline P2P natifs (routing_path / Daisy Chain), sans Web2.
+echo "[*] Lancement du serveur gRPC d'inférence (stage 2, P2P natif)..."
 PYTHONUNBUFFERED=1 python3 "${PYTHON_DIR}/inference_server.py" \
     --port "$GRPC_PORT" \
     --stage 2 \
-    --delegate-url "$INFERENCE_DELEGATE_URL" \
-    --delegate-secret "$INFERENCE_DELEGATE_SECRET" \
     --model "$MODEL_ID" &
 INFERENCE_PID=$!
 

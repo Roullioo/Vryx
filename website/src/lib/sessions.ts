@@ -30,6 +30,10 @@ export type WorkSession = {
   latencyMs: number
   vpsDelegateMs: number
   workerComputeMs: number
+  /** Proto `compute_time_ms` (télémétrie réelle worker). */
+  computeTimeMs?: number
+  /** Chemin Daisy Chain (`routing_path`). */
+  routingPath?: string[]
   promptTokens: number
   completionTokens: number
   totalTokens: number
@@ -40,7 +44,7 @@ export type WorkSession = {
   primaryWorkerPeerId: string
   schedulerWorkersUsed: number
   schedulerWarmupSent: number
-  /** Layout du pipeline (worker_only_pipeline, row_split_tensor_parallel, …) */
+  /** Layout du pipeline (pipeline_relay_daisy_chain, worker_only_pipeline, anciennes traces TP, …) */
   pipelineLayout: string
   pipelineOk: boolean
   /** Pairs qui ont reçu des calculs */
@@ -102,13 +106,17 @@ export function deleteSession(id: string): void {
   try {
     const sessions = loadSessions().filter((s) => s.id !== id)
     localStorage.setItem(KEY, JSON.stringify(sessions))
-  } catch {}
+  } catch {
+    void 0
+  }
 }
 
 export function clearSessions(): void {
   try {
     localStorage.removeItem(KEY)
-  } catch {}
+  } catch {
+    void 0
+  }
 }
 
 /** Construit une WorkSession depuis les données brutes d'un tour P2P. */
@@ -130,9 +138,25 @@ export function buildSession(params: {
     ? (t.metrics as Record<string, unknown>)
     : null
 
-  const peers: string[] = Array.isArray(t?.peers)
+  let peers: string[] = Array.isArray(t?.peers)
     ? (t!.peers as unknown[]).filter((p): p is string => typeof p === 'string')
     : []
+
+  const routingFromTrace = Array.isArray(t?.routing_path)
+    ? (t!.routing_path as unknown[]).filter((p): p is string => typeof p === 'string')
+    : []
+
+  const routingFromData = Array.isArray((params.data as Record<string, unknown>).routingPath)
+    ? ((params.data as Record<string, unknown>).routingPath as unknown[]).filter(
+        (p): p is string => typeof p === 'string',
+      )
+    : []
+
+  const routingPath = routingFromData.length > 0 ? routingFromData : routingFromTrace
+
+  if (peers.length === 0 && routingPath.length > 0) {
+    peers = [...routingPath]
+  }
 
   // Token steps depuis pipeline_trace.generation_steps
   const tokenSteps: SessionTokenStep[] = []
@@ -177,6 +201,11 @@ export function buildSession(params: {
     if (peer) workerSteps.push({ rank: asNum(o.rank), peerId: peer, role: asStr(o.role, 'étape'), latencyMs: asNum(o.latency_ms), outRows: typeof o.out_rows === 'number' ? o.out_rows : undefined })
   }
 
+  const traceCompute = typeof t?.compute_time_ms === 'number' ? asNum(t.compute_time_ms) : 0
+  const dataCompute = asNum((data as Record<string, unknown>).computeTimeMs)
+  const computeTimeMs =
+    dataCompute > 0 ? dataCompute : traceCompute > 0 ? traceCompute : undefined
+
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: Date.now(),
@@ -185,6 +214,8 @@ export function buildSession(params: {
     latencyMs: asNum(data.latencyMs),
     vpsDelegateMs: asNum(data.vpsDelegateMs),
     workerComputeMs: asNum(data.workerComputeMs),
+    computeTimeMs,
+    routingPath: routingPath.length > 0 ? routingPath : undefined,
     promptTokens: asNum(data.promptTokens) || asNum(metrics?.prompt_tokens),
     completionTokens: asNum(data.completionTokens) || asNum(metrics?.completion_tokens),
     totalTokens: asNum(data.totalTokens) || asNum(metrics?.total_tokens),

@@ -16,11 +16,100 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::time;
 use axum::http::StatusCode;
 use axum::{routing::{get, post}, Json, Router};
 use tower_http::cors::CorsLayer;
+use axum::extract::DefaultBodyLimit;
+
+// ============================================================
+//  Codec P2P personnalisé (512 MB pour les poids de modèle)
+// ============================================================
+
+mod vryx_codec {
+    use async_trait::async_trait;
+    use futures::prelude::*;
+    use libp2p::StreamProtocol;
+    use serde::{de::DeserializeOwned, Serialize};
+    use std::{io, marker::PhantomData};
+
+    /// Limite 512 MB — permet le transfert de tranches de poids LLM entre VPS et workers.
+    const MAX_SIZE: u64 = 512 * 1024 * 1024;
+
+    pub struct Codec<Req, Resp> {
+        phantom: PhantomData<(Req, Resp)>,
+    }
+
+    impl<Req, Resp> Default for Codec<Req, Resp> {
+        fn default() -> Self { Codec { phantom: PhantomData } }
+    }
+
+    impl<Req, Resp> Clone for Codec<Req, Resp> {
+        fn clone(&self) -> Self { Self::default() }
+    }
+
+    #[async_trait]
+    impl<Req, Resp> libp2p::request_response::Codec for Codec<Req, Resp>
+    where
+        Req: Send + Serialize + DeserializeOwned,
+        Resp: Send + Serialize + DeserializeOwned,
+    {
+        type Protocol = StreamProtocol;
+        type Request = Req;
+        type Response = Resp;
+
+        async fn read_request<T>(
+            &mut self,
+            _protocol: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Request>
+        where T: AsyncRead + Unpin + Send {
+            let mut buf = Vec::new();
+            io.take(MAX_SIZE).read_to_end(&mut buf).await?;
+            serde_json::from_slice(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+
+        async fn read_response<T>(
+            &mut self,
+            _protocol: &Self::Protocol,
+            io: &mut T,
+        ) -> io::Result<Self::Response>
+        where T: AsyncRead + Unpin + Send {
+            let mut buf = Vec::new();
+            io.take(MAX_SIZE).read_to_end(&mut buf).await?;
+            serde_json::from_slice(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _protocol: &Self::Protocol,
+            io: &mut T,
+            req: Self::Request,
+        ) -> io::Result<()>
+        where T: AsyncWrite + Unpin + Send {
+            let data = serde_json::to_vec(&req)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            io.write_all(&data).await?;
+            Ok(())
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _protocol: &Self::Protocol,
+            io: &mut T,
+            resp: Self::Response,
+        ) -> io::Result<()>
+        where T: AsyncWrite + Unpin + Send {
+            let data = serde_json::to_vec(&resp)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            io.write_all(&data).await?;
+            Ok(())
+        }
+    }
+}
 
 // ============================================================
 //  CLI
@@ -81,7 +170,7 @@ struct Args {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TensorRequest {
-    /// Vide ou `llm_delegate` : comportement historique.
+    /// Type de payload routé en P2P natif (`text`, `vryx.shard.*`, `vryx.dist.*`, ...).
     #[serde(default)]
     kind: String,
     #[serde(with = "base64_vec")]
@@ -148,6 +237,15 @@ impl Default for TensorResponse {
     }
 }
 
+/// Tableau `routing_path` pour les réponses HTTP/SSE (aligné sur `pipeline_trace_json`).
+fn routing_path_from_trace(trace: &serde_json::Value) -> serde_json::Value {
+    trace
+        .get("routing_path")
+        .filter(|v| v.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(vec![]))
+}
+
 mod base64_vec {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use base64::{Engine as _, engine::general_purpose};
@@ -173,7 +271,7 @@ mod base64_vec {
 #[derive(NetworkBehaviour)]
 struct VryxBehaviour {
     mdns: mdns::tokio::Behaviour,
-    request_response: request_response::json::Behaviour<TensorRequest, TensorResponse>,
+    request_response: request_response::Behaviour<vryx_codec::Codec<TensorRequest, TensorResponse>>,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
     autonat: autonat::Behaviour,
@@ -191,7 +289,6 @@ pub mod vryx {
 }
 
 use vryx::inference_service_client::InferenceServiceClient;
-use vryx::TensorData;
 
 // ============================================================
 //  Persistance du keypair libp2p
@@ -367,8 +464,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let peer_id = key.public().to_peer_id();
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
             let mut rr_config = request_response::Config::default();
-            rr_config.set_request_timeout(Duration::from_secs(120));
-            let request_response = request_response::json::Behaviour::new(
+            rr_config.set_request_timeout(Duration::from_secs(600));
+            // Codec personnalisé 512 MB pour le transfert de tranches de poids LLM.
+            let request_response = request_response::Behaviour::with_codec(
+                vryx_codec::Codec::<TensorRequest, TensorResponse>::default(),
                 [(StreamProtocol::new("/vryx/tensor/1.0.0"), ProtocolSupport::Full)],
                 rr_config,
             );
@@ -457,7 +556,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     #[derive(Debug)]
     enum PendingMeta {
-        Chat { retries: u32, target_peer: PeerId },
         P2pRelayReply(tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>),
         Forwarded { original_channel: request_response::ResponseChannel<TensorResponse> },
     }
@@ -473,15 +571,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     enum ChatState {
         Idle,
         Generating {
-            full_prompt: String,
-            target_peer: PeerId,
-            token_count: usize,
-            generated_text: String,
             response_tx: Option<ChatApiTx>,
             request_started: Instant,
-            scheduler_warmup_sent: u32,
-            scheduler_workers_used: u32,
-            pipeline_trace_json: String,
         },
     }
     let mut chat_state = ChatState::Idle;
@@ -575,7 +666,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "ok": true,
                                 "peers": ids,
                                 "count": n,
-                                "layout_hint": "row_split_tensor_parallel",
+                                "layout_hint": "pipeline_relay_daisy_chain",
                             })),
                         )
                     }
@@ -589,7 +680,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let _ = cmd_tx_axum.send((prompt.to_string(), Some(tx)));
                     
-                    match tokio::time::timeout(std::time::Duration::from_secs(240), rx).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
                         Ok(Ok(response)) => {
                             if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
                                 (axum::http::StatusCode::BAD_REQUEST, Json(response))
@@ -677,6 +768,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "total_tokens": resp.total_tokens_llm,
                                 "vps_delegate_ms": resp.vps_delegate_ms,
                                 "worker_compute_ms": resp.worker_compute_ms,
+                                "compute_time_ms": resp.compute_time_ms.max(resp.worker_compute_ms),
                                 "shard_session_id": resp.shard_session_id,
                             })),
                         )
@@ -695,6 +787,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     ),
                 }
             }))
+            .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB pour les poids de modèle
             .layer(CorsLayer::permissive());
 
         let api_port = args.api_port;
@@ -728,8 +821,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()
         .unwrap_or_default();
 
-    let mut stdin_lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-
     // Channel pour les résultats d'inférence (évite de bloquer la boucle swarm)
     enum InferenceResult {
         Stage1 {
@@ -737,10 +828,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             data: Vec<u8>,
             c: u64,
             s: u64,
-            full_prompt: String,
-            /// `Some` = continuation (déjà extrait de l'état) ; `None` = premier tour (prendre `response_tx` sur `chat_state`).
+            /// `Some` = requête HTTP initiale ; conservé pour garder le canal de réponse.
             continuation_response_tx: Option<ChatApiTx>,
-            generated_text: String,
             request_started: Instant,
             pipeline_trace_json: String,
             compute_time_ms: u64,
@@ -820,11 +909,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .copied();
 
                 if let Some(peer) = worker {
-                    let prompt = format!(
-                        "<|system|>\nYou are a helpful assistant.</s>\n\
-                         <|user|>\n{}</s>\n<|assistant|>\n",
-                        line
-                    );
+                    let prompt = line.clone();
                     print!("> Assistant : ");
                     tokio::io::stdout().flush().await?;
 
@@ -841,9 +926,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     data,
                                     c,
                                     s,
-                                    full_prompt: p_clone,
                                     continuation_response_tx: None,
-                                    generated_text: String::new(),
                                     request_started,
                                     pipeline_trace_json: pipe,
                                     compute_time_ms: c_ms,
@@ -858,15 +941,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     });
                     chat_state = ChatState::Generating {
-                        full_prompt: prompt,
-                        target_peer: peer,
-                        token_count: 0,
-                        generated_text: String::new(),
                         response_tx: resp_tx,
                         request_started,
-                        scheduler_warmup_sent: 0,
-                        scheduler_workers_used: 1,
-                        pipeline_trace_json: String::new(),
                     };
                 } else {
                     println!(
@@ -888,7 +964,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             res = rx.recv() => {
                 if let Some(result) = res {
                     match result {
-                        InferenceResult::Stage1 { peer_id, data, c, s, full_prompt, continuation_response_tx, generated_text, request_started, pipeline_trace_json, compute_time_ms } => {
+                        InferenceResult::Stage1 { peer_id, data, c, s, continuation_response_tx, request_started, pipeline_trace_json, compute_time_ms } => {
                             let sched_warm = 0_u32;
                             let mut sched_workers = 1_u32;
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pipeline_trace_json) {
@@ -903,11 +979,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             // Inférence terminée côté Python (worker-only ou tensor-parallel réussi) :
                             // pas de warmup P2P nécessaire, on répond directement.
                             let pipeline_val_parsed = serde_json::from_str::<serde_json::Value>(&pipeline_trace_json).ok();
+                            let pipeline_failed = pipeline_val_parsed.as_ref().map(|v| {
+                                v.get("ok").and_then(|x| x.as_bool()) == Some(false)
+                            }).unwrap_or(false);
+                            if pipeline_failed {
+                                let response_tx = continuation_response_tx.or_else(|| {
+                                    match &mut chat_state {
+                                        ChatState::Generating { response_tx, .. } => response_tx.take(),
+                                        _ => None,
+                                    }
+                                });
+                                let pipeline_value = pipeline_val_parsed.clone().unwrap_or(serde_json::Value::Null);
+                                let err = pipeline_value
+                                    .get("error")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("Capacité P2P worker-only indisponible.");
+                                if let Some(tx) = response_tx {
+                                    let rp = routing_path_from_trace(&pipeline_value);
+                                    let _ = tx.send(serde_json::json!({
+                                        "ok": false,
+                                        "error": err,
+                                        "latency_ms": request_started.elapsed().as_millis() as u64,
+                                        "compute_time_ms": compute_time_ms,
+                                        "worker_compute_ms": compute_time_ms,
+                                        "routing_path": rp,
+                                        "pipeline_trace": pipeline_value,
+                                    }));
+                                }
+                                chat_state = ChatState::Idle;
+                                print!("> Vous : ");
+                                let _ = tokio::io::stdout().flush().await;
+                                continue;
+                            }
                             let worker_only_skip = pipeline_val_parsed.as_ref().map(|v| {
                                 let layout = v.get("layout").and_then(|x| x.as_str()).unwrap_or("");
                                 let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
                                 // Court-circuiter le warmup P2P si Python a déjà géré la computation
-                                let skip_layouts = ["worker_only_pipeline", "row_split_tensor_parallel", "distributed_fanout"];
+                                let skip_layouts = ["worker_only_pipeline", "pipeline_relay_daisy_chain", "distributed_fanout"];
                                 ok && skip_layouts.contains(&layout)
                             }).unwrap_or(false);
 
@@ -944,6 +1052,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let peer_str = peer_id.to_string();
                                 let latency_ms = request_started.elapsed().as_millis() as u64;
                                 if let Some(tx) = response_tx {
+                                    let rp = routing_path_from_trace(&pipeline_value);
                                     let _ = tx.send(serde_json::json!({
                                         "ok": true,
                                         "response": final_text,
@@ -954,7 +1063,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "completion_tokens": ct,
                                         "total_tokens": tt,
                                         "vps_delegate_ms": vps_ms,
-                                        "worker_compute_ms": 0,
+                                        "worker_compute_ms": compute_time_ms,
+                                        "compute_time_ms": compute_time_ms,
+                                        "routing_path": rp,
                                         "p2p_messages_in": 0_u64,
                                         "p2p_messages_out": 0_u64,
                                         "tokens_in": 0,
@@ -968,7 +1079,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "scheduler_workers_used": sched_workers,
                                         "pipeline_trace": pipeline_value,
                                         "pipeline_workers": pipeline_steps,
-                                        "worker_compute_ms": compute_time_ms,
                                     }));
                                 }
                                 chat_state = ChatState::Idle;
@@ -983,36 +1093,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     _ => None,
                                 }
                             });
-
-                            let req = TensorRequest {
-                                kind: String::new(),
-                                data,
-                                dtype: "vryx.pipeline.forward".to_string(),
-                                compute_time_ns: c,
-                                serialization_time_ns: s,
-                                routing_path: vec![], // Initiator simple start
-                                session_id: format!("sess-{}", Instant::now().elapsed().as_nanos()),
-                            };
-                            let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, req.clone());
-                            pending_requests.insert(
-                                req_id,
-                                (req, PendingMeta::Chat {
-                                    retries: 0,
-                                    target_peer: peer_id,
-                                }),
-                            );
-                            chat_state = ChatState::Generating {
-                                full_prompt,
-                                target_peer: peer_id,
-                                token_count: 0,
-                                generated_text,
-                                response_tx,
-                                request_started,
-                                scheduler_warmup_sent: sched_warm,
-                                scheduler_workers_used: sched_workers,
-                                pipeline_trace_json,
-                            };
-                            tokens_out.fetch_add(1, Ordering::Relaxed);
+                            let pipeline_value: serde_json::Value =
+                                serde_json::from_str(&pipeline_trace_json)
+                                    .unwrap_or(serde_json::Value::Null);
+                            if let Some(tx) = response_tx {
+                                let rp = routing_path_from_trace(&pipeline_value);
+                                let _ = tx.send(serde_json::json!({
+                                    "ok": false,
+                                    "error": "capacité worker de génération distribuée non disponible",
+                                    "latency_ms": request_started.elapsed().as_millis() as u64,
+                                    "compute_time_ms": compute_time_ms,
+                                    "worker_compute_ms": compute_time_ms,
+                                    "routing_path": rp,
+                                    "pipeline_trace": pipeline_value,
+                                }));
+                            }
+                            chat_state = ChatState::Idle;
+                            print!("> Vous : ");
+                            let _ = tokio::io::stdout().flush().await;
+                            let _ = (peer_id, data, c, s, sched_warm, sched_workers);
                         }
                         InferenceResult::Stage2 { channel, data, c, s, metrics, compute_time_ms } => {
                             let w_ms = compute_time_ms;
@@ -1292,7 +1391,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             request: TensorRequest {
                                                 kind: String::new(),
                                                 data,
-                                                dtype: "vryx.pipeline.forward".to_string(),
+                                                dtype: dtype_in.clone(),
                                                 compute_time_ns: c,
                                                 serialization_time_ns: s,
                                                 routing_path,
@@ -1326,163 +1425,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Réponse P2P reçue → token généré, continue le chat
                 SwarmEvent::Behaviour(VryxBehaviourEvent::RequestResponse(
                     request_response::Event::Message {
-                        peer,
+                        peer: _,
                         message: request_response::Message::Response { response, request_id },
                         ..
                     },
                 )) => {
-                    let pending_chat = match pending_requests.remove(&request_id) {
+                    match pending_requests.remove(&request_id) {
                         Some((_, PendingMeta::P2pRelayReply(reply_tx))) => {
                             let _ = reply_tx.send(Ok(response.clone()));
-                            false
                         }
                         Some((_, PendingMeta::Forwarded { original_channel })) => {
                             let _ = swarm.behaviour_mut().request_response.send_response(original_channel, response.clone());
-                            false
                         }
-                        Some((_, PendingMeta::Chat { .. })) => true,
-                        None => false,
-                    };
-                    if !pending_chat {
-                        continue;
+                        None => {}
                     }
-
-                    let mut maybe_next: Option<(String, PeerId, Option<ChatApiTx>, String, Instant)> = None;
-
-                    if let ChatState::Generating {
-                        ref mut full_prompt,
-                        ref target_peer,
-                        ref mut token_count,
-                        ref mut generated_text,
-                        ref mut response_tx,
-                        request_started,
-                        scheduler_warmup_sent: _,
-                        scheduler_workers_used: _,
-                        ..
-                    } = chat_state
-                    {
-                        if peer == *target_peer {
-                            let token_final = String::from_utf8_lossy(&response.data).to_string();
-                            print!("{}", token_final);
-                            let _ = tokio::io::stdout().flush().await;
-                            full_prompt.push_str(&token_final);
-                            generated_text.push_str(&token_final);
-
-                            let done = true;
-                            if !done {
-                                *token_count += 1;
-                                let next_resp_tx = response_tx.take();
-                                let next_gen_text = generated_text.clone();
-                                maybe_next = Some((
-                                    full_prompt.clone(),
-                                    *target_peer,
-                                    next_resp_tx,
-                                    next_gen_text,
-                                    request_started,
-                                ));
-                            } else {
-                                println!("\n");
-                                let peer_str = target_peer.to_string();
-                                let started = request_started;
-                                let (sched_w, sched_u, pipeline_trace_json) = match &chat_state {
-                                    ChatState::Generating {
-                                        scheduler_warmup_sent,
-                                        scheduler_workers_used,
-                                        pipeline_trace_json,
-                                        ..
-                                    } => (
-                                        *scheduler_warmup_sent,
-                                        *scheduler_workers_used,
-                                        pipeline_trace_json.clone(),
-                                    ),
-                                    _ => (0_u32, 1_u32, String::new()),
-                                };
-                                let pipeline_value: serde_json::Value =
-                                    serde_json::from_str(&pipeline_trace_json)
-                                        .unwrap_or(serde_json::Value::Null);
-                                let pipeline_steps = pipeline_value
-                                    .get("steps")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Array(vec![]));
-                                if let ChatState::Generating { response_tx, generated_text, .. } =
-                                    std::mem::replace(&mut chat_state, ChatState::Idle)
-                                {
-                                    if let Some(tx) = response_tx {
-                                        let latency_ms = started.elapsed().as_millis() as u64;
-                                        tokens_generated.fetch_add(1, Ordering::Relaxed);
-                                        let pt = response.prompt_tokens_llm;
-                                        let ct = response.completion_tokens_llm;
-                                        let tt = if response.total_tokens_llm > 0 {
-                                            response.total_tokens_llm
-                                        } else {
-                                            pt.saturating_add(ct)
-                                        };
-                                        let _ = tx.send(serde_json::json!({
-                                            "ok": true,
-                                            "response": generated_text,
-                                            "worker_peer_id": peer_str,
-                                            "primary_worker_peer_id": peer_str,
-                                            "latency_ms": latency_ms,
-                                            "prompt_tokens": pt,
-                                            "completion_tokens": ct,
-                                            "total_tokens": tt,
-                                            "vps_delegate_ms": response.vps_delegate_ms,
-                                            "worker_compute_ms": response.worker_compute_ms,
-                                            "p2p_messages_in": 1_u64,
-                                            "p2p_messages_out": 1_u64,
-                                            "tokens_in": 1,
-                                            "tokens_out": 1,
-                                            "tokens_generated": 1,
-                                            "cumulative_tokens_in": tokens_in.load(Ordering::Relaxed),
-                                            "cumulative_tokens_out": tokens_out.load(Ordering::Relaxed),
-                                            "cumulative_tokens_generated": tokens_generated.load(Ordering::Relaxed),
-                                            "shard_session_id": response.shard_session_id,
-                                            "scheduler_warmup_sent": sched_w,
-                                            "scheduler_workers_used": sched_u,
-                                            "pipeline_trace": pipeline_value,
-                                            "pipeline_workers": pipeline_steps,
-                                        }));
-                                    }
-                                }
-                            }
-                        } else {
-                            eprintln!(
-                                "[P2P] Réponse reçue d'un pair inattendu (attendu {}), ignorée.",
-                                target_peer
-                            );
-                        }
-                    }
-
-                    if let Some((prompt, target, resp_tx, gen_text, req_started)) = maybe_next {
-                        let tx_next = tx.clone();
-                        let grpc_port = args.grpc_port;
-                        let p_clone = prompt.clone();
-                        tokio::spawn(async move {
-                            match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string(), vec![], String::new()).await {
-                                Ok((data, c, s, m, _c_ms)) => {
-                                    let pipe = m.pipeline_trace_json.clone();
-                                    let _ = tx_next.send(InferenceResult::Stage1 {
-                                        peer_id: target,
-                                        data,
-                                        c,
-                                        s,
-                                        full_prompt: p_clone,
-                                        continuation_response_tx: resp_tx,
-                                        generated_text: gen_text,
-                                        request_started: req_started,
-                                        pipeline_trace_json: pipe,
-                                        compute_time_ms: _c_ms,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx_next.send(InferenceResult::Error {
-                                        context: "Stage 1 (auto-next)".to_string(),
-                                        message: e.to_string(),
-                                    });
-                                }
-                            }
-                        });
-                    }
+                    continue;
                 }
 
                 // Échec d'envoi → retry sur un autre worker
@@ -1492,16 +1449,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     },
                 )) => {
                     eprintln!("[!] Échec envoi vers {} : {}", peer, error);
-                    if let Some((req, meta)) = pending_requests.remove(&request_id) {
-                        let (retries, _target_peer) = match meta {
+                    if let Some((_req, meta)) = pending_requests.remove(&request_id) {
+                        match meta {
                             PendingMeta::P2pRelayReply(reply_tx) => {
                                 let _ = reply_tx.send(Err(format!("{:?}", error)));
                                 continue;
                             }
-                            PendingMeta::Chat {
-                                retries,
-                                target_peer,
-                            } => (retries, target_peer),
                             PendingMeta::Forwarded { original_channel } => {
                                 let _ = swarm.behaviour_mut().request_response.send_response(
                                     original_channel,
@@ -1512,61 +1465,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 );
                                 continue;
                             }
-                        };
-                        if retries < 2 {
-                            discovered_peers.remove(&peer);
-                            active_peers.lock().unwrap().remove(&peer);
-                            let active_snapshot = active_peers.lock().unwrap().clone();
-                            let alt = discovered_peers
-                                .iter()
-                                .filter(|p| Some(**p) != bootstrap_peer_id && **p != peer)
-                                .find(|p| active_snapshot.contains(*p))
-                                .copied();
-                            if let Some(next_peer) = alt {
-                                let new_id = swarm
-                                    .behaviour_mut()
-                                    .request_response
-                                    .send_request(&next_peer, req.clone());
-                                pending_requests.insert(
-                                    new_id,
-                                    (
-                                        req,
-                                        PendingMeta::Chat {
-                                            retries: retries + 1,
-                                            target_peer: next_peer,
-                                        },
-                                    ),
-                                );
-                                if let ChatState::Generating { ref mut target_peer, .. } = chat_state {
-                                    *target_peer = next_peer;
-                                }
-                            } else {
-                                eprintln!("[!] Aucun worker de repli disponible.");
-                                if let ChatState::Generating { response_tx, .. } = std::mem::replace(&mut chat_state, ChatState::Idle) {
-                                    if let Some(tx) = response_tx {
-                                        let _ = tx.send(serde_json::json!({
-                                            "ok": false,
-                                            "error": format!("Aucun worker P2P actif disponible après échec vers {}", peer),
-                                            "failed_worker_peer_id": peer.to_string(),
-                                        }));
-                                    }
-                                }
-                                print!("> Vous : ");
-                                tokio::io::stdout().flush().await?;
-                            }
-                        } else {
-                            eprintln!("[!] Max retries atteint. Chat interrompu.");
-                            if let ChatState::Generating { response_tx, target_peer, .. } = std::mem::replace(&mut chat_state, ChatState::Idle) {
-                                if let Some(tx) = response_tx {
-                                    let _ = tx.send(serde_json::json!({
-                                        "ok": false,
-                                        "error": format!("Impossible de joindre le worker P2P {}", target_peer),
-                                        "failed_worker_peer_id": target_peer.to_string(),
-                                    }));
-                                }
-                            }
-                            print!("> Vous : ");
-                            tokio::io::stdout().flush().await?;
                         }
                     }
                 }

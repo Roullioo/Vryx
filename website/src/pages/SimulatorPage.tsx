@@ -186,7 +186,7 @@ export function SimulatorPage() {
           />
         </div>
         <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-slate-950/58 sm:bg-slate-950/52"
+          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
           aria-hidden
         />
 
@@ -210,7 +210,7 @@ export function SimulatorPage() {
             <div className="mt-9 flex w-full flex-col gap-3 sm:mx-auto sm:max-w-xl sm:flex-row sm:justify-center sm:gap-4">
               <Link
                 to="/compte#facturation"
-                className="inline-flex min-h-11 flex-1 items-center justify-center rounded-xl bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 sm:flex-none sm:px-8 sm:text-base"
+                className="inline-flex min-h-11 flex-1 items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:flex-none sm:px-8 sm:text-base"
               >
                 Acheter des crédits
               </Link>
@@ -778,7 +778,7 @@ export function SimulatorPage() {
           style={{ backgroundImage: "url('/mid.png')" }}
           aria-hidden
         />
-        <div className="absolute inset-0 bg-gradient-to-b from-slate-950/84 via-slate-950/74 to-slate-950/88" aria-hidden />
+        <div className="hero-overlay absolute inset-0" aria-hidden />
         <div className="relative z-10 mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
           <div className="mx-auto max-w-2xl text-center">
             <h2

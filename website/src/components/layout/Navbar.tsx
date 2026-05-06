@@ -3,7 +3,9 @@ import { Link, NavLink, useLocation } from 'react-router-dom'
 import { IconChevronDown } from '../icons/Icons'
 import { VryxLogo } from '../brand/VryxLogo'
 import { useAuth } from '../../context/AuthContext'
+import { useTheme } from '../../context/ThemeContext'
 import { MOCK_ACCOUNT } from '../../data/accountMock'
+import { ThemeToggle } from './ThemeToggle'
 
 const routeLinks = [
   { to: '/clients', label: 'Clients' },
@@ -17,6 +19,7 @@ export function Navbar() {
   const [menuOpen, setMenuOpen] = useState(false)
   const { pathname } = useLocation()
   const { user, loading, logout } = useAuth()
+  const { resolvedTheme } = useTheme()
   const accountDetailsRef = useRef<HTMLDetailsElement>(null)
 
   const lightNav =
@@ -27,6 +30,9 @@ export function Navbar() {
     pathname === '/comparatif' ||
     pathname === '/workers' ||
     pathname === '/panel/modeles'
+
+  /** Pastilles blanches sur hero uniquement en thème clair résolu. */
+  const heroLightChrome = lightNav && resolvedTheme === 'light'
 
   const navRouteClass = ({ isActive }: { isActive: boolean }) =>
     [
@@ -71,14 +77,17 @@ export function Navbar() {
         </nav>
 
         <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+          <ThemeToggle navOnDarkHero={lightNav} />
           {!loading && user ? (
             <>
               <details ref={accountDetailsRef} className="relative hidden lg:block">
                 <summary
                   className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold [&::-webkit-details-marker]:hidden ${
-                    lightNav
+                    heroLightChrome
                       ? 'bg-white text-slate-950 hover:bg-white/90'
-                      : 'btn-primary'
+                      : lightNav
+                        ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md hover:bg-card'
+                        : 'btn-primary'
                   }`}
                 >
                   Mon compte
@@ -136,7 +145,11 @@ export function Navbar() {
                 to="/connexion"
                 state={{ from: '/compte' }}
                 className={`hidden rounded-lg px-4 py-2 text-sm font-semibold lg:inline-flex ${
-                  lightNav ? 'bg-white text-slate-950 hover:bg-white/90' : 'btn-primary'
+                  heroLightChrome
+                    ? 'bg-white text-slate-950 hover:bg-white/90'
+                    : lightNav
+                      ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md hover:bg-card'
+                      : 'btn-primary'
                 }`}
                 onClick={() => setMenuOpen(false)}
               >
@@ -159,7 +172,11 @@ export function Navbar() {
             <Link
               to="/compte"
               className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${
-                lightNav ? 'bg-white text-slate-950' : 'btn-primary'
+                heroLightChrome
+                  ? 'bg-white text-slate-950'
+                  : lightNav
+                    ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md'
+                    : 'btn-primary'
               }`}
               onClick={() => setMenuOpen(false)}
             >
@@ -170,7 +187,11 @@ export function Navbar() {
               to="/connexion"
               state={{ from: '/compte' }}
               className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${
-                lightNav ? 'bg-white text-slate-950' : 'btn-primary'
+                heroLightChrome
+                  ? 'bg-white text-slate-950'
+                  : lightNav
+                    ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md'
+                    : 'btn-primary'
               }`}
               onClick={() => setMenuOpen(false)}
             >
@@ -209,8 +230,10 @@ export function Navbar() {
       {menuOpen && (
         <div
           id="mobile-nav"
-          className={`border-t px-4 py-4 lg:hidden ${
-            lightNav ? 'border-white/10 bg-slate-950/95 text-white' : 'border-border bg-bg/95'
+          className={`border-t px-4 py-4 backdrop-blur-md lg:hidden ${
+            lightNav
+              ? 'border-white/10 bg-page-hero/95 text-white'
+              : 'border-border bg-bg/95'
           }`}
           role="dialog"
           aria-modal="true"

@@ -27,7 +27,7 @@ export function VryxLogo({
   markSize = 'md',
   labelledBy,
 }: VryxLogoProps) {
-  const fg = tone === 'dark' ? '#171717' : '#ffffff'
+  const wordmarkClass = tone === 'light' ? 'text-white' : 'text-fg'
 
   const mark = (
     <img
@@ -42,9 +42,7 @@ export function VryxLogo({
 
   const wordmark =
     variant === 'full' ? (
-      <span className="font-display text-lg font-semibold tracking-tight sm:text-xl" style={{ color: fg }}>
-        VryxAI
-      </span>
+      <span className={`font-display text-lg font-semibold tracking-tight sm:text-xl ${wordmarkClass}`}>VryxAI</span>
     ) : null
 
   const content = (

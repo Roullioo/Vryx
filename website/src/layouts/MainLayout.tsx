@@ -24,7 +24,7 @@ export function MainLayout() {
     pathname === '/panel/modeles'
 
   return (
-    <div className={`min-h-svh text-fg ${topDarkHero ? 'bg-slate-950' : 'bg-bg'}`}>
+    <div className={`min-h-svh text-fg ${topDarkHero ? 'bg-page-hero' : 'bg-bg'}`}>
       <ScrollToTopOnPathname />
       <Navbar />
       <main className="relative z-0">

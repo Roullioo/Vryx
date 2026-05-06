@@ -27,6 +27,7 @@
 # Logs & exécution locale
 *.log
 **/local-worker-logs/
+nodeAndWorker/logs/
 worker_daemon.log
 
 # Electron / releases

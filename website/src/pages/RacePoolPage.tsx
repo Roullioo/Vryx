@@ -33,7 +33,10 @@ export function RacePoolPage() {
             style={{ backgroundImage: "url('/datacenter.png')" }}
           />
         </div>
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-slate-950/60 sm:bg-slate-950/55" aria-hidden />
+        <div
+          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
+          aria-hidden
+        />
 
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-6 text-center sm:pb-16 sm:pt-8">
           <motion.div
@@ -53,7 +56,7 @@ export function RacePoolPage() {
             </p>
             <Link
               to="/comparatif"
-              className="mt-8 inline-flex min-h-11 w-full max-w-xs items-center justify-center rounded-xl bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 sm:mt-9 sm:w-auto sm:px-8 sm:text-base"
+              className="mt-8 inline-flex min-h-11 w-full max-w-xs items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:mt-9 sm:w-auto sm:px-8 sm:text-base"
             >
               Comparer solo et pool
             </Link>
@@ -123,7 +126,7 @@ export function RacePoolPage() {
                   key={s.title}
                   className="flex flex-col rounded-2xl border border-white/10 bg-black/50 px-5 pb-5 pt-6 text-center shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset] sm:px-6 sm:pb-6 sm:pt-7"
                 >
-                  <div className="mx-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 bg-slate-950/80 font-mono text-xs font-semibold tabular-nums text-white">
+                  <div className="mx-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 bg-page-hero/85 font-mono text-xs font-semibold tabular-nums text-white dark:bg-black/50">
                     {step}
                   </div>
                   <h3 className="font-display mt-4 text-base font-semibold text-white sm:text-lg">{s.title}</h3>

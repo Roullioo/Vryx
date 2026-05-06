@@ -1,9 +1,19 @@
 /**
  * Rapport visuel des workers : barres CSS (pas de SVG), fonctionne dans tous les contextes.
- * - Mode riche : parse pipeline_trace (worker-only, TP) → graphiques par token + chargement par pair.
- * - Mode agrégé : métriques du tour (latency_ms, vps_delegate_ms, worker_compute_ms, tokens).
+ * - Mode riche : parse pipeline_trace (Daisy Chain, TP) → graphiques par token + chargement par pair.
+ * - Mode agrégé : métriques du tour (latency_ms, compute_time_ms, tokens).
+ *
+ * Source de vérité du temps de calcul : `compute_time_ms` du proto `ProcessedTensorData`
+ * (champ 12), retransmis par l'initiateur P2P. Plus de fallback sur des heuristiques
+ * qui produisaient des "0 ms" / "1 ms" trompeurs.
  */
 import { useMemo } from 'react'
+
+import {
+  effectiveComputeMs,
+  type WorkerRoundMetrics,
+  isFallbackMetricsUsable,
+} from './workerRoundMetrics'
 
 /* ─── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -26,28 +36,6 @@ function asArray(v: unknown): unknown[] {
   return Array.isArray(v) ? v : []
 }
 
-/* ─── types publics ────────────────────────────────────────────────────────── */
-
-export type WorkerRoundMetrics = {
-  latencyMs: number
-  vpsDelegateMs: number
-  workerComputeMs: number
-  promptTokens?: number
-  completionTokens?: number
-  totalTokens?: number
-  p2pMessagesIn?: number
-  p2pMessagesOut?: number
-  mode?: string
-}
-
-export function isFallbackMetricsUsable(m: WorkerRoundMetrics | undefined): boolean {
-  if (!m) return false
-  if (m.latencyMs > 0 || m.vpsDelegateMs > 0 || m.workerComputeMs > 0) return true
-  if ((m.completionTokens ?? 0) > 0 || (m.promptTokens ?? 0) > 0) return true
-  if ((m.p2pMessagesIn ?? 0) > 0 || (m.p2pMessagesOut ?? 0) > 0) return true
-  return false
-}
-
 /* ─── sous-composants barres CSS ──────────────────────────────────────────── */
 
 /** Barre de progression simple avec label et valeur. */
@@ -68,7 +56,7 @@ function Bar({
         <span className="text-muted">{label}</span>
         <span className="font-mono tabular-nums text-fg">{value}</span>
       </div>
-      <div className="h-2.5 w-full overflow-hidden rounded-full bg-white/5">
+      <div className="h-2.5 w-full overflow-hidden rounded-full bg-fg/10">
         <div
           className={`h-full rounded-full transition-all ${color}`}
           style={{ width: `${Math.min(100, Math.max(pct * 100, pct > 0 ? 3 : 0))}%` }}
@@ -78,12 +66,13 @@ function Bar({
   )
 }
 
-/** Graphique agrégé pour un tour Ollama (sans pipeline_trace détaillé). */
+/** Graphique agrégé pour un tour P2P (avec ou sans pipeline_trace détaillé). */
 function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
   const total = Math.max(1, m.latencyMs)
-  const vps = Math.max(0, m.vpsDelegateMs)
-  const wrk = Math.max(0, m.workerComputeMs)
-  const other = Math.max(0, total - vps - wrk)
+  const orch = Math.max(0, m.vpsDelegateMs)
+  // `compute_time_ms` du proto est la source de vérité ; sinon retombée sur worker_compute_ms.
+  const compute = effectiveComputeMs(m)
+  const other = Math.max(0, total - orch - compute)
 
   const p = Math.max(0, m.promptTokens ?? 0)
   const c = Math.max(0, m.completionTokens ?? 0)
@@ -93,7 +82,12 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
   const po = Math.max(0, m.p2pMessagesOut ?? 0)
   const msgMax = Math.max(1, pi, po)
 
-  const msPerTok = c > 0 && wrk > 0 ? (wrk / c).toFixed(0) : c > 0 && total > 0 ? (total / c).toFixed(0) : null
+  const msPerTok =
+    c > 0 && compute > 0
+      ? (compute / c).toFixed(0)
+      : c > 0 && total > 0
+        ? (total / c).toFixed(0)
+        : null
 
   return (
     <div className="space-y-3">
@@ -102,10 +96,25 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
         <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">
           Temps du tour — {total.toLocaleString('fr-FR')} ms total
         </p>
-        <Bar pct={vps / total} color="bg-accent" label="Orchestration VPS" value={`${vps.toLocaleString('fr-FR')} ms`} />
-        <Bar pct={wrk / total} color="bg-success" label="Calcul worker" value={`${wrk.toLocaleString('fr-FR')} ms`} />
+        <Bar
+          pct={orch / total}
+          color="bg-accent"
+          label="Orchestration initiateur"
+          value={`${orch.toLocaleString('fr-FR')} ms`}
+        />
+        <Bar
+          pct={compute / total}
+          color="bg-success"
+          label="Calcul worker (compute_time_ms)"
+          value={compute > 0 ? `${compute.toLocaleString('fr-FR')} ms` : '—'}
+        />
         {other > 2 ? (
-          <Bar pct={other / total} color="bg-white/20" label="Réseau / attente" value={`${other.toLocaleString('fr-FR')} ms`} />
+          <Bar
+            pct={other / total}
+            color="bg-muted/40"
+            label="Réseau P2P / attente"
+            value={`${other.toLocaleString('fr-FR')} ms`}
+          />
         ) : null}
         {msPerTok ? (
           <p className="pt-1 text-[9px] text-muted">
@@ -169,6 +178,63 @@ function TokenStepsChart({ steps }: { steps: { tokenIndex: number; totalMs: numb
       <p className="text-[9px] text-muted">
         Max : {maxMs.toFixed(1)} ms · Moy : {(sum(steps.map((s) => s.totalMs)) / steps.length).toFixed(1)} ms
       </p>
+    </div>
+  )
+}
+
+/**
+ * Visualisation Daisy Chain : Nœud 1 → Nœud 2 → Nœud 3 …
+ * Affiche le chemin de relais (Pipeline Parallelism) tracé par le `routing_path` du proto.
+ */
+export function DaisyChainViz({
+  routingPath,
+  computeTimeMs,
+  className = '',
+}: {
+  routingPath: string[]
+  computeTimeMs?: number
+  className?: string
+}) {
+  if (!routingPath || routingPath.length === 0) return null
+  return (
+    <div className={`rounded-lg border border-accent/30 bg-accent/5 p-3 ${className}`}>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[10px] font-semibold uppercase tracking-wide text-accent">
+          Chemin de relais ({routingPath.length} nœud{routingPath.length > 1 ? 's' : ''})
+        </p>
+        {computeTimeMs != null && computeTimeMs > 0 ? (
+          <span className="font-mono text-[10px] text-fg">
+            calcul total {computeTimeMs.toLocaleString('fr-FR')} ms
+          </span>
+        ) : null}
+      </div>
+      <ol className="flex flex-wrap items-center gap-x-1 gap-y-2">
+        {routingPath.map((peer, i) => (
+          <li key={`${peer}-${i}`} className="flex items-center gap-1">
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-bg/80 px-2.5 py-1">
+              <span className="flex h-1.5 w-1.5 rounded-full bg-success" aria-hidden />
+              <span className="font-mono text-[10px] font-semibold text-fg">
+                #{i + 1}
+              </span>
+              <span className="font-mono text-[10px] text-muted" title={peer}>
+                {shortPeer(peer, 14)}
+              </span>
+            </span>
+            {i < routingPath.length - 1 ? (
+              <svg
+                viewBox="0 0 16 16"
+                className="h-3 w-3 shrink-0 text-accent"
+                aria-hidden
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 8h10M9 4l4 4-4 4" />
+              </svg>
+            ) : null}
+          </li>
+        ))}
+      </ol>
     </div>
   )
 }
@@ -277,15 +343,28 @@ export function WorkerComputeReport({
 
     const tokenChartData = generationSteps.length > 0 ? generationSteps : fallbackSteps
 
+    // `routing_path` du proto (chemin de relais Daisy Chain).
+    const routingPath = asArray(t.routing_path).filter(
+      (p): p is string => typeof p === 'string' && p.length > 0,
+    )
+
     const headline =
-      layout === 'worker_only_pipeline' ? 'Pipeline worker-only (sans Ollama)'
-      : layout === 'row_split_tensor_parallel' ? 'Tensor parallel (découpe par lignes)'
-      : layout || 'Pipeline P2P'
+      layout === 'pipeline_relay_daisy_chain' || routingPath.length > 1
+        ? `Pipeline Daisy Chain (${routingPath.length || peers.length} nœuds)`
+        : layout === 'worker_only_pipeline'
+          ? 'Pipeline worker-only (P2P natif)'
+          : layout === 'row_split_tensor_parallel'
+            ? 'Ancien TP row-split — désactivé pour le chat'
+            : layout || 'Pipeline P2P natif'
+
+    const traceComputeMs = typeof t.compute_time_ms === 'number' ? t.compute_time_ms : null
 
     return {
       layout, ok, headline,
       promptTokens, completionTokens, totalTokens, vpsDelegateMs,
       peers, tokenChartData, loads, rowSplitSteps,
+      routingPath,
+      traceComputeMs,
       sessionId: typeof t.session_id === 'string' ? t.session_id : null,
       hidden: typeof t.hidden === 'number' ? t.hidden : null,
       maxNewTokens: typeof t.max_new_tokens === 'number' ? t.max_new_tokens : null,
@@ -332,17 +411,18 @@ export function WorkerComputeReport({
         </div>
       )}
 
-      {/* Pairs (worker-only) */}
-      {parsed && parsed.peers.length > 0 && (
-        <div className="rounded-md border border-border/60 bg-bg/60 px-3 py-2">
-          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
-            Pairs ayant reçu des calculs ({parsed.peers.length})
-          </p>
-          <ul className="space-y-0.5 font-mono text-[9px] text-fg">
-            {parsed.peers.map((p) => <li key={p} className="break-all">{p}</li>)}
-          </ul>
-        </div>
-      )}
+      {/* Daisy chain : Nœud 1 → Nœud 2 → Nœud 3, depuis routing_path ou pipeline_trace.peers. */}
+      {(() => {
+        const path =
+          (parsed?.routingPath && parsed.routingPath.length > 0
+            ? parsed.routingPath
+            : roundMetrics?.routingPath && roundMetrics.routingPath.length > 0
+              ? roundMetrics.routingPath
+              : parsed?.peers) ?? []
+        if (path.length === 0) return null
+        const computeMs = parsed?.traceComputeMs ?? roundMetrics?.computeTimeMs ?? 0
+        return <DaisyChainViz routingPath={path} computeTimeMs={computeMs} />
+      })()}
 
       {/* Graphiques riches (worker-only / TP) */}
       {parsed && parsed.loads.length > 0 && <LoadChart loads={parsed.loads} />}
@@ -374,7 +454,7 @@ export function WorkerComputeReport({
         </div>
       )}
 
-      {/* Graphiques agrégés (mode Ollama / P2P sans trace détaillée) */}
+      {/* Graphiques agrégés (Pipeline P2P natif sans trace détaillée). */}
       {fallbackOk && roundMetrics && (!hasRichTrace || (parsed && parsed.tokenChartData.length === 0 && parsed.loads.length === 0)) && (
         <RoundTimingCharts m={roundMetrics} />
       )}

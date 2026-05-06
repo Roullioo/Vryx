@@ -47,7 +47,12 @@ def main() -> int:
     if "Ollama local indisponible" in text:
         print("ÉCHEC : message Ollama (worker-only non actif ?)", file=sys.stderr)
         return 1
-    if "worker-only" in text.lower() or "worker_only_pipeline" in (resp.pipeline_trace_json or ""):
+    trace = resp.pipeline_trace_json or ""
+    if (
+        "worker-only" in text.lower()
+        or "worker_only_pipeline" in trace
+        or "pipeline_relay_daisy_chain" in trace
+    ):
         return 0
     if resp.completion_tokens and resp.completion_tokens > 0:
         return 0

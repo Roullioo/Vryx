@@ -16,7 +16,7 @@ export function RacePoolSection() {
         style={{ backgroundImage: "url('/mid.png')" }}
         aria-hidden
       />
-      <div className="absolute inset-0 bg-slate-950/75 sm:bg-slate-950/70" aria-hidden />
+      <div className="hero-overlay absolute inset-0" aria-hidden />
 
       <div className="relative z-10 mx-auto max-w-6xl px-4 py-20 sm:px-6 sm:py-28 lg:px-8 lg:py-32">
         <div className="grid gap-12 lg:grid-cols-12 lg:gap-14 lg:items-start">

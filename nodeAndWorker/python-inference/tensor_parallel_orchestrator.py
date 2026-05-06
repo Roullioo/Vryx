@@ -8,7 +8,7 @@ dense si on ignorait ReLU intermédiaire — ici chaque worker fait ReLU sur sa 
 ce qui correspond au TP « partition de sortie » avec activation locale).
 
 Variables :
-  VRYX_TP_ENABLED=1          — active le pré-pipeline avant Ollama (stage 1).
+  VRYX_TP_ENABLED=1          — active le calcul tensor-parallel P2P (stage 1).
   VRYX_P2P_RELAY_URL         — ex. http://127.0.0.1:3031
   VRYX_TP_PEER_IDS           — liste de PeerId (prioritaire si non vide).
   VRYX_TP_USE_ALL_PEERS      — si vide et pas « 0 »/« false »/« no » : GET /api/tp-peers.

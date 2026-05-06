@@ -47,7 +47,7 @@ export function ComparePage() {
           />
         </div>
         <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-gradient-to-b from-slate-950/70 via-slate-950/58 to-slate-950/72 sm:via-slate-950/52"
+          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
           aria-hidden
         />
 
@@ -70,7 +70,7 @@ export function ComparePage() {
             <div className="mt-9 flex w-full flex-col gap-3 sm:mx-auto sm:max-w-lg sm:flex-row sm:justify-center sm:gap-4">
               <Link
                 to="/simulateur"
-                className="inline-flex min-h-11 flex-1 items-center justify-center rounded-xl bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 sm:flex-none sm:px-8 sm:text-base"
+                className="inline-flex min-h-11 flex-1 items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:flex-none sm:px-8 sm:text-base"
               >
                 Simulateur coûts clients
               </Link>
@@ -91,7 +91,7 @@ export function ComparePage() {
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
           transition={{ duration: 0.35 }}
-          className="rounded-2xl border border-border bg-card p-5 shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset] sm:p-7"
+          className="rounded-2xl border border-border bg-card p-5 sm:p-7 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.06)_inset]"
           aria-labelledby="compare-example-heading"
         >
           <h2 id="compare-example-heading" className="font-mono text-xs font-semibold uppercase tracking-[0.18em] text-electric">

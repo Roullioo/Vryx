@@ -9,6 +9,19 @@ Infrastructure d’inférence et de calcul distribué : réseau de nœuds (libp2
 | **[`VRYX.md`](./VRYX.md)** | Vision, architecture technique, glossaire, flux admin / workers / VPS. |
 | **[`website/INSTALLATION.md`](./website/INSTALLATION.md)** | MariaDB, variables d’environnement, `npm run dev`, workers et délégation d’inférence, régénération du proto gRPC. |
 
+## Déploiement VPS (site + API)
+
+Depuis la racine du dépôt, après `pip install paramiko` :
+
+```bash
+export VRYX_VPS_SSH_PASSWORD='…'   # ou VRYX_VPS_SSH_KEY=… pour une clé
+python3 website_deploy.py
+```
+
+Le script build le front (`website/dist`), archive `dist` + `server` (sans `.env`), envoie par SCP, extrait sur le VPS, exécute `npm ci --omit=dev` puis `pm2 restart` (ou premier `pm2 start`). Créez une fois `server/.env` sur le serveur dans le répertoire déployé.
+
+Pour le daemon bootstrap Rust, voir toujours **`vps_deploy.py`**.
+
 ## Structure du dépôt
 
 - **`website/`** — Front React (Vite, TypeScript, Tailwind) et API Express (`website/server/`), Docker MariaDB.

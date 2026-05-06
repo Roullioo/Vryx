@@ -52,7 +52,7 @@ export function WorkersPage() {
           />
         </div>
         <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] bg-slate-950/60 sm:bg-slate-950/55"
+          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
           aria-hidden
         />
 
@@ -73,7 +73,7 @@ export function WorkersPage() {
             <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:gap-4">
               <Link
                 to="/comparatif"
-                className="inline-flex min-h-11 items-center justify-center rounded-xl bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 sm:px-8 sm:text-base"
+                className="inline-flex min-h-11 items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:px-8 sm:text-base"
               >
                 Comparatif des modes
               </Link>
@@ -164,7 +164,7 @@ export function WorkersPage() {
                 key={row.step}
                 className="flex flex-col rounded-2xl border border-white/10 bg-black/50 px-5 pb-5 pt-6 text-center shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset] sm:px-6 sm:pb-6 sm:pt-7"
               >
-                <div className="mx-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 bg-slate-950/80 font-mono text-xs font-semibold tabular-nums text-white">
+                <div className="mx-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 bg-page-hero/85 font-mono text-xs font-semibold tabular-nums text-white dark:bg-black/50">
                   {row.step}
                 </div>
                 <h3 className="font-display mt-4 text-base font-semibold text-white sm:text-lg">{row.title}</h3>
