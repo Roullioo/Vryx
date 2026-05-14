@@ -7,13 +7,13 @@ Prérequis distants : Node.js, npm, PM2 (npm i -g pm2), répertoire cible access
 
 Authentification SSH (au moins une option) :
   - Mot de passe : VRYX_VPS_SSH_PASSWORD
-  - Clé : VRYX_VPS_SSH_KEY=/chemin/vers/id_ed25519
+  - Clé : VRYX_VPS_SSH_KEY ou VRYX_VPS_KEY=/chemin/vers/id_ed25519
   - Sinon : agent SSH + clés par défaut (look_for_keys)
 
 Variables utiles :
   VRYX_VPS_HOST          (défaut : 51.222.26.225)
   VRYX_VPS_USER          (défaut : ubuntu)
-  VRYX_WEBSITE_REMOTE_DIR chemin absolu sur le VPS (défaut : /home/<user>/vryx-website)
+  VRYX_WEBSITE_REMOTE_DIR chemin absolu sur le VPS (défaut : /var/www/vryx, racine web type Nginx)
   VRYX_PM2_APP_NAME      (défaut : vryx-api)
   VRYX_SKIP_BUILD        (défaut : vide) si "1", ne rebuild pas (réutilise website/dist)
 
@@ -45,8 +45,8 @@ WEBSITE = REPO_ROOT / "website"
 HOST = os.environ.get("VRYX_VPS_HOST", "51.222.26.225")
 USER = os.environ.get("VRYX_VPS_USER", "ubuntu")
 PASS = os.environ.get("VRYX_VPS_SSH_PASSWORD")
-KEY_PATH = os.environ.get("VRYX_VPS_SSH_KEY")
-REMOTE_DIR = os.environ.get("VRYX_WEBSITE_REMOTE_DIR", "").strip() or f"/home/{USER}/vryx-website"
+KEY_PATH = os.environ.get("VRYX_VPS_SSH_KEY") or os.environ.get("VRYX_VPS_KEY")
+REMOTE_DIR = os.environ.get("VRYX_WEBSITE_REMOTE_DIR", "").strip() or "/var/www/vryx"
 REMOTE_HOME = os.environ.get("VRYX_VPS_REMOTE_HOME", "").strip() or f"/home/{USER}"
 PM2_NAME = os.environ.get("VRYX_PM2_APP_NAME", "vryx-api")
 SKIP_BUILD = os.environ.get("VRYX_SKIP_BUILD") == "1"
@@ -136,6 +136,8 @@ def deploy() -> None:
     else:
         print("[*] Build ignoré (VRYX_SKIP_BUILD=1)")
 
+    print(f"[*] Cible distante (fichiers + API) : {REMOTE_DIR}/")
+
     tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
     tmp.close()
     tarball = Path(tmp.name)
@@ -154,31 +156,56 @@ def deploy() -> None:
             finally:
                 sftp.close()
 
-            # Chemin absolu recommandé pour REMOTE_DIR (éviter ~ non développé).
+            # Déploiement sous /var/www/vryx : toujours sudo + chown (souvent root:www-data sinon tar échoue).
             remote_script = f"""
 set -euo pipefail
-mkdir -p "{REMOTE_DIR}"
-rm -rf "{REMOTE_DIR}/dist"
+REMOTE="{REMOTE_DIR}"
+sudo mkdir -p "$REMOTE"
+sudo chown -R "$(id -un)":"$(id -gn)" "$REMOTE"
+rm -rf "$REMOTE/dist"
 ENV_BACKUP="$(mktemp)"
-if [[ -f "{REMOTE_DIR}/server/.env" ]]; then
-  cp "{REMOTE_DIR}/server/.env" "$ENV_BACKUP"
+if [[ -f "$REMOTE/server/.env" ]]; then
+  cp "$REMOTE/server/.env" "$ENV_BACKUP"
 fi
-rm -rf "{REMOTE_DIR}/server"
-tar -xzf "{remote_tar_path}" -C "{REMOTE_DIR}"
+rm -rf "$REMOTE/server"
+tar -xzf "{remote_tar_path}" -C "$REMOTE"
 rm -f "{remote_tar_path}"
 if [[ -s "$ENV_BACKUP" ]]; then
-  mv "$ENV_BACKUP" "{REMOTE_DIR}/server/.env"
+  mv "$ENV_BACKUP" "$REMOTE/server/.env"
 else
   rm -f "$ENV_BACKUP"
 fi
-cd "{REMOTE_DIR}/server"
+if [[ ! -f "$REMOTE/server/.env" && -f "/home/$(id -un)/vryx-website/server/.env" ]]; then
+  cp "/home/$(id -un)/vryx-website/server/.env" "$REMOTE/server/.env"
+fi
+if [[ ! -f "$REMOTE/server/.env" && -f "/home/$(id -un)/apps/vryx/server/.env" ]]; then
+  cp "/home/$(id -un)/apps/vryx/server/.env" "$REMOTE/server/.env"
+fi
+if [[ -f "$REMOTE/server/.env" ]] && grep -q '^PORT=' "$REMOTE/server/.env"; then
+  sed -i 's/^PORT=.*/PORT=4000/' "$REMOTE/server/.env"
+fi
+cd "$REMOTE/server"
 npm ci --omit=dev
 if pm2 describe "{PM2_NAME}" >/dev/null 2>&1; then
-  pm2 restart "{PM2_NAME}"
-else
-  pm2 start src/index.js --name "{PM2_NAME}" --cwd "{REMOTE_DIR}/server"
+  pm2 delete "{PM2_NAME}"
 fi
+pm2 start src/index.js --name "{PM2_NAME}" --cwd "$REMOTE/server"
 pm2 save || true
+ok=0
+for _ in 1 2 3 4 5 6; do
+  if curl -sfS "http://127.0.0.1:4000/api/health" -o /dev/null; then
+    ok=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$ok" -eq 1 ]]; then
+  echo "[remote] API : http://127.0.0.1:4000/api/health OK"
+else
+  echo "[remote] ERREUR: l'API ne répond pas sur le port 4000. Voir: pm2 logs {PM2_NAME} --lines 80" >&2
+  echo "[remote] Vérifier: $REMOTE/server/.env (JWT_SECRET, DB_*) et que MariaDB est accessible." >&2
+  exit 1
+fi
 """
 
             status = run_remote_bash(ssh, remote_script)
@@ -190,8 +217,9 @@ pm2 save || true
             print(f"    Fichiers statiques : {REMOTE_DIR}/dist")
             print(f"    API PM2 : {PM2_NAME}")
             print(
-                "    Vérifiez que Nginx (ou équivalent) sert ce dist et proxifie /api vers le port de l’API.",
+                "    Nginx doit avoir : root …/dist avec le même préfixe que la cible ci-dessus (ex. /var/www/vryx/dist).",
             )
+            print("    Si la page ne bouge pas : rechargement forcé (Ctrl+Shift+R) ou cache CDN.")
         finally:
             ssh.close()
     finally:

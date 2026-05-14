@@ -18,7 +18,7 @@ export VRYX_VPS_SSH_PASSWORD='…'   # ou VRYX_VPS_SSH_KEY=… pour une clé
 python3 website_deploy.py
 ```
 
-Le script build le front (`website/dist`), archive `dist` + `server` (sans `.env`), envoie par SCP, extrait sur le VPS, exécute `npm ci --omit=dev` puis `pm2 restart` (ou premier `pm2 start`). Créez une fois `server/.env` sur le serveur dans le répertoire déployé.
+Le script build le front (`website/dist`), archive `dist` + `server` (sans `.env`), envoie sur le VPS, extrait par défaut dans **`/var/www/vryx`** (variable `VRYX_WEBSITE_REMOTE_DIR` pour surcharger), exécute `npm ci --omit=dev` puis recrée le processus **`vryx-api`** sous PM2 avec le bon répertoire. Nginx : `root /var/www/vryx/dist;` et proxy `/api` vers le port de l’API. Créez une fois `server/.env` dans ce dossier sur le serveur.
 
 Pour le daemon bootstrap Rust, voir toujours **`vps_deploy.py`**.
 

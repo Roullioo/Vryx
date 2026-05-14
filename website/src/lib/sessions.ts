@@ -1,4 +1,6 @@
-/** Stockage des sessions de travail P2P en localStorage. */
+import { apiJson } from './api'
+
+/** Stockage des sessions de travail P2P en localStorage, synchronisé avec la DB admin si disponible. */
 
 export type SessionWorkerStep = {
   rank: number
@@ -66,6 +68,37 @@ export type WorkSession = {
     online: boolean
     secondsSinceHeartbeat: number
   }
+  /** Transport QUIC UDP activé */
+  quicUsed?: boolean
+  /** KV cache distribué activé */
+  kvCacheUsed?: boolean
+  /** Format des hidden states (int8, fp16…) */
+  hiddenTransport?: string
+  /** Latence moyenne par token (ms) */
+  avgMsPerToken?: number
+  /** TPS mesuré sur le tour */
+  hotPathTps?: number
+  /** Raison d'arrêt de la génération */
+  stopReason?: string | null
+  /** Prefix cache : hit ? */
+  prefixCacheHit?: boolean
+  /** Tokens récupérés du prefix cache */
+  prefixCacheTokens?: number
+  /** Setup du pipeline (ms) */
+  setupMs?: number
+  /** TPS benchmark agrégé */
+  benchmarkActualTps?: number
+  /** Format demandé par l'admin dans le chat P2P. */
+  requestedQuantization?: 'int8' | 'q4' | 'fp16'
+  /** Format réellement utilisé après validation/fallback. */
+  effectiveQuantization?: string
+  /** Raison du fallback, si q4 n'a pas pu être appliqué. */
+  quantizationFallbackReason?: string | null
+  poolPreference?: 'auto' | 'velocity_mlx' | 'velocity_vllm' | 'legacy_pytorch'
+  poolClass?: string
+  poolFallbackReason?: string | null
+  batching?: Record<string, unknown> | null
+  overlap?: Record<string, unknown> | null
 }
 
 const KEY = 'vryx_admin_sessions'
@@ -117,6 +150,39 @@ export function clearSessions(): void {
   } catch {
     void 0
   }
+}
+
+export async function fetchSessionsFromDb(): Promise<WorkSession[]> {
+  const r = await apiJson<{ ok?: boolean; sessions?: WorkSession[] }>('/api/admin/sessions')
+  if (r.ok !== true) return loadSessions()
+  const sessions = Array.isArray(r.data.sessions) ? r.data.sessions : []
+  try {
+    localStorage.setItem(KEY, JSON.stringify(sessions.slice(0, MAX)))
+  } catch {
+    void 0
+  }
+  return sessions
+}
+
+export async function fetchSessionFromDb(id: string): Promise<WorkSession | null> {
+  const r = await apiJson<{ ok?: boolean; session?: WorkSession }>(`/api/admin/sessions/${encodeURIComponent(id)}`)
+  if (r.ok !== true || !r.data.session) return null
+  return r.data.session
+}
+
+export async function saveSessionToDb(s: WorkSession): Promise<void> {
+  await apiJson('/api/admin/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ session: s }),
+  })
+}
+
+export async function deleteSessionFromDb(id: string): Promise<void> {
+  await apiJson(`/api/admin/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export async function clearSessionsFromDb(): Promise<void> {
+  await apiJson('/api/admin/sessions', { method: 'DELETE' })
 }
 
 /** Construit une WorkSession depuis les données brutes d'un tour P2P. */
@@ -233,5 +299,57 @@ export function buildSession(params: {
     loadSteps,
     workerSteps,
     workerInfo,
+    quicUsed: data.quicUsed != null ? Boolean(data.quicUsed) : (t?.quic_used != null ? Boolean(t.quic_used) : undefined),
+    kvCacheUsed: data.kvCacheUsed != null ? Boolean(data.kvCacheUsed) : (t?.worker_kv_cache != null ? Boolean(t.worker_kv_cache) : undefined),
+    hiddenTransport: asStr(data.hiddenTransport) || asStr(t?.hidden_transport) || undefined,
+    avgMsPerToken: asNum(data.avgMsPerToken) || asNum(t?.avg_ms_per_token) || undefined,
+    hotPathTps: asNum(data.hotPathTps) || asNum(t?.hot_path_tps) || undefined,
+    stopReason: data.stopReason != null
+      ? String(data.stopReason) || null
+      : (t?.generation_control && typeof t.generation_control === 'object' && !Array.isArray(t.generation_control))
+        ? String((t.generation_control as Record<string, unknown>).stop_reason ?? '') || null
+        : undefined,
+    prefixCacheHit: data.prefixCacheHit != null
+      ? Boolean(data.prefixCacheHit)
+      : t?.prefix_cache && typeof t.prefix_cache === 'object' && !Array.isArray(t.prefix_cache)
+        ? Boolean((t.prefix_cache as Record<string, unknown>).hit)
+        : undefined,
+    prefixCacheTokens: asNum(data.prefixCacheTokens) ||
+      (t?.prefix_cache && typeof t.prefix_cache === 'object' && !Array.isArray(t.prefix_cache)
+        ? asNum((t.prefix_cache as Record<string, unknown>).tokens)
+        : 0) || undefined,
+    setupMs: asNum(data.setupMs) || asNum(t?.setup_ms) || undefined,
+    benchmarkActualTps: asNum(data.benchmarkActualTps) || asNum(t?.hot_path_tps) || undefined,
+    requestedQuantization:
+      data.requestedQuantization === 'q4' || data.requestedQuantization === 'int8'
+        ? data.requestedQuantization
+        : t?.requested_quantization === 'q4' || t?.requested_quantization === 'int8'
+          ? t.requested_quantization
+          : undefined,
+    effectiveQuantization: asStr(data.effectiveQuantization) || asStr(t?.effective_quantization) || undefined,
+    quantizationFallbackReason: data.quantizationFallbackReason != null
+      ? String(data.quantizationFallbackReason) || null
+      : t?.quantization_fallback_reason != null
+        ? String(t.quantization_fallback_reason) || null
+        : undefined,
+    poolPreference:
+      data.poolPreference === 'auto' ||
+      data.poolPreference === 'velocity_mlx' ||
+      data.poolPreference === 'velocity_vllm' ||
+      data.poolPreference === 'legacy_pytorch'
+        ? data.poolPreference
+        : undefined,
+    poolClass: asStr(data.poolClass) || asStr(t?.pool_class) || undefined,
+    poolFallbackReason: data.poolFallbackReason != null
+      ? String(data.poolFallbackReason) || null
+      : t?.pool_fallback_reason != null
+        ? String(t.pool_fallback_reason) || null
+        : undefined,
+    batching: t?.batching && typeof t.batching === 'object' && !Array.isArray(t.batching)
+      ? t.batching as Record<string, unknown>
+      : undefined,
+    overlap: t?.overlap && typeof t.overlap === 'object' && !Array.isArray(t.overlap)
+      ? t.overlap as Record<string, unknown>
+      : undefined,
   }
 }

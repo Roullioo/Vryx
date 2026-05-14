@@ -2,9 +2,20 @@ grpcio
 grpcio-tools
 numpy>=1.24
 gguf>=0.10.0
-torch
-transformers
+# PyTorch 2.6+ : wheels cp313 utilisables depuis le site officiel ;
+# torchvision requis pour transformers≥5 important modeling via image_utils (Mac arm64/Linux).
+torch>=2.6.0
+torchvision>=0.20.0
+transformers>=5,<6
+huggingface_hub
+safetensors
 bitsandbytes
 accelerate
+# Optionnel workers Mac Velocity : active VRYX_ENABLE_MLX_RUNTIME=1 après installation.
+mlx; platform_system == "Darwin" and platform_machine == "arm64"
+mlx-lm; platform_system == "Darwin" and platform_machine == "arm64"
 # Optionnel sur les workers GPU : installer PyTorch CUDA séparément, par exemple :
 # pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Optionnel workers Nvidia Velocity : installer sur une machine CUDA puis activer
+# VRYX_ENABLE_VLLM_RUNTIME=1 VRYX_RUNTIME_BACKEND=vllm.
+# vllm

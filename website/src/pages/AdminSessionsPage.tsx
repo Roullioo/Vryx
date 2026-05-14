@@ -1,12 +1,27 @@
-import { Fragment, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
-import { loadSessions, deleteSession, clearSessions, type WorkSession } from '../lib/sessions'
+import {
+  clearSessions,
+  clearSessionsFromDb,
+  deleteSession,
+  deleteSessionFromDb,
+  fetchSessionFromDb,
+  fetchSessionsFromDb,
+  loadSessions,
+  type WorkSession,
+} from '../lib/sessions'
 
 /* ─── Helpers ─────────────────────────────────────────────────────────────── */
 function fmt(n: number) { return n.toLocaleString('fr-FR') }
 function ms(n: number) { return `${n.toLocaleString('fr-FR')} ms` }
 function shortId(s: string, n = 16) { return s.length > n ? `${s.slice(0, n)}…` : s }
+function quantizationLabel(q: string) {
+  if (q === 'q4') return '4-bit'
+  if (q === 'int8') return '8-bit'
+  if (q === 'fp16') return 'fp16'
+  return q
+}
 
 function relativeTime(ts: number) {
   const sec = Math.floor((Date.now() - ts) / 1000)
@@ -36,10 +51,10 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
         <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
           Chronologie — {ms(totalMs)} total
         </p>
-        <div className="overflow-hidden rounded-xl border border-border bg-[#f9f9f9]">
+        <div className="overflow-hidden rounded-xl border border-border bg-surface dark:bg-elevated">
           {/* Légende */}
           <div className="flex items-center gap-4 border-b border-border px-4 py-2.5 text-[10px] font-medium text-muted">
-            <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-accent" />VPS / Initiateur</span>
+            <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-electric" />VPS / Initiateur</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-success" />Worker(s)</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-sm bg-border" />Réseau</span>
           </div>
@@ -49,7 +64,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
               {vps > 0 && (
                 <div
                   title={`VPS : ${ms(vps)}`}
-                  className="flex h-full items-center justify-center bg-accent text-[10px] font-medium text-white transition-all"
+                  className="flex h-full items-center justify-center bg-electric text-[10px] font-medium text-white transition-all"
                   style={{ width: `${(vps / totalMs) * 100}%` }}
                 >
                   {vps > totalMs * 0.08 ? ms(vps) : ''}
@@ -67,7 +82,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
               {net > 2 && (
                 <div
                   title={`Réseau : ${ms(net)}`}
-                  className="flex h-full flex-1 items-center justify-center bg-border/50 text-[10px] text-muted"
+                  className="flex h-full flex-1 items-center justify-center bg-border/60 text-[10px] text-muted dark:bg-zinc-700/60 dark:text-zinc-300"
                 >
                   {net > totalMs * 0.08 ? ms(net) : ''}
                 </div>
@@ -86,7 +101,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
         <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">
           Flux de traitement
         </p>
-        <div className="overflow-x-auto rounded-xl border border-border bg-[#f9f9f9] p-4">
+        <div className="overflow-x-auto rounded-xl border border-border bg-surface p-4 dark:bg-elevated">
           <div className="flex min-w-max items-center gap-0">
             {/* Client */}
             <div className="flex flex-col items-center">
@@ -106,11 +121,11 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
 
             {/* VPS Initiateur */}
             <div className="flex flex-col items-center">
-              <div className="flex h-16 w-36 items-center justify-center rounded-xl border-2 border-accent/30 bg-accent/5 shadow-sm">
+              <div className="flex h-16 w-36 items-center justify-center rounded-xl border-2 border-electric/35 bg-electric/10 shadow-sm dark:border-electric/40 dark:bg-electric/15">
                 <div className="text-center">
-                  <p className="text-[11px] font-bold text-accent">VPS / Initiateur</p>
+                  <p className="text-[11px] font-bold text-electric">VPS / Initiateur</p>
                   <p className="text-[9px] text-muted">gRPC → Python</p>
-                  {vps > 0 && <p className="text-[9px] font-mono text-accent/70">{ms(vps)}</p>}
+                  {vps > 0 && <p className="text-[9px] font-mono text-electric/80">{ms(vps)}</p>}
                 </div>
               </div>
             </div>
@@ -269,7 +284,7 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
                 <div key={tk.tokenIndex} className="flex items-center gap-2 text-[10px]">
                   <span className="w-6 shrink-0 text-right text-muted">#{tk.tokenIndex}</span>
                   <div className="flex-1 overflow-hidden rounded-full bg-border/30 h-2">
-                    <div className="h-full rounded-full bg-accent" style={{ width: `${(tk.totalMs / max) * 100}%` }} />
+                    <div className="h-full rounded-full bg-electric" style={{ width: `${(tk.totalMs / max) * 100}%` }} />
                   </div>
                   <span className="w-16 shrink-0 text-right font-mono text-fg">{tk.totalMs.toFixed(1)} ms</span>
                 </div>
@@ -317,13 +332,62 @@ function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete:
         </div>
       </div>
       <div className="border-t border-border/50 px-4 py-2.5">
-        <div className="flex flex-wrap gap-4 text-[10px] text-muted">
+        <div className="flex flex-wrap gap-3 text-[10px] text-muted">
           <span>VPS <span className="font-mono text-fg">{fmt(s.vpsDelegateMs)} ms</span></span>
           <span>Worker <span className="font-mono text-fg">{fmt(s.workerComputeMs)} ms</span></span>
           <span>Prompt <span className="font-mono text-fg">{fmt(s.promptTokens)}</span></span>
           <span>Complétion <span className="font-mono text-fg">{fmt(s.completionTokens)}</span></span>
           {s.peers.length > 0 && <span><span className="font-mono text-fg">{s.peers.length}</span> pair(s)</span>}
+          {s.hotPathTps != null && s.hotPathTps > 0 && (
+            <span className="rounded bg-success/10 px-1.5 py-0.5 font-mono font-bold text-success">
+              {s.hotPathTps.toFixed(3)} TPS
+            </span>
+          )}
           {s.pipelineLayout && <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-accent">{s.pipelineLayout}</span>}
+        </div>
+      </div>
+      <div className="border-t border-border/50 px-4 py-2">
+        <div className="flex flex-wrap gap-1">
+          {s.quicUsed != null && (
+            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${s.quicUsed ? 'bg-success/15 text-success' : 'bg-border/40 text-muted'}`}>
+              {s.quicUsed ? 'QUIC' : 'TCP'}
+            </span>
+          )}
+          {s.kvCacheUsed != null && (
+            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${s.kvCacheUsed ? 'bg-electric/15 text-electric' : 'bg-border/40 text-muted'}`}>
+              {s.kvCacheUsed ? 'KV ON' : 'KV OFF'}
+            </span>
+          )}
+          {s.hiddenTransport && (
+            <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[9px] font-bold uppercase text-accent">
+              {s.hiddenTransport}
+            </span>
+          )}
+          {s.requestedQuantization && (
+            <span className="rounded bg-electric/10 px-1.5 py-0.5 text-[9px] font-bold uppercase text-electric">
+              demandé : {quantizationLabel(s.requestedQuantization)}
+            </span>
+          )}
+          {s.quantizationFallbackReason && (
+            <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] text-warning">
+              fallback : {s.quantizationFallbackReason}
+            </span>
+          )}
+          {s.poolClass && (
+            <span className="rounded bg-success/10 px-1.5 py-0.5 text-[9px] font-bold uppercase text-success">
+              pool : {s.poolClass}
+            </span>
+          )}
+          {s.prefixCacheHit != null && (
+            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${s.prefixCacheHit ? 'bg-primary/15 text-primary' : 'bg-border/40 text-muted'}`}>
+              {s.prefixCacheHit ? 'Cache HIT' : 'Cache MISS'}
+            </span>
+          )}
+          {s.stopReason && s.stopReason !== 'null' && (
+            <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] text-warning">
+              {s.stopReason}
+            </span>
+          )}
         </div>
       </div>
       <div className="border-t border-border/50 px-4 py-2.5">
@@ -341,23 +405,37 @@ function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete:
 /* ─── Page liste sessions ────────────────────────────────────────────────── */
 export function AdminSessionsPage() {
   const [sessions, setSessions] = useState<WorkSession[]>(() => loadSessions())
+  const [loading, setLoading] = useState(true)
 
-  function refresh() { setSessions(loadSessions()) }
+  async function refresh() {
+    setLoading(true)
+    try {
+      setSessions(await fetchSessionsFromDb())
+    } finally {
+      setLoading(false)
+    }
+  }
 
-  function handleDelete(id: string) {
+  useEffect(() => {
+    void refresh()
+  }, [])
+
+  async function handleDelete(id: string) {
     deleteSession(id)
+    await deleteSessionFromDb(id)
     refresh()
   }
 
-  function handleClear() {
+  async function handleClear() {
     clearSessions()
+    await clearSessionsFromDb()
     refresh()
   }
 
   return (
     <AdminShell
       title="Sessions"
-      subtitle={`${sessions.length} session${sessions.length > 1 ? 's' : ''} enregistrée${sessions.length > 1 ? 's' : ''}`}
+      subtitle={`${sessions.length} session${sessions.length > 1 ? 's' : ''} enregistrée${sessions.length > 1 ? 's' : ''}${loading ? ' · synchronisation DB…' : ''}`}
       actions={
         sessions.length > 0 ? (
           <button
@@ -396,8 +474,18 @@ export function AdminSessionsPage() {
 /* ─── Page détail session ────────────────────────────────────────────────── */
 export function AdminSessionDetailPage() {
   const { sessionId } = useParams<{ sessionId: string }>()
-  const sessions = loadSessions()
-  const session = sessions.find((s) => s.id === sessionId) ?? null
+  const [session, setSession] = useState<WorkSession | null>(() => {
+    const sessions = loadSessions()
+    return sessions.find((s) => s.id === sessionId) ?? null
+  })
+
+  useEffect(() => {
+    if (!sessionId) return
+    void (async () => {
+      const remote = await fetchSessionFromDb(sessionId)
+      if (remote) setSession(remote)
+    })()
+  }, [sessionId])
 
   if (!session) return (
     <AdminShell title="Détail session">
@@ -448,8 +536,75 @@ export function AdminSessionDetailPage() {
           ))}
         </div>
 
+        {/* Badges transport & performance */}
+        <div className="flex flex-wrap gap-2 rounded-2xl border border-border bg-card p-4 shadow-sm">
+          {session.hotPathTps != null && session.hotPathTps > 0 && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-3 py-1 text-xs font-bold text-success">
+              <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5" aria-hidden><circle cx="8" cy="8" r="3"/></svg>
+              {session.hotPathTps.toFixed(3)} TPS
+            </span>
+          )}
+          {session.avgMsPerToken != null && session.avgMsPerToken > 0 && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-border/40 px-3 py-1 text-xs font-semibold text-muted">
+              {session.avgMsPerToken} ms/tok
+            </span>
+          )}
+          {session.quicUsed != null && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${session.quicUsed ? 'bg-success/10 text-success' : 'bg-border/40 text-muted'}`}>
+              {session.quicUsed ? 'QUIC UDP' : 'TCP'}
+            </span>
+          )}
+          {session.kvCacheUsed != null && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${session.kvCacheUsed ? 'bg-electric/10 text-electric' : 'bg-border/40 text-muted'}`}>
+              {session.kvCacheUsed ? 'KV Cache ON' : 'KV Cache OFF'}
+            </span>
+          )}
+          {session.hiddenTransport && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-3 py-1 text-xs font-bold text-accent">
+              {session.hiddenTransport}
+            </span>
+          )}
+          {session.requestedQuantization && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-electric/10 px-3 py-1 text-xs font-bold text-electric">
+              Demandé : {quantizationLabel(session.requestedQuantization)}
+            </span>
+          )}
+          {session.effectiveQuantization && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-3 py-1 text-xs font-bold text-success">
+              Effectif : {session.effectiveQuantization}
+            </span>
+          )}
+          {session.quantizationFallbackReason && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
+              Fallback : {session.quantizationFallbackReason}
+            </span>
+          )}
+          {session.poolClass && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-3 py-1 text-xs font-bold text-success">
+              Pool : {session.poolClass}
+            </span>
+          )}
+          {session.poolFallbackReason && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
+              Pool fallback : {session.poolFallbackReason}
+            </span>
+          )}
+          {session.prefixCacheHit != null && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${session.prefixCacheHit ? 'bg-primary/10 text-primary' : 'bg-border/40 text-muted'}`}>
+              {session.prefixCacheHit
+                ? `Prefix Cache HIT${session.prefixCacheTokens ? ` (${fmt(session.prefixCacheTokens)} tok)` : ''}`
+                : 'Prefix Cache MISS'}
+            </span>
+          )}
+          {session.stopReason && session.stopReason !== 'null' && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
+              arrêt : {session.stopReason}
+            </span>
+          )}
+        </div>
+
         {/* Explication du mode */}
-        <div className="rounded-2xl border border-accent/20 bg-accent/5 p-5">
+        <div className="rounded-2xl border border-border bg-surface p-5 dark:border-border dark:bg-elevated">
           <h3 className="text-sm font-semibold text-fg">Comprendre ce traitement</h3>
           <p className="mt-2 text-xs leading-relaxed text-muted">
             {session.pipelineLayout === 'pipeline_relay_daisy_chain' ? (
@@ -500,6 +655,10 @@ export function AdminSessionDetailPage() {
                 { label: 'Prompt tokens', value: fmt(session.promptTokens) },
                 { label: 'Complétion tokens', value: fmt(session.completionTokens) },
                 { label: 'Total tokens', value: fmt(session.totalTokens) },
+                ...(session.setupMs != null && session.setupMs > 0 ? [{ label: 'Setup pipeline', value: ms(session.setupMs) }] : []),
+                ...(session.avgMsPerToken != null && session.avgMsPerToken > 0 ? [{ label: 'Moy. ms/token', value: `${session.avgMsPerToken} ms` }] : []),
+                ...(session.hotPathTps != null && session.hotPathTps > 0 ? [{ label: 'TPS mesuré', value: `${session.hotPathTps.toFixed(3)} tok/s` }] : []),
+                ...(session.benchmarkActualTps != null && session.benchmarkActualTps > 0 ? [{ label: 'TPS benchmark', value: `${session.benchmarkActualTps.toFixed(3)} tok/s (cible : 15)` }] : []),
               ].map((r) => (
                 <div key={r.label} className="flex justify-between border-b border-border/40 py-1.5 text-[12px] last:border-0">
                   <dt className="text-muted">{r.label}</dt>

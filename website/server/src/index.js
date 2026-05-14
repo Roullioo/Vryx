@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import crypto from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
@@ -13,6 +14,31 @@ import { nodeMonitor } from './node-monitor.js'
 const PORT = Number(process.env.PORT) || 4000
 /** URL de l'API Axum du daemon initiateur (chat P2P). */
 const VRYX_INITIATOR_CHAT_URL = (process.env.VRYX_INITIATOR_CHAT_URL || 'http://127.0.0.1:3031').replace(/\/$/, '')
+/** Préfixes autorisés (CSV) pour `initiator_chat_url` dans POST /api/admin/p2p/chat/stream (orchestreur Edge). Vide = pas de surcharge. */
+const VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES = (process.env.VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES || '')
+  .split(',')
+  .map((s) => s.trim().replace(/\/$/, ''))
+  .filter(Boolean)
+
+function resolveInitiatorChatUrl(body) {
+  const raw =
+    typeof body?.initiator_chat_url === 'string' ? body.initiator_chat_url.trim().replace(/\/$/, '') : ''
+  if (!raw) return VRYX_INITIATOR_CHAT_URL
+  if (VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES.length === 0) {
+    const err = new Error(
+      "Surcharge initiator_chat_url refusée : configurez VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES sur l'API (CSV d'origines HTTP).",
+    )
+    err.statusCode = 400
+    throw err
+  }
+  const ok = VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES.some((p) => raw === p || raw.startsWith(`${p}/`))
+  if (!ok) {
+    const err = new Error("URL d'initiateur non couverte par les préfixes autorisés.")
+    err.statusCode = 400
+    throw err
+  }
+  return raw
+}
 /** Heartbeat récent pour la liste « workers live » (sidebar admin). */
 const WORKER_LIVE_SEC = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE_SEC) || 30))
 /** Adresses e-mail promues admin automatiquement à chaque démarrage. */
@@ -29,6 +55,18 @@ const COOKIE_NAME = 'velocity_token'
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 const NODE_ENV = process.env.NODE_ENV || 'development'
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173'
+
+/** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
+let pipelineChatSessions = 0
+function pipelineChatBegin() {
+  pipelineChatSessions += 1
+}
+function pipelineChatEnd() {
+  pipelineChatSessions = Math.max(0, pipelineChatSessions - 1)
+}
+function isPipelineChatActive() {
+  return pipelineChatSessions > 0
+}
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   console.error('FATAL: JWT_SECRET manquant ou trop court (minimum 32 caractères). Copiez server/env.example vers server/.env.')
@@ -164,6 +202,28 @@ async function ensureWorkersTable() {
   if (!present.has('tokens_out'))       await pool.query(`ALTER TABLE workers ADD COLUMN tokens_out BIGINT UNSIGNED NOT NULL DEFAULT 0`)
   if (!present.has('gpu_name'))         await pool.query(`ALTER TABLE workers ADD COLUMN gpu_name VARCHAR(120) NULL`)
   if (!present.has('gpu_vram_mb'))      await pool.query(`ALTER TABLE workers ADD COLUMN gpu_vram_mb INT UNSIGNED NULL`)
+  if (!present.has('runtime_backend'))  await pool.query(`ALTER TABLE workers ADD COLUMN runtime_backend VARCHAR(40) NULL`)
+  if (!present.has('weight_quantization')) await pool.query(`ALTER TABLE workers ADD COLUMN weight_quantization VARCHAR(40) NULL`)
+  if (!present.has('supports_q4_weights')) await pool.query(`ALTER TABLE workers ADD COLUMN supports_q4_weights TINYINT(1) NOT NULL DEFAULT 0`)
+  if (!present.has('supports_mlx'))     await pool.query(`ALTER TABLE workers ADD COLUMN supports_mlx TINYINT(1) NOT NULL DEFAULT 0`)
+  if (!present.has('supports_vllm'))    await pool.query(`ALTER TABLE workers ADD COLUMN supports_vllm TINYINT(1) NOT NULL DEFAULT 0`)
+}
+
+async function ensureP2pChatSessionsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS p2p_chat_sessions (
+      id VARCHAR(80) NOT NULL,
+      user_id BIGINT UNSIGNED NOT NULL,
+      prompt MEDIUMTEXT NOT NULL,
+      response MEDIUMTEXT NOT NULL,
+      session_json LONGTEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_p2p_chat_sessions_user_created (user_id, created_at),
+      CONSTRAINT fk_p2p_chat_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
 }
 
 async function ensureForcedAdmins() {
@@ -278,7 +338,7 @@ const authLimiter = rateLimit({
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 15,
+  max: 40,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Trop de tentatives de connexion. Réessayez plus tard.' },
@@ -354,6 +414,13 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     return res.json({ user: { id, email, isAdmin } })
   } catch (e) {
     console.error('login', e)
+    const code = e?.code
+    if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') {
+      return res.status(503).json({ error: 'Service temporairement indisponible (base de données).' })
+    }
+    if (typeof code === 'string' && code.startsWith('ER_')) {
+      return res.status(503).json({ error: 'Service temporairement indisponible. Réessayez plus tard.' })
+    }
     return res.status(500).json({ error: 'Une erreur est survenue. Réessayez plus tard.' })
   }
 })
@@ -390,7 +457,114 @@ app.get('/api/auth/me', async (req, res) => {
 //                        ROUTES WORKERS (publiques + admin)
 // ===========================================================================
 
-const WORKER_OFFLINE_SEC = 90
+/** Seuil présence dans `/api/workers/status` (utilisé par l’initiateur Rust pour re-découvrir les workers). Défaut 90 s peut exclure des nœuds domiciles encore joignables en P2P ; surcharger WORKER_OFFLINE_SEC (ex. 43200 pour 12 h). */
+const WORKER_OFFLINE_SEC = Math.min(
+  7 * 24 * 3600,
+  Math.max(30, Number(process.env.WORKER_OFFLINE_SEC) || 90),
+)
+
+const GRAPH_ORCHESTRATOR_ID = 'vps-core'
+
+function sanitizeGraphPoolGroupId(poolId) {
+  return String(poolId || 'default')
+    .replace(/[^a-zA-Z0-9_-]/g, '-')
+    .slice(0, 48)
+}
+
+/** Estimation grossière des indices de couches pour l’UI (pipeline parallel). */
+function estimateShardLayerRange(rank, assignmentCount, totalLayers = 32) {
+  if (assignmentCount <= 0 || rank < 0) return '—'
+  const start = Math.floor((rank / assignmentCount) * totalLayers)
+  const end = Math.max(start, Math.ceil(((rank + 1) / assignmentCount) * totalLayers) - 1)
+  return `${start}-${end}`
+}
+
+/**
+ * État graphe « Nerve Center » : nœuds + liens (react-force-graph).
+ */
+function buildPoolGraphPayload({
+  poolId,
+  assignments,
+  routingPath,
+  registeredWorkers,
+  pipelineActive,
+}) {
+  const nodes = []
+  const links = []
+  const groupLabel = sanitizeGraphPoolGroupId(poolId)
+
+  nodes.push({
+    id: GRAPH_ORCHESTRATOR_ID,
+    group: 'orchestrator',
+    val: 50,
+    poolId,
+    hardware: 'Orchestrateur VPS',
+    vram: null,
+    shards: '—',
+    status: pipelineActive ? 'computing' : 'idle',
+    pingMs: null,
+  })
+
+  const routingSet = new Set(Array.isArray(routingPath) ? routingPath : [])
+  const assignList = Array.isArray(assignments) ? assignments : []
+  const nAssign = assignList.length
+
+  /** Même critère « live » que `routingPath` / orchestrateur : pas de nœuds hors pool active. */
+  const workerRows = registeredWorkers.filter(
+    (w) => w.mode === 'worker' && Number(w.secondsSinceHeartbeat) <= WORKER_LIVE_SEC,
+  )
+  for (const w of workerRows) {
+    const vramMb = Number(w.gpuVramMb) || 0
+    const vramGb = Math.round((vramMb / 1024) * 10) / 10 || 0.5
+    const assign = assignList.find((a) => a.peer === w.peerId)
+    const rank = typeof assign?.rank === 'number' ? assign.rank : -1
+
+    let status = 'idle'
+    if (pipelineActive && routingSet.has(w.peerId)) status = 'computing'
+
+    const shards =
+      assign && nAssign > 0 ? estimateShardLayerRange(rank, nAssign) : 'non assigné'
+
+    const pingMs =
+      typeof w.secondsSinceHeartbeat === 'number'
+        ? Math.min(600_000, Math.max(0, w.secondsSinceHeartbeat * 1000))
+        : null
+
+    nodes.push({
+      id: w.peerId,
+      group: `pool-${groupLabel}`,
+      poolId,
+      hardware: w.gpuName || 'GPU inconnu',
+      vram: vramGb,
+      val: Math.max(1, vramGb),
+      shards,
+      status,
+      pingMs,
+      vramMbTotal: vramMb > 0 ? vramMb : null,
+      vramMbUsed: null,
+      publicIp: w.publicIp ?? null,
+      model: w.model ?? null,
+    })
+  }
+
+  const rp = Array.isArray(routingPath) ? routingPath.filter((x) => typeof x === 'string' && x.length > 0) : []
+  if (rp.length > 0) {
+    links.push({
+      source: GRAPH_ORCHESTRATOR_ID,
+      target: rp[0],
+      is_active: !!pipelineActive,
+    })
+    for (let i = 0; i < rp.length - 1; i++) {
+      links.push({
+        source: rp[i],
+        target: rp[i + 1],
+        is_active: !!pipelineActive,
+      })
+    }
+  }
+
+  return { nodes, links }
+}
 
 const heartbeatBodySchema = z.object({
   peer_id: z.string().min(1).max(100),
@@ -406,6 +580,11 @@ const heartbeatBodySchema = z.object({
   tokens_out: z.number().int().min(0).optional().default(0),
   gpu_name: z.string().max(120).nullable().optional(),
   gpu_vram_mb: z.number().int().min(0).max(262144).nullable().optional(),
+  runtime_backend: z.string().max(40).nullable().optional(),
+  weight_quantization: z.string().max(40).nullable().optional(),
+  supports_q4_weights: z.boolean().optional().default(false),
+  supports_mlx: z.boolean().optional().default(false),
+  supports_vllm: z.boolean().optional().default(false),
 })
 
 const workerLimiter = rateLimit({
@@ -436,9 +615,25 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
     tokens_out,
     gpu_name,
     gpu_vram_mb,
+    runtime_backend,
+    weight_quantization,
+    supports_q4_weights,
+    supports_mlx,
+    supports_vllm,
   } = parsed.data
   const hasGpuName = gpu_name !== undefined
   const hasGpuVram = gpu_vram_mb !== undefined
+  const hasRuntimeBackend = runtime_backend !== undefined && runtime_backend !== null && String(runtime_backend).trim() !== ''
+  const hasWeightQuantization =
+    weight_quantization !== undefined && weight_quantization !== null && String(weight_quantization).trim() !== ''
+  const normalizedRuntimeBackend = hasRuntimeBackend
+    ? String(runtime_backend).trim().toLowerCase()
+    : supports_mlx
+      ? 'mlx'
+      : supports_vllm
+        ? 'vllm'
+        : 'pytorch'
+  const shouldUpdateRuntimeBackend = hasRuntimeBackend || supports_mlx || supports_vllm
   const public_ip =
     req.headers['x-real-ip'] ||
     req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
@@ -447,9 +642,11 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
   try {
     await pool.query(
       `INSERT INTO workers (peer_id, mode, grpc_port, p2p_port, public_ip, version, p2p_peers, tokens_generated,
-                            tokens_in, tokens_out, model, user_id, gpu_name, gpu_vram_mb)
+                            tokens_in, tokens_out, model, user_id, gpu_name, gpu_vram_mb,
+                            runtime_backend, weight_quantization, supports_q4_weights, supports_mlx, supports_vllm)
        VALUES (:peer_id, :mode, :grpc_port, :p2p_port, :public_ip, :version, :p2p_peers, :tokens_generated,
-               :tokens_in, :tokens_out, :model, :user_id, :gpu_name_ins, :gpu_vram_ins)
+               :tokens_in, :tokens_out, :model, :user_id, :gpu_name_ins, :gpu_vram_ins,
+               :runtime_backend, :weight_quantization, :supports_q4_weights, :supports_mlx, :supports_vllm)
        ON DUPLICATE KEY UPDATE
          mode = VALUES(mode),
          grpc_port = VALUES(grpc_port),
@@ -464,6 +661,11 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
          user_id = IF(VALUES(user_id) > 0, VALUES(user_id), user_id),
          gpu_name = IF(:has_gpu_name, VALUES(gpu_name), gpu_name),
          gpu_vram_mb = IF(:has_gpu_vram, VALUES(gpu_vram_mb), gpu_vram_mb),
+         runtime_backend = IF(:has_runtime_backend, VALUES(runtime_backend), runtime_backend),
+         weight_quantization = IF(:has_weight_quantization, VALUES(weight_quantization), weight_quantization),
+         supports_q4_weights = VALUES(supports_q4_weights),
+         supports_mlx = VALUES(supports_mlx),
+         supports_vllm = VALUES(supports_vllm),
          last_heartbeat_at = CURRENT_TIMESTAMP`,
       {
         peer_id,
@@ -482,6 +684,13 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
         gpu_vram_ins: gpu_vram_mb ?? null,
         has_gpu_name: hasGpuName ? 1 : 0,
         has_gpu_vram: hasGpuVram ? 1 : 0,
+        has_runtime_backend: shouldUpdateRuntimeBackend ? 1 : 0,
+        has_weight_quantization: hasWeightQuantization ? 1 : 0,
+        runtime_backend: normalizedRuntimeBackend,
+        weight_quantization: hasWeightQuantization ? String(weight_quantization).trim().toLowerCase() : 'fp16',
+        supports_q4_weights: supports_q4_weights ? 1 : 0,
+        supports_mlx: supports_mlx ? 1 : 0,
+        supports_vllm: supports_vllm ? 1 : 0,
       },
     )
     return res.json({ ok: true })
@@ -498,6 +707,10 @@ app.get('/api/workers/status', async (_req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT peer_id, mode, grpc_port, p2p_port, public_ip, version,
+              p2p_peers, tokens_generated, tokens_in, tokens_out, model,
+              gpu_name AS gpuName, gpu_vram_mb AS gpuVramMb,
+              runtime_backend AS runtimeBackend, weight_quantization AS weightQuantization,
+              supports_q4_weights AS supportsQ4Weights, supports_mlx AS supportsMlx, supports_vllm AS supportsVllm,
               last_heartbeat_at AS lastHeartbeatAt, first_seen_at AS firstSeenAt,
               TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
        FROM workers
@@ -514,6 +727,18 @@ app.get('/api/workers/status', async (_req, res) => {
         p2pPort: r.p2p_port,
         publicIp: r.public_ip,
         version: r.version,
+        p2pPeers: Number(r.p2p_peers || 0),
+        tokensGenerated: Number(r.tokens_generated || 0),
+        tokensIn: Number(r.tokens_in || 0),
+        tokensOut: Number(r.tokens_out || 0),
+        model: r.model ?? null,
+        gpuName: r.gpuName ?? null,
+        gpuVramMb: r.gpuVramMb != null ? Number(r.gpuVramMb) : null,
+        runtimeBackend: r.runtimeBackend ?? 'pytorch',
+        weightQuantization: r.weightQuantization ?? 'fp16',
+        supportsQ4Weights: Boolean(r.supportsQ4Weights),
+        supportsMlx: Boolean(r.supportsMlx),
+        supportsVllm: Boolean(r.supportsVllm),
         lastHeartbeatAt: r.lastHeartbeatAt,
         firstSeenAt: r.firstSeenAt,
         secondsSinceHeartbeat: Number(r.secondsSinceHeartbeat),
@@ -660,6 +885,8 @@ adminRouter.get('/workers/live', async (_req, res) => {
               w.public_ip AS publicIp, w.version, w.p2p_peers AS p2pPeers,
               w.tokens_generated AS tokensGenerated, w.tokens_in AS tokensIn, w.tokens_out AS tokensOut,
               w.model, w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
+              w.runtime_backend AS runtimeBackend, w.weight_quantization AS weightQuantization,
+              w.supports_q4_weights AS supportsQ4Weights, w.supports_mlx AS supportsMlx, w.supports_vllm AS supportsVllm,
               w.last_heartbeat_at AS lastHeartbeatAt,
               TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
               u.email AS ownerEmail
@@ -701,12 +928,17 @@ adminRouter.get('/workers/registered', async (req, res) => {
   const limit = Math.max(10, Math.min(500, Number(req.query.limit) || 200))
   try {
     const [rows] = await pool.query(
-      `SELECT peer_id, mode, grpc_port, p2p_port, public_ip, version,
-              p2p_peers, tokens_generated, tokens_in, tokens_out, model,
-              gpu_name AS gpuName, gpu_vram_mb AS gpuVramMb,
-              last_heartbeat_at AS lastHeartbeatAt, first_seen_at AS firstSeenAt,
-              TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
-       FROM workers ORDER BY last_heartbeat_at DESC LIMIT :limit`,
+      `SELECT w.peer_id, w.mode, w.grpc_port, w.p2p_port, w.public_ip, w.version,
+              w.p2p_peers, w.tokens_generated, w.tokens_in, w.tokens_out, w.model,
+              w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
+              w.runtime_backend AS runtimeBackend, w.weight_quantization AS weightQuantization,
+              w.supports_q4_weights AS supportsQ4Weights, w.supports_mlx AS supportsMlx, w.supports_vllm AS supportsVllm,
+              w.last_heartbeat_at AS lastHeartbeatAt, w.first_seen_at AS firstSeenAt,
+              TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
+              u.email AS ownerEmail
+       FROM workers w
+       LEFT JOIN users u ON u.id = w.user_id
+       ORDER BY w.last_heartbeat_at DESC LIMIT :limit`,
       { limit },
     )
     const totalTokens = rows.reduce((s, r) => s + Number(r.tokens_generated || 0), 0)
@@ -730,12 +962,276 @@ adminRouter.get('/workers/registered', async (req, res) => {
         firstSeenAt: r.firstSeenAt,
         online: Number(r.secondsSinceHeartbeat) <= WORKER_OFFLINE_SEC,
         secondsSinceHeartbeat: Number(r.secondsSinceHeartbeat),
+        ownerEmail: r.ownerEmail ?? null,
       })),
     })
   } catch (e) {
     console.error('admin/workers/registered', e)
     return res.status(500).json({ error: 'Erreur lecture workers.' })
   }
+})
+
+adminRouter.post('/workers/:peerId/actions', async (req, res) => {
+  const peerId = decodeURIComponent(String(req.params.peerId || ''))
+  const action = req.body?.action
+  if (!peerId) return res.status(400).json({ ok: false, error: 'peerId requis.' })
+  if (action === 'disconnect') {
+    return res.status(501).json({
+      ok: false,
+      error:
+        'Déconnexion forcée à distance : non disponible pour le moment (aucun signal standard vers le worker). Prévoir une commande via le daemon initiateur.',
+    })
+  }
+  if (action === 'change_pool') {
+    return res.status(501).json({
+      ok: false,
+      error:
+        'Changement de pool : réservé à une future API d’orchestration (placement dynamique des shards).',
+    })
+  }
+  return res.status(400).json({ ok: false, error: 'Action inconnue.' })
+})
+
+/** Empreinte stable pour le SSE : ignore pingMs, sampledAt, tokens, etc. (sinon hash change à chaque tick DB). */
+function stablePoolStreamHash(snap) {
+  const liveWorkerPeerIds = (snap.registeredWorkers || [])
+    .filter((w) => w.mode === 'worker' && Number(w.secondsSinceHeartbeat) <= WORKER_LIVE_SEC)
+    .map((w) => w.peerId)
+    .sort()
+  const normNodes = (snap.nodes || [])
+    .map((n) => ({
+      id: n.id,
+      group: n.group,
+      val: n.val,
+      shards: n.shards ?? null,
+      status: n.status ?? null,
+      poolId: n.poolId ?? null,
+    }))
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)))
+  const normLinks = (snap.links || [])
+    .map((l) => {
+      const s = typeof l.source === 'object' && l.source !== null ? l.source.id : l.source
+      const t = typeof l.target === 'object' && l.target !== null ? l.target.id : l.target
+      return { s: String(s), t: String(t), a: !!l.is_active }
+    })
+    .sort((a, b) => `${a.s}|${a.t}`.localeCompare(`${b.s}|${b.t}`))
+  const compact = {
+    normNodes,
+    normLinks,
+    pipelineActive: !!snap.pipelineActive,
+    poolStatus: snap.pool?.status,
+    poolId: snap.pool?.id,
+    routingPath: snap.pool?.routingPath,
+    liveWorkerPeerIds,
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(compact)).digest('hex')
+}
+
+async function buildAdminPoolSnapshot() {
+  const [registeredRows] = await pool.query(
+    `SELECT w.peer_id, w.mode, w.grpc_port, w.p2p_port, w.public_ip, w.version,
+            w.p2p_peers, w.tokens_generated, w.tokens_in, w.tokens_out, w.model,
+            w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
+            w.runtime_backend AS runtimeBackend, w.weight_quantization AS weightQuantization,
+            w.supports_q4_weights AS supportsQ4Weights, w.supports_mlx AS supportsMlx, w.supports_vllm AS supportsVllm,
+            w.last_heartbeat_at AS lastHeartbeatAt, w.first_seen_at AS firstSeenAt,
+            TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
+            u.email AS ownerEmail
+     FROM workers w
+     LEFT JOIN users u ON u.id = w.user_id
+     ORDER BY w.last_heartbeat_at DESC LIMIT 500`,
+  )
+  const registeredWorkers = registeredRows.map((r) => ({
+    peerId: r.peer_id,
+    mode: r.mode,
+    grpcPort: r.grpc_port,
+    p2pPort: r.p2p_port,
+    publicIp: r.public_ip,
+    version: r.version,
+    p2pPeers: Number(r.p2p_peers || 0),
+    tokensGenerated: Number(r.tokens_generated || 0),
+    tokensIn: Number(r.tokens_in ?? 0),
+    tokensOut: Number(r.tokens_out ?? 0),
+    model: r.model ?? null,
+    gpuName: r.gpuName ?? null,
+    gpuVramMb: r.gpuVramMb != null ? Number(r.gpuVramMb) : null,
+    lastHeartbeatAt: r.lastHeartbeatAt,
+    firstSeenAt: r.firstSeenAt,
+    online: Number(r.secondsSinceHeartbeat) <= WORKER_OFFLINE_SEC,
+    secondsSinceHeartbeat: Number(r.secondsSinceHeartbeat),
+    ownerEmail: r.ownerEmail ?? null,
+  }))
+  const liveWorkers = registeredWorkers.filter((w) => w.secondsSinceHeartbeat <= WORKER_LIVE_SEC)
+  const workerPeers = liveWorkers.filter((w) => w.mode === 'worker').map((w) => w.peerId).sort()
+  const totalVramMb = liveWorkers.reduce((s, w) => s + Number(w.gpuVramMb || 0), 0)
+  const requiredModelVramMb = Number(process.env.VRYX_POOL_REQUIRED_VRAM_MB || 100 * 1024)
+  const estimatedWorkersNeeded = totalVramMb > 0
+    ? Math.max(1, Math.ceil(requiredModelVramMb / Math.max(1, totalVramMb / Math.max(1, liveWorkers.length))))
+    : 0
+  const sortedByVram = [...liveWorkers].sort((a, b) => Number(b.gpuVramMb || 0) - Number(a.gpuVramMb || 0))
+  const poolId = workerPeers.length > 0 ? `pool-${workerPeers.join('|').slice(0, 10)}` : 'pool-empty'
+  const assignments = workerPeers.map((peerId, rank) => {
+    const w = liveWorkers.find((x) => x.peerId === peerId)
+    return {
+      peer: peerId,
+      rank,
+      role: rank === 0 ? 'embedding' : rank === workerPeers.length - 1 ? 'lm_head' : 'layers',
+      gpu: w?.gpuName ?? null,
+      vramMb: w?.gpuVramMb ?? null,
+      ready: true,
+    }
+  })
+  const pipelineActive = isPipelineChatActive()
+  const graph = buildPoolGraphPayload({
+    poolId,
+    assignments,
+    routingPath: workerPeers,
+    registeredWorkers,
+    pipelineActive,
+  })
+
+  return {
+    ok: true,
+    sampledAt: Date.now(),
+    liveSec: WORKER_LIVE_SEC,
+    pipelineActive,
+    nodes: graph.nodes,
+    links: graph.links,
+    registeredWorkers,
+    liveWorkers,
+    totalTokensGenerated: registeredWorkers.reduce((s, w) => s + Number(w.tokensGenerated || 0), 0),
+    pool: {
+      id: poolId,
+      status: workerPeers.length >= 2 ? 'ready_for_placement' : 'insufficient_workers',
+      model: process.env.VRYX_DIST_MODEL || 'Qwen/Qwen2.5-1.5B-Instruct',
+      routingPath: workerPeers,
+      assignments,
+      totalVramMb,
+      requiredModelVramMb,
+      estimatedWorkersNeeded,
+      replicationFactor: Number(process.env.VRYX_POOL_REPLICATION_FACTOR || 1),
+      hotWorkers: workerPeers.length,
+      warmReplicas: Math.max(0, liveWorkers.length - workerPeers.length),
+      largestGpu: sortedByVram[0]
+        ? { peerId: sortedByVram[0].peerId, gpuName: sortedByVram[0].gpuName, gpuVramMb: sortedByVram[0].gpuVramMb }
+        : null,
+      latencyTargetsMs: {
+        hotRouting: [10, 50],
+        firstTokenSmallModel: [400, 1000],
+        nextTokenWithKvCache: [120, 350],
+        hotFailover: [100, 500],
+        coldShardReload: [20000, 120000],
+      },
+    },
+    nodeStatus: await nodeMonitor.getStatus(),
+    history: {
+      points: nodeMonitor.getHistory(120),
+      tests: nodeMonitor.getTestHistory(),
+    },
+  }
+}
+
+adminRouter.get('/pool/snapshot', async (_req, res) => {
+  try {
+    res.json(await buildAdminPoolSnapshot())
+  } catch (e) {
+    console.error('admin/pool/snapshot', e)
+    res.status(500).json({ error: 'Erreur lecture pool P2P.' })
+  }
+})
+
+adminRouter.get('/pool/stream', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  res.flushHeaders?.()
+  const send = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+    if (typeof res.flush === 'function') res.flush()
+  }
+  const closedRef = { closed: false }
+  let lastHash = ''
+  let lastSentAt = 0
+  let timeoutId = null
+  let prevPeerIds = new Set()
+  let streamSeenOnce = false
+
+  const STREAM_FORCE_MS = 45_000
+  const tick = async () => {
+    if (closedRef.closed) return
+    try {
+      const snap = await buildAdminPoolSnapshot()
+      const h = stablePoolStreamHash(snap)
+      const now = Date.now()
+      const stale = now - lastSentAt >= STREAM_FORCE_MS
+
+      const workerIds = new Set(
+        (snap.registeredWorkers || [])
+          .filter((w) => w.mode === 'worker' && Number(w.secondsSinceHeartbeat) <= WORKER_LIVE_SEC)
+          .map((w) => w.peerId),
+      )
+      let streamEvent = null
+      if (streamSeenOnce) {
+        for (const id of workerIds) {
+          if (!prevPeerIds.has(id)) {
+            streamEvent = 'worker_connected'
+            break
+          }
+        }
+        if (!streamEvent) {
+          for (const id of prevPeerIds) {
+            if (!workerIds.has(id)) {
+              streamEvent = 'worker_disconnected'
+              break
+            }
+          }
+        }
+      }
+      prevPeerIds = workerIds
+      streamSeenOnce = true
+
+      if (!streamEvent && h !== lastHash) {
+        streamEvent = snap.pipelineActive ? 'pipeline_active' : 'pool_status_changed'
+      }
+
+      const mustPushSnapshot =
+        h !== lastHash ||
+        streamEvent === 'worker_connected' ||
+        streamEvent === 'worker_disconnected'
+
+      if (mustPushSnapshot) {
+        lastHash = h
+        lastSentAt = now
+        send({
+          ...snap,
+          streamEvent: streamEvent || 'pool_status_changed',
+        })
+      } else if (stale) {
+        lastSentAt = now
+        res.write(': keepalive\n\n')
+        if (typeof res.flush === 'function') res.flush()
+      }
+    } catch (e) {
+      send({ ok: false, error: e.message || 'Erreur pool stream.' })
+    }
+  }
+
+  const schedule = () => {
+    const delay = isPipelineChatActive() ? 1500 : 5000
+    timeoutId = setTimeout(async () => {
+      await tick()
+      if (!closedRef.closed) schedule()
+    }, delay)
+  }
+
+  await tick()
+  schedule()
+
+  req.on('close', () => {
+    closedRef.closed = true
+    if (timeoutId) clearTimeout(timeoutId)
+  })
 })
 
 /** Visibilité scheduler / runtime shard éphémère (stub documenté côté API). */
@@ -749,6 +1245,107 @@ adminRouter.get('/p2p/shard-runtime', (_req, res) => {
   })
 })
 
+adminRouter.get('/sessions', async (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100))
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, session_json AS sessionJson
+       FROM p2p_chat_sessions
+       WHERE user_id = :userId
+       ORDER BY created_at DESC
+       LIMIT ${limit}`,
+      { userId: req.user.id },
+    )
+    const sessions = rows
+      .map((row) => {
+        try {
+          return JSON.parse(row.sessionJson)
+        } catch {
+          return null
+        }
+      })
+      .filter(Boolean)
+    res.json({ ok: true, sessions })
+  } catch (e) {
+    console.error('admin sessions list', e)
+    res.status(500).json({ error: 'Impossible de charger les sessions.' })
+  }
+})
+
+adminRouter.get('/sessions/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT session_json AS sessionJson
+       FROM p2p_chat_sessions
+       WHERE id = :id AND user_id = :userId
+       LIMIT 1`,
+      { id: String(req.params.id), userId: req.user.id },
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'Session introuvable.' })
+    res.json({ ok: true, session: JSON.parse(rows[0].sessionJson) })
+  } catch (e) {
+    console.error('admin session detail', e)
+    res.status(500).json({ error: 'Impossible de charger cette session.' })
+  }
+})
+
+adminRouter.post('/sessions', async (req, res) => {
+  const s = req.body?.session
+  if (!s || typeof s !== 'object' || Array.isArray(s)) {
+    return res.status(400).json({ error: 'Session invalide.' })
+  }
+  const id = typeof s.id === 'string' && s.id.trim() ? s.id.trim().slice(0, 80) : crypto.randomUUID()
+  const prompt = typeof s.prompt === 'string' ? s.prompt : ''
+  const response = typeof s.response === 'string' ? s.response : ''
+  if (!prompt.trim()) return res.status(400).json({ error: 'Prompt session requis.' })
+  const session = { ...s, id }
+  try {
+    await pool.query(
+      `INSERT INTO p2p_chat_sessions (id, user_id, prompt, response, session_json)
+       VALUES (:id, :userId, :prompt, :response, :sessionJson)
+       ON DUPLICATE KEY UPDATE
+         prompt = VALUES(prompt),
+         response = VALUES(response),
+         session_json = VALUES(session_json),
+         updated_at = CURRENT_TIMESTAMP`,
+      {
+        id,
+        userId: req.user.id,
+        prompt,
+        response,
+        sessionJson: JSON.stringify(session),
+      },
+    )
+    res.json({ ok: true, session })
+  } catch (e) {
+    console.error('admin session save', e)
+    res.status(500).json({ error: 'Impossible de sauvegarder la session.' })
+  }
+})
+
+adminRouter.delete('/sessions/:id', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM p2p_chat_sessions WHERE id = :id AND user_id = :userId', {
+      id: String(req.params.id),
+      userId: req.user.id,
+    })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('admin session delete', e)
+    res.status(500).json({ error: 'Impossible de supprimer la session.' })
+  }
+})
+
+adminRouter.delete('/sessions', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM p2p_chat_sessions WHERE user_id = :userId', { userId: req.user.id })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('admin sessions clear', e)
+    res.status(500).json({ error: 'Impossible de vider les sessions.' })
+  }
+})
+
 adminRouter.post('/chat/stream', (_req, res) => {
   return res.status(410).json({
     error: 'Ancien endpoint admin désactivé. Rechargez le panel : le chat utilise maintenant /api/admin/p2p/chat/stream.',
@@ -760,6 +1357,26 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
   const prompt = req.body?.prompt
   if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
     return res.status(400).json({ error: 'prompt requis' })
+  }
+  let initiatorChatUrl
+  try {
+    initiatorChatUrl = resolveInitiatorChatUrl(req.body)
+  } catch (e) {
+    const msg = typeof e?.message === 'string' ? e.message : 'Initiateur invalide.'
+    return res.status(Number(e?.statusCode) === 400 ? 400 : 400).json({ error: msg })
+  }
+  const requestedQuantization = ['q4', 'int8', 'fp16'].includes(req.body?.quantization)
+    ? req.body.quantization
+    : 'fp16'
+  const poolPreference = ['auto', 'velocity_mlx', 'velocity_vllm', 'legacy_pytorch'].includes(req.body?.pool_preference)
+    ? req.body.pool_preference
+    : 'auto'
+  let maxNewTokens = null
+  const rawCap = req.body?.maxNewTokens ?? req.body?.max_new_tokens
+  const parsedCap =
+    typeof rawCap === 'number' ? rawCap : typeof rawCap === 'string' ? Number(rawCap) : NaN
+  if (Number.isFinite(parsedCap) && parsedCap >= 1 && parsedCap <= 4096) {
+    maxNewTokens = Math.floor(parsedCap)
   }
   res.setHeader('Content-Type', 'text/event-stream')
   res.setHeader('Cache-Control', 'no-cache')
@@ -784,14 +1401,55 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     clearInterval(keepAliveInterval)
     ctrl.abort()
   })
+  pipelineChatBegin()
+  /** Timer progression : l’initiateur Rust ne stream pas le JSON, on informe le client pendant l’attente. */
+  let progressTimer = null
+  const clearProgressTimer = () => {
+    if (progressTimer) {
+      clearInterval(progressTimer)
+      progressTimer = null
+    }
+  }
   try {
-    const r = await fetch(`${VRYX_INITIATOR_CHAT_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: prompt.trim() }),
-      signal: ctrl.signal,
+    send({
+      stage: 'queued',
+      status: 'Requête acceptée, préparation de l’appel initiateur…',
     })
-    const text = await r.text()
+    const waitStartedAt = Date.now()
+    progressTimer = setInterval(() => {
+      const elapsedSec = Math.floor((Date.now() - waitStartedAt) / 1000)
+      send({
+        stage: 'awaiting_initiator',
+        status: `Attente du pipeline P2P (initiateur, ${elapsedSec} s)…`,
+        elapsedSec,
+      })
+    }, 2000)
+
+    const chatBody = {
+      prompt: prompt.trim(),
+      quantization: requestedQuantization,
+      hidden_transport: requestedQuantization,
+      pool_preference: poolPreference,
+    }
+    if (maxNewTokens != null) chatBody.max_new_tokens = maxNewTokens
+    const chatPayload = JSON.stringify(chatBody)
+    const callInitiatorChat = () =>
+      fetch(`${initiatorChatUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: chatPayload,
+        signal: ctrl.signal,
+      })
+
+    let r = await callInitiatorChat()
+    clearProgressTimer()
+    send({
+      stage: 'http_headers',
+      status: r.ok ? 'Réponse HTTP reçue, lecture du corps…' : `Réponse HTTP ${r.status}, lecture du corps…`,
+    })
+    let text = await r.text()
+
+    /** L’initiateur Rust peut lancer « Pré-chat » + dial puis échouer tant que select! n’a pas traité ConnexionEstablished. Une seule retry API suffit pour la même requête. */
     let data
     try {
       data = JSON.parse(text)
@@ -799,15 +1457,77 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       send({ error: 'Réponse initiateur invalide.' })
       return res.end()
     }
-    if (!r.ok) {
+    const noWorkerTransient = () =>
+      !r.ok &&
+      typeof data?.error === 'string' &&
+      (data.error.includes('worker P2P') ||
+        data.error.includes('Aucun worker'))
+
+    if (noWorkerTransient()) {
       send({
-        error: data?.error || `HTTP ${r.status}`,
-        computeTimeMs: Number(data?.compute_time_ms ?? data?.computeTimeMs ?? 0) || 0,
+        stage: 'p2p_warm_retry',
+        status:
+          'Aucune session P2P active pour ce tour initiateur : nouvelle tentative après 850 ms pour laisser le relais s’établir.',
+      })
+      progressTimer = setInterval(() => {
+        const elapsedSec = Math.floor((Date.now() - waitStartedAt) / 1000)
+        send({
+          stage: 'awaiting_initiator',
+          status: `Nouvelle tentative imminente (${elapsedSec} s depuis le départ)…`,
+          elapsedSec,
+        })
+      }, 2000)
+      await new Promise((resolve) => setTimeout(resolve, 850))
+      clearProgressTimer()
+      r = await callInitiatorChat()
+      send({
+        stage: 'http_headers_retry',
+        status: r.ok ? 'Deuxième réponse initiateur OK, lecture…' : `Deuxième réponse HTTP ${r.status}…`,
+      })
+      text = await r.text()
+      try {
+        data = JSON.parse(text)
+      } catch {
+        send({ error: 'Réponse initiateur invalide (2ᵉ tentative).' })
+        return res.end()
+      }
+    }
+
+    send({ stage: 'parsed', status: 'Analyse du JSON initiateur terminée.' })
+    if (!r.ok) {
+      let detailError = typeof data?.error === 'string' ? data.error : `HTTP ${r.status}`
+      if (
+        typeof detailError === 'string' &&
+        (detailError.includes('worker P2P') || detailError.includes('Aucun worker'))
+      ) {
+        try {
+          const stRes = await fetch(`http://127.0.0.1:${PORT}/api/workers/status`, {
+            headers: { Accept: 'application/json' },
+          })
+          const stBody = await stRes.json().catch(() => null)
+          const workers = Array.isArray(stBody?.workers) ? stBody.workers : []
+          const nWorker = workers.filter((w) => w.mode === 'worker').length
+          detailError +=
+            ` Contexte API : ${nWorker} ligne(s) mode worker dans GET /api/workers/status (${workers.length} entrée(s) dans la liste publique). Si ce nombre est supérieur à 0, le décalage vient très probablement du relais libp2p (consultez les logs initiateur : lignes « Pré-chat », « Dial » et « Connexion établie »). Réessayez après quelques secondes.`
+        } catch {
+          /* ignore diagnostic secondaire */
+        }
+      }
+      const errComputeMs = Number(data?.compute_time_ms ?? data?.computeTimeMs ?? 0) || 0
+      const errLatencyRaw = Number(data?.latency_ms ?? data?.latencyMs ?? 0) || 0
+      send({
+        error: detailError,
+        latencyMs: Math.max(errLatencyRaw, errComputeMs),
+        computeTimeMs: errComputeMs,
         workerComputeMs: Number(data?.worker_compute_ms ?? data?.workerComputeMs ?? 0) || 0,
         routingPath: Array.isArray(data?.routing_path)
           ? data.routing_path.filter((s) => typeof s === 'string' && s.length > 0)
           : [],
         pipelineTrace: data?.pipeline_trace ?? data?.pipelineTrace ?? null,
+        requestedQuantization,
+        poolPreference,
+        effectiveQuantization: data?.effective_quantization ?? data?.effectiveQuantization ?? null,
+        quantizationFallbackReason: data?.quantization_fallback_reason ?? data?.quantizationFallbackReason ?? null,
       })
       return res.end()
     }
@@ -866,43 +1586,89 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       pipelineTrace && typeof pipelineTrace === 'object' && pipelineTrace.layout
         ? String(pipelineTrace.layout)
         : ''
+    const tr = pipelineTrace && typeof pipelineTrace === 'object' && !Array.isArray(pipelineTrace) ? pipelineTrace : null
+    const quicUsed = Boolean(data.quic_used ?? tr?.quic_used ?? false)
+    const quicAvailable = Boolean(data.quic_available ?? tr?.quic_available ?? false)
+    const kvCacheUsed = Boolean(data.worker_kv_cache ?? tr?.worker_kv_cache ?? false)
+    const hiddenTransport = String(data.hidden_transport ?? tr?.hidden_transport ?? 'fp16')
+    const effectiveQuantization = String(
+      data.effective_quantization ??
+        data.effectiveQuantization ??
+        tr?.effective_quantization ??
+        tr?.hidden_transport ??
+        hiddenTransport,
+    )
+    const quantizationFallbackReason =
+      tr?.quantization_fallback_reason ??
+      data.quantization_fallback_reason ??
+      data.quantizationFallbackReason ??
+      null
+    const avgMsPerToken = Number(data.avg_ms_per_token ?? tr?.avg_ms_per_token ?? 0) || 0
+    const hotPathTps = Number(data.hot_path_tps ?? tr?.hot_path_tps ?? 0) || 0
+    const decodeMode = String(data.decode_mode ?? data.decodeMode ?? tr?.decode_mode ?? '') || null
+    const stopReason = String(tr?.generation_control?.stop_reason ?? data.stop_reason ?? '') || null
+    const prefixCacheHit = Boolean(tr?.prefix_cache?.hit ?? false)
+    const prefixCacheTokens = Number(tr?.prefix_cache?.tokens ?? 0) || 0
+    const setupMs = Number(data.setup_ms ?? tr?.setup_ms ?? 0) || 0
+    const benchmarkActualTps = Number(tr?.benchmark?.actual_tps ?? tr?.hot_path_tps ?? 0) || 0
+    const genControl = tr?.generation_control && typeof tr.generation_control === 'object' ? tr.generation_control : null
+    const poolClass = String(data.pool_class ?? data.poolClass ?? tr?.pool_class ?? 'legacy_pytorch')
+    const requestedPoolClass = String(tr?.requested_pool_class ?? data.requested_pool_class ?? data.requestedPoolClass ?? poolClass)
+    const actualPoolClass = String(tr?.actual_pool_class ?? data.actual_pool_class ?? data.actualPoolClass ?? poolClass)
+    const poolFallbackReason = tr?.pool_fallback_reason ?? data.pool_fallback_reason ?? data.poolFallbackReason ?? null
+    const batching = tr?.batching && typeof tr.batching === 'object' ? tr.batching : null
+    const overlap = tr?.overlap && typeof tr.overlap === 'object' ? tr.overlap : null
+    const runtimeBackendPerWorker = tr?.runtime_backend_per_worker ?? null
+    const weightQuantizationPerWorker = tr?.weight_quantization_per_worker ?? null
+    const attentionBackendPerWorker = tr?.attention_backend_per_worker ?? null
     let worker = null
     if (workerPeerId) {
-      const [rows] = await pool.query(
-        `SELECT w.peer_id AS peerId, w.mode, w.grpc_port AS grpcPort, w.p2p_port AS p2pPort,
-                w.public_ip AS publicIp, w.version, w.p2p_peers AS p2pPeers,
-                w.tokens_generated AS tokensGenerated, w.tokens_in AS tokensIn, w.tokens_out AS tokensOut,
-                w.model, w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
-                w.last_heartbeat_at AS lastHeartbeatAt,
-                TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
-                u.email AS ownerEmail
-         FROM workers w
-         LEFT JOIN users u ON u.id = w.user_id
-         WHERE w.peer_id = :peerId
-         LIMIT 1`,
-        { peerId: workerPeerId },
-      )
-      const row = rows[0]
-      if (row) {
-        worker = {
-          peerId: row.peerId,
-          mode: row.mode,
-          grpcPort: row.grpcPort,
-          p2pPort: row.p2pPort,
-          publicIp: row.publicIp,
-          version: row.version,
-          p2pPeers: Number(row.p2pPeers || 0),
-          tokensGenerated: Number(row.tokensGenerated || 0),
-          tokensIn: Number(row.tokensIn || 0),
-          tokensOut: Number(row.tokensOut || 0),
-          model: row.model ?? null,
-          gpuName: row.gpuName ?? null,
-          gpuVramMb: row.gpuVramMb != null ? Number(row.gpuVramMb) : null,
-          lastHeartbeatAt: row.lastHeartbeatAt,
-          secondsSinceHeartbeat: Number(row.secondsSinceHeartbeat),
-          ownerEmail: row.ownerEmail ?? null,
-          online: Number(row.secondsSinceHeartbeat) <= WORKER_OFFLINE_SEC,
+      try {
+        const [rows] = await pool.query(
+          `SELECT w.peer_id AS peerId, w.mode, w.grpc_port AS grpcPort, w.p2p_port AS p2pPort,
+                  w.public_ip AS publicIp, w.version, w.p2p_peers AS p2pPeers,
+                  w.tokens_generated AS tokensGenerated, w.tokens_in AS tokensIn, w.tokens_out AS tokensOut,
+                  w.model, w.gpu_name AS gpuName, w.gpu_vram_mb AS gpuVramMb,
+                  w.runtime_backend AS runtimeBackend, w.weight_quantization AS weightQuantization,
+                  w.supports_q4_weights AS supportsQ4Weights, w.supports_mlx AS supportsMlx, w.supports_vllm AS supportsVllm,
+                  w.last_heartbeat_at AS lastHeartbeatAt,
+                  TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
+                  u.email AS ownerEmail
+           FROM workers w
+           LEFT JOIN users u ON u.id = w.user_id
+           WHERE w.peer_id = :peerId
+           LIMIT 1`,
+          { peerId: workerPeerId },
+        )
+        const row = rows[0]
+        if (row) {
+          worker = {
+            peerId: row.peerId,
+            mode: row.mode,
+            grpcPort: row.grpcPort,
+            p2pPort: row.p2pPort,
+            publicIp: row.publicIp,
+            version: row.version,
+            p2pPeers: Number(row.p2pPeers || 0),
+            tokensGenerated: Number(row.tokensGenerated || 0),
+            tokensIn: Number(row.tokensIn || 0),
+            tokensOut: Number(row.tokensOut || 0),
+            model: row.model ?? null,
+            gpuName: row.gpuName ?? null,
+            gpuVramMb: row.gpuVramMb != null ? Number(row.gpuVramMb) : null,
+            runtimeBackend: row.runtimeBackend ?? 'pytorch',
+            weightQuantization: row.weightQuantization ?? 'fp16',
+            supportsQ4Weights: Boolean(row.supportsQ4Weights),
+            supportsMlx: Boolean(row.supportsMlx),
+            supportsVllm: Boolean(row.supportsVllm),
+            lastHeartbeatAt: row.lastHeartbeatAt,
+            secondsSinceHeartbeat: Number(row.secondsSinceHeartbeat),
+            ownerEmail: row.ownerEmail ?? null,
+            online: Number(row.secondsSinceHeartbeat) <= WORKER_OFFLINE_SEC,
+          }
         }
+      } catch (e) {
+        console.error('p2p chat stream : enrichissement worker ignoré', e?.message || e)
       }
     }
     if (worker) {
@@ -914,8 +1680,20 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       worker.llmTotalTokens = totalTokens
     }
     const words = reply.length ? reply.split(/(\s+)/) : []
+    const nWords = words.filter(Boolean).length
+    // Pas de tempo artificielle : tout le goulot réseau+P2P est déjà résolu avant ce point ; diffusé en rafales au client.
+    const delayMsPerToken = 0
+    send({
+      stage: 'streaming_tokens',
+      status: `Diffusion de la réponse (${nWords} fragment(s))…`,
+    })
     for (const w of words) {
-      if (w) send({ token: w })
+      if (w) {
+        send({ token: w })
+        if (delayMsPerToken > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMsPerToken))
+        }
+      }
     }
     send({
       done: true,
@@ -938,6 +1716,32 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       shardSessionId,
       pipelineTrace,
       pipelineWorkers,
+      quicUsed,
+      quicAvailable,
+      kvCacheUsed,
+      hiddenTransport,
+      avgMsPerToken,
+      hotPathTps,
+      decodeMode,
+      stopReason,
+      prefixCacheHit,
+      prefixCacheTokens,
+      setupMs,
+      benchmarkActualTps,
+      genControl,
+      requestedQuantization,
+      effectiveQuantization,
+      quantizationFallbackReason,
+      poolPreference,
+      poolClass,
+      requestedPoolClass,
+      actualPoolClass,
+      poolFallbackReason,
+      batching,
+      overlap,
+      runtimeBackendPerWorker,
+      weightQuantizationPerWorker,
+      attentionBackendPerWorker,
       mode:
         routingPath.length > 1
           ? `Pipeline Daisy Chain (${routingPath.length} nœuds)`
@@ -947,14 +1751,28 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       worker,
     })
   } catch (e) {
+    clearProgressTimer()
     if (e.name === 'AbortError') {
-      send({ error: 'Timeout P2P (600s)' })
+      send({ error: 'Timeout P2P (600 s) ou fermeture de la connexion.' })
     } else {
-      send({ error: e.message || 'Erreur initiateur P2P.' })
+      const msgRaw = typeof e?.message === 'string' ? e.message : ''
+      const causeCode = typeof e?.cause?.code === 'string' ? e.cause.code : ''
+      const tech = msgRaw ? `${msgRaw}${causeCode ? ` (${causeCode})` : ''}` : causeCode || String(e ?? '')
+      const unreachable =
+        /fetch failed|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|socket hang up/i.test(
+          `${msgRaw} ${causeCode}`,
+        )
+      send({
+        error: unreachable
+          ? `Échec de connexion au daemon initiateur (${initiatorChatUrl}). Sur le VPS exécutez : curl -sfS '${initiatorChatUrl}/api/status'. Vérifiez systemd (vryx-initiator, vryx-inference-stage1) et VRYX_INITIATOR_CHAT_URL pour le process Node (même localhost que Rust). Technique : ${tech || 'inconnu'}`
+          : tech || 'Erreur initiateur P2P.',
+      })
     }
   } finally {
+    clearProgressTimer()
     clearTimeout(timer)
     clearInterval(keepAliveInterval)
+    pipelineChatEnd()
   }
   res.end()
 })
@@ -1037,7 +1855,7 @@ app.use('/api/admin', adminRouter)
  * Les workers téléchargent leurs couches directement depuis le VPS via HTTPS, sans passer par le relay P2P.
  * Accessible uniquement depuis localhost (Python VPS).
  */
-app.use('/api/internal/shard-serve', express.static('/tmp/vryx-shards', {
+app.use('/api/internal/shard-serve', express.static(process.env.VRYX_SHARD_BASE_DIR || '/var/tmp/vryx-shards', {
   dotfiles: 'deny',
   maxAge: 0,
   setHeaders(res) {
@@ -1079,6 +1897,7 @@ async function start() {
   await waitForDatabase()
   await ensureTable()
   await ensureWorkersTable()
+  await ensureP2pChatSessionsTable()
   await ensureForcedAdmins()
   nodeMonitor.startSampling()
   app.listen(PORT, '127.0.0.1', () => {

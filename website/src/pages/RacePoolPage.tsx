@@ -104,7 +104,7 @@ export function RacePoolPage() {
           style={{ backgroundImage: "url('/mid.png')" }}
           aria-hidden
         />
-        <div className="absolute inset-0 bg-gradient-to-b from-slate-950/82 via-slate-950/72 to-slate-950/88" aria-hidden />
+        <div className="hero-overlay absolute inset-0" aria-hidden />
         <div className="relative z-10 mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
           <div className="mx-auto max-w-2xl text-center">
             <p className="font-mono text-[0.7rem] font-medium uppercase tracking-[0.22em] text-white/45">

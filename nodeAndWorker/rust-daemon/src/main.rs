@@ -6,15 +6,18 @@ use libp2p::{
     autonat, dcutr, identify, kad, mdns, noise,
     relay,
     request_response::{self, ProtocolSupport},
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::time;
@@ -93,6 +96,7 @@ mod vryx_codec {
             let data = serde_json::to_vec(&req)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             io.write_all(&data).await?;
+            io.close().await?;
             Ok(())
         }
 
@@ -106,6 +110,7 @@ mod vryx_codec {
             let data = serde_json::to_vec(&resp)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             io.write_all(&data).await?;
+            io.close().await?;
             Ok(())
         }
     }
@@ -239,11 +244,25 @@ impl Default for TensorResponse {
 
 /// Tableau `routing_path` pour les réponses HTTP/SSE (aligné sur `pipeline_trace_json`).
 fn routing_path_from_trace(trace: &serde_json::Value) -> serde_json::Value {
-    trace
+    let mut rp = trace
         .get("routing_path")
-        .filter(|v| v.is_array())
+        .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_else(|| serde_json::Value::Array(vec![]))
+        .unwrap_or_default();
+    if rp.is_empty() {
+        if let Some(peers) = trace.get("peers").and_then(|v| v.as_array()) {
+            rp = peers.clone();
+        }
+    }
+    serde_json::Value::Array(rp)
+}
+
+fn env_u64_clamped(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 mod base64_vec {
@@ -289,6 +308,18 @@ pub mod vryx {
 }
 
 use vryx::inference_service_client::InferenceServiceClient;
+use tonic::transport::Channel;
+
+static GRPC_CHANNELS: OnceLock<Mutex<HashMap<u16, Channel>>> = OnceLock::new();
+
+fn grpc_drop_cached_channel(port: u16) {
+    if let Some(cache) = GRPC_CHANNELS.get() {
+        let removed = cache.lock().unwrap().remove(&port).is_some();
+        if removed {
+            eprintln!("[*] Canal gRPC local port {} retiré du cache (reconnexion).", port);
+        }
+    }
+}
 
 // ============================================================
 //  Persistance du keypair libp2p
@@ -329,17 +360,32 @@ struct LlmMetrics {
     pipeline_trace_json: String,
 }
 
-async fn call_local_inference(
+async fn call_local_inference_once(
     port: u16,
     data: Vec<u8>,
     dtype: String,
     routing_path: Vec<String>,
     session_id: String,
-) -> Result<(Vec<u8>, u64, u64, LlmMetrics, u64), Box<dyn Error>> {
-    let mut client = InferenceServiceClient::connect(format!("http://127.0.0.1:{}", port))
-        .await?
-        .max_decoding_message_size(100 * 1024 * 1024)
-        .max_encoding_message_size(100 * 1024 * 1024);
+) -> Result<(Vec<u8>, u64, u64, LlmMetrics, u64), Box<dyn Error + Send + Sync>> {
+    let maybe_channel = {
+        let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+        cache.lock().unwrap().get(&port).cloned()
+    };
+    let channel = match maybe_channel {
+        Some(ch) => ch,
+        None => {
+            let endpoint = Channel::from_shared(format!("http://127.0.0.1:{}", port))?;
+            let ch = endpoint.connect().await?;
+            let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+            cache.lock().unwrap().insert(port, ch.clone());
+            ch
+        }
+    };
+    let mut client = InferenceServiceClient::new(channel)
+        // Aligné avec `inference_server.py` (grpc.aio.server 1 Go) : un init shard / forward
+        // peut dépasser 100 Mo (config, métriques, réponses protobuf) sous peine de « transport error » tonic.
+        .max_decoding_message_size(1024 * 1024 * 1024)
+        .max_encoding_message_size(1024 * 1024 * 1024);
 
     let response = client
         .process(tonic::Request::new(vryx::TensorData {
@@ -372,6 +418,67 @@ async fn call_local_inference(
     ))
 }
 
+/// Après redémarrage du `inference_server.py` local, le canal tonic mis en cache devient invalide
+/// (« transport error », « connection refused », etc.). On purge le cache et on réessaie.
+async fn call_local_inference(
+    port: u16,
+    data: Vec<u8>,
+    dtype: String,
+    routing_path: Vec<String>,
+    session_id: String,
+) -> Result<(Vec<u8>, u64, u64, LlmMetrics, u64), Box<dyn Error + Send + Sync>> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut last_msg = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            grpc_drop_cached_channel(port);
+            tokio::time::sleep(std::time::Duration::from_millis(200 + u64::from(attempt) * 400)).await;
+        }
+        match call_local_inference_once(
+            port,
+            data.clone(),
+            dtype.clone(),
+            routing_path.clone(),
+            session_id.clone(),
+        )
+        .await
+        {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = e.to_string();
+                let s = msg.to_lowercase();
+                let retryable = s.contains("transport")
+                    || s.contains("connection refused")
+                    || s.contains("tcp connect")
+                    || s.contains("broken pipe")
+                    || s.contains("cancelled")
+                    || s.contains("deadline exceeded")
+                    || s.contains("unavailable")
+                    || s.contains("connection reset");
+                last_msg = msg.clone();
+                if retryable && attempt + 1 < MAX_ATTEMPTS {
+                    eprintln!(
+                        "[!] gRPC local port {} : tentative {} — {}",
+                        port,
+                        attempt + 1,
+                        msg
+                    );
+                    continue;
+                }
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg)));
+            }
+        }
+    }
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        if last_msg.is_empty() {
+            "gRPC local : échec inattendu.".to_string()
+        } else {
+            last_msg
+        },
+    )))
+}
+
 // ============================================================
 //  Heartbeat → API Vryx
 // ============================================================
@@ -389,6 +496,13 @@ struct HeartbeatPayload {
     tokens_generated: u64,
     p2p_peers: usize,
     model: Option<String>,
+    gpu_name: Option<String>,
+    gpu_vram_mb: Option<u64>,
+    runtime_backend: Option<String>,
+    weight_quantization: Option<String>,
+    supports_q4_weights: bool,
+    supports_mlx: bool,
+    supports_vllm: bool,
 }
 
 async fn send_heartbeat(
@@ -407,6 +521,105 @@ async fn send_heartbeat(
         Err(e) => {
             eprintln!("[!] Heartbeat erreur : {}", e);
         }
+    }
+}
+
+/// Initiateur : lit `/api/workers/status`, enregistre les workers et relance un dial relay.
+/// Évite la course avec le ticker heartbeat (~30 s) quand `/api/chat` arrive juste après le démarrage.
+async fn initiator_pull_workers_from_api_now(
+    swarm: &mut Swarm<VryxBehaviour>,
+    http_client: &reqwest::Client,
+    api_url: &str,
+    bootstrap_peer_id: Option<PeerId>,
+    bootstrap_node: Option<&String>,
+    my_peer_id: PeerId,
+    discovered_peers: &mut HashSet<PeerId>,
+    active_peers: &Arc<Mutex<HashSet<PeerId>>>,
+    registry_worker_count: Option<&Arc<AtomicUsize>>,
+    log_origin: &'static str,
+) {
+    let Some(boot_addr_str) = bootstrap_node.map(|s| s.as_str()) else {
+        return;
+    };
+    if boot_addr_str.trim().is_empty() {
+        return;
+    }
+    let url = format!("{}/api/workers/status", api_url.trim_end_matches('/'));
+    let fetch = async {
+        let resp = http_client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    };
+    let body = match tokio::time::timeout(Duration::from_secs(4), fetch).await {
+        Ok(Some(json)) => json,
+        Ok(None) => {
+            if log_origin == "chat" {
+                eprintln!(
+                    "[P2P] Pré-chat : HTTP invalide ou JSON pour {}",
+                    url
+                );
+            }
+            return;
+        }
+        Err(_) => {
+            if log_origin == "chat" {
+                eprintln!("[P2P] Pré-chat : dépassement 4 s sur {}", url);
+            }
+            return;
+        }
+    };
+    let workers = match body.get("workers").and_then(|v| v.as_array()) {
+        Some(w) => w,
+        None => return,
+    };
+    let mut registry_count = 0usize;
+    for worker in workers {
+        if worker.get("mode").and_then(|v| v.as_str()) != Some("worker") {
+            continue;
+        }
+        let Some(peer_str) = worker.get("peerId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if peer_str == my_peer_id.to_string() {
+            continue;
+        }
+        let Ok(peer_id) = peer_str.parse::<PeerId>() else {
+            continue;
+        };
+        if Some(peer_id) == bootstrap_peer_id {
+            continue;
+        }
+        registry_count += 1;
+        let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", boot_addr_str, peer_id);
+        let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() else {
+            continue;
+        };
+        swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
+        let newly_discovered = discovered_peers.insert(peer_id);
+        if newly_discovered {
+            match log_origin {
+                "heartbeat" => println!("[P2P] Worker heartbeat ajouté : {}", peer_id),
+                _ => println!("[P2P] Pré-chat : worker depuis API : {}", peer_id),
+            }
+        }
+        if !active_peers.lock().unwrap().contains(&peer_id) {
+            if let Err(e) = swarm.dial(relay_addr) {
+                eprintln!(
+                    "[!] Dial worker {} échoué ({:?})",
+                    peer_id, e
+                );
+            } else {
+                match log_origin {
+                    "heartbeat" => println!("[P2P] Dial worker heartbeat : {}", peer_id),
+                    _ => println!("[P2P] Pré-chat : dial relay vers {}", peer_id),
+                }
+            }
+        }
+    }
+    if let Some(atom) = registry_worker_count {
+        atom.store(registry_count, Ordering::Relaxed);
     }
 }
 
@@ -451,6 +664,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 config
             }
         )?
+        .with_quic()
         .with_dns()?
         .with_relay_client(
             noise::Config::new,
@@ -464,7 +678,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let peer_id = key.public().to_peer_id();
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
             let mut rr_config = request_response::Config::default();
-            rr_config.set_request_timeout(Duration::from_secs(600));
+            let p2p_request_timeout_s = env_u64_clamped("VRYX_P2P_REQUEST_TIMEOUT_S", 3600, 30, 7200);
+            rr_config.set_request_timeout(Duration::from_secs(p2p_request_timeout_s));
             // Codec personnalisé 512 MB pour le transfert de tranches de poids LLM.
             let request_response = request_response::Behaviour::with_codec(
                 vryx_codec::Codec::<TensorRequest, TensorResponse>::default(),
@@ -486,7 +701,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 config.reservation_duration = Duration::from_secs(3600);
                 config.max_reservations = 1000;
                 config.max_circuits = 1000;
-                config.max_circuit_duration = Duration::from_secs(600); // 10 min
+                config.max_circuit_duration = Duration::from_secs(3600);
                 config.max_circuit_bytes = 1024 * 1024 * 1024; // 1 GB
                 // Désactivation des rate limiters pour debug
                 config.reservation_rate_limiters = vec![];
@@ -507,12 +722,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 dcutr,
             })
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
+        .with_swarm_config(|c| {
+            let idle_timeout_s = env_u64_clamped("VRYX_P2P_IDLE_TIMEOUT_S", 900, 30, 7200);
+            c.with_idle_connection_timeout(Duration::from_secs(idle_timeout_s))
+        })
         .build();
 
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", args.p2p_port).parse()?)?;
+    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", args.p2p_port).parse()?)?;
     if args.mode == "bootstrap" {
         swarm.add_external_address(format!("/ip4/51.222.26.225/tcp/{}", args.p2p_port).parse()?);
+        swarm.add_external_address(format!("/ip4/51.222.26.225/udp/{}/quic-v1", args.p2p_port).parse()?);
     }
 
     let my_peer_id = *swarm.local_peer_id();
@@ -556,13 +776,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     #[derive(Debug)]
     enum PendingMeta {
-        P2pRelayReply(tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>),
+        P2pRelayReply {
+            reply_tx: tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>,
+            relay_started: Instant,
+            hidden_bytes: u64,
+            persistent_relay: bool,
+            connection_reuse: bool,
+        },
         Forwarded { original_channel: request_response::ResponseChannel<TensorResponse> },
     }
 
     let mut pending_requests: HashMap<
         request_response::OutboundRequestId,
         (TensorRequest, PendingMeta),
+    > = HashMap::new();
+    // Requêtes POST /api/p2p/relay avant qu'une première connexion libp2p existe : send_request trop tôt → DialFailure libp2p.
+    let mut pending_relay_until_connected: HashMap<
+        PeerId,
+        VecDeque<(
+            TensorRequest,
+            tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>,
+            Instant,
+        )>,
     > = HashMap::new();
 
     type ChatApiTx = tokio::sync::oneshot::Sender<serde_json::Value>;
@@ -576,9 +811,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
     }
     let mut chat_state = ChatState::Idle;
+    // Requêtes `/api/chat` reçues pendant une génération en cours (évite « inférence encore en cours »).
+    let mut chat_pending: VecDeque<(String, Option<ChatApiTx>)> = VecDeque::new();
+    let chat_queue_max: usize = std::env::var("VRYX_CHAT_QUEUE_MAX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64usize)
+        .clamp(1, 256);
+    let hidden_quic_requested = std::env::var("VRYX_HIDDEN_QUIC")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     // ── Shared State (pour l'API Axum) ────────────────────────────────────
     let active_peers = Arc::new(Mutex::new(HashSet::<PeerId>::new()));
+    // Compteur par pair : plusieurs connexions simultanées (QUIC + relay, etc.) sont courantes ;
+    // ne pas retirer le pair de `active_peers` à la fermeture d'un seul canal.
+    let peer_connection_count = Arc::new(Mutex::new(HashMap::<PeerId, u32>::new()));
+    // Dernier nombre de workers mode « worker » vus via GET /api/workers/status (aligné sur la base / heartbeat).
+    let initiator_registry_workers = Arc::new(AtomicUsize::new(0));
     let tokens_in = Arc::new(AtomicU64::new(0));
     let tokens_out = Arc::new(AtomicU64::new(0));
     let tokens_generated = Arc::new(AtomicU64::new(0));
@@ -607,26 +857,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let p2p_relay_axum = p2p_relay_tx.clone();
         let mode_chat = args.mode.clone();
         let mode_relay = args.mode.clone();
-        let mode_tp_peers = args.mode.clone();
+        let mode_status_diag = args.mode.clone();
+        let mode_tp_diag = args.mode.clone();
+        let grpc_axum_health = args.grpc_port;
+        let api_axum_port = args.api_port;
+        let active_status_peers = Arc::clone(&active_peers);
+        let active_relay_peers = Arc::clone(&active_peers);
         let active_tp_peers = Arc::clone(&active_peers);
+        let quic_requested_status = hidden_quic_requested;
+        let registry_status_peers = Arc::clone(&initiator_registry_workers);
 
         let app = Router::new()
             .route("/api/status", get(move || {
-                let connections = active_peers.lock().unwrap().len();
+                let connections = active_status_peers.lock().unwrap().len();
                 let t_in = tokens_in.load(Ordering::Relaxed);
                 let t_out = tokens_out.load(Ordering::Relaxed);
                 let t_gen = tokens_generated.load(Ordering::Relaxed);
                 let shard = last_shard_trace_axum.lock().unwrap().clone();
+                let active_orch_snap = Arc::clone(&active_status_peers);
+                let mode_s = mode_status_diag.clone();
+                let boot_id = boot_for_tp_api;
+                let me_id = my_peer_id;
+                let grpc_s = grpc_axum_health;
+                let api_s = api_axum_port;
                 async move {
                     let mut j = serde_json::json!({
                         "peer_id": my_peer_id_str,
+                        "daemon_mode": mode_s,
                         "active_connections": connections,
                         "tokens_in": t_in,
                         "tokens_out": t_out,
                         "tokens_generated": t_gen,
+                        "quic_requested": quic_requested_status,
+                        "quic_available": true,
+                        "quic_used": quic_requested_status,
+                        "quic_fallback": if quic_requested_status { "native_quic_enabled" } else { "disabled" },
                     });
                     if let Some(obj) = j.as_object_mut() {
                         obj.insert("last_shard_trace".into(), shard.unwrap_or(serde_json::Value::Null));
+                        if mode_s == "initiator" {
+                            let n_live = {
+                                let snap = active_orch_snap.lock().unwrap();
+                                snap.iter()
+                                    .copied()
+                                    .filter(|&pid| {
+                                        boot_id.map(|b| b != pid).unwrap_or(true) && pid != me_id
+                                    })
+                                    .count()
+                            };
+                            let n_reg = registry_status_peers.load(Ordering::Relaxed);
+                            // Les dials relay peuvent rester sans « Connexion établie » immédiate alors que les workers sont bien listés dans l’API (heartbeat).
+                            let n_workers = n_live.max(n_reg);
+                            obj.insert(
+                                "orchestrator_health".into(),
+                                serde_json::json!({
+                                    "ok": true,
+                                    "grpc_stage1_port": grpc_s,
+                                    "axum_api_port": api_s,
+                                    "workers_connected_p2p": n_live,
+                                    "workers_visible_p2p": n_workers,
+                                }),
+                            );
+                        }
                     }
                     Json(j)
                 }
@@ -635,7 +927,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "/api/tp-peers",
                 get({
                     let active = Arc::clone(&active_tp_peers);
-                    let mode = mode_tp_peers.clone();
+                    let mode = mode_tp_diag.clone();
                     let boot = boot_for_tp_api;
                     let me = my_peer_id;
                     move || async move {
@@ -677,10 +969,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     return (axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Node not in initiator mode"})));
                 }
                 if let Some(prompt) = payload["prompt"].as_str() {
+                    let quantization = payload
+                        .get("quantization")
+                        .or_else(|| payload.get("hidden_transport"))
+                        .and_then(|v| v.as_str())
+                        .filter(|v| matches!(*v, "q4" | "int8" | "fp16"))
+                        .unwrap_or("int8");
+                    let pool_preference = payload
+                        .get("pool_preference")
+                        .and_then(|v| v.as_str())
+                        .filter(|v| matches!(*v, "auto" | "velocity_mlx" | "velocity_vllm" | "legacy_pytorch"))
+                        .unwrap_or("auto");
+                    let mut request_obj = serde_json::json!({
+                        "prompt": prompt,
+                        "quantization": quantization,
+                        "hidden_transport": quantization,
+                        "pool_preference": pool_preference,
+                    });
+                    if let Some(mt) =
+                        payload
+                            .get("max_new_tokens")
+                            .and_then(|v| {
+                                v.as_u64().or_else(|| {
+                                    v.as_i64().and_then(|i| {
+                                        if i >= 1 { Some(i as u64) } else { None }
+                                    })
+                                })
+                            })
+                            .filter(|&mt| mt >= 1 && mt <= 4096)
+                    {
+                        request_obj["max_new_tokens"] = serde_json::json!(mt);
+                    }
+                    let request_payload = request_obj.to_string();
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = cmd_tx_axum.send((prompt.to_string(), Some(tx)));
+                    let _ = cmd_tx_axum.send((request_payload, Some(tx)));
                     
-                    match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(3600), rx).await {
                         Ok(Ok(response)) => {
                             if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
                                 (axum::http::StatusCode::BAD_REQUEST, Json(response))
@@ -735,6 +1059,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 };
                 let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let persistent_relay = payload
+                    .get("persistent_relay")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let routing_path = payload.get("routing_path").and_then(|v| v.as_array()).map(|arr| {
                     arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
                 }).unwrap_or_default();
@@ -749,13 +1077,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     session_id,
                 };
                 let (tx, rx) = tokio::sync::oneshot::channel();
+                let connection_reuse = active_relay_peers.lock().unwrap().contains(&peer);
                 if p2p_relay_axum.send((peer, req, tx)).is_err() {
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({"ok": false, "error": "Canal relais indisponible."})),
                     );
                 }
-                match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(3600), rx).await {
                     Ok(Ok(Ok(resp))) => {
                         let data_b64 = general_purpose::STANDARD.encode(&resp.data);
                         (
@@ -763,6 +1092,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             Json(serde_json::json!({
                                 "ok": true,
                                 "data_b64": data_b64,
+                                "relay_ms": resp.vps_delegate_ms,
+                                "serialization_ms": resp.serialization_time_ns / 1_000_000,
+                                "hidden_bytes": resp.p2p_messages_in,
+                                "persistent_relay": persistent_relay,
+                                "connection_reuse": connection_reuse,
                                 "prompt_tokens": resp.prompt_tokens_llm,
                                 "completion_tokens": resp.completion_tokens_llm,
                                 "total_tokens": resp.total_tokens_llm,
@@ -858,6 +1192,138 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InferenceResult>();
 
+    // Démarre Stage 1 (orchestrateur local) vers le premier worker actif. Retourne `true` si un job a été lancé.
+    macro_rules! try_start_chat_inference {
+        ($prompt_line:expr, $resp_tx:expr) => {{
+            let prompt_line = $prompt_line;
+            let mut resp_opt = $resp_tx;
+            let active_snapshot = active_peers.lock().unwrap().clone();
+            // Préférer un worker à la fois dans la DHT/API et connecté ; sinon secours : worker seulement
+            // « découvert » (p.ex. une connexion relay vient de retomber alors que le heartbeat API est encore bon).
+            let worker = {
+                let mut cand: Vec<PeerId> = discovered_peers
+                    .iter()
+                    .copied()
+                    .filter(|p| !bootstrap_peer_id.is_some_and(|b| b == *p))
+                    .collect();
+                cand.sort_by_key(|p| p.to_string());
+                cand.iter()
+                    .find(|p| active_snapshot.contains(p))
+                    .copied()
+                    .or_else(|| cand.first().copied())
+            };
+            if let Some(peer) = worker {
+                if !active_snapshot.contains(&peer) {
+                    eprintln!(
+                        "[P2P] Chat : secours (worker connu via API / dial, pas encore dans active_peers) → {}",
+                        peer
+                    );
+                }
+                let prompt = prompt_line.clone();
+                print!("> Assistant : ");
+                let _ = tokio::io::stdout().flush().await;
+                let request_started = Instant::now();
+                let tx_stage1 = tx.clone();
+                let grpc_port = args.grpc_port;
+                let p_clone = prompt.clone();
+                let stage1_timeout_secs = std::env::var("VRYX_STAGE1_TIMEOUT_S")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| env_u64_clamped("VRYX_INFERENCE_TIMEOUT_S", 600, 600, 3600))
+                    .clamp(600, 3600);
+                tokio::spawn(async move {
+                    match tokio::time::timeout(Duration::from_secs(stage1_timeout_secs), call_local_inference(
+                        grpc_port,
+                        p_clone.as_bytes().to_vec(),
+                        "text".to_string(),
+                        vec![],
+                        String::new(),
+                    ))
+                    .await
+                    {
+                        Ok(Ok((data, c, s, m, c_ms))) => {
+                            let pipe = m.pipeline_trace_json.clone();
+                            let _ = tx_stage1.send(InferenceResult::Stage1 {
+                                peer_id: peer,
+                                data,
+                                c,
+                                s,
+                                continuation_response_tx: None,
+                                request_started,
+                                pipeline_trace_json: pipe,
+                                compute_time_ms: c_ms,
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            let _ = tx_stage1.send(InferenceResult::Error {
+                                context: "Stage 1".to_string(),
+                                message: e.to_string(),
+                            });
+                        }
+                        Err(_) => {
+                            let _ = tx_stage1.send(InferenceResult::Error {
+                                context: "Stage 1 timeout".to_string(),
+                                message: format!(
+                                    "Stage 1 n'a pas répondu après {}s. Vérifiez que les workers compatibles avec le modèle sont actifs.",
+                                    stage1_timeout_secs
+                                ),
+                            });
+                        }
+                    }
+                });
+                chat_state = ChatState::Generating {
+                    response_tx: resp_opt.take(),
+                    request_started,
+                };
+                true
+            } else {
+                println!(
+                    "[!] Aucun worker découvert pour l'instant. \
+                     Attendez la connexion au bootstrap…"
+                );
+                if let Some(tx) = resp_opt.take() {
+                    let _ = tx.send(serde_json::json!({
+                        "ok": false,
+                        "error": "Aucun worker P2P connecté encore (découverte API ou relais en cours). Vérifiez le bootstrap et les journaux initiateur (« Pré-chat », « Dial », « Connexion établie »). Réessayez après quelques secondes si les workers ont un heartbeat récent."
+                    }));
+                }
+                print!("> Vous : ");
+                let _ = tokio::io::stdout().flush().await;
+                false
+            }
+        }};
+    }
+
+    macro_rules! drain_chat_pending_after_idle {
+        () => {
+            while matches!(chat_state, ChatState::Idle) {
+                let Some((ql, qtx)) = chat_pending.pop_front() else {
+                    break;
+                };
+                if try_start_chat_inference!(ql, qtx) {
+                    break;
+                }
+            }
+        };
+    }
+
+    // Stage 1 part par gRPC local : les connexions relay peuvent être vides alors que Python orchestre encore des workers ;
+    // tant que l’API liste des workers ou qu’un pair non-bootstrap reste dans `active_peers`, on ne doit pas court-circuiter.
+    let chat_cancel_keepalive_signal = {
+        let active_for_cancel = Arc::clone(&active_peers);
+        let boot_cancel = bootstrap_peer_id;
+        let registry_for_cancel = Arc::clone(&initiator_registry_workers);
+        move || {
+            let has_non_boot_connected = active_for_cancel
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| !boot_cancel.is_some_and(|b| *p == b));
+            has_non_boot_connected
+                || registry_for_cancel.load(Ordering::Relaxed) > 0
+        }
+    };
+
     // ── Boucle principale ─────────────────────────────────────────────────
     loop {
         tokio::select! {
@@ -865,11 +1331,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
             relay_cmd = p2p_relay_rx.recv(), if args.mode == "initiator" => {
                 let Some((peer, req, reply_tx)) = relay_cmd else { continue };
                 let req_clone = req.clone();
-                let req_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&peer, req);
-                pending_requests.insert(req_id, (req_clone, PendingMeta::P2pRelayReply(reply_tx)));
+                let relay_started = Instant::now();
+                let hidden_bytes = req_clone.data.len() as u64;
+                let persistent_relay = true;
+                let connected_now = active_peers.lock().unwrap().contains(&peer);
+                let connection_reuse = connected_now;
+                if connected_now {
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, req);
+                    pending_requests.insert(req_id, (req_clone, PendingMeta::P2pRelayReply {
+                        reply_tx,
+                        relay_started,
+                        hidden_bytes,
+                        persistent_relay,
+                        connection_reuse,
+                    }));
+                } else {
+                    eprintln!(
+                        "[P2P] Relais HTTP vers {} avant connexion P2P : dial circuit bootstrap + mise en file (payload ~ {:.1} Ko)",
+                        peer,
+                        hidden_bytes as f64 / 1024.0
+                    );
+                    if let Some(bs) = args
+                        .bootstrap_node
+                        .as_ref()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                    {
+                        let relay_addr_str =
+                            format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), peer);
+                        if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
+                            swarm.behaviour_mut().kad.add_address(&peer, ma.clone());
+                            if let Err(e) = swarm.dial(ma) {
+                                eprintln!("[!] Relais dial circuit vers worker : {:?}", e);
+                            }
+                        }
+                    }
+                    pending_relay_until_connected
+                        .entry(peer)
+                        .or_default()
+                        .push_back((req, reply_tx, Instant::now()));
+                }
             }
 
             // ── stdin : chat initiator ──────────────────────────────────
@@ -880,84 +1384,97 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
                 if line.is_empty() { continue }
 
-                // Auto-reset si le ChatState est bloqué en Generating depuis plus de 95s
-                // (le timeout Axum est 90s, donc response_tx est déjà mort).
+                // Auto-reset : si l'inférence dépasse VRYX_INFERENCE_TIMEOUT_S (défaut 600s)
+                // ou si plus aucun worker n'est actif, on débloque le state immédiatement.
+                let inference_timeout_secs: u64 = std::env::var("VRYX_INFERENCE_TIMEOUT_S")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(600)
+                    .clamp(600, 3600);
                 if let ChatState::Generating { request_started, .. } = &chat_state {
-                    if request_started.elapsed().as_secs() > 95 {
-                        eprintln!("[!] ChatState::Generating expiré (>95s), reset à Idle.");
+                    let no_workers_for_cancel = !chat_cancel_keepalive_signal();
+                    let elapsed = request_started.elapsed().as_secs();
+                    if elapsed > inference_timeout_secs {
+                        eprintln!(
+                            "[!] ChatState::Generating expiré ({}s > {}s), reset à Idle.",
+                            elapsed, inference_timeout_secs
+                        );
+                        // Renvoyer une erreur propre à la requête en attente
+                        if let ChatState::Generating { response_tx, .. } = &mut chat_state {
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(serde_json::json!({
+                                    "ok": false,
+                                    "error": format!(
+                                        "Inférence expirée après {}s. Aucun résultat reçu.",
+                                        elapsed
+                                    ),
+                                }));
+                            }
+                        }
                         chat_state = ChatState::Idle;
+                        drain_chat_pending_after_idle!();
+                    } else if no_workers_for_cancel && elapsed > 45 {
+                        eprintln!(
+                            "[!] Génération en cours mais aucun signal worker ({}s sans P2P ni registre API). Reset à Idle.",
+                            elapsed
+                        );
+                        if let ChatState::Generating { response_tx, .. } = &mut chat_state {
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(serde_json::json!({
+                                    "ok": false,
+                                    "error": "Aucun worker P2P actif. La génération a été annulée.",
+                                }));
+                            }
+                        }
+                        chat_state = ChatState::Idle;
+                        drain_chat_pending_after_idle!();
                     }
                 }
 
                 if !matches!(chat_state, ChatState::Idle) {
-                    println!("[!] Génération en cours, patientez…");
-                    if let Some(resp_tx) = resp_tx {
-                        let _ = resp_tx.send(serde_json::json!({
-                            "ok": false,
-                            "error": "Inférence précédente encore en cours, réessayez dans quelques secondes."
-                        }));
+                    if chat_pending.len() >= chat_queue_max {
+                        println!(
+                            "[!] File d'attente chat saturée (max {}).",
+                            chat_queue_max
+                        );
+                        if let Some(tx) = resp_tx {
+                            let _ = tx.send(serde_json::json!({
+                                "ok": false,
+                                "error": format!(
+                                    "Trop de requêtes en file d'attente (max {}). Réessayez après les réponses en cours.",
+                                    chat_queue_max
+                                ),
+                            }));
+                        }
+                    } else {
+                        println!(
+                            "[*] Génération en cours : requête mise en file (position {}).",
+                            chat_pending.len() + 1
+                        );
+                        chat_pending.push_back((line, resp_tx));
                     }
                     continue;
                 }
 
-                // Cherche un worker actif (exclut le bootstrap et les anciens peers Kad déconnectés)
-                let active_snapshot = active_peers.lock().unwrap().clone();
-                let worker = discovered_peers
-                    .iter()
-                    .filter(|p| Some(**p) != bootstrap_peer_id)
-                    .find(|p| active_snapshot.contains(*p))
-                    .copied();
-
-                if let Some(peer) = worker {
-                    let prompt = line.clone();
-                    print!("> Assistant : ");
-                    tokio::io::stdout().flush().await?;
-
-                    let request_started = Instant::now();
-                    let tx_stage1 = tx.clone();
-                    let grpc_port = args.grpc_port;
-                    let p_clone = prompt.clone();
-                    tokio::spawn(async move {
-                        match call_local_inference(grpc_port, p_clone.as_bytes().to_vec(), "text".to_string(), vec![], String::new()).await {
-                            Ok((data, c, s, m, c_ms)) => {
-                                let pipe = m.pipeline_trace_json.clone();
-                                let _ = tx_stage1.send(InferenceResult::Stage1 {
-                                    peer_id: peer,
-                                    data,
-                                    c,
-                                    s,
-                                    continuation_response_tx: None,
-                                    request_started,
-                                    pipeline_trace_json: pipe,
-                                    compute_time_ms: c_ms,
-                                });
-                            }
-                            Err(e) => {
-                                let _ = tx_stage1.send(InferenceResult::Error {
-                                    context: "Stage 1".to_string(),
-                                    message: e.to_string(),
-                                });
-                            }
-                        }
-                    });
-                    chat_state = ChatState::Generating {
-                        response_tx: resp_tx,
-                        request_started,
-                    };
-                } else {
-                    println!(
-                        "[!] Aucun worker découvert pour l'instant. \
-                         Attendez la connexion au bootstrap…"
-                    );
-                    if let Some(tx) = resp_tx {
-                        let _ = tx.send(serde_json::json!({
-                            "ok": false,
-                            "error": "Aucun worker P2P découvert. Vérifiez qu'un nœud worker est en ligne."
-                        }));
+                if args.mode == "initiator" {
+                    if let Some(ref api_u) = args.api_url {
+                        initiator_pull_workers_from_api_now(
+                            &mut swarm,
+                            &http_client,
+                            api_u.as_str(),
+                            bootstrap_peer_id,
+                            args.bootstrap_node.as_ref(),
+                            my_peer_id,
+                            &mut discovered_peers,
+                            &active_peers,
+                            Some(&initiator_registry_workers),
+                            "chat",
+                        )
+                        .await;
                     }
-                    print!("> Vous : ");
-                    tokio::io::stdout().flush().await?;
                 }
+
+                let _ = try_start_chat_inference!(line, resp_tx);
             }
 
             // ── Résultats d'inférence (async) ──────────────────────────
@@ -1007,6 +1524,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }));
                                 }
                                 chat_state = ChatState::Idle;
+                                drain_chat_pending_after_idle!();
                                 print!("> Vous : ");
                                 let _ = tokio::io::stdout().flush().await;
                                 continue;
@@ -1015,7 +1533,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let layout = v.get("layout").and_then(|x| x.as_str()).unwrap_or("");
                                 let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
                                 // Court-circuiter le warmup P2P si Python a déjà géré la computation
-                                let skip_layouts = ["worker_only_pipeline", "pipeline_relay_daisy_chain", "distributed_fanout"];
+                                let skip_layouts = ["worker_only_pipeline", "pipeline_relay_daisy_chain", "distributed_fanout", "mlx_lm_direct_p2p"];
                                 ok && skip_layouts.contains(&layout)
                             }).unwrap_or(false);
 
@@ -1082,6 +1600,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }));
                                 }
                                 chat_state = ChatState::Idle;
+                                drain_chat_pending_after_idle!();
                                 print!("> Vous : ");
                                 let _ = tokio::io::stdout().flush().await;
                                 continue;
@@ -1109,6 +1628,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }));
                             }
                             chat_state = ChatState::Idle;
+                            drain_chat_pending_after_idle!();
                             print!("> Vous : ");
                             let _ = tokio::io::stdout().flush().await;
                             let _ = (peer_id, data, c, s, sched_warm, sched_workers);
@@ -1139,7 +1659,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = swarm.behaviour_mut().request_response.send_response(
                                 channel,
                                 TensorResponse {
-                                    data: format!("ERROR: {}", message).into_bytes(),
+                                    data: serde_json::json!({
+                                        "ok": false,
+                                        "error": message,
+                                    }).to_string().into_bytes(),
                                     ..Default::default()
                                 },
                             );
@@ -1162,6 +1685,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }));
                                 }
                                 chat_state = ChatState::Idle;
+                                drain_chat_pending_after_idle!();
                                 print!("> Vous : ");
                                 let _ = tokio::io::stdout().flush().await;
                             }
@@ -1180,7 +1704,109 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // ── Heartbeat status ───────────────────────────────────────
             _ = heartbeat_interval.tick() => {
+                // Surveillance périodique du ChatState : reset si expiré ou sans workers.
+                if args.mode == "initiator" {
+                    let inference_timeout_secs: u64 = std::env::var("VRYX_INFERENCE_TIMEOUT_S")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(600)
+                        .clamp(600, 3600);
+                    if let ChatState::Generating { request_started, .. } = &chat_state {
+                        let no_workers_for_cancel = !chat_cancel_keepalive_signal();
+                        let elapsed = request_started.elapsed().as_secs();
+                        let expired = elapsed > inference_timeout_secs;
+                        let stuck_no_worker = no_workers_for_cancel && elapsed > 120;
+                        if expired || stuck_no_worker {
+                            eprintln!(
+                                "[!] Heartbeat : ChatState::Generating bloqué {}s (expired={}, no_workers={}), reset à Idle.",
+                                elapsed, expired, stuck_no_worker
+                            );
+                            if let ChatState::Generating { response_tx, .. } = &mut chat_state {
+                                if let Some(tx) = response_tx.take() {
+                                    let reason = if stuck_no_worker {
+                                        "Aucun worker P2P actif. La génération a été annulée.".to_string()
+                                    } else {
+                                        format!("Inférence expirée après {}s.", elapsed)
+                                    };
+                                    let _ = tx.send(serde_json::json!({
+                                        "ok": false,
+                                        "error": reason,
+                                    }));
+                                }
+                            }
+                            chat_state = ChatState::Idle;
+                            drain_chat_pending_after_idle!();
+                        }
+                    }
+                    // Relay HTTP : timeouts des requêtes en file avant connexion P2P
+                    let relay_deadline_secs: u64 = std::env::var("VRYX_RELAY_PEER_CONNECT_DEADLINE_SEC")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(180_u64)
+                        .max(45);
+                    let relay_deadline = Duration::from_secs(relay_deadline_secs);
+                    let now_hb = Instant::now();
+                    for (_pt, dq) in pending_relay_until_connected.iter_mut() {
+                        while dq.front().is_some_and(|(_, _, enq)| {
+                            now_hb.saturating_duration_since(*enq) > relay_deadline
+                        }) {
+                            if let Some((_r, rtx, _)) = dq.pop_front() {
+                                let _ = rtx.send(Err(format!(
+                                    "RelayPeerConnectTimeout:{}s connexion absent vers worker (vérifier workers + bootstrap relay).",
+                                    relay_deadline_secs
+                                )));
+                                eprintln!("[!] Relay fichier attente abandonnée (timeout {}s avant connexion P2P).", relay_deadline_secs);
+                            }
+                        }
+                    }
+                    pending_relay_until_connected.retain(|_, dq| !dq.is_empty());
+                    let waiting: Vec<PeerId> = pending_relay_until_connected.keys().copied().collect();
+                    'redial_lp: for pt in waiting {
+                        if active_peers.lock().unwrap().contains(&pt) {
+                            continue 'redial_lp;
+                        }
+                        if let Some(bs) = args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                            let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), pt);
+                            if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
+                                swarm.behaviour_mut().kad.add_address(&pt, ma.clone());
+                                let _ = swarm.dial(ma);
+                            }
+                        }
+                    }
+                }
+
                 if let Some(api_url) = &args.api_url {
+                    let runtime_backend = std::env::var("VRYX_RUNTIME_BACKEND")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if std::env::var("VRYX_ENABLE_MLX_RUNTIME")
+                                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+                                .unwrap_or(false)
+                            {
+                                "mlx".to_string()
+                            } else {
+                                "pytorch".to_string()
+                            }
+                        })
+                        .to_lowercase();
+                    let supports_mlx = runtime_backend == "mlx"
+                        || std::env::var("VRYX_SUPPORTS_MLX")
+                            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+                            .unwrap_or(false)
+                        || std::env::var("VRYX_ENABLE_MLX_RUNTIME")
+                            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+                            .unwrap_or(false);
+                    let weight_quantization = std::env::var("VRYX_WEIGHT_QUANTIZATION")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| "fp16".to_string())
+                        .to_lowercase();
+                    let supports_q4_weights = supports_mlx
+                        || weight_quantization == "q4"
+                        || std::env::var("VRYX_SUPPORTS_Q4_WEIGHTS")
+                            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+                            .unwrap_or(false);
                     let payload = HeartbeatPayload {
                         peer_id: my_peer_id.to_string(),
                         mode: args.mode.clone(),
@@ -1193,53 +1819,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         tokens_generated: tokens_generated.load(Ordering::Relaxed),
                         p2p_peers: active_peers.lock().unwrap().len(),
                         model: model_name.clone(),
+                        gpu_name: std::env::var("VRYX_GPU_NAME").ok(),
+                        gpu_vram_mb: std::env::var("VRYX_GPU_VRAM_MB").ok().and_then(|v| v.parse::<u64>().ok()),
+                        runtime_backend: Some(runtime_backend),
+                        weight_quantization: Some(weight_quantization),
+                        supports_q4_weights,
+                        supports_mlx,
+                        supports_vllm: std::env::var("VRYX_SUPPORTS_VLLM")
+                            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+                            .unwrap_or(false),
                     };
                     send_heartbeat(&http_client, api_url, &payload).await;
 
                     // Initiator: fallback robuste de découverte depuis les heartbeats API.
-                    // Les workers peuvent être visibles en DB sans être encore découverts par Kademlia.
                     if args.mode == "initiator" {
-                        let url = format!("{}/api/workers/status", api_url.trim_end_matches('/'));
-                        if let Ok(resp) = http_client.get(&url).send().await {
-                            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                                if let Some(workers) = body.get("workers").and_then(|v| v.as_array()) {
-                                    for worker in workers {
-                                        if worker.get("mode").and_then(|v| v.as_str()) != Some("worker") {
-                                            continue;
-                                        }
-                                        let Some(peer_str) = worker.get("peerId").and_then(|v| v.as_str()) else {
-                                            continue;
-                                        };
-                                        if peer_str == my_peer_id.to_string() {
-                                            continue;
-                                        }
-                                        let Ok(peer_id) = peer_str.parse::<PeerId>() else {
-                                            continue;
-                                        };
-                                        if Some(peer_id) == bootstrap_peer_id {
-                                            continue;
-                                        }
-
-                                        if let Some(boot_addr) = &args.bootstrap_node {
-                                            let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", boot_addr, peer_id);
-                                            if let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() {
-                                                swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
-                                                if discovered_peers.insert(peer_id) {
-                                                    println!("[P2P] Worker heartbeat ajouté : {}", peer_id);
-                                                }
-                                                if !active_peers.lock().unwrap().contains(&peer_id) {
-                                                    if let Err(e) = swarm.dial(relay_addr.clone()) {
-                                                        eprintln!("[!] Dial worker heartbeat {} échoué : {:?}", peer_id, e);
-                                                    } else {
-                                                        println!("[P2P] Dial worker heartbeat : {}", peer_id);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        initiator_pull_workers_from_api_now(
+                            &mut swarm,
+                            &http_client,
+                            api_url,
+                            bootstrap_peer_id,
+                            args.bootstrap_node.as_ref(),
+                            my_peer_id,
+                            &mut discovered_peers,
+                            &active_peers,
+                            Some(&initiator_registry_workers),
+                            "heartbeat",
+                        )
+                        .await;
                     }
                 }
             }
@@ -1255,7 +1861,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         println!("[P2P] Connexion établie avec {} ({:?})", peer_id, endpoint);
-                        active_peers.lock().unwrap().insert(peer_id);
+                        let first_logical_link = {
+                            let mut c = peer_connection_count.lock().unwrap();
+                            let n = c.entry(peer_id).or_insert(0);
+                            *n += 1;
+                            *n == 1
+                        };
+                        if first_logical_link {
+                            active_peers.lock().unwrap().insert(peer_id);
+                            if args.mode == "initiator"
+                                && Some(peer_id) != bootstrap_peer_id
+                                && peer_id != my_peer_id
+                            {
+                                if let Some(q) = pending_relay_until_connected.remove(&peer_id) {
+                                    if !q.is_empty() {
+                                        eprintln!(
+                                            "[P2P] Connexion ouverte avec {} → envoi de {} requête(s) relay retardée(s)",
+                                            peer_id,
+                                            q.len()
+                                        );
+                                        for (r, rtx, _) in q {
+                                            let r_clone = r.clone();
+                                            let relay_started_i = Instant::now();
+                                            let hidden_b = r_clone.data.len() as u64;
+                                            let req_id_i = swarm
+                                                .behaviour_mut()
+                                                .request_response
+                                                .send_request(&peer_id, r);
+                                            pending_requests.insert(
+                                                req_id_i,
+                                                (
+                                                    r_clone,
+                                                    PendingMeta::P2pRelayReply {
+                                                        reply_tx: rtx,
+                                                        relay_started: relay_started_i,
+                                                        hidden_bytes: hidden_b,
+                                                        persistent_relay: true,
+                                                        connection_reuse: false,
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         println!("[P2P_READY] Connecté au réseau P2P");
                         let _ = tokio::io::stdout().flush().await;
                         if let Some(boot_id) = bootstrap_peer_id {
@@ -1275,9 +1925,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     println!("[P2P] Connexion fermée : {}", peer_id);
-                    active_peers.lock().unwrap().remove(&peer_id);
-                    if Some(peer_id) != bootstrap_peer_id {
-                        discovered_peers.remove(&peer_id);
+                    let disconnect_peer_entirely = {
+                        let mut c = peer_connection_count.lock().unwrap();
+                        match c.get_mut(&peer_id) {
+                            Some(n) if *n <= 1 => {
+                                c.remove(&peer_id);
+                                true
+                            }
+                            Some(n) => {
+                                *n -= 1;
+                                false
+                            }
+                            None => true,
+                        }
+                    };
+                    if disconnect_peer_entirely {
+                        active_peers.lock().unwrap().remove(&peer_id);
+                        if Some(peer_id) != bootstrap_peer_id {
+                            discovered_peers.remove(&peer_id);
+                        }
                     }
                 }
 
@@ -1359,6 +2025,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let tx_stage2 = tx.clone();
                     let grpc_port = args.grpc_port;
                     let dtype_in = request.dtype.clone();
+                    let prior_compute_ns = request.compute_time_ns;
                     let trace_shard = Arc::clone(&last_shard_trace);
                     let mut routing_path = request.routing_path.clone();
                     let session_id = request.session_id.clone();
@@ -1366,6 +2033,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     tokio::spawn(async move {
                         match call_local_inference(grpc_port, request.data, request.dtype, routing_path.clone(), session_id.clone()).await {
                             Ok((data, c, s, metrics, c_ms)) => {
+                                let total_compute_ns = prior_compute_ns.saturating_add(c);
+                                let total_compute_ms = (total_compute_ns / 1_000_000).max(c_ms);
                                 if dtype_in.starts_with("vryx.shard.")
                                     || dtype_in.starts_with("vryx.tp.")
                                     || dtype_in.starts_with("vryx.dist.")
@@ -1392,7 +2061,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                 kind: String::new(),
                                                 data,
                                                 dtype: dtype_in.clone(),
-                                                compute_time_ns: c,
+                                                compute_time_ns: total_compute_ns,
                                                 serialization_time_ns: s,
                                                 routing_path,
                                                 session_id,
@@ -1406,10 +2075,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 let _ = tx_stage2.send(InferenceResult::Stage2 {
                                     channel,
                                     data,
-                                    c,
+                                    c: total_compute_ns,
                                     s,
                                     metrics,
-                                    compute_time_ms: c_ms,
+                                    compute_time_ms: total_compute_ms,
                                 });
                             }
                             Err(e) => {
@@ -1431,8 +2100,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     },
                 )) => {
                     match pending_requests.remove(&request_id) {
-                        Some((_, PendingMeta::P2pRelayReply(reply_tx))) => {
-                            let _ = reply_tx.send(Ok(response.clone()));
+                        Some((_, PendingMeta::P2pRelayReply {
+                            reply_tx,
+                            relay_started,
+                            hidden_bytes,
+                            persistent_relay: _persistent_relay,
+                            connection_reuse: _connection_reuse,
+                        })) => {
+                            let mut response_with_metrics = response.clone();
+                            response_with_metrics.vps_delegate_ms = relay_started.elapsed().as_millis() as u64;
+                            response_with_metrics.p2p_messages_in = hidden_bytes;
+                            if response_with_metrics.serialization_time_ns == 0 {
+                                response_with_metrics.serialization_time_ns = response.serialization_time_ns;
+                            }
+                            let _ = reply_tx.send(Ok(response_with_metrics));
                         }
                         Some((_, PendingMeta::Forwarded { original_channel })) => {
                             let _ = swarm.behaviour_mut().request_response.send_response(original_channel, response.clone());
@@ -1449,17 +2130,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     },
                 )) => {
                     eprintln!("[!] Échec envoi vers {} : {}", peer, error);
-                    if let Some((_req, meta)) = pending_requests.remove(&request_id) {
+                    if let Some((req_retry, meta)) = pending_requests.remove(&request_id) {
                         match meta {
-                            PendingMeta::P2pRelayReply(reply_tx) => {
-                                let _ = reply_tx.send(Err(format!("{:?}", error)));
+                            PendingMeta::P2pRelayReply { reply_tx, .. } => {
+                                let es = format!("{:?}", error);
+                                let dial_like_fail = args.mode == "initiator"
+                                    && (es.contains("DialFailure")
+                                        || es.contains("NotConnected"));
+                                if dial_like_fail {
+                                    eprintln!(
+                                        "[P2P] Échec type dial après envoi relay → éviction vue connexion peer {} + mise en retry file",
+                                        peer
+                                    );
+                                    active_peers.lock().unwrap().remove(&peer);
+                                    peer_connection_count.lock().unwrap().remove(&peer);
+                                    if let Some(bs) =
+                                        args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
+                                    {
+                                        let relay_addr_str =
+                                            format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), peer);
+                                        if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
+                                            swarm.behaviour_mut().kad.add_address(&peer, ma.clone());
+                                            let _ = swarm.dial(ma);
+                                        }
+                                    }
+                                    pending_relay_until_connected.entry(peer).or_default().push_back((
+                                        req_retry,
+                                        reply_tx,
+                                        Instant::now(),
+                                    ));
+                                } else {
+                                    let _ = reply_tx.send(Err(es));
+                                }
                                 continue;
                             }
                             PendingMeta::Forwarded { original_channel } => {
                                 let _ = swarm.behaviour_mut().request_response.send_response(
                                     original_channel,
                                     TensorResponse {
-                                        data: format!("ERROR: Pipeline hop failed at {}", peer).into_bytes(),
+                                        data: serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("Pipeline hop failed at {}: {}", peer, error),
+                                        }).to_string().into_bytes(),
                                         ..Default::default()
                                     },
                                 );

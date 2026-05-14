@@ -1,6 +1,7 @@
 #!/bin/bash
-# Lance 3 workers Vryx sur macOS (Python stage 2 + daemon Rust chacun).
-# Ports distincts : gRPC 50052–50054, API Axum 3031–3033, libp2p 4021–4023.
+# Lance des workers Vryx sur macOS (Python stage 2 + daemon Rust chacun).
+# Par défaut : 1 worker (RAM). Ports : gRPC 50052+, API Axum 3031+, libp2p 4021+.
+# Multi-workers : export VRYX_WORKER_COUNT=4
 #
 # Optionnel :
 #   export VRYX_WORKER_MODEL="unsloth/gemma-2-9b-it"
@@ -16,10 +17,13 @@ KEYS_DIR="${SCRIPT_DIR}/.vryx-keys-mac"
 BOOTSTRAP_NODE="${VRYX_BOOTSTRAP_NODE:-/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz}"
 MODEL_ID="${VRYX_WORKER_MODEL:-unsloth/gemma-2-9b-it}"
 API_URL="${VRYX_WORKER_API_URL:-https://vryx.eu}"
+WORKER_COUNT="${VRYX_WORKER_COUNT:-1}"
 
-if [[ ! -f "${DAEMON_BIN}" ]]; then
+if [[ ! -f "${DAEMON_BIN}" || "${SCRIPT_DIR}/rust-daemon/src/main.rs" -nt "${DAEMON_BIN}" || "${SCRIPT_DIR}/rust-daemon/Cargo.toml" -nt "${DAEMON_BIN}" ]]; then
   echo "[*] Compilation du daemon Rust…"
-  (cd "${SCRIPT_DIR}/rust-daemon" && cargo build --release)
+  (cd "${SCRIPT_DIR}/rust-daemon" && CARGO_TARGET_DIR=/tmp/vryx-rust-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo build --release --locked --message-format short)
+  mkdir -p "${SCRIPT_DIR}/target/release"
+  cp /tmp/vryx-rust-target/release/rust-daemon "${DAEMON_BIN}"
 fi
 
 if [[ ! -d "${VENV_PATH}" ]]; then
@@ -35,23 +39,20 @@ fi
 
 mkdir -p "${KEYS_DIR}"
 
-echo "[*] Arrêt des anciens workers sur les ports 50052–50054 / 3031–3033 / 4021–4023…"
-for p in 50052 50053 50054 3031 3032 3033 4021 4022 4023; do
+echo "[*] Arrêt des anciens workers sur les ports 50052–50060 / 3031–3039 / 4021–4029…"
+for p in 50052 50053 50054 50055 50056 50057 50058 50059 50060 3031 3032 3033 3034 3035 3036 3037 3038 3039 4021 4022 4023 4024 4025 4026 4027 4028 4029; do
   lsof -ti:"${p}" | xargs kill -9 2>/dev/null || true
 done
 
-PIDS_FILE="/tmp/vryx-mac-3-workers.pids"
+PIDS_FILE="/tmp/vryx-mac-workers.pids"
 rm -f "${PIDS_FILE}"
 
 start_one() {
   local n="$1"
   local grpc api p2p
-  case "${n}" in
-    1) grpc=50052; api=3031; p2p=4021 ;;
-    2) grpc=50053; api=3032; p2p=4022 ;;
-    3) grpc=50054; api=3033; p2p=4023 ;;
-    *) echo "[!] Index worker invalide"; exit 1 ;;
-  esac
+  grpc=$((50051 + n))
+  api=$((3030 + n))
+  p2p=$((4020 + n))
 
   local keyfile="${KEYS_DIR}/worker-${n}.key"
   local log_py="/tmp/vryx-mac-worker${n}-python.log"
@@ -59,7 +60,13 @@ start_one() {
 
   echo "[+] Worker ${n} : gRPC ${grpc}, API ${api}, P2P ${p2p}"
 
-  PYTHONUNBUFFERED=1 nohup python3 "${PYTHON_DIR}/inference_server.py" \
+  VRYX_WORKER_KV_CACHE=true \
+  VRYX_HIDDEN_TRANSPORT=int8 \
+  VRYX_HIDDEN_QUIC=1 \
+  VRYX_PERSISTENT_RELAY=1 \
+  VRYX_PIPELINE_CHAIN_MODE="${VRYX_PIPELINE_CHAIN_MODE:-initiator_sequential}" \
+  VRYX_PREFIX_CACHE=1 \
+  PYTHONUNBUFFERED=1 nohup "${VENV_PATH}/bin/python" "${PYTHON_DIR}/inference_server.py" \
     --port "${grpc}" \
     --stage 2 \
     --model "${MODEL_ID}" \
@@ -68,6 +75,9 @@ start_one() {
 
   sleep 0.5
 
+  VRYX_HIDDEN_QUIC=1 \
+  VRYX_P2P_REQUEST_TIMEOUT_S=3600 \
+  VRYX_P2P_IDLE_TIMEOUT_S=900 \
   nohup "${DAEMON_BIN}" \
     --mode worker \
     --grpc-port "${grpc}" \
@@ -81,16 +91,16 @@ start_one() {
   echo "$!" >> "${PIDS_FILE}"
 }
 
-for i in 1 2 3; do
+for i in $(seq 1 "${WORKER_COUNT}"); do
   start_one "${i}"
   sleep 1
 done
 
 echo ""
-echo "[OK] 3 workers lancés (6 processus : 3× Python gRPC + 3× Rust P2P)."
+echo "[OK] ${WORKER_COUNT} workers lancés (${WORKER_COUNT}× Python gRPC + ${WORKER_COUNT}× Rust P2P)."
 echo "    PIDs enregistrés dans ${PIDS_FILE}"
-echo "    Journaux : /tmp/vryx-mac-worker{1,2,3}-{python,rust}.log"
-echo "    API locales : http://127.0.0.1:3031 … 3033 (GET /api/status)"
+echo "    Journaux : /tmp/vryx-mac-worker{1..${WORKER_COUNT}}-{python,rust}.log"
+echo "    API locales : http://127.0.0.1:3031 … $((3030 + WORKER_COUNT)) (GET /api/status)"
 echo ""
 echo "    Pour tout arrêter : ./stop-3-workers-mac.sh"
 echo ""

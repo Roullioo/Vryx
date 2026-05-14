@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
-import { apiJson } from '../lib/api'
+import type { PoolGraphLink, PoolGraphNode } from '../components/admin/PoolNetworkGraph'
+import { apiJson, apiUrl } from '../lib/api'
+
+const PoolNetworkGraph = lazy(() =>
+  import('../components/admin/PoolNetworkGraph').then((m) => ({ default: m.PoolNetworkGraph })),
+)
 
 type RegisteredWorker = {
   peerId: string
@@ -20,6 +25,18 @@ type RegisteredWorker = {
   firstSeenAt: string | null
   online: boolean
   secondsSinceHeartbeat: number
+  gpuName?: string | null
+  gpuVramMb?: number | null
+}
+
+type PoolStreamPayload = {
+  ok: boolean
+  pipelineActive?: boolean
+  nodes?: PoolGraphNode[]
+  links?: PoolGraphLink[]
+  registeredWorkers?: RegisteredWorker[]
+  streamEvent?: string
+  error?: string
 }
 
 function fmt(n: number) {
@@ -60,7 +77,8 @@ function WorkerCard({ w }: { w: RegisteredWorker }) {
             <span className="font-mono text-[11px] font-semibold text-fg">{truncate(w.peerId, 20)}</span>
           </div>
           <p className="mt-1 text-xs text-muted">
-            {w.publicIp ?? '—'} · {w.model ?? 'Modèle inconnu'}
+            {w.publicIp ?? '—'}
+            {w.gpuName ? ` · ${w.gpuName}` : ''} · {w.model ?? 'Modèle inconnu'}
           </p>
         </div>
         <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase ${
@@ -110,6 +128,10 @@ function WorkerCard({ w }: { w: RegisteredWorker }) {
 export function AdminWorkersPage() {
   const [workers, setWorkers] = useState<RegisteredWorker[]>([])
   const [loading, setLoading] = useState(true)
+  const [graphNodes, setGraphNodes] = useState<PoolGraphNode[]>([])
+  const [graphLinks, setGraphLinks] = useState<PoolGraphLink[]>([])
+  const [pipelineActive, setPipelineActive] = useState(false)
+  const [streamLabel, setStreamLabel] = useState<string>('Connexion SSE…')
 
   const refresh = useCallback(async () => {
     const r = await apiJson<{ workers: RegisteredWorker[] }>('/api/admin/workers/registered')
@@ -118,43 +140,84 @@ export function AdminWorkersPage() {
   }, [])
 
   useEffect(() => {
-    const tid = window.setTimeout(() => {
-      void refresh()
-    }, 0)
-    return () => window.clearTimeout(tid)
-  }, [refresh])
-  useEffect(() => {
-    const id = setInterval(refresh, 10_000)
-    return () => clearInterval(id)
+    void refresh()
   }, [refresh])
 
+  useEffect(() => {
+    const url = apiUrl('/api/admin/pool/stream')
+    const es = new EventSource(url)
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data) as PoolStreamPayload
+        if (data.ok && Array.isArray(data.registeredWorkers)) {
+          setWorkers(data.registeredWorkers)
+          setLoading(false)
+        }
+        if (data.ok && Array.isArray(data.nodes) && Array.isArray(data.links)) {
+          setGraphNodes(data.nodes)
+          setGraphLinks(data.links)
+          setPipelineActive(!!data.pipelineActive)
+        }
+        if (data.streamEvent) setStreamLabel(`SSE · ${data.streamEvent}`)
+      } catch {
+        /* ignore */
+      }
+    }
+    es.onerror = () => {
+      setStreamLabel('SSE interrompu — les données peuvent être obsolètes.')
+    }
+    return () => es.close()
+  }, [])
+
   const online = workers.filter((w) => w.online)
-  const offline = workers.filter((w) => !w.online)
   const totalTokens = workers.reduce((s, w) => s + w.tokensGenerated, 0)
 
   return (
     <AdminShell
       title="Workers"
-      subtitle={`${workers.length} nœud${workers.length > 1 ? 's' : ''} enregistré${workers.length > 1 ? 's' : ''} · ${online.length} en ligne`}
+      subtitle={`${online.length} en ligne · ${workers.length} enregistré${workers.length > 1 ? 's' : ''}`}
       actions={
-        <button
-          onClick={refresh}
-          className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-3.5 w-3.5">
-            <path d="M23 4v6h-6" /><path d="M1 20v-6h6" />
-            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-          </svg>
-          Rafraîchir
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="hidden max-w-[200px] truncate text-[10px] text-muted sm:inline" title={streamLabel}>
+            {streamLabel}
+          </span>
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-3.5 w-3.5">
+              <path d="M23 4v6h-6" /><path d="M1 20v-6h6" />
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+            </svg>
+            Rafraîchir la liste
+          </button>
+        </div>
       }
     >
+      {/* Nerve Center — graphe temps réel (SSE uniquement, pas de polling) */}
+      <section className="mb-8 rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-6">
+        <Suspense
+          fallback={
+            <div className="flex min-h-[280px] items-center justify-center rounded-xl border border-border/50 bg-surface/50 text-[12px] text-muted">
+              Chargement du graphe…
+            </div>
+          }
+        >
+          <PoolNetworkGraph nodes={graphNodes} links={graphLinks} pipelineActive={pipelineActive} />
+        </Suspense>
+        {graphNodes.length === 0 && (
+          <p className="mt-3 text-center text-[12px] text-muted">
+            En attente du flux pool… Les workers apparaîtront ici avec la VRAM relative et la chaîne de relais.
+          </p>
+        )}
+      </section>
+
       {/* Stats rapides */}
-      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-3">
         {[
-          { label: 'Total workers', value: String(workers.length) },
+          { label: 'Enregistrés', value: String(workers.length) },
           { label: 'En ligne', value: String(online.length), accent: true },
-          { label: 'Hors ligne', value: String(offline.length) },
           { label: 'Tokens générés', value: fmt(totalTokens) },
         ].map((s) => (
           <div key={s.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
@@ -176,25 +239,22 @@ export function AdminWorkersPage() {
         <div className="rounded-2xl border border-border bg-card p-12 text-center">
           <p className="text-sm text-muted">Aucun worker enregistré.</p>
         </div>
-      ) : (
-        <div className="space-y-4">
-          {online.length > 0 && (
-            <section>
-              <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">En ligne ({online.length})</h2>
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                {online.map((w) => <WorkerCard key={w.peerId} w={w} />)}
-              </div>
-            </section>
-          )}
-          {offline.length > 0 && (
-            <section>
-              <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Hors ligne ({offline.length})</h2>
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                {offline.map((w) => <WorkerCard key={w.peerId} w={w} />)}
-              </div>
-            </section>
-          )}
+      ) : online.length === 0 ? (
+        <div className="rounded-2xl border border-border bg-card p-10 text-center">
+          <p className="text-sm text-muted">Aucun worker en ligne pour le moment.</p>
+          <p className="mt-2 text-xs text-muted">
+            Les nœuds hors ligne restent en base mais ne sont plus listés ici.
+          </p>
         </div>
+      ) : (
+        <section>
+          <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">En ligne ({online.length})</h2>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {online.map((w) => (
+              <WorkerCard key={w.peerId} w={w} />
+            ))}
+          </div>
+        </section>
       )}
     </AdminShell>
   )

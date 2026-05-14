@@ -47,7 +47,7 @@ export function AdminP2PChatPage() {
       title="Chat P2P"
       subtitle="Inférence distribuée via l’initiateur Rust (SSE, métriques pipeline)"
     >
-      <div className="mx-auto max-w-6xl space-y-6 pb-12">
+      <div className="mx-auto max-w-384 space-y-6 pb-12">
         <div className="flex flex-col gap-3 border-b border-border/80 pb-4 sm:flex-row sm:items-center sm:justify-between">
           <Link
             to="/admin/noeud"
@@ -60,7 +60,9 @@ export function AdminP2PChatPage() {
           </Link>
           <p className="text-[11px] text-muted">
             Flux : navigateur → API Node (<span className="font-mono">/api/admin/p2p/chat/stream</span>) → initiateur{' '}
-            <span className="font-mono">VRYX_INITIATOR_CHAT_URL</span> → workers P2P (gRPC).
+            <span className="font-mono">VRYX_INITIATOR_CHAT_URL</span>
+            {' '}(ou surcharge contrôlée <span className="font-mono">initiator_chat_url</span> + préfixes) → chaîne{' '}
+            <span className="font-mono">initiator_sequential</span> sur les workers P2P (gRPC).
           </p>
         </div>
 
@@ -68,10 +70,11 @@ export function AdminP2PChatPage() {
           <div className="lg:col-span-2">
             <h2 className="font-display text-lg font-semibold text-fg">Ce que fait cette page</h2>
             <p className="mt-2 text-sm leading-relaxed text-muted">
-              Chaque message est envoyé au daemon initiateur Vryx. La réponse arrive en flux SSE (tokens), puis un
-              événement final regroupe la latence, le chemin <span className="font-mono text-fg/90">routing_path</span>,
-              les compteurs P2P et la trace pipeline si le worker la renvoie. Les sessions peuvent être historisées
-              pour la page Sessions (stockage local du navigateur).
+              Chaque message est envoyé au daemon initiateur Vryx. Le serveur relaie un flux SSE : événements de
+              progression pendant l’attente de l’initiateur, puis fragments de réponse au fil de l’eau, et enfin un
+              événement final avec la latence, le chemin <span className="font-mono text-fg/90">routing_path</span>,
+              les compteurs P2P et la trace pipeline si le worker la renvoie. Chaque tour est historisé en base pour
+              alimenter la page Sessions, avec une copie locale de secours.
             </p>
             <ul className="mt-4 space-y-2 text-[13px] text-muted">
               <li className="flex gap-2">
@@ -112,7 +115,7 @@ export function AdminP2PChatPage() {
           </div>
         </section>
 
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)] lg:items-start">
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)] xl:items-start">
           <div className="min-w-0 space-y-4">
             <AdminP2PChatPanel
               liveWorkers={liveWorkers}
@@ -130,10 +133,10 @@ export function AdminP2PChatPage() {
             />
           </div>
 
-          <aside className="space-y-4 lg:sticky lg:top-28">
+          <aside className="space-y-4 xl:sticky xl:top-28">
             {(lastPipelineTrace && Object.keys(lastPipelineTrace).length > 0) ||
             isFallbackMetricsUsable(lastRoundMetrics ?? undefined) ? (
-              <div className="panel border-accent/25 bg-accent/[0.04] p-4 sm:p-5">
+              <div className="panel border-accent/25 bg-accent/4 p-4 sm:p-5">
                 <h3 className="text-xs font-semibold uppercase tracking-wide text-muted">Dernier tour</h3>
                 <p className="mt-1 text-[10px] leading-relaxed text-muted">
                   Visualisation du dernier message envoyé : chaîne de relais et métriques agrégées.

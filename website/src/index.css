@@ -36,6 +36,10 @@
 
   --shadow-panel: 0 4px 6px -1px rgb(0 0 0 / 0.05), 0 2px 4px -1px rgb(0 0 0 / 0.03);
   --shadow-panel-dark: 0 4px 24px -4px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(255 255 255 / 0.04);
+
+  /* Bulles « moi » (admin chat, etc.) */
+  --color-chat-self: #ea580c;
+  --color-chat-self-fg: #ffffff;
 }
 
 .dark {
@@ -62,6 +66,9 @@
   --color-admin-sidebar: #070708;
   --color-admin-canvas: #0f0f12;
   --color-admin-mobile-header: rgb(22 22 24 / 0.92);
+
+  --color-chat-self: #f97316;
+  --color-chat-self-fg: #0c0a09;
 }
 
 @layer base {

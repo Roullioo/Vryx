@@ -177,6 +177,8 @@ cd nodeAndWorker
 ./test_worker_only_llm.sh "Votre phrase de test."
 ```
 
+Le script lance **`scripts/shard_serve_local.py`** (port **18765** par défaut), définit **`VRYX_SHARD_BASE_DIR`**, **`VRYX_SHARD_DOWNLOAD_BASE_URL`**, **`VRYX_DIST_MODEL`** (défaut **Qwen/Qwen2-0.5B-Instruct**), **`VRYX_DIST_PEER_IDS`**, **`VRYX_PIPELINE_CHAIN_MODE`**, puis **`curl`** vers **`/api/chat`** (timeout **300 s** pour le premier téléchargement HF / init shards). Sans serveur shard local, le worker peut rester bloqué sur des URLs **`vryx.eu`** inexistantes pour la session.
+
 - Les journaux du dernier run : fichier `/tmp/vryx_worker_only_last_logdir.txt` (contient le chemin vers un répertoire temporaire).
 
 **Autres vérifications utiles :**
@@ -196,6 +198,18 @@ cd nodeAndWorker && ./start-3-workers-mac.sh
 ```
 
 **[Peu utile / bruit]** : anciennes instructions avec `cd ../website` depuis `rust-daemon` — le front est à la racine : **`../../website`** depuis `nodeAndWorker/rust-daemon`.
+
+**Smoke orchestrateur / micro-batch (sans daemon Rust ni MLX distant) :**
+
+```bash
+cd nodeAndWorker/python-inference
+PYTHONPATH=. python3 -m unittest test_orchestrator_smoke_aggregate -v
+python3 -m py_compile distributed_llm_orchestrator.py mlx_backend.py
+```
+
+Ces checks valident les motifs de code critiques (boucle `while`, `micro_decode_budget`, keep-alive relais) et la logique d’agrégation multi-jetons. Ils complètent `./test_worker_only_llm.sh`, pas un substitut E2E réseau.
+
+**Stack locale 1 worker + initiateur (`quick-local-p2p.sh`)** : démarre `shard_serve_local.py`, fixe **`VRYX_DIST_PEER_IDS`**, évite les 404 shards sur **vryx.eu**. Sur Apple Silicon (**arm64**) le script force **MLX** par défaut (`VRYX_QUICK_USE_PYTORCH=1` pour désactiver). Mesure brute : `./scripts/bench_local_chat_tps.py` (nécessite assez de **completion_tokens**, sinon résultats non significatifs — relancer une stack fraîche).
 
 ---
 
@@ -230,6 +244,18 @@ cd nodeAndWorker && ./start-3-workers-mac.sh
   `VRYX_P2P_RELAY_URL=http://127.0.0.1:<port_API_initiateur>`,  
   et `VRYX_TP_PEER_IDS` ou découverte via `/api/tp-peers` ou **`/api/internal/live-peers`** selon votre configuration.
 - **Python** : créer un venv sur le VPS, `pip install -r python-inference/requirements.txt`, puis lancer les stages nécessaires pour vos tests bout en bout.
+
+Variables utiles après déploiement **micro-décodage greedy** sur **un seul worker** avec KV cache :
+
+- **`VRYX_DECODE_MICROBATCH=1`** (défaut) : active l’envoi de `micro_decode_budget` côté orchestrateur.
+- **`VRYX_DECODE_MICROBATCH_CAP=32`** (défaut, max 64 ; `export …=64` pour pousser au plafond si la RAM le permet) : jetons maximum produits localement MLX avant un nouvel appel relay.
+- **`VRYX_SAMPLING_TEMPERATURE`** : doit rester **0** ou quasi nul pour le mode greedy MLX multi-pas ; sinon le worker ne développe pas le micro-batch.
+
+Indicateurs sur le **worker** MLX : lignes **`tokens_batch=`** **`> 1`** dans les logs ; sur le **stage 1 Python** : `ms/tok` doit **diminuer** si la latence dominante était le RTT WAN par jeton.
+
+**Chaîne relais** : défaut **`VRYX_PIPELINE_CHAIN_MODE=initiator_sequential`** (scripts `start-initiator.sh`, `quick-local-p2p.sh`). Éviter **`vps_sequential`** si l’objectif est de limiter les hops centrés VPS.
+
+**MLX strict (worker)** : **`VRYX_MLX_STRICT=1`** avec **`VRYX_RUNTIME_BACKEND=mlx`** — pas de fallback PyTorch silencieux si MLX est indisponible (`shard_runtime._select_backend`). **`VRYX_DISABLE_PYTORCH_FALLBACK=1`** reste équivalent pour le refus de secours.
 
 ---
 

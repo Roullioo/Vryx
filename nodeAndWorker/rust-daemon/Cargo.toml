@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 libp2p = { version = "0.53", features = [
     "tcp", "dns", "noise", "yamux", "mdns", "tokio", "macros",
-    "request-response", "json", "kad", "identify", "autonat",
+    "request-response", "json", "kad", "identify", "autonat", "quic",
     "relay", "dcutr",
 ] }
 tokio = { version = "1.0", features = ["full"] }

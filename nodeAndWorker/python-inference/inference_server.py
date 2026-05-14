@@ -2,13 +2,12 @@
 Serveur gRPC d'inférence Vryx — Pipeline Parallelism (Daisy Chain).
 
 Stage 1 (VPS / Initiateur) :
-  - Charge Qwen/Qwen2.5-0.5B-Instruct une fois en mémoire.
+  - Charge uniquement le tokenizer/config et sert les poids du modèle depuis le SSD.
   - Pousse les tranches de couches aux workers via P2P (vryx.shard.*).
   - Tokenise le prompt et lance la boucle autorégressive :
       token_ids → [worker1 embed+layers] → [worker2 layers] → [worker3 lm_head]
       → next_token_id → dé-tokenise → loop
-  - JAMAIS de génération de texte côté VPS/initiateur.
-  - Fallback Ollama local si aucun worker disponible (pour le dev).
+  - JAMAIS de génération de texte ni de modèle complet côté VPS/initiateur.
 
 Stage 2 (Worker) :
   - Reçoit vryx.shard.init/load/build/forward/pipeline/unload.
@@ -84,7 +83,8 @@ def _ollama_generate_blocking(prompt: str, model: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        ollama_timeout = max(600.0, float(os.environ.get("VRYX_OLLAMA_TIMEOUT_SEC", "600")))
+        with urllib.request.urlopen(req, timeout=ollama_timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             msg = data.get("message") or {}
             text = (msg.get("content") or data.get("response") or "").strip()
@@ -147,13 +147,12 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
         if stage == 1:
             print(
                 "[*] Stage 1 (initiateur) — Pipeline Parallelism P2P : "
-                "Qwen2.5-0.5B-Instruct découpé sur les workers. "
-                "Fallback : Ollama local si aucun worker disponible."
+                "tokenizer/config côté VPS, shards safetensors servis aux workers."
             )
         else:
             print(
                 f"[*] Stage 2 (worker) — reçoit poids depuis VPS et exécute "
-                f"des couches Qwen2 via gRPC (vryx.shard.*). Aucun modèle local requis."
+                f"des couches Qwen/Qwen3 via gRPC (vryx.shard.*). Aucun modèle local requis."
             )
 
     async def ReportCapabilities(self, request, context):
@@ -182,6 +181,85 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
         routing_path = list(getattr(request, "routing_path", []) or [])
         session_id = getattr(request, "session_id", "") or ""
 
+        # ── vryx.pool.status (stage 1) ───────────────────────────────────────
+        if dtype == "vryx.pool.status":
+            if self.stage == 1:
+                result = distributed_llm_orchestrator.get_pool_snapshot()
+            else:
+                result = {"ok": True, "stage": 2, "worker": shard_runtime.pipeline_shard_status(raw)}
+            return _proto_from_bytes(json.dumps(result, ensure_ascii=False).encode(), start, 0)
+
+        # ── Ping léger pour matrice de latence hot pool ──────────────────────
+        if dtype == "vryx.ping.peer":
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                payload = {}
+            result = {
+                "ok": True,
+                "peer_stage": self.stage,
+                "echo": payload,
+                "received_ms": int(time.time() * 1000),
+            }
+            return _proto_from_bytes(json.dumps(result, ensure_ascii=False).encode(), start, 0)
+
+        # ── Circuit chaud persistant logique : ouvre/ferme une session pool ──
+        if dtype in ("vryx.stream.open", "vryx.stream.close", "vryx.stream.heartbeat"):
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+            except Exception:
+                payload = {}
+            result = {
+                "ok": True,
+                "session_id": payload.get("session_id") or session_id,
+                "pool_id": payload.get("pool_id"),
+                "mode": dtype,
+                "fallback": "persistent_request_response" if payload.get("persistent_relay") else "request_response",
+                "persistent_session": True,
+                "persistent_relay": bool(payload.get("persistent_relay")),
+                "connection_reuse": bool(payload.get("persistent_relay")),
+                "pipeline_overlap": bool(payload.get("pipeline_overlap")),
+                "double_buffering": bool(payload.get("pipeline_overlap")),
+                "quic_requested": bool(payload.get("hidden_quic")),
+                "quic_available": False,
+                "quic_used": False,
+                "fallback_reason": "native_quic_not_enabled_in_worker",
+                "received_ms": int(time.time() * 1000),
+            }
+            return _proto_from_bytes(json.dumps(result, ensure_ascii=False).encode(), start, 0)
+
+        # ── Prefix cache partagé prototype ───────────────────────────────────
+        if dtype == "vryx.cache.save":
+            result = shard_runtime.pipeline_cache_save(raw)
+            return _proto_from_bytes(result.encode(), start, 0)
+        if dtype == "vryx.cache.load":
+            result = shard_runtime.pipeline_cache_load(raw)
+            return _proto_from_bytes(result.encode(), start, 0)
+        if dtype == "vryx.cache.status":
+            result = shard_runtime.pipeline_cache_status(raw)
+            return _proto_from_bytes(result.encode(), start, 0)
+
+        # ── QUIC expérimental : probe de capacité, fallback obligatoire ──────
+        if dtype == "vryx.quic.probe":
+            quic_enabled = os.environ.get("VRYX_HIDDEN_QUIC", "0").lower() in ("1", "true", "yes")
+            result = {
+                "ok": True,
+                "quic_requested": True,
+                "quic_available": quic_enabled,
+                "quic_used": quic_enabled,
+                "fallback": "native_quic_enabled" if quic_enabled else "request_response",
+                "fallback_reason": None if quic_enabled else "native_quic_transport_disabled",
+                "received_ms": int(time.time() * 1000),
+            }
+            return _proto_from_bytes(json.dumps(result, ensure_ascii=False).encode(), start, 0)
+
+        # ── Génération directe mlx-lm officiel ────────────────────────────────
+        if dtype == "vryx.mlx_lm.generate":
+            t0 = time.perf_counter()
+            out_bytes = shard_runtime.mlx_lm_direct_generate(raw)
+            compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            return _proto_from_bytes(out_bytes, start, compute_ms, sid=session_id or "")
+
         # ── vryx.shard.init ───────────────────────────────────────────────────
         if dtype == "vryx.shard.init":
             result = shard_runtime.pipeline_shard_init(raw)
@@ -199,6 +277,11 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             except Exception:
                 sid = session_id
             result = shard_runtime.pipeline_shard_build(sid)
+            return _proto_from_bytes(result.encode(), start, 0)
+
+        # ── vryx.shard.status ─────────────────────────────────────────────────
+        if dtype == "vryx.shard.status":
+            result = shard_runtime.pipeline_shard_status(raw)
             return _proto_from_bytes(result.encode(), start, 0)
 
         # ── vryx.shard.unload ─────────────────────────────────────────────────
@@ -257,11 +340,25 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                                     shard_session_id=sid)
 
         # ── Prompt texte (stage 1 uniquement) ─────────────────────────────────
+        request_options = {}
         if dtype == "text":
             try:
                 prompt = raw.decode("utf-8", errors="replace")
             except Exception:
                 prompt = ""
+            try:
+                maybe_payload = json.loads(prompt)
+                if isinstance(maybe_payload, dict) and isinstance(maybe_payload.get("prompt"), str):
+                    prompt = maybe_payload.get("prompt", "")
+                    request_options = {
+                        "hidden_transport": maybe_payload.get("hidden_transport") or maybe_payload.get("quantization"),
+                        "quantization": maybe_payload.get("quantization") or maybe_payload.get("hidden_transport"),
+                        "pool_preference": maybe_payload.get("pool_preference"),
+                    }
+                    if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
+                        request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
+            except Exception:
+                request_options = {}
         else:
             try:
                 inner = raw.decode("utf-8", errors="replace").strip()
@@ -281,28 +378,67 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
         compute_start = time.perf_counter_ns()
 
         def _run_pipeline():
-            return distributed_llm_orchestrator.maybe_run_worker_only_chat(prompt)
+            return distributed_llm_orchestrator.maybe_run_worker_only_chat(prompt, request_options)
 
         pipeline_result = None
         try:
             pipeline_result = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(None, _run_pipeline),
-                timeout=600.0,
+                timeout=3600.0,
             )
         except asyncio.TimeoutError:
             print("[!] Timeout pipeline P2P.")
-            pipeline_result = {"ok": False, "error": "Timeout pipeline P2P (600s)."}
+            pipeline_result = {
+                "ok": False,
+                "error": "Timeout pipeline P2P (3600s).",
+                "trace": {
+                    "layout": "pipeline_relay_daisy_chain",
+                    "ok": False,
+                    "routing_path": list(routing_path),
+                    "failure_stage": "asyncio_timeout",
+                },
+                "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+            }
         except Exception as e:
             print(f"[!] Erreur pipeline : {e}")
+            pipeline_result = {
+                "ok": False,
+                "text": "",
+                "error": f"Exception orchestrateur stage1 : {e}",
+                "trace": {
+                    "layout": "pipeline_relay_daisy_chain",
+                    "ok": False,
+                    "routing_path": list(routing_path),
+                    "failure_stage": "executor_exception",
+                },
+                "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+            }
 
         compute_ms = max(0, int((time.perf_counter_ns() - compute_start) / 1_000_000))
 
         # Résultat du pipeline distribué
-        if pipeline_result and pipeline_result.get("ok") and pipeline_result.get("text"):
-            text_out = pipeline_result["text"]
-            metrics = pipeline_result.get("metrics") or {}
-            trace_obj = pipeline_result.get("trace") or {}
+        pr = pipeline_result or {}
+        pr_ok = bool(pr.get("ok"))
+        raw_text = pr.get("text")
+        text_out = raw_text if isinstance(raw_text, str) else ("" if raw_text is None else str(raw_text))
+        metrics = pr.get("metrics") or {}
+        ct = int(metrics.get("completion_tokens") or 0)
+        # Succès : l'orchestrateur peut renvoyer ok=True avec texte vide après nettoyage
+        # (tokens spéciaux / template) — ne pas traiter comme « Pipeline P2P indisponible ».
+        if pr_ok and (text_out.strip() or ct > 0):
+            if not text_out.strip() and ct > 0:
+                print(
+                    f"[!] Pipeline OK mais décodage vide (completion_tokens={ct}) — message de secours.",
+                    flush=True,
+                )
+                text_out = (
+                    f"[{ct} jetons générés ; aucune sortie textuelle après décodage. "
+                    "Vérifier le chat template et les stop tokens.]"
+                )
+            trace_obj = pr.get("trace") or {}
             trace_obj["compute_time_ms"] = compute_ms
+            trace_obj["ok"] = True
+            trace_obj.pop("error", None)
             pipeline_trace_json = json.dumps(trace_obj, ensure_ascii=False)
             print(f"[>] Pipeline OK : {len(text_out)} chars, {compute_ms}ms")
             return _proto_from_text(
@@ -312,18 +448,31 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             )
 
         # Pipeline a échoué — le VPS NE CALCULE PAS, on remonte l'erreur explicite.
-        err_msg = (pipeline_result or {}).get("error", "Pipeline P2P indisponible.")
-        err_trace = (pipeline_result or {}).get("trace") or {
-            "layout": "pipeline_relay_daisy_chain", "ok": False, "routing_path": routing_path
-        }
-        err_trace["compute_time_ms"] = compute_ms
+        err_msg = pr.get("error", "Pipeline P2P indisponible.")
+        if pr_ok and not text_out.strip() and ct == 0:
+            err_msg = pr.get("error") or "Pipeline P2P : aucun jeton généré."
+        err_trace: dict = dict(pr.get("trace") or {})
+        if not err_trace:
+            err_trace = {"layout": "pipeline_relay_daisy_chain", "ok": False, "routing_path": list(routing_path)}
+        err_trace.setdefault("layout", "pipeline_relay_daisy_chain")
         err_trace["ok"] = False
+        _rp_err = list(err_trace.get("routing_path") or [])
+        _peer_err = list(err_trace.get("peers") or [])
+        if not _rp_err and _peer_err:
+            err_trace["routing_path"] = _peer_err
+        elif not _rp_err and routing_path:
+            err_trace["routing_path"] = list(routing_path)
+        err_trace["compute_wall_ms"] = compute_ms
+        err_trace["timing_scope"] = "stage1_wall_ms"
+        err_trace["compute_time_ms"] = compute_ms
         err_trace.setdefault("error", err_msg)
         text_out = err_msg
-        metrics = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0}
+        err_metrics = pr.get("metrics") or {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0
+        }
         print(f"[!] Pipeline KO : {err_msg}")
         return _proto_from_text(
-            text_out, start, metrics,
+            text_out, start, err_metrics,
             pipeline_trace_json=json.dumps(err_trace, ensure_ascii=False),
             compute_time_ms=compute_ms,
         )
@@ -341,7 +490,7 @@ def _handle_legacy_shard(dtype: str, raw: bytes, session_id: str):
     if eff_dtype == "vryx.shard.init":
         meta = json.loads(raw.decode("utf-8", errors="replace"))
         sid = session_id or str(meta.get("session_id") or "")
-        msg = shard_runtime.shard_init(sid, int(meta.get("ttl_sec") or 120),
+        msg = shard_runtime.shard_init(sid, int(meta.get("ttl_sec") or 600),
                                         int(meta.get("layer_start") or 0),
                                         int(meta.get("layer_end") or 0),
                                         str(meta.get("model_tag") or ""))
@@ -395,11 +544,11 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=50052)
     parser.add_argument("--stage", type=int, default=2,
                         help="1 = initiateur P2P, 2 = worker (couches gRPC)")
-    parser.add_argument("--model", type=str, default="", help="Surcharge OLLAMA_MODEL (fallback)")
+    parser.add_argument("--model", type=str, default="", help="Nom du modèle annoncé par le worker")
     parser.add_argument("--layers", type=str, default="")
     parser.add_argument("--remote-url", type=str, default="")
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
     if args.model:
-        os.environ["OLLAMA_MODEL"] = args.model
+        os.environ["VRYX_WORKER_MODEL"] = args.model
     asyncio.run(serve(args.port, args.stage))

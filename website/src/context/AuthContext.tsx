@@ -35,15 +35,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async () => {
-    const maxAttempts = 40
-    const delayMs = 400
+    const dev = import.meta.env.DEV
+    const maxAttempts = dev ? 30 : 3
+    const delayMs = dev ? 400 : 500
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const r = await apiJson<{ user: AuthUser | null }>('/api/auth/me')
       if (r.ok) {
         setUser(r.data.user ?? null)
         return
       }
-      if (!isTransientMeFailure(r.status) || attempt === maxAttempts - 1) {
+      const last = attempt === maxAttempts - 1
+      if (!isTransientMeFailure(r.status) || last) {
         setUser(null)
         return
       }

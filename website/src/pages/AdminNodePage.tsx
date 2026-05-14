@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
 import { workerLabel, type LiveWorker } from '../components/admin/AdminP2PChatPanel'
-import { apiJson } from '../lib/api'
+import { apiJson, apiUrl } from '../lib/api'
 
 type Worker = {
   pid: number
@@ -98,6 +98,45 @@ type TestReport = {
   }
 }
 
+type PoolSnapshot = {
+  ok: boolean
+  sampledAt: number
+  liveSec: number
+  registeredWorkers: RegisteredWorker[]
+  liveWorkers: LiveWorker[]
+  totalTokensGenerated: number
+  nodeStatus: NodeStatus
+  history: HistoryPayload
+  pool: {
+    id: string
+    status: string
+    model: string
+    routingPath: string[]
+    totalVramMb: number
+    requiredModelVramMb: number
+    estimatedWorkersNeeded: number
+    replicationFactor: number
+    hotWorkers: number
+    warmReplicas: number
+    largestGpu: { peerId: string; gpuName: string | null; gpuVramMb: number | null } | null
+    latencyTargetsMs: {
+      hotRouting: [number, number]
+      firstTokenSmallModel: [number, number]
+      nextTokenWithKvCache: [number, number]
+      hotFailover: [number, number]
+      coldShardReload: [number, number]
+    }
+    assignments: {
+      peer: string
+      rank: number
+      role: string
+      gpu: string | null
+      vramMb: number | null
+      ready: boolean
+    }[]
+  }
+}
+
 function formatUptime(sec: number) {
   if (!sec || sec < 0) return '—'
   const d = Math.floor(sec / 86400)
@@ -174,6 +213,7 @@ export function AdminNodePage() {
   const [error, setError] = useState<string | null>(null)
   const [hint, setHint] = useState<string | null>(null)
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(5)
+  const [poolSnapshot, setPoolSnapshot] = useState<PoolSnapshot | null>(null)
 
   const [testParallel, setTestParallel] = useState(4)
   const [testRepeat, setTestRepeat] = useState(20)
@@ -205,15 +245,34 @@ export function AdminNodePage() {
   }, [])
 
   useEffect(() => {
-    const timerBoot = window.setTimeout(() => {
-      void refresh()
-    }, 0)
-    const id = window.setInterval(refresh, refreshIntervalSec * 1000)
-    return () => {
-      window.clearTimeout(timerBoot)
-      window.clearInterval(id)
+    const source = new EventSource(apiUrl('/api/admin/pool/stream'))
+    source.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as PoolSnapshot | { ok: false; error?: string }
+        if ('error' in data && data.ok === false) {
+          setError(data.error || 'Flux pool indisponible.')
+          return
+        }
+        const snapshot = data as PoolSnapshot
+        setPoolSnapshot(snapshot)
+        setStatus(snapshot.nodeStatus)
+        setHistory(snapshot.history)
+        setRegisteredWorkers(snapshot.registeredWorkers)
+        setLiveWorkers(snapshot.liveWorkers)
+        setTotalTokens(snapshot.totalTokensGenerated)
+        _setLiveSec(snapshot.liveSec)
+        setError(null)
+      } catch {
+        setError('Flux pool invalide.')
+      }
     }
-  }, [refresh, refreshIntervalSec])
+    source.onerror = () => {
+      setError('Flux pool interrompu, bascule en actualisation manuelle.')
+      source.close()
+      void refresh()
+    }
+    return () => source.close()
+  }, [refresh])
 
   useEffect(() => {
     const id = window.setInterval(() => setClockMs(Date.now()), 1000)
@@ -229,14 +288,11 @@ export function AdminNodePage() {
   }, [])
 
   useEffect(() => {
+    if (poolSnapshot) return
     const timerBoot = window.setTimeout(() => {
       void refreshLive()
     }, 0)
-    const id = window.setInterval(refreshLive, 3000)
-    return () => {
-      window.clearTimeout(timerBoot)
-      window.clearInterval(id)
-    }
+    return () => window.clearTimeout(timerBoot)
   }, [refreshLive])
 
   async function runTest(stress: boolean) {
@@ -319,6 +375,7 @@ export function AdminNodePage() {
 
   const navSections = [
     { id: 'synthese', label: 'Synthèse' },
+    { id: 'pool-p2p', label: 'Pool P2P' },
     { id: 'live-reseau', label: 'Réseau live' },
     { id: 'systeme-gpu', label: 'Système et GPU' },
     { id: 'workers', label: 'Workers' },
@@ -371,17 +428,14 @@ export function AdminNodePage() {
             </p>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted">
-            <label htmlFor="refresh">Rafraîchissement</label>
+            <label htmlFor="refresh">Flux</label>
             <select
               id="refresh"
               value={refreshIntervalSec}
               onChange={(e) => setRefreshIntervalSec(Number(e.target.value))}
               className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg"
             >
-              <option value={2}>2 s</option>
-              <option value={5}>5 s</option>
-              <option value={10}>10 s</option>
-              <option value={30}>30 s</option>
+              <option value={5}>SSE 15 s</option>
             </select>
             <button
               type="button"
@@ -406,6 +460,95 @@ export function AdminNodePage() {
             {hint}
           </div>
         )}
+
+        <section id="pool-p2p" className="scroll-mt-24 space-y-3">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-fg">Pool P2P LLM persistante</h3>
+              <p className="text-[11px] text-muted">
+                Placement pondéré par VRAM, routing sticky et modèle résident côté workers. Les données arrivent par SSE.
+              </p>
+            </div>
+            <span className="shrink-0 rounded-md border border-accent/25 bg-accent/5 px-2 py-1 text-[11px] font-medium text-accent">
+              {poolSnapshot?.pool.status || 'initialisation'}
+            </span>
+          </div>
+          <div className="grid gap-4 md:grid-cols-4">
+            <div className="panel p-4">
+              <p className="text-[11px] uppercase tracking-wide text-muted">VRAM pool</p>
+              <p className="mt-1 font-display text-xl font-bold text-fg">
+                {poolSnapshot ? `${(poolSnapshot.pool.totalVramMb / 1024).toFixed(1)} Go` : '—'}
+              </p>
+              <p className="mt-1 text-[10px] text-muted">
+                Besoin cible : {poolSnapshot ? `${(poolSnapshot.pool.requiredModelVramMb / 1024).toFixed(0)} Go` : '—'}
+              </p>
+            </div>
+            <div className="panel p-4">
+              <p className="text-[11px] uppercase tracking-wide text-muted">Workers hot</p>
+              <p className="mt-1 font-display text-xl font-bold text-success">
+                {poolSnapshot?.pool.hotWorkers ?? '—'}
+              </p>
+              <p className="mt-1 text-[10px] text-muted">
+                Réplication : x{poolSnapshot?.pool.replicationFactor ?? 0}
+              </p>
+            </div>
+            <div className="panel p-4">
+              <p className="text-[11px] uppercase tracking-wide text-muted">Routage hot</p>
+              <p className="mt-1 font-display text-xl font-bold text-electric">
+                {poolSnapshot ? `${poolSnapshot.pool.latencyTargetsMs.hotRouting[0]}-${poolSnapshot.pool.latencyTargetsMs.hotRouting[1]} ms` : '—'}
+              </p>
+              <p className="mt-1 text-[10px] text-muted">Préparation de chaîne sans reload.</p>
+            </div>
+            <div className="panel p-4">
+              <p className="text-[11px] uppercase tracking-wide text-muted">Failover hot</p>
+              <p className="mt-1 font-display text-xl font-bold text-fg">
+                {poolSnapshot ? `${poolSnapshot.pool.latencyTargetsMs.hotFailover[0]}-${poolSnapshot.pool.latencyTargetsMs.hotFailover[1]} ms` : '—'}
+              </p>
+              <p className="mt-1 text-[10px] text-muted">Si shard répliqué déjà chargé.</p>
+            </div>
+          </div>
+          <div className="panel overflow-hidden p-0">
+            <div className="border-b border-border px-4 py-3">
+              <p className="text-xs font-semibold text-fg">Chaîne active et placement</p>
+              <p className="mt-1 text-[10px] text-muted">
+                Gros GPU réservés aux extrémités : embedding au début, lm_head à la fin.
+              </p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-left text-xs">
+                <thead className="bg-surface/60 text-[10px] uppercase tracking-wide text-muted">
+                  <tr>
+                    <th className="px-4 py-2">Rang</th>
+                    <th className="px-4 py-2">Pair</th>
+                    <th className="px-4 py-2">Rôle</th>
+                    <th className="px-4 py-2">GPU</th>
+                    <th className="px-4 py-2">VRAM</th>
+                    <th className="px-4 py-2">État</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(poolSnapshot?.pool.assignments ?? []).map((a) => (
+                    <tr key={`${a.peer}-${a.rank}`} className="border-t border-border/60">
+                      <td className="px-4 py-2 font-mono">{a.rank}</td>
+                      <td className="px-4 py-2 font-mono">{a.peer.slice(0, 18)}…</td>
+                      <td className="px-4 py-2">{a.role}</td>
+                      <td className="px-4 py-2">{a.gpu || '—'}</td>
+                      <td className="px-4 py-2">{a.vramMb ? `${(a.vramMb / 1024).toFixed(1)} Go` : '—'}</td>
+                      <td className="px-4 py-2">{a.ready ? 'Prêt' : 'En attente'}</td>
+                    </tr>
+                  ))}
+                  {!poolSnapshot?.pool.assignments?.length && (
+                    <tr>
+                      <td className="px-4 py-6 text-center text-muted" colSpan={6}>
+                        Aucun placement pool prêt pour le moment.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
 
         <section id="live-reseau" className="scroll-mt-24 space-y-3">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">

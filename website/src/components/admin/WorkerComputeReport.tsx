@@ -68,10 +68,11 @@ function Bar({
 
 /** Graphique agrégé pour un tour P2P (avec ou sans pipeline_trace détaillé). */
 function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
-  const total = Math.max(1, m.latencyMs)
   const orch = Math.max(0, m.vpsDelegateMs)
   // `compute_time_ms` du proto est la source de vérité ; sinon retombée sur worker_compute_ms.
   const compute = effectiveComputeMs(m)
+  const rawLat = Math.max(0, Number(m.latencyMs ?? 0) || 0)
+  const total = Math.max(1, rawLat, orch + compute)
   const other = Math.max(0, total - orch - compute)
 
   const p = Math.max(0, m.promptTokens ?? 0)
@@ -89,13 +90,97 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
         ? (total / c).toFixed(0)
         : null
 
+  const timingScope = m.timingScope ?? ''
+  const computeIsServerWall =
+    timingScope === 'stage1_wall_ms' ||
+    (typeof m.mode === 'string' && m.mode.includes('Erreur') && compute > 0 && (m.completionTokens ?? 0) === 0)
+  const computeBarLabel = computeIsServerWall
+    ? 'Stage1 / orchestrateur (mur serveur)'
+    : 'Calcul worker (compute_time_ms)'
+
+  const tps = m.hotPathTps != null && m.hotPathTps > 0
+    ? m.hotPathTps.toFixed(3)
+    : msPerTok && Number(msPerTok) > 0
+      ? (1000 / Number(msPerTok)).toFixed(3)
+      : null
+
   return (
     <div className="space-y-3">
+      {/* Badges transport & optimisations */}
+      {(m.quicUsed != null ||
+        m.kvCacheUsed != null ||
+        m.hiddenTransport ||
+        m.requestedQuantization ||
+        m.effectiveQuantization ||
+        m.poolClass ||
+        m.prefixCacheHit != null) && (
+        <div className="flex flex-wrap gap-1 rounded-lg border border-border/60 bg-bg/60 px-3 py-2">
+          {m.quicUsed != null && (
+            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${m.quicUsed ? 'bg-success/15 text-success' : 'bg-border/40 text-muted'}`}>
+              {m.quicUsed ? 'QUIC UDP' : 'TCP'}
+            </span>
+          )}
+          {m.kvCacheUsed != null && (
+            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${m.kvCacheUsed ? 'bg-electric/15 text-electric' : 'bg-border/40 text-muted'}`}>
+              {m.kvCacheUsed ? 'KV Cache ON' : 'KV Cache OFF'}
+            </span>
+          )}
+          {m.hiddenTransport && (
+            <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[9px] font-bold uppercase text-accent">
+              {m.hiddenTransport}
+            </span>
+          )}
+          {m.requestedQuantization && (
+            <span className="rounded bg-electric/10 px-1.5 py-0.5 text-[9px] font-bold uppercase text-electric">
+              demandé : {m.requestedQuantization === 'q4' ? '4-bit' : '8-bit'}
+            </span>
+          )}
+          {m.effectiveQuantization && m.effectiveQuantization !== m.hiddenTransport && (
+            <span className="rounded bg-success/10 px-1.5 py-0.5 text-[9px] font-bold uppercase text-success">
+              effectif : {m.effectiveQuantization}
+            </span>
+          )}
+          {m.quantizationFallbackReason && (
+            <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] font-semibold text-warning">
+              fallback : {m.quantizationFallbackReason}
+            </span>
+          )}
+          {m.poolClass && (
+            <span className="rounded bg-success/10 px-1.5 py-0.5 text-[9px] font-bold uppercase text-success">
+              pool : {m.poolClass}
+            </span>
+          )}
+          {m.poolFallbackReason && (
+            <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] font-semibold text-warning">
+              pool fallback : {m.poolFallbackReason}
+            </span>
+          )}
+          {m.prefixCacheHit != null && (
+            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${m.prefixCacheHit ? 'bg-primary/15 text-primary' : 'bg-border/40 text-muted'}`}>
+              {m.prefixCacheHit
+                ? `Prefix Cache HIT (${m.prefixCacheTokens ?? 0} tok)`
+                : 'Prefix Cache MISS'}
+            </span>
+          )}
+          {m.stopReason && m.stopReason !== 'null' && (
+            <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] font-semibold text-warning">
+              arrêt : {m.stopReason}
+            </span>
+          )}
+        </div>
+      )}
       {/* Temps du tour */}
       <div className="space-y-2 rounded-lg border border-border/60 bg-bg/60 p-3">
-        <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">
-          Temps du tour — {total.toLocaleString('fr-FR')} ms total
-        </p>
+        <div className="flex flex-wrap items-center justify-between gap-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">
+            Temps du tour — {total.toLocaleString('fr-FR')} ms total
+          </p>
+          {tps && (
+            <span className="rounded bg-success/10 px-1.5 py-0.5 font-mono text-[10px] font-bold text-success">
+              {tps} TPS
+            </span>
+          )}
+        </div>
         <Bar
           pct={orch / total}
           color="bg-accent"
@@ -105,7 +190,7 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
         <Bar
           pct={compute / total}
           color="bg-success"
-          label="Calcul worker (compute_time_ms)"
+          label={computeBarLabel}
           value={compute > 0 ? `${compute.toLocaleString('fr-FR')} ms` : '—'}
         />
         {other > 2 ? (
@@ -119,8 +204,32 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
         {msPerTok ? (
           <p className="pt-1 text-[9px] text-muted">
             Estimation ≈ <span className="font-mono text-fg">{msPerTok} ms / token</span> de complétion
+            {m.avgMsPerToken != null && m.avgMsPerToken > 0 && (
+              <> · réel <span className="font-mono text-success">{m.avgMsPerToken} ms</span></>
+            )}
+          </p>
+        ) : m.avgMsPerToken != null && m.avgMsPerToken > 0 ? (
+          <p className="pt-1 text-[9px] text-muted">
+            Réel : <span className="font-mono text-success">{m.avgMsPerToken} ms / token</span>
           </p>
         ) : null}
+        {m.setupMs != null && m.setupMs > 0 && (
+          <p className="text-[9px] text-muted">Setup pipeline : <span className="font-mono text-fg">{m.setupMs} ms</span></p>
+        )}
+        {m.batching && (
+          <p className="text-[9px] text-muted">
+            Batching : <span className="font-mono text-fg">
+              size {String(m.batching.batch_size ?? 1)} · queue {String(m.batching.queue_wait_ms ?? 0)} ms
+            </span>
+          </p>
+        )}
+        {m.overlap && (
+          <p className="text-[9px] text-muted">
+            Overlap : <span className="font-mono text-fg">
+              {String(m.overlap.compute_overlap_pct ?? 0)}% · réseau caché {String(m.overlap.network_hidden_ms ?? '—')} ms
+            </span>
+          </p>
+        )}
       </div>
 
       {/* Tokens */}
@@ -148,6 +257,26 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
           Mode : <span className="font-mono text-fg">{m.mode}</span>
         </p>
       ) : null}
+      {/* Paramètres de génération */}
+      {m.genControl && typeof m.genControl === 'object' && (
+        <div className="rounded-lg border border-border/60 bg-bg/60 px-3 py-2">
+          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted">Paramètres génération</p>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10px]">
+            {m.genControl.temperature != null && (
+              <><dt className="text-muted">Température</dt><dd className="font-mono tabular-nums">{String(m.genControl.temperature)}</dd></>
+            )}
+            {m.genControl.top_p != null && (
+              <><dt className="text-muted">Top-P</dt><dd className="font-mono tabular-nums">{String(m.genControl.top_p)}</dd></>
+            )}
+            {m.genControl.top_k != null && (
+              <><dt className="text-muted">Top-K</dt><dd className="font-mono tabular-nums">{String(m.genControl.top_k)}</dd></>
+            )}
+            {m.genControl.repetition_penalty != null && (
+              <><dt className="text-muted">Pén. répétition</dt><dd className="font-mono tabular-nums">{String(m.genControl.repetition_penalty)}</dd></>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -348,14 +477,20 @@ export function WorkerComputeReport({
       (p): p is string => typeof p === 'string' && p.length > 0,
     )
 
-    const headline =
+    const routeCount = routingPath.length || peers.filter((p) => p.length > 0).length
+    let headline =
       layout === 'pipeline_relay_daisy_chain' || routingPath.length > 1
-        ? `Pipeline Daisy Chain (${routingPath.length || peers.length} nœuds)`
+        ? `Pipeline Daisy Chain (${routeCount} nœuds)`
         : layout === 'worker_only_pipeline'
           ? 'Pipeline worker-only (P2P natif)'
           : layout === 'row_split_tensor_parallel'
             ? 'Ancien TP row-split — désactivé pour le chat'
             : layout || 'Pipeline P2P natif'
+
+    if (!ok && routeCount === 0 && layout === 'pipeline_relay_daisy_chain') {
+      headline =
+        'Échec pipeline distribué (aucun peer dans la trace ; consulter l’erreur ci-dessus et les logs stage1)'
+    }
 
     const traceComputeMs = typeof t.compute_time_ms === 'number' ? t.compute_time_ms : null
 

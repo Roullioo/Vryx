@@ -141,7 +141,7 @@ export function WorkersPage() {
           style={{ backgroundImage: "url('/mid.png')" }}
           aria-hidden
         />
-        <div className="absolute inset-0 bg-gradient-to-b from-slate-950/82 via-slate-950/72 to-slate-950/88" aria-hidden />
+        <div className="hero-overlay absolute inset-0" aria-hidden />
         <div className="relative z-10 mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
           <div className="mx-auto max-w-2xl text-center">
             <h2 id="workflow-workers" className="font-display text-2xl font-semibold tracking-tight text-white sm:text-3xl">

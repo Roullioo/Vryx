@@ -6,6 +6,31 @@ export function apiUrl(path: string): string {
   return `${base}${p}`
 }
 
+/** Texte d’erreur lisible (Express, rate-limit v7, proxy HTML, etc.). */
+function parseApiError(status: number, body: unknown, rawText: string): string {
+  if (typeof body === 'object' && body !== null) {
+    const o = body as Record<string, unknown>
+    if (typeof o.error === 'string' && o.error.trim()) return o.error.trim()
+    if (typeof o.message === 'string' && o.message.trim()) return o.message.trim()
+    const msg = o.message
+    if (typeof msg === 'object' && msg !== null && 'error' in msg) {
+      const e = (msg as { error: unknown }).error
+      if (typeof e === 'string' && e.trim()) return e.trim()
+    }
+  }
+  if (status === 429) {
+    return 'Trop de tentatives. Patientez quelques minutes avant de réessayer.'
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return 'Le serveur est temporairement indisponible. Réessayez dans un instant.'
+  }
+  const t = rawText.trim()
+  if (t && t.length < 400 && !t.startsWith('<')) {
+    return t
+  }
+  return `Réponse inattendue du serveur (code ${status}).`
+}
+
 export async function apiJson<T>(
   path: string,
   init?: RequestInit,
@@ -31,11 +56,7 @@ export async function apiJson<T>(
     body = null
   }
   if (!res.ok) {
-    const err =
-      typeof body === 'object' && body !== null && 'error' in body && typeof (body as { error: unknown }).error === 'string'
-        ? (body as { error: string }).error
-        : 'Une erreur est survenue.'
-    return { ok: false, status: res.status, error: err }
+    return { ok: false, status: res.status, error: parseApiError(res.status, body, text) }
   }
   return { ok: true, data: body as T }
 }

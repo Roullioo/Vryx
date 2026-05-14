@@ -14,6 +14,7 @@ function ScrollToTopOnPathname() {
 
 export function MainLayout() {
   const { pathname } = useLocation()
+  const isAdmin = pathname.startsWith('/admin')
   const topDarkHero =
     pathname === '/' ||
     pathname === '/clients' ||
@@ -24,13 +25,17 @@ export function MainLayout() {
     pathname === '/panel/modeles'
 
   return (
-    <div className={`min-h-svh text-fg ${topDarkHero ? 'bg-page-hero' : 'bg-bg'}`}>
+    <div
+      className={`min-h-svh text-fg ${
+        isAdmin ? 'bg-admin-canvas' : topDarkHero ? 'bg-page-hero' : 'bg-bg'
+      }`}
+    >
       <ScrollToTopOnPathname />
-      <Navbar />
-      <main className="relative z-0">
+      {!isAdmin && <Navbar />}
+      <main className={`relative z-0 ${isAdmin ? 'min-h-dvh' : ''}`}>
         <Outlet />
       </main>
-      <Footer />
+      {!isAdmin && <Footer />}
     </div>
   )
 }

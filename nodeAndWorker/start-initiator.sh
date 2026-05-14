@@ -18,6 +18,24 @@ P2P_PORT="${1:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_DIR="${SCRIPT_DIR}/python-inference"
 
+export VRYX_DIST_TIMEOUT_SEC="${VRYX_DIST_TIMEOUT_SEC:-600}"
+export VRYX_PIPELINE_STEP_TIMEOUT_SEC="${VRYX_PIPELINE_STEP_TIMEOUT_SEC:-600}"
+export VRYX_P2P_REQUEST_TIMEOUT_S="${VRYX_P2P_REQUEST_TIMEOUT_S:-3600}"
+export VRYX_P2P_IDLE_TIMEOUT_S="${VRYX_P2P_IDLE_TIMEOUT_S:-900}"
+# Chaîne W1→W2 directe dans le même profil Daisy (moins de sauts WAN sur l’initiateur).
+export VRYX_PIPELINE_CHAIN_MODE="${VRYX_PIPELINE_CHAIN_MODE:-initiator_sequential}"
+export VRYX_PERSISTENT_RELAY="${VRYX_PERSISTENT_RELAY:-1}"
+export VRYX_HIDDEN_TRANSPORT="${VRYX_HIDDEN_TRANSPORT:-int8}"
+export VRYX_WORKER_KV_CACHE="${VRYX_WORKER_KV_CACHE:-true}"
+export VRYX_HIDDEN_QUIC="${VRYX_HIDDEN_QUIC:-1}"
+export VRYX_PREFIX_CACHE="${VRYX_PREFIX_CACHE:-1}"
+# Réduction latence « shard ready » (orchestrateur) ; ancien comportement équivalent ~2 s :
+export VRYX_SHARD_READY_POLL_SEC="${VRYX_SHARD_READY_POLL_SEC:-0.75}"
+export VRYX_SHARD_READY_POLL_SLOW_SEC="${VRYX_SHARD_READY_POLL_SLOW_SEC:-5}"
+# VPS multi-workers : peut augmenter RAM/I/O si activé :
+# export VRYX_PARALLEL_SHARD_INIT=1
+# export VRYX_PARALLEL_SHARD_INIT_MAX=2
+
 echo ""
 echo "  +------------------------------------------+"
 echo "  |        Vryx Initiator (Chat)             |"
@@ -85,9 +103,13 @@ if [ -z "${PROTOC:-}" ]; then
     done
 fi
 
-if [ ! -f "${SCRIPT_DIR}/target/release/rust-daemon" ]; then
+if [ ! -f "${SCRIPT_DIR}/target/release/rust-daemon" ] \
+    || [ "${SCRIPT_DIR}/rust-daemon/src/main.rs" -nt "${SCRIPT_DIR}/target/release/rust-daemon" ] \
+    || [ "${SCRIPT_DIR}/rust-daemon/Cargo.toml" -nt "${SCRIPT_DIR}/target/release/rust-daemon" ]; then
     echo "[*] Compilation du daemon Rust..."
-    (cd "${SCRIPT_DIR}" && cargo build --release -p rust-daemon 2>&1 | grep -E "Compiling|Finished|error" | tail -5)
+    (cd "${SCRIPT_DIR}/rust-daemon" && CARGO_TARGET_DIR=/tmp/vryx-rust-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo build --release --locked --message-format short)
+    mkdir -p "${SCRIPT_DIR}/target/release"
+    cp /tmp/vryx-rust-target/release/rust-daemon "${SCRIPT_DIR}/target/release/rust-daemon"
 else
     echo "[*] Daemon Rust deja compile, passage au demarrage..."
 fi
