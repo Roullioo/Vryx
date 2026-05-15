@@ -172,10 +172,11 @@ SHARD_TTL = int(os.environ.get("VRYX_DIST_SHARD_TTL", "1800"))
 POOL_TTL = int(os.environ.get("VRYX_POOL_TTL_SEC", str(max(SHARD_TTL, 24 * 3600))))
 KEEP_POOL_SHARDS = os.environ.get("VRYX_POOL_KEEP_SHARDS", "true").lower() not in ("0", "false", "no")
 POOL_REPLICATION_FACTOR = max(0, int(os.environ.get("VRYX_POOL_REPLICATION_FACTOR", "1")))
-SHARD_BASE_DIR = os.environ.get("VRYX_SHARD_BASE_DIR", "/var/tmp/vryx-shards")
+SHARD_BASE_DIR = os.environ.get("VRYX_SHARD_BASE_DIR", "/var/lib/vryx-shards")
 # WAN / relais : 25 ms exclut la plupart des workers domicile → défaut plus large (override possible).
 HOT_POOL_MAX_RTT_MS = float(os.environ.get("VRYX_HOT_POOL_MAX_RTT_MS", "2000"))
 HOT_POOL_IDEAL_RTT_MS = float(os.environ.get("VRYX_HOT_POOL_IDEAL_RTT_MS", "80"))
+MICROBATCH_RTT_TARGET_MS = float(os.environ.get("VRYX_MICROBATCH_RTT_TARGET_MS", "180"))
 HIDDEN_TRANSPORT = os.environ.get("VRYX_HIDDEN_TRANSPORT", "int8").lower()
 PIPELINE_STREAM_MODE = os.environ.get("VRYX_PIPELINE_STREAM_MODE", "hot_session").lower()
 WORKER_KV_CACHE = os.environ.get("VRYX_WORKER_KV_CACHE", "true").lower() not in ("0", "false", "no")
@@ -422,6 +423,44 @@ def _select_pool_peers(peers: list[str], catalog: dict[str, dict], preference: s
     if len(by_class["velocity_mlx"]) >= MIN_WORKERS:
         return by_class["velocity_mlx"], "velocity_mlx", None
     return by_class["legacy_pytorch"] or peers, "legacy_pytorch", "velocity_pool_unavailable"
+
+
+def _vps_rtt_ms(peer_id: str, latency_matrix: dict[str, Any]) -> Optional[int]:
+    value = (latency_matrix.get("vps_to_worker", {}).get(peer_id) or {}).get("vps_rtt_ms")
+    return value if isinstance(value, int) else None
+
+
+def _order_peers_for_vps_latency(peers: list[str], catalog: dict[str, dict], latency_matrix: dict[str, Any]) -> list[str]:
+    return sorted(
+        peers,
+        key=lambda peer: (
+            _vps_rtt_ms(peer, latency_matrix) if _vps_rtt_ms(peer, latency_matrix) is not None else HOT_POOL_MAX_RTT_MS * 4,
+            -_worker_weight(peer, catalog),
+            peer,
+        ),
+    )
+
+
+def _microbatch_cap_for_rtt(routing_path: list[str], latency_matrix: dict[str, Any]) -> int:
+    if not routing_path:
+        return DECODE_MICROBATCH_CAP
+    rtts = [
+        _vps_rtt_ms(peer, latency_matrix)
+        for peer in routing_path
+        if _vps_rtt_ms(peer, latency_matrix) is not None
+    ]
+    if not rtts:
+        return DECODE_MICROBATCH_CAP
+    max_rtt = max(rtts)
+    if max_rtt <= MICROBATCH_RTT_TARGET_MS:
+        return DECODE_MICROBATCH_CAP
+    ratio = max(1.0, max_rtt / max(1.0, MICROBATCH_RTT_TARGET_MS))
+    return max(2, min(DECODE_MICROBATCH_CAP, int(DECODE_MICROBATCH_CAP / ratio)))
+
+
+def _requires_mlx_lm_direct_guard() -> bool:
+    normalized = MODEL_ID.lower().replace("_", "-")
+    return MLX_LM_DIRECT and ("qwen3.5" in normalized or "qwen3-5" in normalized)
 
 
 def _now_ms() -> int:
@@ -1831,11 +1870,25 @@ def _quic_probe(routing_path: list[str], session_id: str, pool_id: str, hidden_t
     }
     result = _cache_control(routing_path, "vryx.quic.probe", payload)
     available = all((r.get("data") or {}).get("quic_available") for r in result.get("results", []))
+    transport_samples = []
+    for item in result.get("results", []):
+        if isinstance(item, dict):
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            transport_samples.append({
+                "peer": item.get("peer"),
+                "quic_available": bool(data.get("quic_available")),
+                "quic_used": bool(data.get("quic_used")),
+                "connection_transport": data.get("connection_transport"),
+                "fallback": data.get("fallback"),
+            })
     return {
         "ok": result.get("ok", False),
         "enabled": True,
         "quic_available": available,
         "quic_used": available,
+        "native_transport_verified": available and all(t.get("quic_used") for t in transport_samples),
+        "transport_samples": transport_samples,
+        "relay_transport": "libp2p_request_response",
         "fallback": "request_response",
         "fallback_reason": None if available else "native_quic_transport_not_available",
         "results": result.get("results", []),
@@ -2452,6 +2505,12 @@ def _run_mlx_lm_direct_chat(
         "compute_time_ms": generation_ms,
         "relay_ms": relay_ms,
         "setup_ms": int(response.get("load_ms") or 0),
+        "mlx_lm_load_ms": int(response.get("mlx_lm_load_ms") or response.get("load_ms") or 0),
+        "mlx_lm_cache_hit": bool(response.get("cache_hit")),
+        "mlx_lm_cache_status": response.get("cache_status") or ("hit" if response.get("cache_hit") else "loaded"),
+        "resident_model": bool(response.get("resident_model", True)),
+        "model_cache_size": int(response.get("model_cache_size") or 0),
+        "token_events": response.get("token_events") if isinstance(response.get("token_events"), list) else [],
         "tokens_generated": completion_tokens,
         "hot_path_tps": actual_tps,
         "benchmark": {
@@ -2464,6 +2523,7 @@ def _run_mlx_lm_direct_chat(
             "relay_ms": relay_ms,
             "ttft_ms": response.get("ttft_ms"),
             "load_ms": response.get("load_ms"),
+            "cache_hit": bool(response.get("cache_hit")),
             "runtime_backend": "mlx_lm",
         },
         "metrics": {
@@ -2541,6 +2601,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     selected_peers, pool_class, pool_fallback_reason = _select_pool_peers(peers_sorted, catalog, pool_preference)
     peers_sorted = sorted(selected_peers)
     peers_sorted = _filter_workers_by_catalog_public_ip_optional(peers_sorted, catalog)
+    selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
+    peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
     if len(peers_sorted) < MIN_WORKERS:
         # Pas assez de workers : retourne une ERREUR explicite (le VPS ne calcule jamais)
         mismatch_note = ""
@@ -2565,6 +2627,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "min_workers_required": MIN_WORKERS,
                 "required_model": MODEL_ID,
                 "incompatible_model_peers": incompatible_model_peers,
+                "peer_latency_matrix": selection_latency_matrix,
             },
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
@@ -2579,6 +2642,26 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     )
     if direct_result is not None:
         return direct_result
+    if _requires_mlx_lm_direct_guard():
+        return {
+            "ok": False,
+            "text": "",
+            "error": (
+                "mlx_lm_direct_p2p obligatoire pour Qwen3.5-9B en production. "
+                "Le fallback vers le backend shard custom est bloqué pour préserver la qualité et le TPS."
+            ),
+            "trace": {
+                "layout": "mlx_lm_direct_p2p",
+                "ok": False,
+                "routing_path": peers_sorted[:1],
+                "peers": peers_sorted,
+                "failure_stage": "mlx_lm_direct_guard",
+                "fallback_blocked": True,
+                "model_id": MODEL_ID,
+                "peer_latency_matrix": selection_latency_matrix,
+            },
+            "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
     n = _routing_pipeline_width(len(peers_sorted))
     peers = peers_sorted[:n]
@@ -2631,6 +2714,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     if sess_status == "created":
         print(f"[VPS] Setup poids en {setup_ms}ms")
     pool_info = _pool_for_session(session_id)
+    latency_matrix_for_decode = pool_info.get("peer_latency_matrix") or selection_latency_matrix
+    dynamic_microbatch_cap = _microbatch_cap_for_rtt(peers, latency_matrix_for_decode)
     stream_open = {"ok": False, "results": []}
     pool_id = str(pool_info.get("pool_id") or "")
     if hidden_transport == "q4":
@@ -2815,6 +2900,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "relay_ms": result.get("relay_ms"),
             "serialization_ms": result.get("serialization_ms"),
             "hidden_bytes": result.get("hidden_bytes"),
+            "connection_transport": result.get("connection_transport"),
+            "quic_used": bool(result.get("quic_used")),
         })
 
         if not result.get("ok", True):
@@ -2835,6 +2922,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                     "relay_ms": result.get("relay_ms"),
                     "serialization_ms": result.get("serialization_ms"),
                     "hidden_bytes": result.get("hidden_bytes"),
+                    "connection_transport": result.get("connection_transport"),
+                    "quic_used": bool(result.get("quic_used")),
                 }
                 if result.get("ok", True):
                     err = ""
@@ -2981,7 +3070,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             and float(SAMPLING_TEMPERATURE) <= 1e-9
             and next_step_val >= 1
         ):
-            micro_budget = max(2, min(DECODE_MICROBATCH_CAP, remaining_gen))
+            micro_budget = max(2, min(dynamic_microbatch_cap, remaining_gen))
 
         current_payload = {
             "session_id": session_id,
@@ -3040,6 +3129,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     relay_ms_total = sum(int(m.get("relay_ms") or 0) for m in relay_metrics)
     serialization_ms_total = sum(int(m.get("serialization_ms") or 0) for m in relay_metrics)
     hidden_bytes_total = sum(int(m.get("hidden_bytes") or 0) for m in relay_metrics)
+    relay_quic_used = any(bool(m.get("quic_used")) for m in relay_metrics)
     max_batch_size_seen = max((int(t.get("batch_size") or 1) for t in batch_traces), default=1)
     avg_queue_wait_ms = int(sum(int(t.get("queue_wait_ms") or 0) for t in batch_traces) / len(batch_traces)) if batch_traces else 0
     decode_batch_ms_total = sum(int(t.get("decode_batch_ms") or 0) for t in batch_traces)
@@ -3098,6 +3188,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "serialization_ms": serialization_ms_total,
         "hidden_bytes": hidden_bytes_total,
         "worker_kv_cache": WORKER_KV_CACHE,
+        "microbatch_tuning": {
+            "enabled": DECODE_MICROBATCH,
+            "configured_cap": DECODE_MICROBATCH_CAP,
+            "dynamic_cap": dynamic_microbatch_cap,
+            "rtt_target_ms": MICROBATCH_RTT_TARGET_MS,
+        },
         "generation_control": {
             "stop_token_ids": stop_ids,
             "stop_reason": stop_reason,
@@ -3108,10 +3204,19 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "repetition_guard": REPETITION_GUARD,
         },
         "quic_enabled": HIDDEN_QUIC,
-        "quic_used": bool(quic_probe.get("quic_used")),
+        "quic_used": bool(quic_probe.get("quic_used")) or relay_quic_used,
         "quic_probe": quic_probe,
-        "quic_available": bool(quic_probe.get("quic_available")),
+        "quic_available": bool(quic_probe.get("quic_available")) or relay_quic_used,
         "quic_fallback_reason": quic_probe.get("fallback_reason") or ("disabled" if not HIDDEN_QUIC else None),
+        "relay_transport_samples": [
+            {
+                "transport": m.get("connection_transport"),
+                "quic_used": bool(m.get("quic_used")),
+                "relay_ms": m.get("relay_ms"),
+            }
+            for m in relay_metrics
+            if m.get("connection_transport")
+        ],
         "prefix_cache": {
             "enabled": PREFIX_CACHE,
             "hit": bool(prefix_cache_hit.get("hit")),
@@ -3140,7 +3245,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
              "latency_ms": ms,
              "relay_ms": (relay_metrics[i] if i < len(relay_metrics) else {}).get("relay_ms"),
              "serialization_ms": (relay_metrics[i] if i < len(relay_metrics) else {}).get("serialization_ms"),
-             "hidden_bytes": (relay_metrics[i] if i < len(relay_metrics) else {}).get("hidden_bytes")}
+             "hidden_bytes": (relay_metrics[i] if i < len(relay_metrics) else {}).get("hidden_bytes"),
+             "connection_transport": (relay_metrics[i] if i < len(relay_metrics) else {}).get("connection_transport"),
+             "quic_used": bool((relay_metrics[i] if i < len(relay_metrics) else {}).get("quic_used"))}
             for i, ms in enumerate(step_latencies[:len(routing_path)])
         ],
         "compute_time_ms": total_ms,

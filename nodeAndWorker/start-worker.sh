@@ -3,9 +3,11 @@
 # Vryx Worker Startup Script (macOS Edition)
 # Usage: ./start-worker.sh --model "google/gemma-2-2b-it"
 
-MODEL_ID="unsloth/gemma-2-9b-it"
+# Aligné sur le stage1 prod (VPS) : Qwen3.5-9B + port P2P annoncé dans les heartbeats.
+MODEL_ID="Qwen/Qwen3.5-9B"
 GRPC_PORT=50052
 API_PORT=3031
+P2P_PORT=4021
 BOOTSTRAP_NODE="/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz"
 API_URL="https://vryx.eu"
 
@@ -16,6 +18,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL_ID="$2"; shift 2 ;;
     --port|--grpc-port) GRPC_PORT="$2"; shift 2 ;;
     --api-port) API_PORT="$2"; shift 2 ;;
+    --p2p-port) P2P_PORT="$2"; shift 2 ;;
     --bootstrap-node) BOOTSTRAP_NODE="$2"; shift 2 ;;
     --api-url) API_URL="$2"; shift 2 ;;
     --user-id) USER_ID="$2"; shift 2 ;;
@@ -29,6 +32,8 @@ echo "  +------------------------------------------+"
 echo "  |         Vryx Worker Launcher             |"
 echo "  |            (macOS Edition)               |"
 echo "  +------------------------------------------+"
+echo ""
+echo "[*] Modèle : ${MODEL_ID}  |  gRPC : ${GRPC_PORT}  |  P2P TCP/QUIC : ${P2P_PORT}  |  API locale : ${API_PORT}"
 echo ""
 
 # 0. Nettoyage des processus fantômes
@@ -67,13 +72,20 @@ if [ ! -f "${DAEMON_BIN}" ]; then
     cargo build --release
 fi
 
+mkdir -p "${SCRIPT_DIR}/.vryx-keys"
+NODE_KEY_FILE="${SCRIPT_DIR}/.vryx-keys/worker.node.key"
+
+# QUIC + relais persistant : meilleure traversée NAT vers le bootstrap VPS.
+VRYX_HIDDEN_QUIC=1 VRYX_PERSISTENT_RELAY=1 \
 "${DAEMON_BIN}" \
     --mode worker \
     --grpc-port "$GRPC_PORT" \
+    --p2p-port "$P2P_PORT" \
     --api-port "$API_PORT" \
     --bootstrap-node "$BOOTSTRAP_NODE" \
     --api-url "$API_URL" \
     --model "$MODEL_ID" \
+    --node-key-file "$NODE_KEY_FILE" \
     ${USER_ID:+--user-id "$USER_ID"} > >(tee -a "${SCRIPT_DIR}/worker_daemon.log") 2>&1 &
 RUST_PID=$!
 

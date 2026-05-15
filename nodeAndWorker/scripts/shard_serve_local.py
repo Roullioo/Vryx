@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 def main() -> None:
-    root = os.path.abspath(os.environ.get("VRYX_SHARD_BASE_DIR", "/var/tmp/vryx-shards"))
+    root = os.path.abspath(os.environ.get("VRYX_SHARD_BASE_DIR", "/var/lib/vryx-shards"))
     port = int(os.environ.get("VRYX_SHARD_SERVE_PORT", "18765"))
     prefix = "/api/internal/shard-serve/"
 

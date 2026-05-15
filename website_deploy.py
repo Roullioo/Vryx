@@ -162,6 +162,14 @@ set -euo pipefail
 REMOTE="{REMOTE_DIR}"
 sudo mkdir -p "$REMOTE"
 sudo chown -R "$(id -un)":"$(id -gn)" "$REMOTE"
+SHARD_DIR="${{VRYX_SHARD_BASE_DIR:-/var/lib/vryx-shards}}"
+MIN_FREE_MB="${{VRYX_DEPLOY_MIN_FREE_MB:-10240}}"
+sudo mkdir -p "$SHARD_DIR"
+free_mb="$(df -Pm "$SHARD_DIR" | awk 'NR==2 {{print $4}}')"
+if [[ -z "$free_mb" || "$free_mb" -lt "$MIN_FREE_MB" ]]; then
+  echo "[remote] ERREUR: espace disque insuffisant pour shards (${{free_mb:-0}} Mo libres, minimum $MIN_FREE_MB Mo) sur $SHARD_DIR" >&2
+  exit 1
+fi
 rm -rf "$REMOTE/dist"
 ENV_BACKUP="$(mktemp)"
 if [[ -f "$REMOTE/server/.env" ]]; then

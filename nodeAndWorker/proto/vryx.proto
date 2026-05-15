@@ -5,6 +5,7 @@ package vryx;
 // Inférence locale (VPS ou worker via gRPC).
 service InferenceService {
   rpc Process(TensorData) returns (ProcessedTensorData);
+  rpc ProcessStream(TensorData) returns (stream StreamChunk);
   // Capacités déclarées par le worker (RAM, device) pour le scheduler tensor-parallèle.
   rpc ReportCapabilities(WorkerCapabilities) returns (CapabilitiesAck);
   // Vérification / warmup du runtime shard éphémère (sans persistance disque).
@@ -35,6 +36,15 @@ message ProcessedTensorData {
   // Trace JSON du pipeline tensor-parallel (étapes P2P, pairs, latences) pour l'admin.
   string pipeline_trace_json = 11;
   uint64 compute_time_ms = 12;
+}
+
+message StreamChunk {
+  string event = 1;
+  string token = 2;
+  string json = 3;
+  bool done = 4;
+  string error = 5;
+  uint64 elapsed_ms = 6;
 }
 
 // --- Tensor parallel éphémère (metadata + futures charges RAM) ---

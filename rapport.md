@@ -1,5 +1,88 @@
 # Rapport : réduction du « mur » perçu (admin chat P2P)
 
+## Mise à jour critique : TPS et latence pipeline P2P (15 mai 2026)
+
+### Ce qu'il se passait avant
+
+- Attente de **90+ secondes** avant toute réponse ou erreur sur le chat P2P.
+- Cause racine : `workers_connected_p2p: 0` (worker visible via heartbeat mais P2P non connecté). L'orchestrateur Python appelait `_discover_live_peers()` qui retournait le worker depuis `/api/internal/live-peers` (heartbeat API). La relay HTTP vers ce worker était mise en file (`pending_relay_until_connected`) dans le Rust, sans jamais aboutir.
+- Le heartbeat du Rust nettoie cette file seulement toutes les **30 s**, avec un minimum forcé à **45 s** (`relay_deadline.max(45)`), donc la requête attendait entre 45 s et 105 s avant un timeout.
+- Les timeouts systèmd étaient tous à **600 s** (`VRYX_DIST_TIMEOUT_SEC`, `VRYX_PIPELINE_STEP_TIMEOUT_SEC`, `VRYX_STAGE1_TIMEOUT_S`) — de nombreux fichiers drop-in se réécrivaient les uns les autres (les fichiers `99-*` et `zzzz-*` écrasaient notre override `50-fast-timeouts.conf`).
+
+### Ce qu'il se passe maintenant
+
+- **Fail rapide** : `_discover_live_peers()` interroge d'abord `/api/tp-peers` (pairs P2P réellement dans le swarm libp2p). Si vide ET que l'endpoint répond, on retourne `[]` immédiatement — sans tomber sur les heartbeats API qui génèrent des relais impossibles.
+- **Réponse en < 1 s** lorsque aucun worker P2P n'est connecté : `failure_stage: "discover_live_peers_empty"`, `latency_ms ≈ 7`.
+- **Message d'erreur clair** côté front : `"Aucun worker P2P actif. Connectés P2P : 0 / Visibles via heartbeat : 2 / Déclarés API : 1. Relancez le daemon rust-daemon en mode worker sur la machine Apple Silicon."` — affiché en quelques secondes, pas après 90 s.
+- **Override timeouts définitif** : fichier `zzzzzz-fast-fail.conf` (sort après tous les `zzzzz*`) sur le stage1 impose `VRYX_DIST_TIMEOUT_SEC=25`, `VRYX_PIPELINE_STEP_TIMEOUT_SEC=25`.
+- **Bootstrap + initiateur redémarrés** pour forcer une nouvelle tentative de reconnexion P2P.
+
+### Pour retrouver les TPS d'avant (25+ TPS)
+
+Le worker Apple Silicon à 88.178.19.205 envoie des heartbeats API mais n'est **pas connecté P2P** (port 4021 injoignable depuis le VPS). Pour rétablir le TPS :
+
+1. Sur la machine worker (Apple Silicon), depuis le dépôt : `cd nodeAndWorker && ./start-worker.sh` (défaut prod : modèle **Qwen/Qwen3.5-9B**, **--p2p-port 4021**, QUIC + relais, clé stable dans `.vryx-keys/worker.node.key`).
+2. Vérifier que le worker dial bien le bootstrap : `/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz`
+3. Vérifier dans `curl http://51.222.26.225:3031/api/status` que `workers_connected_p2p ≥ 1`.
+4. Le modèle déclaré par le worker doit être `Qwen/Qwen3.5-9B` (correspond à `VRYX_DIST_MODEL`).
+
+Le panneau admin **Chat P2P** inclut un encart dépliable avec la même commande.
+
+## Mise à jour : Chat P2P UI responsive + budget tokens (15 mai 2026)
+
+- **Plafond `max_new_tokens`** : interface jusqu’à **16 384** jetons (au lieu de 1 024), réglage par pas de **64** ; champ numérique + curseur. API Node : variable **`VRYX_P2P_ADMIN_MAX_NEW_TOKENS`** (défaut 16 384, bornée 256–65 536). Stage1 VPS : override **`zzzzzzz-dist-max-tokens.conf`** avec **`VRYX_DIST_MAX_TOKENS=16384`** (avant : 512) pour que l’orchestrateur Python honore la demande.
+- **Page** `/admin/chat-p2p` : layout **mobile-first** (pile, boutons min. 44 px, détails techniques repliés), **XL** en deux colonnes (chat + sidebar). Le long bloc « Rôle de cette page » et le panneau **Runtime shard** ont été retirés au profit d’une **carte d’en-tête** (dégradé, compteur workers, liens).
+- **Panneau** : en-tête compact, zone réglages scrollable, transport P2P en **snap horizontal** sur petit écran, pied de page avec **safe-area** iOS, fermeture **`</section>`** sémantique.
+
+## Mise à jour : page Chat P2P allégée (15 mai 2026)
+
+- Interface plus lisible : carte d’accueil avec badge workers live, accès **Supervision nœud** et **Flux technique** (repliable), colonnes **Dernier tour** et **Workers live** harmonisées.
+
+## Mise à jour : Chat P2P « je ne peux pas parler » + test VPS (15 mai 2026)
+
+### Ce qu’il se passait avant
+
+- Sur le VPS, l’initiateur Rust répondait en **HTTP 404** sur `POST /api/chat/stream` : binaire **sans** la route NDJSON actuelle. Node retombait sur `POST /api/chat`, qui peut rester **bloqué très longtemps** si `workers_connected_p2p` reste à 0 (dial P2P vers les workers).
+- Pendant tout ce temps, le front gardait **`loading === true`** : bouton d’envoi désactivé et **Entrée** ignorée (`send()` sort tout de suite), d’où l’impression de ne plus pouvoir « parler » au chat.
+- Aucun moyen clair d’**interrompre** une requête côté navigateur ; pas de message explicite expliquant l’absence de `/api/chat/stream` sur l’initiateur.
+
+### Ce qu’il se passe maintenant
+
+- Le panneau admin affiche **« Annuler la requête »** pendant la génération : `AbortController` sur le `fetch` vers `/api/admin/p2p/chat/stream`, ce qui coupe la connexion, déclenche `req.close` côté Node (`ctrl.abort()` déjà câblé) et remet l’interface utilisable avec un message d’annulation.
+- L’API Node envoie un événement SSE **`initiator_legacy`** dès qu’elle détecte un **404** sur l’appel stream vers l’initiateur, pour expliquer le basculement vers `/api/chat` et rappeler qu’un **rust-daemon** à jour expose le flux NDJSON.
+- **Déploiement** : `website_deploy.py` (build local déjà fait, `VRYX_SKIP_BUILD=1`) vers `vryx.eu` / PM2 `vryx-api` exécuté avec succès.
+- **Test réel** sur le VPS : `curl` vers `127.0.0.1:3031/api/chat/stream` → **404** ; statut initiateur avec `workers_visible_p2p: 5` mais **`workers_connected_p2p: 0`** : la latence vient du pipeline P2P, pas du formulaire du site. Pour un test bout-en-bout avec réponse rapide : reconnecter les workers au relais **ou** déployer l’initiateur **et** les workers alignés sur la branche courante.
+
+### Prompt si l’erreur persiste après déploiement Rust
+
+« Recompiler et redémarrer le service initiateur (`rust-daemon`) sur le VPS pour que `POST http://127.0.0.1:3031/api/chat/stream` renvoie 200 et du NDJSON, puis vérifier `workers_connected_p2p > 0` dans `GET /api/status`. »
+
+## Mise à jour : objectifs 95+ transport, streaming, qualité et opérabilité (15 mai 2026)
+
+### Ce qu’il se passait avant
+
+- Le placement des workers compatibles pouvait encore repartir d’un ordre stable mais peu optimal pour le worker unique `mlx_lm_direct_p2p`; la proximité réseau VPS n’était pas systématiquement prioritaire avant le direct path.
+- Le Chat P2P affichait un pseudo-streaming : Node attendait la réponse JSON complète de l’initiateur, puis découpait le texte en mots côté serveur.
+- Le chemin `mlx-lm` officiel gardait déjà le modèle en cache, mais l’interface ne voyait pas explicitement `cache_hit`, `load_ms`, ni le statut résident.
+- Aucun workflow CI ne bloquait une régression de parité logits `Transformers` vs `mlx-lm`.
+- Les shards utilisaient encore `/var/tmp/vryx-shards` par défaut, sans profil systemd versionné ni garde disque explicite.
+
+### Ce qu’il se passe maintenant
+
+- Les workers sont retriés après mesure RTT VPS, avec un cap micro-batch dynamique (`VRYX_MICROBATCH_RTT_TARGET_MS`) pour garder le micro-décodage sans créer un gros bloc WAN sur lien lent.
+- Le proto gRPC expose `ProcessStream`; le stage 1 pousse des `StreamChunk`, le daemon Rust expose `/api/chat/stream` en NDJSON, et Node retransmet les tokens en SSE sans attendre le vieux `/api/chat` JSON quand le stream natif est disponible.
+- `mlx_lm_direct_p2p` remonte `mlx_lm_load_ms`, `cache_hit`, `cache_status`, `resident_model`, `model_cache_size` et bloque le fallback silencieux vers le shard custom sur Qwen3.5 quand `VRYX_MLX_LM_DIRECT=1`.
+- La CI ajoute `logits-parity.yml` sur runner self-hosted Apple Silicon : 3 prompts fixes × Qwen2/Qwen3.5, top-10 exact obligatoire.
+- Le build Rust Linux est vérifié par `rust-linux-build.yml`; les profils systemd prod sont versionnés dans `deploy/systemd/`.
+- Le défaut shard passe à `/var/lib/vryx-shards`, avec check disque dans `website_deploy.py` et snippets `ExecStartPre`.
+
+### Vérifications locales
+
+- `python3 -m py_compile` sur orchestrateur, runtime shard, serveur gRPC, stubs générés et script logits : OK.
+- `npm run build` dans `website/` : OK.
+- `node --check website/server/src/index.js` : OK.
+- `cargo check -p rust-daemon` : OK, uniquement warnings de dépréciation libp2p/yamux déjà non bloquants.
+
 ## Mise à jour : tokens, grand chat et sessions DB (14 mai 2026)
 
 ### Ce qu’il se passait avant
@@ -184,3 +267,37 @@ Test 128 tokens :
 
 Objectif **Qwen3.5 9B >15 TPS** atteint sur un vrai appel P2P VPS. Le chemin produit recommandé est `mlx-lm` officiel direct ; le backend shard MLX custom doit rester désactivé pour Qwen3.5 tant que sa `linear_attn` n’est pas alignée avec les logits de référence.
 
+---
+
+## Panneau admin « Zone de dialogue » P2P (mai 2026)
+
+### Ce qu’il se passait avant
+
+- La zone des messages restait visuellement petite : les réglages pipeline (transport, pool, budget) occupaient beaucoup de hauteur avec scroll interne, en plus du flux SSE fixe, ce qui multipliait les barres de défilement.
+- Le texte des messages s’affichait en bloc brut (`whitespace-pre-wrap` seul), peu lisible pour les paragraphes et les listes.
+
+### Ce qu’il se passe maintenant
+
+- **Mobile / étroit** : les réglages du pipeline sont dans un accordéon « Réglages du pipeline », ce qui libère la hauteur pour la conversation.
+- **Large écran** : les réglages restent visibles au-dessus du fil, dans une bande à hauteur plafonnée et scrollable si besoin.
+- **Zone messages** : conteneur avec hauteur minimale plus généreuse (`min-h` en `dvh`) et enrobage `flex` correct (`min-h-0` sur le parent) pour que la liste des messages occupe l’espace disponible.
+- **Flux temps réel** : repliable (`<details>`), avec la dernière ligne visible dans le résumé ; liste interne plus basse (`max-h-28` / `32`).
+- **Contenu** : rendu via `FormattedMessageBody` (paragraphes séparés par une ligne vide, listes `-` / `*` / numérotées, liens stylés ; ton « self » pour les bulles utilisateur).
+
+### Depuis cette évolution (Markdown + plein cadre)
+
+- **Markdown** : titres (`#` à `######`), **gras**, *italique*, listes, citations, blocs de code, tableaux et GitHub Flavored Markdown (`remark-gfm`) via `react-markdown` et le composant `ChatMarkdown`.
+- **Plein cadre** : page `Chat P2P` sans bandeau titre desktop ni padding du `main` ; panneau `layout="full"` en hauteur disponible ; colonne droite (trace + workers + liens) sur grand écran, empilée sous le chat sur mobile.
+
+### Marque dans la barre latérale admin
+
+- **Avant** : pastille « VX » et titre « Vryx Admin ».
+- **Maintenant** : même pictogramme que le site public (`/logo-withoutbg.png` via `VryxLogo`) et libellé **Virtualized Remote Yield eXchange** à côté ; le pictogramme renvoie vers l’accueil (`/`).
+
+---
+
+## Déploiement site + API (mai 2026)
+
+- **Procédure** : `python3 website_deploy.py` depuis la racine du dépôt (build `website`, archive `dist` + `server`, SFTP vers le VPS, `npm ci --omit=dev` dans `/var/www/vryx/server`, redémarrage PM2 `vryx-api`, contrôle `http://127.0.0.1:4000/api/health`).
+- **Résultat** : déploiement réussi sur le VPS cible ; API **online** après `pm2 save`.
+- **Secrets** : utiliser `VRYX_VPS_SSH_PASSWORD` (ou clé `VRYX_VPS_SSH_KEY`) en variable d’environnement locale, sans commiter de mot de passe.

@@ -20,6 +20,13 @@ const VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES = (process.env.VRYX_ALLOWED_INITIATOR
   .map((s) => s.trim().replace(/\/$/, ''))
   .filter(Boolean)
 
+/** Plafond `max_new_tokens` pour POST /api/admin/p2p/chat/stream (env, défaut 16384, borné 256–65536). */
+const VRYX_P2P_ADMIN_MAX_NEW_TOKENS = (() => {
+  const n = Number(process.env.VRYX_P2P_ADMIN_MAX_NEW_TOKENS)
+  if (!Number.isFinite(n)) return 16384
+  return Math.min(65536, Math.max(256, Math.floor(n)))
+})()
+
 function resolveInitiatorChatUrl(body) {
   const raw =
     typeof body?.initiator_chat_url === 'string' ? body.initiator_chat_url.trim().replace(/\/$/, '') : ''
@@ -1375,7 +1382,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
   const rawCap = req.body?.maxNewTokens ?? req.body?.max_new_tokens
   const parsedCap =
     typeof rawCap === 'number' ? rawCap : typeof rawCap === 'string' ? Number(rawCap) : NaN
-  if (Number.isFinite(parsedCap) && parsedCap >= 1 && parsedCap <= 4096) {
+  if (Number.isFinite(parsedCap) && parsedCap >= 1 && parsedCap <= VRYX_P2P_ADMIN_MAX_NEW_TOKENS) {
     maxNewTokens = Math.floor(parsedCap)
   }
   res.setHeader('Content-Type', 'text/event-stream')
@@ -1440,30 +1447,130 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
         body: chatPayload,
         signal: ctrl.signal,
       })
+    const callInitiatorChatStream = () =>
+      fetch(`${initiatorChatUrl}/api/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+        body: chatPayload,
+        signal: ctrl.signal,
+      })
 
-    let r = await callInitiatorChat()
-    clearProgressTimer()
-    send({
-      stage: 'http_headers',
-      status: r.ok ? 'Réponse HTTP reçue, lecture du corps…' : `Réponse HTTP ${r.status}, lecture du corps…`,
-    })
-    let text = await r.text()
-
-    /** L’initiateur Rust peut lancer « Pré-chat » + dial puis échouer tant que select! n’a pas traité ConnexionEstablished. Une seule retry API suffit pour la même requête. */
-    let data
+    let streamedTokensAlreadySent = false
+    let streamedReply = ''
+    let r = null
+    let data = null
+    let sr = null
     try {
-      data = JSON.parse(text)
+      sr = await callInitiatorChatStream()
+      if (sr.ok && sr.body) {
+        clearProgressTimer()
+        send({ stage: 'native_stream', status: 'Stream token natif initiateur ouvert.' })
+        const reader = sr.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() ?? ''
+          for (const line of lines) {
+            const rawLine = line.trim()
+            if (!rawLine) continue
+            let evt = null
+            try {
+              evt = JSON.parse(rawLine)
+            } catch {
+              continue
+            }
+            if (evt.event === 'token' && typeof evt.token === 'string' && evt.token.length > 0) {
+              streamedReply += evt.token
+              streamedTokensAlreadySent = true
+              send({ token: evt.token })
+            } else if (evt.event === 'stage' && typeof evt.json === 'string') {
+              try {
+                const stageData = JSON.parse(evt.json)
+                send(stageData)
+              } catch {
+                send({ stage: 'native_stream', status: evt.json })
+              }
+            } else if (evt.event === 'error' || evt.error) {
+              send({ error: String(evt.error || 'Erreur stream initiateur.') })
+              return res.end()
+            } else if (evt.event === 'done' || evt.done) {
+              const doneData = typeof evt.json === 'string' && evt.json
+                ? JSON.parse(evt.json)
+                : {}
+              data = {
+                ok: true,
+                response: typeof doneData.response === 'string' ? doneData.response : streamedReply,
+                ...doneData,
+              }
+            }
+          }
+        }
+        if (buffer.trim()) {
+          try {
+            const evt = JSON.parse(buffer.trim())
+            if ((evt.event === 'done' || evt.done) && typeof evt.json === 'string') {
+              const doneData = JSON.parse(evt.json)
+              data = {
+                ok: true,
+                response: typeof doneData.response === 'string' ? doneData.response : streamedReply,
+                ...doneData,
+              }
+            }
+          } catch {
+            void 0
+          }
+        }
+        r = { ok: Boolean(data), status: sr.status }
+      }
     } catch {
-      send({ error: 'Réponse initiateur invalide.' })
-      return res.end()
+      data = null
+      r = null
     }
+
+    if (sr && sr.ok === false && sr.status === 404) {
+      send({
+        stage: 'initiator_legacy',
+        status:
+          'Initiateur sans /api/chat/stream (HTTP 404) : utilisation de /api/chat. Déployez le rust-daemon actuel pour le flux NDJSON ; sinon le pipeline peut rester long si aucun worker P2P n’est relié.',
+      })
+    }
+
+    if (!data || !r) {
+      r = await callInitiatorChat()
+      clearProgressTimer()
+      send({
+        stage: 'http_headers',
+        status: r.ok ? 'Réponse HTTP reçue, lecture du corps…' : `Réponse HTTP ${r.status}, lecture du corps…`,
+      })
+      const text = await r.text()
+
+      /** L’initiateur Rust peut lancer « Pré-chat » + dial puis échouer tant que select! n’a pas traité ConnexionEstablished. Une seule retry API suffit pour la même requête. */
+      try {
+        data = JSON.parse(text)
+      } catch {
+        send({ error: 'Réponse initiateur invalide.' })
+        return res.end()
+      }
+    }
+    /** Fail rapide intentionnel (aucun worker P2P connecté, tp-peers vide) — pas de retry. */
+    const isNoWorkerPermanent = () =>
+      !r.ok &&
+      (data?.pipeline_trace?.failure_stage === 'discover_live_peers_empty' ||
+        (typeof data?.error === 'string' &&
+          (data.error.includes('pair worker') || data.error.includes('liste vide'))))
+
     const noWorkerTransient = () =>
       !r.ok &&
+      !isNoWorkerPermanent() &&
       typeof data?.error === 'string' &&
       (data.error.includes('worker P2P') ||
         data.error.includes('Aucun worker'))
 
-    if (noWorkerTransient()) {
+    if (!streamedTokensAlreadySent && noWorkerTransient()) {
       send({
         stage: 'p2p_warm_retry',
         status:
@@ -1484,7 +1591,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
         stage: 'http_headers_retry',
         status: r.ok ? 'Deuxième réponse initiateur OK, lecture…' : `Deuxième réponse HTTP ${r.status}…`,
       })
-      text = await r.text()
+      const text = await r.text()
       try {
         data = JSON.parse(text)
       } catch {
@@ -1496,19 +1603,29 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     send({ stage: 'parsed', status: 'Analyse du JSON initiateur terminée.' })
     if (!r.ok) {
       let detailError = typeof data?.error === 'string' ? data.error : `HTTP ${r.status}`
-      if (
+      const isWorkerError =
         typeof detailError === 'string' &&
-        (detailError.includes('worker P2P') || detailError.includes('Aucun worker'))
-      ) {
+        (detailError.includes('worker P2P') ||
+          detailError.includes('Aucun worker') ||
+          detailError.includes('pair worker') ||
+          detailError.includes('liste vide') ||
+          data?.pipeline_trace?.failure_stage === 'discover_live_peers_empty')
+      if (isWorkerError) {
         try {
-          const stRes = await fetch(`http://127.0.0.1:${PORT}/api/workers/status`, {
-            headers: { Accept: 'application/json' },
-          })
-          const stBody = await stRes.json().catch(() => null)
+          const [stRes, initRes] = await Promise.allSettled([
+            fetch(`http://127.0.0.1:${PORT}/api/workers/status`, { headers: { Accept: 'application/json' } }),
+            fetch('http://127.0.0.1:3031/api/status', { headers: { Accept: 'application/json' } }),
+          ])
+          const stBody = stRes.status === 'fulfilled' ? await stRes.value.json().catch(() => null) : null
+          const initBody = initRes.status === 'fulfilled' ? await initRes.value.json().catch(() => null) : null
           const workers = Array.isArray(stBody?.workers) ? stBody.workers : []
           const nWorker = workers.filter((w) => w.mode === 'worker').length
-          detailError +=
-            ` Contexte API : ${nWorker} ligne(s) mode worker dans GET /api/workers/status (${workers.length} entrée(s) dans la liste publique). Si ce nombre est supérieur à 0, le décalage vient très probablement du relais libp2p (consultez les logs initiateur : lignes « Pré-chat », « Dial » et « Connexion établie »). Réessayez après quelques secondes.`
+          const connectedP2P = initBody?.orchestrator_health?.workers_connected_p2p ?? '?'
+          const visibleP2P = initBody?.orchestrator_health?.workers_visible_p2p ?? '?'
+          detailError =
+            `Aucun worker P2P actif. ` +
+            `Connectés P2P : ${connectedP2P} / Visibles via heartbeat : ${visibleP2P} / Déclarés API : ${nWorker}. ` +
+            `Relancez le daemon rust-daemon en mode worker sur la machine Apple Silicon pour rétablir la connexion P2P.`
         } catch {
           /* ignore diagnostic secondaire */
         }
@@ -1683,15 +1800,17 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     const nWords = words.filter(Boolean).length
     // Pas de tempo artificielle : tout le goulot réseau+P2P est déjà résolu avant ce point ; diffusé en rafales au client.
     const delayMsPerToken = 0
-    send({
-      stage: 'streaming_tokens',
-      status: `Diffusion de la réponse (${nWords} fragment(s))…`,
-    })
-    for (const w of words) {
-      if (w) {
-        send({ token: w })
-        if (delayMsPerToken > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMsPerToken))
+    if (!streamedTokensAlreadySent) {
+      send({
+        stage: 'streaming_tokens',
+        status: `Diffusion de la réponse (${nWords} fragment(s))…`,
+      })
+      for (const w of words) {
+        if (w) {
+          send({ token: w })
+          if (delayMsPerToken > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delayMsPerToken))
+          }
         }
       }
     }
@@ -1855,7 +1974,7 @@ app.use('/api/admin', adminRouter)
  * Les workers téléchargent leurs couches directement depuis le VPS via HTTPS, sans passer par le relay P2P.
  * Accessible uniquement depuis localhost (Python VPS).
  */
-app.use('/api/internal/shard-serve', express.static(process.env.VRYX_SHARD_BASE_DIR || '/var/tmp/vryx-shards', {
+app.use('/api/internal/shard-serve', express.static(process.env.VRYX_SHARD_BASE_DIR || '/var/lib/vryx-shards', {
   dotfiles: 'deny',
   maxAge: 0,
   setHeaders(res) {

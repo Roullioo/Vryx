@@ -225,6 +225,8 @@ def _select_backend(shard: PipelineShard, meta: dict[str, Any]) -> RuntimeBacken
 _shards: Dict[str, PipelineShard] = {}
 _mlx_lm_models: Dict[str, Any] = {}
 _mlx_lm_tokenizers: Dict[str, Any] = {}
+_mlx_lm_lock = threading.Lock()
+_mlx_lm_stats: Dict[str, dict[str, Any]] = {}
 _prefix_cache: Dict[str, dict[str, Any]] = {}
 _prefix_cache_lock = threading.Lock()
 HIDDEN_TRANSPORT = os.environ.get("VRYX_HIDDEN_TRANSPORT", "int8").lower()
@@ -455,23 +457,40 @@ def mlx_lm_direct_generate(raw: bytes) -> bytes:
         return json.dumps({"ok": False, "error": f"mlx_lm_unavailable:{type(exc).__name__}:{exc}"}).encode()
 
     load_ms = 0
-    if model_id not in _mlx_lm_models:
-        t_load = time.perf_counter()
-        model, tokenizer = load(model_id)
-        _mlx_lm_models[model_id] = model
-        _mlx_lm_tokenizers[model_id] = tokenizer
-        load_ms = int((time.perf_counter() - t_load) * 1000)
+    cache_hit = model_id in _mlx_lm_models
+    with _mlx_lm_lock:
+        cache_hit = model_id in _mlx_lm_models
+        if not cache_hit:
+            t_load = time.perf_counter()
+            model, tokenizer = load(model_id)
+            _mlx_lm_models[model_id] = model
+            _mlx_lm_tokenizers[model_id] = tokenizer
+            load_ms = int((time.perf_counter() - t_load) * 1000)
+            _mlx_lm_stats[model_id] = {
+                "loads": int((_mlx_lm_stats.get(model_id) or {}).get("loads") or 0) + 1,
+                "last_load_ms": load_ms,
+                "loaded_at_ms": int(time.time() * 1000),
+            }
+        model = _mlx_lm_models[model_id]
+        tokenizer = _mlx_lm_tokenizers[model_id]
 
     chunks: list[str] = []
     token_count = 0
     first_token_ms: int | None = None
     t0 = time.perf_counter()
     try:
-        for response in stream_generate(_mlx_lm_models[model_id], _mlx_lm_tokenizers[model_id], prompt, max_tokens=max_tokens):
+        token_events: list[dict[str, Any]] = []
+        for response in stream_generate(model, tokenizer, prompt, max_tokens=max_tokens):
             if first_token_ms is None:
                 first_token_ms = int((time.perf_counter() - t0) * 1000)
             token_count += 1
-            chunks.append(str(getattr(response, "text", "") or ""))
+            piece = str(getattr(response, "text", "") or "")
+            chunks.append(piece)
+            token_events.append({
+                "index": token_count,
+                "text": piece,
+                "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            })
     except Exception as exc:
         return json.dumps({
             "ok": False,
@@ -479,6 +498,8 @@ def mlx_lm_direct_generate(raw: bytes) -> bytes:
             "runtime_backend": "mlx_lm",
             "model_id": model_id,
             "load_ms": load_ms,
+            "cache_hit": cache_hit,
+            "cache_status": "hit" if cache_hit else "loaded",
         }, ensure_ascii=False).encode()
 
     generation_ms = max(1, int((time.perf_counter() - t0) * 1000))
@@ -491,8 +512,14 @@ def mlx_lm_direct_generate(raw: bytes) -> bytes:
         "prompt_tokens": 0,
         "total_tokens": token_count,
         "load_ms": load_ms,
+        "mlx_lm_load_ms": load_ms,
+        "cache_hit": cache_hit,
+        "cache_status": "hit" if cache_hit else "loaded",
+        "resident_model": True,
+        "model_cache_size": len(_mlx_lm_models),
         "generation_ms": generation_ms,
         "ttft_ms": first_token_ms,
+        "token_events": token_events,
         "actual_tps": round(token_count * 1000.0 / generation_ms, 3) if generation_ms > 0 else 0,
         "decode_mode": "mlx_lm_direct_stream_generate",
     }, ensure_ascii=False).encode()

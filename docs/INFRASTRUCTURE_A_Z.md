@@ -224,6 +224,7 @@ Inspecte les processus `rust-daemon` / `inference_server.py`, agrège CPU/RAM/GP
 | RPC | Arguments | Retour | Rôle |
 |-----|-----------|--------|------|
 | `Process` | `TensorData` | `ProcessedTensorData` | Inférence principale (tokenIds, hiddenStates, compteurs tokens, trace pipeline) |
+| `ProcessStream` | `TensorData` | stream `StreamChunk` | Chat streamé : événements stage, tokens, puis métriques finales |
 | `ReportCapabilities` | `WorkerCapabilities` | `CapabilitiesAck` | Enregistrement capacités worker |
 | `PingShardRuntime` | `ShardInit` | `ActivationTensor` | Warmup / ping |
 
@@ -256,6 +257,7 @@ Inspecte les processus `rust-daemon` / `inference_server.py`, agrège CPU/RAM/GP
 | `GET` | `/api/status` | Statut nœud (peer_id, connexions, compteurs tokens, dernière trace shard) |
 | `GET` | `/api/tp-peers` | Topologie peers / layout hint pour l'UI |
 | `POST` | `/api/chat` | **Chat LLM** — relaie vers gRPC Python stage 1 |
+| `POST` | `/api/chat/stream` | **Chat streamé** — relaie `ProcessStream` en NDJSON |
 | `POST` | `/api/p2p/relay` | **Relais P2P** — transmet un `TensorRequest` au peer cible via libp2p |
 
 ### 6.3 Fonctionnement Daisy Chain
@@ -347,14 +349,14 @@ Gère le cycle de vie des shards éphémères (`PipelineShard`, `EphemeralShardS
 │ API Express (Node.js PM2 :4000)                                    │
 │  • Vérifie JWT admin                                               │
 │  • Envoie des événements SSE de progression au navigateur          │
-│  • Fetch POST → http://127.0.0.1:3031/api/chat (initiateur Rust)   │
+│  • Fetch POST → http://127.0.0.1:3031/api/chat/stream (NDJSON)     │
 └────────────────────────┬───────────────────────────────────────────┘
-                         │ HTTP JSON
+                         │ HTTP NDJSON stream
 ┌────────────────────────▼───────────────────────────────────────────┐
 │ Daemon Rust — Initiateur (:3031)                                   │
 │  • Reçoit la requête chat                                          │
 │  • Pré-fetch workers depuis /api/workers/status si nécessaire      │
-│  • Appel gRPC → Python stage 1 (:50051)                            │
+│  • Appel gRPC ProcessStream → Python stage 1 (:50051)              │
 └────────────────────────┬───────────────────────────────────────────┘
                          │ gRPC Process(TensorData)
 ┌────────────────────────▼───────────────────────────────────────────┐
@@ -455,7 +457,7 @@ Proxy TLS → PM2 Node `:4000`. La configuration n'est pas versionnée dans ce d
 | `VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES` | — | CSV préfixes autorisés pour surcharge URL |
 | `WORKER_LIVE_SEC` | `15` | Seuil « live » pour `/workers/live` |
 | `WORKER_OFFLINE_SEC` | `90` | Seuil « offline » pour `/workers/status` |
-| `VRYX_SHARD_BASE_DIR` | `/var/tmp/vryx-shards` | Répertoire shards statiques |
+| `VRYX_SHARD_BASE_DIR` | `/var/lib/vryx-shards` | Répertoire shards statiques persistant |
 
 ### Orchestrateur Python (sélection)
 
@@ -478,6 +480,15 @@ Proxy TLS → PM2 Node `:4000`. La configuration n'est pas versionnée dans ce d
 ### Daemon Rust (CLI)
 
 Les paramètres sont principalement en **arguments CLI** (`clap`) : `--mode`, `--grpc-port`, `--p2p-port`, `--api-port`, `--bootstrap-node`, `--api-url`, `--model`, `--node-key-file`.
+
+### CI obligatoire
+
+Deux workflows protègent `main` :
+
+- `.github/workflows/rust-linux-build.yml` compile `rust-daemon` en release sur Linux, avec `protobuf-compiler`.
+- `.github/workflows/logits-parity.yml` tourne sur runner self-hosted Apple Silicon (`self-hosted`, `macOS`, `ARM64`) et bloque les régressions si les top-10 logits `Transformers` et `mlx-lm` divergent sur Qwen2 et Qwen3.5.
+
+Dans GitHub, ces checks doivent être configurés comme required status checks sur `main`.
 
 ---
 
@@ -513,6 +524,22 @@ python3 vps_deploy.py
 cargo build --release
 scp target/release/rust-daemon ubuntu@51.222.26.225:/opt/vryx/
 sudo systemctl restart vryx-initiator
+```
+
+### Profils systemd versionnés
+
+Les drop-ins de référence sont dans `deploy/systemd/` :
+
+- `vryx-inference-stage1.service.d/95-prod-qwen35.conf` : Qwen3.5 9B, `VRYX_MLX_LM_DIRECT=1`, `VRYX_SHARD_BASE_DIR=/var/lib/vryx-shards`, check disque avant démarrage.
+- `vryx-initiator.service.d/95-prod-network.conf` : QUIC activé et timeouts P2P adaptés aux générations longues.
+- `vryx-api.pm2.env.example` : variables PM2/API Node à refléter dans le `.env` serveur.
+
+Pour vérifier le profil actif sur le VPS :
+
+```bash
+systemctl cat vryx-inference-stage1
+systemctl cat vryx-initiator
+pm2 env vryx-api
 ```
 
 ---
@@ -565,7 +592,8 @@ Si `inference_server.py` a été redémarré, le canal tonic en cache peut être
 ### VPS — espace disque épuisé (shards)
 
 ```bash
-du -sh /var/tmp/vryx-shards/
-sudo rm -rf /var/tmp/vryx-shards/*
+du -sh /var/lib/vryx-shards/
+df -h /var/lib/vryx-shards/
+sudo find /var/lib/vryx-shards -mindepth 1 -maxdepth 1 -mtime +2 -exec rm -rf {} +
 sudo systemctl restart vryx-inference-stage1
 ```

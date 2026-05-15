@@ -21,7 +21,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::time;
+use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::{routing::{get, post}, Json, Router};
 use tower_http::cors::CorsLayer;
 use axum::extract::DefaultBodyLimit;
@@ -479,6 +481,43 @@ async fn call_local_inference(
     )))
 }
 
+async fn call_local_inference_stream(
+    port: u16,
+    data: Vec<u8>,
+    dtype: String,
+    routing_path: Vec<String>,
+    session_id: String,
+) -> Result<tonic::Streaming<vryx::StreamChunk>, Box<dyn Error + Send + Sync>> {
+    let maybe_channel = {
+        let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+        cache.lock().unwrap().get(&port).cloned()
+    };
+    let channel = match maybe_channel {
+        Some(ch) => ch,
+        None => {
+            let endpoint = Channel::from_shared(format!("http://127.0.0.1:{}", port))?;
+            let ch = endpoint.connect().await?;
+            let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+            cache.lock().unwrap().insert(port, ch.clone());
+            ch
+        }
+    };
+    let mut client = InferenceServiceClient::new(channel)
+        .max_decoding_message_size(1024 * 1024 * 1024)
+        .max_encoding_message_size(1024 * 1024 * 1024);
+
+    let response = client
+        .process_stream(tonic::Request::new(vryx::TensorData {
+            data,
+            shape: vec![],
+            dtype,
+            routing_path,
+            session_id,
+        }))
+        .await?;
+    Ok(response.into_inner())
+}
+
 // ============================================================
 //  Heartbeat → API Vryx
 // ============================================================
@@ -824,6 +863,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ── Shared State (pour l'API Axum) ────────────────────────────────────
     let active_peers = Arc::new(Mutex::new(HashSet::<PeerId>::new()));
+    let peer_transports = Arc::new(Mutex::new(HashMap::<PeerId, String>::new()));
     // Compteur par pair : plusieurs connexions simultanées (QUIC + relay, etc.) sont courantes ;
     // ne pas retirer le pair de `active_peers` à la fermeture d'un seul canal.
     let peer_connection_count = Arc::new(Mutex::new(HashMap::<PeerId, u32>::new()));
@@ -856,14 +896,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let cmd_tx_axum = cmd_tx.clone();
         let p2p_relay_axum = p2p_relay_tx.clone();
         let mode_chat = args.mode.clone();
+        let mode_chat_stream = args.mode.clone();
         let mode_relay = args.mode.clone();
         let mode_status_diag = args.mode.clone();
         let mode_tp_diag = args.mode.clone();
         let grpc_axum_health = args.grpc_port;
+        let grpc_chat_stream = args.grpc_port;
         let api_axum_port = args.api_port;
         let active_status_peers = Arc::clone(&active_peers);
         let active_relay_peers = Arc::clone(&active_peers);
         let active_tp_peers = Arc::clone(&active_peers);
+        let status_peer_transports = Arc::clone(&peer_transports);
+        let relay_peer_transports = Arc::clone(&peer_transports);
         let quic_requested_status = hidden_quic_requested;
         let registry_status_peers = Arc::clone(&initiator_registry_workers);
 
@@ -874,6 +918,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let t_out = tokens_out.load(Ordering::Relaxed);
                 let t_gen = tokens_generated.load(Ordering::Relaxed);
                 let shard = last_shard_trace_axum.lock().unwrap().clone();
+                let transport_snapshot = status_peer_transports.lock().unwrap().clone();
                 let active_orch_snap = Arc::clone(&active_status_peers);
                 let mode_s = mode_status_diag.clone();
                 let boot_id = boot_for_tp_api;
@@ -892,6 +937,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "quic_available": true,
                         "quic_used": quic_requested_status,
                         "quic_fallback": if quic_requested_status { "native_quic_enabled" } else { "disabled" },
+                        "connection_transports": transport_snapshot.iter().map(|(p, t)| (p.to_string(), t.clone())).collect::<HashMap<String, String>>(),
                     });
                     if let Some(obj) = j.as_object_mut() {
                         obj.insert("last_shard_trace".into(), shard.unwrap_or(serde_json::Value::Null));
@@ -1025,6 +1071,88 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing prompt"})))
                 }
             }))
+            .route("/api/chat/stream", post(move |Json(payload): Json<serde_json::Value>| async move {
+                if mode_chat_stream != "initiator" {
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "application/x-ndjson; charset=utf-8")
+                        .body(Body::from("{\"event\":\"error\",\"error\":\"Node not in initiator mode\",\"done\":true}\n"))
+                        .unwrap();
+                }
+                let Some(prompt) = payload["prompt"].as_str() else {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("content-type", "application/x-ndjson; charset=utf-8")
+                        .body(Body::from("{\"event\":\"error\",\"error\":\"Missing prompt\",\"done\":true}\n"))
+                        .unwrap();
+                };
+                let quantization = payload
+                    .get("quantization")
+                    .or_else(|| payload.get("hidden_transport"))
+                    .and_then(|v| v.as_str())
+                    .filter(|v| matches!(*v, "q4" | "int8" | "fp16"))
+                    .unwrap_or("int8");
+                let pool_preference = payload
+                    .get("pool_preference")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| matches!(*v, "auto" | "velocity_mlx" | "velocity_vllm" | "legacy_pytorch"))
+                    .unwrap_or("auto");
+                let mut request_obj = serde_json::json!({
+                    "prompt": prompt,
+                    "quantization": quantization,
+                    "hidden_transport": quantization,
+                    "pool_preference": pool_preference,
+                });
+                if let Some(mt) = payload
+                    .get("max_new_tokens")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 1 { Some(i as u64) } else { None })))
+                    .filter(|&mt| mt >= 1 && mt <= 4096)
+                {
+                    request_obj["max_new_tokens"] = serde_json::json!(mt);
+                }
+                match call_local_inference_stream(
+                    grpc_chat_stream,
+                    request_obj.to_string().into_bytes(),
+                    "text".to_string(),
+                    vec![],
+                    String::new(),
+                ).await {
+                    Ok(stream) => {
+                        let mapped = stream.map(|item| {
+                            let value = match item {
+                                Ok(chunk) => serde_json::json!({
+                                    "event": chunk.event,
+                                    "token": chunk.token,
+                                    "json": chunk.json,
+                                    "done": chunk.done,
+                                    "error": chunk.error,
+                                    "elapsed_ms": chunk.elapsed_ms,
+                                }),
+                                Err(err) => serde_json::json!({
+                                    "event": "error",
+                                    "error": err.to_string(),
+                                    "done": true,
+                                }),
+                            };
+                            Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("{}\n", value)))
+                        });
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/x-ndjson; charset=utf-8")
+                            .header("cache-control", "no-cache")
+                            .body(Body::from_stream(mapped))
+                            .unwrap()
+                    }
+                    Err(err) => Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .header("content-type", "application/x-ndjson; charset=utf-8")
+                        .body(Body::from(format!(
+                            "{}\n",
+                            serde_json::json!({"event":"error","error":err.to_string(),"done":true})
+                        )))
+                        .unwrap(),
+                }
+            }))
             .route("/api/p2p/relay", post(move |Json(payload): Json<serde_json::Value>| async move {
                 use base64::{Engine as _, engine::general_purpose};
                 if mode_relay != "initiator" {
@@ -1078,6 +1206,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let connection_reuse = active_relay_peers.lock().unwrap().contains(&peer);
+                let connection_transport = relay_peer_transports
+                    .lock()
+                    .unwrap()
+                    .get(&peer)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let relay_quic_used = connection_transport.contains("/quic");
                 if p2p_relay_axum.send((peer, req, tx)).is_err() {
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -1097,6 +1232,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "hidden_bytes": resp.p2p_messages_in,
                                 "persistent_relay": persistent_relay,
                                 "connection_reuse": connection_reuse,
+                                "connection_transport": connection_transport,
+                                "quic_available": true,
+                                "quic_used": relay_quic_used,
                                 "prompt_tokens": resp.prompt_tokens_llm,
                                 "completion_tokens": resp.completion_tokens_llm,
                                 "total_tokens": resp.total_tokens_llm,
@@ -1861,6 +1999,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         println!("[P2P] Connexion établie avec {} ({:?})", peer_id, endpoint);
+                        peer_transports.lock().unwrap().insert(
+                            peer_id,
+                            endpoint.get_remote_address().to_string(),
+                        );
                         let first_logical_link = {
                             let mut c = peer_connection_count.lock().unwrap();
                             let n = c.entry(peer_id).or_insert(0);
@@ -1941,6 +2083,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     };
                     if disconnect_peer_entirely {
                         active_peers.lock().unwrap().remove(&peer_id);
+                        peer_transports.lock().unwrap().remove(&peer_id);
                         if Some(peer_id) != bootstrap_peer_id {
                             discovered_peers.remove(&peer_id);
                         }

@@ -1,6 +1,7 @@
 import { NavLink, Navigate, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { useEffect, useState } from 'react'
+import { VryxLogo } from '../brand/VryxLogo'
 import { useAuth } from '../../context/AuthContext'
 
 /* ─── Icons ───────────────────────────────────────────────────────────────── */
@@ -114,14 +115,16 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
           open ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        {/* Logo */}
-        <div className="flex h-14 items-center gap-3 border-b border-white/8 px-5">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-zinc-100">
-            <span className="font-display text-[11px] font-bold leading-none text-zinc-950">VX</span>
+        {/* Logo + sigle étendu */}
+        <div className="flex min-h-14 items-start gap-2.5 border-b border-white/8 px-4 py-3 sm:px-5">
+          <VryxLogo variant="mark" tone="light" markSize="sm" to="/" className="shrink-0 self-start pt-0.5" />
+          <div className="min-w-0 flex-1">
+            <p className="font-display text-[11px] font-semibold leading-snug tracking-tight text-white sm:text-xs">
+              Virtualized Remote Yield eXchange
+            </p>
           </div>
-          <span className="font-display text-[15px] font-semibold text-white">Vryx Admin</span>
           <button
-            className="ml-auto text-white/40 hover:text-white lg:hidden"
+            className="ml-auto shrink-0 self-start text-white/40 hover:text-white lg:hidden"
             onClick={onClose}
             aria-label="Fermer"
           >
@@ -188,9 +191,20 @@ type AdminShellProps = {
   title: string
   subtitle?: string
   actions?: ReactNode
+  /** `none` : pas de padding sur le contenu principal (vue immersive, ex. chat plein cadre). */
+  mainSpacing?: 'default' | 'none'
+  /** Masque le bandeau titre / sous-titre sous la barre mobile (grand écran : plus de place au contenu). */
+  showDesktopTitleBar?: boolean
 }
 
-export function AdminShell({ children, title, subtitle, actions }: AdminShellProps) {
+export function AdminShell({
+  children,
+  title,
+  subtitle,
+  actions,
+  mainSpacing = 'default',
+  showDesktopTitleBar = true,
+}: AdminShellProps) {
   const { user, loading } = useAuth()
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
@@ -226,7 +240,7 @@ export function AdminShell({ children, title, subtitle, actions }: AdminShellPro
 
       {/* Main */}
       <div
-        className="flex min-w-0 flex-1 flex-col lg:pl-[220px]"
+        className="flex min-h-0 min-w-0 flex-1 flex-col lg:pl-[220px]"
       >
         {/* Top bar mobile */}
         <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-[var(--color-admin-mobile-header)] px-4 backdrop-blur-md lg:hidden">
@@ -240,19 +254,26 @@ export function AdminShell({ children, title, subtitle, actions }: AdminShellPro
           <span className="font-display text-[15px] font-semibold text-fg">{title}</span>
         </header>
 
-        {/* Page header */}
-        <div className="border-b border-border bg-card px-6 py-5 lg:px-8">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h1 className="font-display text-xl font-bold text-fg lg:text-2xl">{title}</h1>
-              {subtitle && <p className="mt-0.5 text-sm text-muted">{subtitle}</p>}
+        {showDesktopTitleBar ? (
+          <div className="hidden border-b border-border bg-card px-6 py-4 lg:block lg:px-8">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h1 className="font-display text-xl font-bold text-fg lg:text-2xl">{title}</h1>
+                {subtitle && <p className="mt-0.5 text-sm text-muted">{subtitle}</p>}
+              </div>
+              {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
             </div>
-            {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
           </div>
-        </div>
+        ) : null}
 
         {/* Content */}
-        <main className="flex-1 overflow-auto p-4 lg:p-6">
+        <main
+          className={
+            mainSpacing === 'none'
+              ? 'flex min-h-0 flex-1 flex-col overflow-hidden p-0'
+              : 'flex-1 overflow-auto p-4 lg:p-6'
+          }
+        >
           {children}
         </main>
       </div>

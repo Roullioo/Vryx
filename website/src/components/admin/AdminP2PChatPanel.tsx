@@ -1,10 +1,22 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { WorkerRoundMetrics } from './workerRoundMetrics'
 import { WorkerComputeReport } from './WorkerComputeReport'
+import { ChatMarkdown } from './ChatMarkdown'
 import { buildSession, saveSession, saveSessionToDb } from '../../lib/sessions'
 
 type QuantizationMode = 'int8' | 'q4' | 'fp16'
 type PoolPreference = 'auto' | 'velocity_mlx' | 'velocity_vllm' | 'legacy_pytorch'
+
+/** Aligné sur `VRYX_P2P_ADMIN_MAX_NEW_TOKENS` côté API (défaut 16384). */
+export const P2P_ADMIN_MAX_NEW_TOKENS = 16384
+const P2P_ADMIN_MIN_NEW_TOKENS = 64
+const P2P_ADMIN_TOKEN_STEP = 64
+
+function clampTokens(n: number) {
+  const raw = Number.isFinite(n) ? Math.floor(n) : P2P_ADMIN_MIN_NEW_TOKENS
+  const stepped = Math.round(raw / P2P_ADMIN_TOKEN_STEP) * P2P_ADMIN_TOKEN_STEP
+  return Math.min(P2P_ADMIN_MAX_NEW_TOKENS, Math.max(P2P_ADMIN_MIN_NEW_TOKENS, stepped))
+}
 
 /** Workers avec heartbeat récent (route admin `/workers/live`). */
 export type LiveWorker = {
@@ -150,10 +162,15 @@ function quantizationLabel(q: string) {
 
 export function AdminP2PChatPanel({
   liveWorkers,
+  liveSec = 30,
   activeChatPeerId,
   onP2pRoundComplete,
+  aside,
+  layout = 'card',
 }: {
   liveWorkers: LiveWorker[]
+  /** Fenêtre heartbeat affichée (secondes), alignée sur l’API live. */
+  liveSec?: number
   activeChatPeerId: string | null
   onP2pRoundComplete?: (
     workerPeerId: string,
@@ -163,6 +180,8 @@ export function AdminP2PChatPanel({
       roundMetrics?: WorkerRoundMetrics
     },
   ) => void
+  aside?: ReactNode
+  layout?: 'card' | 'full'
 }) {
   const [prompt, setPrompt] = useState('')
   const [messages, setMessages] = useState<{
@@ -176,7 +195,24 @@ export function AdminP2PChatPanel({
   // fp16 défaut : qualité logits fiable avec MLX/Vélocité ; q4 coupe la bande passante mais peut brouiller les activités.
   const [quantization, setQuantization] = useState<QuantizationMode>('fp16')
   const [poolPreference, setPoolPreference] = useState<PoolPreference>('auto')
-  const [maxNewTokens, setMaxNewTokens] = useState(256)
+  const [maxNewTokens, setMaxNewTokens] = useState(1024)
+  const chatAbortRef = useRef<AbortController | null>(null)
+  const [isWideLayout, setIsWideLayout] = useState(
+    typeof window !== 'undefined' ? window.matchMedia('(min-width: 1024px)').matches : true,
+  )
+
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1024px)')
+    const sync = () => setIsWideLayout(mq.matches)
+    sync()
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [])
+
+  function cancelGeneration() {
+    chatAbortRef.current?.abort()
+    chatAbortRef.current = null
+  }
 
   async function send() {
     if (!prompt.trim() || loading) return
@@ -184,12 +220,15 @@ export function AdminP2PChatPanel({
     setPrompt('')
     setMessages((prev) => [...prev, { role: 'user', content: userMsg }, { role: 'ai', content: '' }])
     setLoading(true)
+    const ac = new AbortController()
+    chatAbortRef.current = ac
 
     try {
       const response = await fetch('/api/admin/p2p/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        signal: ac.signal,
         body: JSON.stringify({ prompt: userMsg, quantization, pool_preference: poolPreference, maxNewTokens }),
       })
 
@@ -450,7 +489,10 @@ export function AdminP2PChatPanel({
           }
         }
       }
-    } catch {
+    } catch (e: unknown) {
+      const aborted =
+        (typeof DOMException !== 'undefined' && e instanceof DOMException && e.name === 'AbortError') ||
+        (e instanceof Error && e.name === 'AbortError')
       setMessages((prev) => {
         const last = prev[prev.length - 1]
         const rest = prev.slice(0, -1)
@@ -459,154 +501,151 @@ export function AdminP2PChatPanel({
           {
             ...last,
             streamLog: undefined,
-            content: 'Erreur lors de la génération P2P.',
-            trace: { worker: '—', latencyMs: 0, mode: 'Erreur' },
+            content: aborted
+              ? 'Génération interrompue (annulation côté navigateur).'
+              : 'Erreur lors de la génération P2P.',
+            trace: { worker: '—', latencyMs: 0, mode: aborted ? 'Annulé' : 'Erreur' },
           },
         ]
       })
     } finally {
+      chatAbortRef.current = null
       setLoading(false)
     }
   }
 
-  return (
-    <div className="panel flex h-full min-h-[78svh] flex-col overflow-hidden border-border bg-card shadow-lg xl:max-h-[calc(100svh-7rem)]">
-      <div className="border-b border-border bg-surface/50 px-4 py-4 sm:px-6">
-        <h3 className="flex items-center gap-2 text-base font-semibold text-fg sm:text-lg">
-          <span className={`flex h-2 w-2 rounded-full ${loading ? 'animate-pulse bg-accent' : 'bg-success'}`} />
-          Chat P2P natif (initiateur Rust)
-        </h3>
-        <p className="mt-1 text-[10px] leading-relaxed text-muted">
-          Toutes les requêtes traversent le pipeline gRPC. Avec{' '}
-          <span className="font-mono">initiator_sequential</span>, les workers se suivent en chaîne directe pour limiter
-          les allers-retours WAN. Côté serveur : <span className="font-mono">VRYX_INITIATOR_CHAT_URL</span> (et
-          optionnellement des préfixes CSV pour <span className="font-mono">initiator_chat_url</span>). Aucune
-          dépendance Web2 pour l’inférence.
-        </p>
-        <p className="mt-1.5 rounded-md border border-border bg-surface px-2 py-1.5 text-[10px] leading-relaxed text-fg">
-          Après chaque réponse, ouvrez « Détails du traitement » : QUIC, KV Cache, TPS, tokens et métriques pipeline.
-        </p>
-        <div className="mt-3 rounded-xl border border-border bg-card p-2">
-          <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted">
-            Quantification du transport P2P
-          </p>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-            {[
-              {
-                id: 'q4' as const,
-                title: 'Q4 transport',
-                desc: 'Débit filaire privilégié (workers MLX).',
-              },
-              {
-                id: 'int8' as const,
-                title: 'INT8 transport',
-                desc: 'Alternative entière 8 bits.',
-              },
-              {
-                id: 'fp16' as const,
-                title: 'FP16 transport',
-                desc: 'Meilleure fidélité, plus lourd sur le réseau.',
-              },
-            ].map((item) => {
-              const selected = quantization === item.id
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setQuantization(item.id)}
-                  disabled={loading}
-                  className={`rounded-lg border px-3 py-2 text-left transition-colors ${
-                    selected
-                      ? 'border-accent/60 bg-accent/10 text-fg'
-                      : 'border-border bg-surface text-muted hover:border-accent/30 hover:text-fg'
-                  } disabled:cursor-not-allowed disabled:opacity-60`}
-                  aria-pressed={selected}
-                >
-                  <span className="flex items-center justify-between gap-2 text-[12px] font-semibold">
-                    {item.title}
-                    {selected ? (
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={2} className="h-3.5 w-3.5 text-accent" aria-hidden>
-                        <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
-                      </svg>
-                    ) : null}
-                  </span>
-                  <span className="mt-0.5 block text-[10px] leading-snug text-muted">{item.desc}</span>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-        <div className="mt-3 rounded-xl border border-border bg-card p-2">
-          <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted">
-            Pool de calcul
-          </p>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-4">
-            {[
-              { id: 'auto' as const, title: 'Auto', desc: 'Velocity si saine, sinon legacy.' },
-              { id: 'velocity_mlx' as const, title: 'Velocity MLX', desc: 'Pool Mac optimisée.' },
-              { id: 'velocity_vllm' as const, title: 'Velocity vLLM', desc: 'Pool Nvidia PagedAttention.' },
-              { id: 'legacy_pytorch' as const, title: 'Legacy PyTorch', desc: 'Chemin stable actuel.' },
-            ].map((item) => {
-              const selected = poolPreference === item.id
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setPoolPreference(item.id)}
-                  disabled={loading}
-                  className={`rounded-lg border px-3 py-2 text-left transition-colors ${
-                    selected
-                      ? 'border-success/60 bg-success/10 text-fg'
-                      : 'border-border bg-surface text-muted hover:border-success/30 hover:text-fg'
-                  } disabled:cursor-not-allowed disabled:opacity-60`}
-                  aria-pressed={selected}
-                >
-                  <span className="block text-[12px] font-semibold">{item.title}</span>
-                  <span className="mt-0.5 block text-[10px] leading-snug text-muted">{item.desc}</span>
-                </button>
-              )
-            })}
-          </div>
-        </div>
-        <div className="mt-3 rounded-xl border border-accent/20 bg-accent/4 p-3">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">
-                Longueur de réponse
-              </p>
-              <p className="mt-1 text-[11px] leading-relaxed text-muted">
-                Le plafond était bloqué à 32 tokens. Ce réglage pilote maintenant{' '}
-                <span className="font-mono text-fg">max_new_tokens</span> jusqu’à 1 024 tokens.
-              </p>
-            </div>
-            <div className="flex min-w-0 items-center gap-3 sm:min-w-72">
-              <input
-                type="range"
-                min={32}
-                max={1024}
-                step={32}
-                value={maxNewTokens}
-                onChange={(e) => setMaxNewTokens(Number(e.target.value))}
+  const pipelineSettingsControls = (
+    <>
+      <div className="rounded-xl border border-border/80 bg-card/90 p-2 shadow-sm sm:p-2.5">
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted">Transport P2P</p>
+        <div className="-mx-1 flex snap-x snap-mandatory gap-2 overflow-x-auto pb-1 sm:mx-0 sm:grid sm:grid-cols-3 sm:overflow-visible sm:pb-0">
+          {[
+            {
+              id: 'q4' as const,
+              title: 'Q4 transport',
+              desc: 'Débit filaire privilégié (workers MLX).',
+            },
+            {
+              id: 'int8' as const,
+              title: 'INT8 transport',
+              desc: 'Alternative entière 8 bits.',
+            },
+            {
+              id: 'fp16' as const,
+              title: 'FP16 transport',
+              desc: 'Meilleure fidélité, plus lourd sur le réseau.',
+            },
+          ].map((item) => {
+            const selected = quantization === item.id
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setQuantization(item.id)}
                 disabled={loading}
-                className="min-w-0 flex-1 accent-current"
-                aria-label="Nombre maximum de tokens à générer"
+                className={`min-w-[9.5rem] shrink-0 snap-start rounded-lg border px-3 py-2.5 text-left transition-colors sm:min-w-0 ${
+                  selected
+                    ? 'border-accent/60 bg-accent/10 text-fg'
+                    : 'border-border bg-surface text-muted hover:border-accent/30 hover:text-fg'
+                } disabled:cursor-not-allowed disabled:opacity-60`}
+                aria-pressed={selected}
+              >
+                <span className="flex items-center justify-between gap-2 text-[12px] font-semibold">
+                  {item.title}
+                  {selected ? (
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={2} className="h-3.5 w-3.5 text-accent" aria-hidden>
+                      <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
+                    </svg>
+                  ) : null}
+                </span>
+                <span className="mt-0.5 block text-[10px] leading-snug text-muted">{item.desc}</span>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      <div className="mt-3 rounded-xl border border-border/80 bg-card/90 p-2 shadow-sm sm:mt-3 sm:p-2.5">
+        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted">Pool de calcul</p>
+        <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+          {[
+            { id: 'auto' as const, title: 'Auto', desc: 'Velocity si saine, sinon legacy.' },
+            { id: 'velocity_mlx' as const, title: 'Velocity MLX', desc: 'Pool Mac optimisée.' },
+            { id: 'velocity_vllm' as const, title: 'Velocity vLLM', desc: 'Pool Nvidia PagedAttention.' },
+            { id: 'legacy_pytorch' as const, title: 'Legacy PyTorch', desc: 'Chemin stable actuel.' },
+          ].map((item) => {
+            const selected = poolPreference === item.id
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setPoolPreference(item.id)}
+                disabled={loading}
+                className={`rounded-lg border px-2.5 py-2 text-left transition-colors sm:px-3 sm:py-2.5 ${
+                  selected
+                    ? 'border-success/60 bg-success/10 text-fg'
+                    : 'border-border bg-surface text-muted hover:border-success/30 hover:text-fg'
+                } disabled:cursor-not-allowed disabled:opacity-60`}
+                aria-pressed={selected}
+              >
+                <span className="block text-[12px] font-semibold">{item.title}</span>
+                <span className="mt-0.5 block text-[10px] leading-snug text-muted">{item.desc}</span>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      <div className="mt-3 rounded-xl border border-accent/25 bg-gradient-to-br from-accent/[0.07] to-card p-3 sm:p-3.5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+          <div className="min-w-0 flex-1">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Budget de génération</p>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted sm:text-xs">
+              Contrôle <span className="font-mono text-fg/90">max_new_tokens</span> envoyé à l&apos;initiateur (plafond UI{' '}
+              {P2P_ADMIN_MAX_NEW_TOKENS.toLocaleString('fr-FR')} jetons). Le stage1 peut encore appliquer{' '}
+              <span className="font-mono text-fg/90">VRYX_DIST_MAX_TOKENS</span> côté VPS.
+            </p>
+          </div>
+          <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:gap-3 lg:w-auto lg:min-w-[min(100%,24rem)]">
+            <input
+              type="range"
+              min={P2P_ADMIN_MIN_NEW_TOKENS}
+              max={P2P_ADMIN_MAX_NEW_TOKENS}
+              step={P2P_ADMIN_TOKEN_STEP}
+              value={maxNewTokens}
+              onChange={(e) => setMaxNewTokens(clampTokens(Number(e.target.value)))}
+              disabled={loading}
+              className="min-h-[44px] min-w-0 flex-1 cursor-pointer accent-accent"
+              aria-valuemin={P2P_ADMIN_MIN_NEW_TOKENS}
+              aria-valuemax={P2P_ADMIN_MAX_NEW_TOKENS}
+              aria-valuenow={maxNewTokens}
+              aria-label="Nombre maximum de tokens à générer"
+            />
+            <label className="flex items-center gap-2 sm:shrink-0">
+              <span className="sr-only">Valeur exacte</span>
+              <input
+                type="number"
+                min={P2P_ADMIN_MIN_NEW_TOKENS}
+                max={P2P_ADMIN_MAX_NEW_TOKENS}
+                step={P2P_ADMIN_TOKEN_STEP}
+                value={maxNewTokens}
+                onChange={(e) => setMaxNewTokens(clampTokens(Number(e.target.value)))}
+                disabled={loading}
+                className="w-full rounded-lg border border-border bg-card px-2 py-2 text-center font-mono text-sm font-semibold text-fg tabular-nums sm:w-24"
               />
-              <span className="w-20 rounded-lg border border-border bg-card px-2 py-1 text-center font-mono text-xs font-semibold text-fg">
-                {maxNewTokens}
-              </span>
-            </div>
+            </label>
           </div>
         </div>
-        {loading && (
-          <p className="mt-2 flex items-center gap-2 text-[11px] font-medium text-accent">
-            <svg className="h-3.5 w-3.5 shrink-0 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path
-                className="opacity-90"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-              />
-            </svg>
+      </div>
+      {loading && (
+        <p className="mt-2 flex items-start gap-2 rounded-lg border border-accent/20 bg-accent/5 px-2 py-2 text-[11px] font-medium leading-snug text-accent sm:items-center sm:text-xs">
+          <svg className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin sm:mt-0" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path
+              className="opacity-90"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+            />
+          </svg>
+          <span>
             {(() => {
               const tail = messages[messages.length - 1]
               const lastLine =
@@ -615,69 +654,214 @@ export function AdminP2PChatPanel({
                   : null
               if (lastLine) return lastLine
               return liveWorkers.length > 0
-                ? 'Routage côté initiateur (pair P2P choisi dynamiquement). Les étapes détaillées s’affichent sous la bulle.'
-                : 'Recherche d’un worker P2P actif. Les étapes détaillées s’affichent sous la bulle.'
+                ? 'Routage initiateur : les étapes détaillées s’affichent sous la bulle assistant.'
+                : 'Recherche d’un worker P2P actif ; les étapes s’affichent sous la bulle assistant.'
             })()}
-          </p>
-        )}
-        {!loading && activeChatPeerId && (
-          <p className="mt-2 text-[10px] text-muted">
-            Dernier pair actif :{' '}
-            <span className="font-mono text-fg">{activeChatPeerId.slice(0, 20)}…</span>
-          </p>
-        )}
-      </div>
+          </span>
+        </p>
+      )}
+      {!loading && activeChatPeerId && (
+        <p className="mt-2 text-[10px] text-muted">
+          Dernier pair actif : <span className="font-mono text-fg">{activeChatPeerId.slice(0, 20)}…</span>
+        </p>
+      )}
+    </>
+  )
 
-      <div className="min-h-[360px] flex-1 space-y-5 overflow-y-auto bg-neutral-100 p-4 sm:p-6 dark:bg-black">
-        {messages.length === 0 ? (
-          <div className="flex h-full min-h-[160px] flex-col items-center justify-center text-center">
-            <p className="text-sm text-muted dark:text-zinc-500">
-              Écrivez un message : il sera relayé en chaîne sur le réseau P2P natif (gRPC, sans API centrale).
+  const isFull = layout === 'full'
+
+  return (
+    <section
+      className={
+        isFull
+          ? aside
+            ? 'flex min-h-0 w-full flex-1 flex-col overflow-hidden bg-card lg:flex-row'
+            : 'flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden bg-card'
+          : 'flex w-full flex-col overflow-hidden rounded-2xl border border-border/90 bg-card shadow-md ring-1 ring-zinc-950/4 dark:bg-zinc-950/40 dark:ring-white/[0.07] min-h-[min(86dvh,calc(100dvh-10.5rem))] max-h-[min(92dvh,calc(100dvh-7.5rem))] sm:min-h-[min(80dvh,calc(100dvh-9rem))] lg:max-h-[min(90dvh,calc(100dvh-6.5rem))]'
+      }
+      aria-labelledby="p2p-admin-chat-title"
+    >
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <header className="shrink-0 border-b border-border/80 bg-gradient-to-b from-surface/95 to-card px-3 py-3 sm:px-5 sm:py-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h3
+              id="p2p-admin-chat-title"
+              className="flex items-center gap-2 font-display text-sm font-semibold tracking-tight text-fg sm:text-base"
+            >
+              <span
+                className={`flex h-2 w-2 shrink-0 rounded-full ${loading ? 'animate-pulse bg-accent' : 'bg-success'}`}
+                aria-hidden
+              />
+              Zone de dialogue
+            </h3>
+            <p className="mt-1 text-[11px] leading-snug text-muted sm:text-xs">
+              Initiateur Rust · SSE · chaîne <span className="font-mono text-fg/85">initiator_sequential</span>
             </p>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            <div
+              className="inline-flex items-center gap-1.5 rounded-full border border-border/80 bg-surface/90 px-2.5 py-1 text-[10px] font-medium text-muted sm:text-xs"
+              title="Workers vus par l’API live dans la fenêtre heartbeat"
+            >
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-success" aria-hidden />
+              <span>
+                <span className="font-semibold tabular-nums text-fg">{liveWorkers.length}</span> pair
+                {liveWorkers.length !== 1 ? 's' : ''} · {liveSec}s
+              </span>
+            </div>
+            {loading ? (
+              <div className="flex shrink-0 items-center gap-1.5 rounded-full border border-accent/25 bg-accent/8 px-2.5 py-1 text-[10px] font-semibold text-accent">
+                <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path
+                    className="opacity-90"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                  />
+                </svg>
+                En cours
+              </div>
+            ) : null}
+          </div>
+        </div>
+        <details className="mt-2 rounded-lg border border-border/70 bg-surface/40 text-left sm:mt-3">
+          <summary className="cursor-pointer px-2 py-1.5 text-[11px] font-medium text-muted marker:text-muted sm:px-3 sm:text-xs">
+            Aide · variables serveur et worker Mac
+          </summary>
+          <div className="space-y-2 border-t border-border/60 px-2 py-2 text-[11px] leading-relaxed text-muted sm:px-3 sm:text-xs">
+            <p>
+              Côté API : <span className="font-mono text-fg/90">VRYX_INITIATOR_CHAT_URL</span>, option{' '}
+              <span className="font-mono text-fg/90">VRYX_ALLOWED_INITIATOR_CHAT_PREFIXES</span> pour surcharger l&apos;URL
+              initiateur.
+            </p>
+            <p className="rounded-md border border-border/60 bg-card/80 px-2 py-1.5 text-[10px] sm:text-[11px]">
+              Après chaque réponse : ouvrir « Détails du traitement » sous la bulle (QUIC, KV cache, TPS, tokens).
+            </p>
+            <details className="rounded-md border border-border/60 bg-card/80">
+              <summary className="cursor-pointer px-2 py-1.5 text-[11px] font-semibold text-fg sm:text-xs">
+                « Aucun worker P2P actif » : lancer le worker sur Apple Silicon
+              </summary>
+              <div className="space-y-2 border-t border-border/50 px-2 py-2 text-[10px] sm:text-[11px]">
+                <p>
+                  L&apos;initiateur doit voir au moins un pair dans le swarm (message d&apos;erreur : connectés P2P). Sur le Mac,
+                  dans le dépôt :
+                </p>
+                <pre className="overflow-x-auto rounded-md border border-border bg-zinc-950 p-2 font-mono text-[10px] leading-relaxed text-zinc-100">
+                  {`cd nodeAndWorker
+./start-worker.sh --model "Qwen/Qwen3.5-9B" --p2p-port 4021`}
+                </pre>
+                <p>
+                  Laisser le terminal ouvert ; vérifier <span className="font-mono text-fg">worker_daemon.log</span> (ligne
+                  « Heartbeat OK »), puis renvoyer un message ici.
+                </p>
+              </div>
+            </details>
+          </div>
+        </details>
+      </header>
+
+      {isWideLayout ? (
+        <div className="shrink-0 max-h-[min(28vh,15rem)] overflow-y-auto overscroll-contain border-b border-border/70 bg-muted/35 px-3 py-2.5 sm:max-h-[min(30vh,16rem)] sm:px-4 md:py-3">
+          {pipelineSettingsControls}
+        </div>
+      ) : (
+        <details className="shrink-0 border-b border-border/70 bg-muted/35">
+          <summary className="flex min-h-[44px] cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-sm font-semibold text-fg [&::-webkit-details-marker]:hidden sm:px-4">
+            <svg className="h-4 w-4 shrink-0 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h10M4 18h16" />
+            </svg>
+            Réglages du pipeline
+          </summary>
+          <div className="max-h-[min(62vh,28rem)] overflow-y-auto overscroll-contain border-t border-border/50 px-3 pb-3 pt-2 sm:px-4">
+            {pipelineSettingsControls}
+          </div>
+        </details>
+      )}
+
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div
+          className={
+            isFull
+              ? 'min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-y-contain bg-gradient-to-b from-zinc-100/95 to-zinc-100/80 px-3 py-4 sm:px-5 sm:py-5 dark:from-zinc-900/90 dark:to-zinc-950/85 dark:ring-1 dark:ring-inset dark:ring-zinc-800/80'
+              : 'min-h-[min(52dvh,22rem)] flex-1 space-y-6 overflow-y-auto overscroll-y-contain bg-gradient-to-b from-zinc-100/95 to-zinc-100/80 px-3 py-4 sm:min-h-[min(48dvh,24rem)] sm:px-5 sm:py-5 dark:from-zinc-900/90 dark:to-zinc-950/85 dark:ring-1 dark:ring-inset dark:ring-zinc-800/80'
+          }
+        >
+        {messages.length === 0 ? (
+          <div
+            className={
+              isFull
+                ? 'flex min-h-[min(36dvh,12rem)] flex-col items-center justify-center gap-4 px-2 py-8 text-center sm:min-h-0 sm:flex-1 sm:py-10'
+                : 'flex min-h-[min(48dvh,18rem)] flex-col items-center justify-center gap-4 px-2 py-10 text-center sm:min-h-[min(44dvh,20rem)] sm:py-12'
+            }
+          >
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-border/80 bg-card shadow-sm">
+              <svg className="h-7 w-7 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+            </div>
+            <div className="max-w-md space-y-2">
+              <p className="text-base font-medium leading-relaxed text-zinc-900 dark:text-zinc-50 sm:text-lg">
+                Premier message
+              </p>
+              <p className="text-sm leading-relaxed text-zinc-600 dark:text-zinc-300">
+                Le texte traverse le réseau P2P natif (gRPC). Réglez le budget de tokens ci-dessus si besoin, puis
+                écrivez votre consigne.
+              </p>
+            </div>
           </div>
         ) : (
           messages.map((m, i) => (
-            <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+            <div key={i} className={`flex flex-col gap-1.5 ${m.role === 'user' ? 'items-end' : 'items-stretch sm:items-start'}`}>
               {m.role === 'ai' && (m.streamLog?.length || (loading && i === messages.length - 1 && !m.trace)) ? (
-                <div
-                  className={`mb-2 max-w-[95%] rounded-xl border border-border/80 bg-surface/80 px-3 py-2 text-[11px] leading-snug text-muted shadow-sm dark:border-zinc-700 dark:bg-zinc-900/90 sm:max-w-[90%]`}
+                <details
+                  className={`mb-1 max-w-[95%] rounded-xl border border-border/80 bg-white/95 px-3 py-2 text-xs leading-snug text-zinc-700 shadow-sm open:pb-2.5 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200 sm:max-w-[90%]`}
                   aria-live="polite"
                 >
-                  <div className="mb-1 flex items-center gap-1.5 font-semibold text-fg">
+                  <summary className="flex cursor-pointer list-none items-center gap-2 text-left text-sm font-semibold text-zinc-900 marker:content-none dark:text-zinc-50 [&::-webkit-details-marker]:hidden">
                     <svg className="h-3.5 w-3.5 shrink-0 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} aria-hidden>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
                     </svg>
-                    Flux temps réel
-                  </div>
-                  <ul className="max-h-28 space-y-0.5 overflow-y-auto font-mono text-[10px] text-muted">
-                    {(m.streamLog ?? []).slice(-14).map((line, li) => (
-                      <li key={`${i}-${li}-${line.slice(0, 24)}`} className="border-l-2 border-accent/35 pl-2 text-fg/90">
+                    <span className="min-w-0 shrink-0">Flux temps réel</span>
+                    <span className="min-w-0 truncate font-mono text-[10px] font-normal text-zinc-500 dark:text-zinc-400">
+                      {(m.streamLog ?? []).length
+                        ? (m.streamLog ?? [])[(m.streamLog ?? []).length - 1]
+                        : loading && i === messages.length - 1
+                          ? 'Connexion au flux SSE…'
+                          : ''}
+                    </span>
+                  </summary>
+                  <ul className="mt-2 max-h-28 space-y-1 overflow-y-auto border-t border-border/50 pt-2 font-mono text-[11px] leading-snug text-zinc-600 dark:border-zinc-600 dark:text-zinc-300 sm:max-h-32">
+                    {(m.streamLog ?? []).slice(-10).map((line, li) => (
+                      <li key={`${i}-${li}-${line.slice(0, 24)}`} className="border-l-2 border-accent/50 pl-2 text-zinc-800 dark:text-zinc-100">
                         {line}
                       </li>
                     ))}
                     {loading && i === messages.length - 1 && !(m.streamLog?.length) ? (
-                      <li className="border-l-2 border-accent/35 pl-2 text-fg/80">Connexion au flux SSE…</li>
+                      <li className="border-l-2 border-accent/50 pl-2 text-zinc-700 dark:text-zinc-200">Connexion au flux SSE…</li>
                     ) : null}
                   </ul>
-                </div>
+                </details>
               ) : null}
               <div
-                className={`max-w-[94%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-relaxed sm:max-w-[86%] ${
+                className={`rounded-2xl px-4 py-3.5 text-[15px] leading-[1.7] shadow-sm sm:px-5 sm:text-base ${
+                  isFull ? 'max-w-[min(100%,min(94vw,88rem))]' : 'max-w-[min(100%,42rem)]'
+                } ${
                   m.role === 'user'
-                    ? 'border border-chat-self/35 bg-chat-self text-chat-self-fg shadow-sm'
-                    : 'border border-border bg-card text-fg shadow-sm dark:border-zinc-700 dark:bg-zinc-900'
+                    ? 'border border-chat-self/35 bg-chat-self text-chat-self-fg'
+                    : 'border border-zinc-200/90 bg-white text-zinc-900 dark:border-zinc-600 dark:bg-zinc-800/95 dark:text-zinc-50'
                 }`}
               >
                 {m.role === 'ai' && !m.content && loading && i === messages.length - 1 ? (
-                  <span className="inline-flex items-center gap-2 text-muted">
+                  <span className="inline-flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
                     <svg className="h-4 w-4 shrink-0 animate-pulse text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} aria-hidden>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
                     </svg>
                     En attente des premiers jetons…
                   </span>
-                ) : (
-                  m.content
-                )}
+                ) : m.content?.trim() ? (
+                  <ChatMarkdown text={m.content} tone={m.role === 'user' ? 'self' : 'default'} />
+                ) : null}
               </div>
 
               {m.role === 'ai' && m.trace && (
@@ -919,9 +1103,21 @@ export function AdminP2PChatPanel({
           ))
         )}
       </div>
+      </div>
 
-      <div className="border-t border-border bg-card p-3 dark:bg-zinc-950 sm:p-4">
-        <div className="relative flex items-end gap-2">
+      <footer className="shrink-0 border-t border-border/90 bg-card/95 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 shadow-[0_-10px_30px_-18px_rgba(0,0,0,0.1)] dark:bg-zinc-950/95 sm:px-5 sm:pb-4 sm:pt-4">
+        {loading ? (
+          <div className="mb-2 flex justify-end sm:mb-3">
+            <button
+              type="button"
+              onClick={cancelGeneration}
+              className="inline-flex min-h-[44px] items-center justify-center rounded-xl border border-border bg-surface px-4 text-sm font-semibold text-fg transition-colors hover:bg-surface/80 active:scale-[0.99]"
+            >
+              Annuler la requête
+            </button>
+          </div>
+        ) : null}
+        <div className="relative flex items-end gap-2 sm:gap-3">
           <textarea
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
@@ -931,23 +1127,29 @@ export function AdminP2PChatPanel({
                 void send()
               }
             }}
-            placeholder="Message complet au réseau P2P… Maj + Entrée pour une nouvelle ligne."
+            placeholder="Votre message au réseau P2P… (Maj + Entrée : nouvelle ligne)"
             rows={3}
-            className="max-h-52 min-h-24 w-full resize-y rounded-2xl border border-border bg-surface py-3 pl-4 pr-14 text-sm leading-relaxed text-fg focus:border-accent/50 focus:ring-1 focus:ring-accent/20 dark:border-zinc-700 dark:bg-zinc-900"
+            className="min-h-[5.5rem] max-h-[40vh] w-full resize-y rounded-2xl border border-zinc-300 bg-white py-3 pl-4 pr-14 text-base leading-relaxed text-zinc-900 placeholder:text-zinc-500 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500 sm:min-h-[6rem] sm:py-3.5 sm:pl-5 sm:pr-16 sm:text-[17px]"
           />
           <button
             type="button"
             onClick={send}
             disabled={loading || !prompt.trim()}
-            className="absolute bottom-2.5 right-2.5 flex h-10 w-10 items-center justify-center rounded-full bg-chat-self text-chat-self-fg shadow-sm transition-opacity hover:opacity-95 disabled:opacity-50"
+            className="absolute bottom-2.5 right-2.5 flex h-11 w-11 items-center justify-center rounded-full bg-chat-self text-chat-self-fg shadow-md transition-opacity hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-45 sm:bottom-3 sm:right-3 sm:h-12 sm:w-12"
             aria-label="Envoyer"
           >
-            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
             </svg>
           </button>
         </div>
+      </footer>
       </div>
-    </div>
+      {aside ? (
+        <aside className="max-h-[min(42vh,18rem)] w-full shrink-0 overflow-y-auto overscroll-contain border-t border-border bg-card/95 p-3 lg:max-h-none lg:w-[min(100%,24rem)] lg:border-l lg:border-t-0 lg:p-4 xl:w-[26rem]">
+          {aside}
+        </aside>
+      ) : null}
+    </section>
   )
 }

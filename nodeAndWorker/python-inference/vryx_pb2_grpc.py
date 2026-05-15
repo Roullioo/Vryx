@@ -40,6 +40,11 @@ class InferenceServiceStub(object):
                 request_serializer=vryx__pb2.TensorData.SerializeToString,
                 response_deserializer=vryx__pb2.ProcessedTensorData.FromString,
                 _registered_method=True)
+        self.ProcessStream = channel.unary_stream(
+                '/vryx.InferenceService/ProcessStream',
+                request_serializer=vryx__pb2.TensorData.SerializeToString,
+                response_deserializer=vryx__pb2.StreamChunk.FromString,
+                _registered_method=True)
         self.ReportCapabilities = channel.unary_unary(
                 '/vryx.InferenceService/ReportCapabilities',
                 request_serializer=vryx__pb2.WorkerCapabilities.SerializeToString,
@@ -57,6 +62,12 @@ class InferenceServiceServicer(object):
     """
 
     def Process(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ProcessStream(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -83,6 +94,11 @@ def add_InferenceServiceServicer_to_server(servicer, server):
                     servicer.Process,
                     request_deserializer=vryx__pb2.TensorData.FromString,
                     response_serializer=vryx__pb2.ProcessedTensorData.SerializeToString,
+            ),
+            'ProcessStream': grpc.unary_stream_rpc_method_handler(
+                    servicer.ProcessStream,
+                    request_deserializer=vryx__pb2.TensorData.FromString,
+                    response_serializer=vryx__pb2.StreamChunk.SerializeToString,
             ),
             'ReportCapabilities': grpc.unary_unary_rpc_method_handler(
                     servicer.ReportCapabilities,
@@ -123,6 +139,33 @@ class InferenceService(object):
             '/vryx.InferenceService/Process',
             vryx__pb2.TensorData.SerializeToString,
             vryx__pb2.ProcessedTensorData.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProcessStream(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/vryx.InferenceService/ProcessStream',
+            vryx__pb2.TensorData.SerializeToString,
+            vryx__pb2.StreamChunk.FromString,
             options,
             channel_credentials,
             insecure,

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nvryx.proto\x12\x04vryx\"b\n\nTensorData\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\x12\x14\n\x0crouting_path\x18\x04 \x03(\t\x12\x12\n\nsession_id\x18\x05 \x01(\t\"\xb3\x02\n\x13ProcessedTensorData\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\x17\n\x0f\x63ompute_time_ns\x18\x03 \x01(\x04\x12\x1d\n\x15serialization_time_ns\x18\x04 \x01(\x04\x12\x15\n\rprompt_tokens\x18\x05 \x01(\x04\x12\x19\n\x11\x63ompletion_tokens\x18\x06 \x01(\x04\x12\x14\n\x0ctotal_tokens\x18\x07 \x01(\x04\x12\x17\n\x0fvps_delegate_ms\x18\x08 \x01(\x04\x12\x18\n\x10shard_session_id\x18\t \x01(\t\x12\x16\n\x0eshard_layer_id\x18\n \x01(\r\x12\x1b\n\x13pipeline_trace_json\x18\x0b \x01(\t\x12\x17\n\x0f\x63ompute_time_ms\x18\x0c \x01(\x04\"\x9e\x01\n\x12WorkerCapabilities\x12\x18\n\x10ram_available_mb\x18\x01 \x01(\x04\x12\x16\n\x0e\x62\x61\x63kend_device\x18\x02 \x01(\t\x12\x17\n\x0fruntime_version\x18\x03 \x01(\t\x12\x1e\n\x16max_ephemeral_shard_mb\x18\x04 \x01(\r\x12\x1d\n\x15network_mbps_estimate\x18\x05 \x01(\x01\".\n\x0f\x43\x61pabilitiesAck\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"k\n\tShardInit\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07ttl_sec\x18\x02 \x01(\r\x12\x13\n\x0blayer_start\x18\x03 \x01(\r\x12\x11\n\tlayer_end\x18\x04 \x01(\r\x12\x11\n\tmodel_tag\x18\x05 \x01(\t\"Z\n\tShardLoad\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x63hunk_index\x18\x02 \x01(\r\x12\x13\n\x0b\x63hunk_total\x18\x03 \x01(\r\x12\x0f\n\x07payload\x18\x04 \x01(\x0c\"Y\n\x0b\x46orwardPass\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x10\n\x08layer_id\x18\x02 \x01(\r\x12$\n\nactivation\x18\x03 \x01(\x0b\x32\x10.vryx.TensorData\">\n\x10\x41\x63tivationTensor\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\"!\n\x0bShardUnload\x12\x12\n\nsession_id\x18\x01 \x01(\t2\xd1\x01\n\x10InferenceService\x12\x36\n\x07Process\x12\x10.vryx.TensorData\x1a\x19.vryx.ProcessedTensorData\x12\x45\n\x12ReportCapabilities\x12\x18.vryx.WorkerCapabilities\x1a\x15.vryx.CapabilitiesAck\x12>\n\x10PingShardRuntime\x12\x0f.vryx.ShardInit\x1a\x19.vryx.ProcessedTensorDatab\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nvryx.proto\x12\x04vryx\"b\n\nTensorData\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\x12\x14\n\x0crouting_path\x18\x04 \x03(\t\x12\x12\n\nsession_id\x18\x05 \x01(\t\"\xb3\x02\n\x13ProcessedTensorData\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\x17\n\x0f\x63ompute_time_ns\x18\x03 \x01(\x04\x12\x1d\n\x15serialization_time_ns\x18\x04 \x01(\x04\x12\x15\n\rprompt_tokens\x18\x05 \x01(\x04\x12\x19\n\x11\x63ompletion_tokens\x18\x06 \x01(\x04\x12\x14\n\x0ctotal_tokens\x18\x07 \x01(\x04\x12\x17\n\x0fvps_delegate_ms\x18\x08 \x01(\x04\x12\x18\n\x10shard_session_id\x18\t \x01(\t\x12\x16\n\x0eshard_layer_id\x18\n \x01(\r\x12\x1b\n\x13pipeline_trace_json\x18\x0b \x01(\t\x12\x17\n\x0f\x63ompute_time_ms\x18\x0c \x01(\x04\"j\n\x0bStreamChunk\x12\r\n\x05\x65vent\x18\x01 \x01(\t\x12\r\n\x05token\x18\x02 \x01(\t\x12\x0c\n\x04json\x18\x03 \x01(\t\x12\x0c\n\x04\x64one\x18\x04 \x01(\x08\x12\r\n\x05\x65rror\x18\x05 \x01(\t\x12\x12\n\nelapsed_ms\x18\x06 \x01(\x04\"\x9e\x01\n\x12WorkerCapabilities\x12\x18\n\x10ram_available_mb\x18\x01 \x01(\x04\x12\x16\n\x0e\x62\x61\x63kend_device\x18\x02 \x01(\t\x12\x17\n\x0fruntime_version\x18\x03 \x01(\t\x12\x1e\n\x16max_ephemeral_shard_mb\x18\x04 \x01(\r\x12\x1d\n\x15network_mbps_estimate\x18\x05 \x01(\x01\".\n\x0f\x43\x61pabilitiesAck\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"k\n\tShardInit\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07ttl_sec\x18\x02 \x01(\r\x12\x13\n\x0blayer_start\x18\x03 \x01(\r\x12\x11\n\tlayer_end\x18\x04 \x01(\r\x12\x11\n\tmodel_tag\x18\x05 \x01(\t\"Z\n\tShardLoad\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x13\n\x0b\x63hunk_index\x18\x02 \x01(\r\x12\x13\n\x0b\x63hunk_total\x18\x03 \x01(\r\x12\x0f\n\x07payload\x18\x04 \x01(\x0c\"Y\n\x0b\x46orwardPass\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x10\n\x08layer_id\x18\x02 \x01(\r\x12$\n\nactivation\x18\x03 \x01(\x0b\x32\x10.vryx.TensorData\">\n\x10\x41\x63tivationTensor\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12\r\n\x05shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\"!\n\x0bShardUnload\x12\x12\n\nsession_id\x18\x01 \x01(\t2\x89\x02\n\x10InferenceService\x12\x36\n\x07Process\x12\x10.vryx.TensorData\x1a\x19.vryx.ProcessedTensorData\x12\x36\n\rProcessStream\x12\x10.vryx.TensorData\x1a\x11.vryx.StreamChunk0\x01\x12\x45\n\x12ReportCapabilities\x12\x18.vryx.WorkerCapabilities\x1a\x15.vryx.CapabilitiesAck\x12>\n\x10PingShardRuntime\x12\x0f.vryx.ShardInit\x1a\x19.vryx.ProcessedTensorDatab\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,20 +35,22 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TENSORDATA']._serialized_end=118
   _globals['_PROCESSEDTENSORDATA']._serialized_start=121
   _globals['_PROCESSEDTENSORDATA']._serialized_end=428
-  _globals['_WORKERCAPABILITIES']._serialized_start=431
-  _globals['_WORKERCAPABILITIES']._serialized_end=589
-  _globals['_CAPABILITIESACK']._serialized_start=591
-  _globals['_CAPABILITIESACK']._serialized_end=637
-  _globals['_SHARDINIT']._serialized_start=639
-  _globals['_SHARDINIT']._serialized_end=746
-  _globals['_SHARDLOAD']._serialized_start=748
-  _globals['_SHARDLOAD']._serialized_end=838
-  _globals['_FORWARDPASS']._serialized_start=840
-  _globals['_FORWARDPASS']._serialized_end=929
-  _globals['_ACTIVATIONTENSOR']._serialized_start=931
-  _globals['_ACTIVATIONTENSOR']._serialized_end=993
-  _globals['_SHARDUNLOAD']._serialized_start=995
-  _globals['_SHARDUNLOAD']._serialized_end=1028
-  _globals['_INFERENCESERVICE']._serialized_start=1031
-  _globals['_INFERENCESERVICE']._serialized_end=1240
+  _globals['_STREAMCHUNK']._serialized_start=430
+  _globals['_STREAMCHUNK']._serialized_end=536
+  _globals['_WORKERCAPABILITIES']._serialized_start=539
+  _globals['_WORKERCAPABILITIES']._serialized_end=697
+  _globals['_CAPABILITIESACK']._serialized_start=699
+  _globals['_CAPABILITIESACK']._serialized_end=745
+  _globals['_SHARDINIT']._serialized_start=747
+  _globals['_SHARDINIT']._serialized_end=854
+  _globals['_SHARDLOAD']._serialized_start=856
+  _globals['_SHARDLOAD']._serialized_end=946
+  _globals['_FORWARDPASS']._serialized_start=948
+  _globals['_FORWARDPASS']._serialized_end=1037
+  _globals['_ACTIVATIONTENSOR']._serialized_start=1039
+  _globals['_ACTIVATIONTENSOR']._serialized_end=1101
+  _globals['_SHARDUNLOAD']._serialized_start=1103
+  _globals['_SHARDUNLOAD']._serialized_end=1136
+  _globals['_INFERENCESERVICE']._serialized_start=1139
+  _globals['_INFERENCESERVICE']._serialized_end=1404
 # @@protoc_insertion_point(module_scope)

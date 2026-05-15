@@ -1,0 +1,32 @@
+name: rust-linux-build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  rust-daemon-linux:
+    name: Rust daemon Linux release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build rust-daemon
+        run: cargo build --release -p rust-daemon

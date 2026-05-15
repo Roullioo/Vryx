@@ -22,6 +22,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -475,6 +476,64 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             text_out, start, err_metrics,
             pipeline_trace_json=json.dumps(err_trace, ensure_ascii=False),
             compute_time_ms=compute_ms,
+        )
+
+    async def ProcessStream(self, request, context):
+        start = time.perf_counter()
+        yield vryx_pb2.StreamChunk(
+            event="stage",
+            json=json.dumps({"stage": "stage1_started", "status": "Pipeline P2P démarré"}, ensure_ascii=False),
+            elapsed_ms=0,
+        )
+        if self.stage == 2:
+            yield vryx_pb2.StreamChunk(
+                event="error",
+                error="ProcessStream est réservé au stage 1 initiateur.",
+                done=True,
+                elapsed_ms=int((time.perf_counter() - start) * 1000),
+            )
+            return
+
+        response = await self.Process(request, context)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        trace = {}
+        try:
+            trace = json.loads(response.pipeline_trace_json or "{}")
+        except Exception:
+            trace = {}
+        text = bytes(response.data or b"").decode("utf-8", errors="replace")
+        token_events = trace.get("token_events") if isinstance(trace, dict) else None
+        if isinstance(token_events, list) and token_events:
+            for event in token_events:
+                if not isinstance(event, dict):
+                    continue
+                token = str(event.get("text") or "")
+                if token:
+                    yield vryx_pb2.StreamChunk(
+                        event="token",
+                        token=token,
+                        elapsed_ms=int(event.get("elapsed_ms") or elapsed_ms),
+                    )
+        else:
+            for part in re.split(r"(\s+)", text):
+                if part:
+                    yield vryx_pb2.StreamChunk(event="token", token=part, elapsed_ms=elapsed_ms)
+
+        done_payload = {
+            "response": text,
+            "pipeline_trace": trace,
+            "prompt_tokens": int(response.prompt_tokens or 0),
+            "completion_tokens": int(response.completion_tokens or 0),
+            "total_tokens": int(response.total_tokens or 0),
+            "vps_delegate_ms": int(response.vps_delegate_ms or 0),
+            "compute_time_ms": int(response.compute_time_ms or 0),
+            "shard_session_id": response.shard_session_id,
+        }
+        yield vryx_pb2.StreamChunk(
+            event="done",
+            json=json.dumps(done_payload, ensure_ascii=False),
+            done=True,
+            elapsed_ms=elapsed_ms,
         )
 
 

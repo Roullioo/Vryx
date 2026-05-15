@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Compare un prompt court entre Transformers/PyTorch et mlx-lm.
+"""Compare la parité logits top-10 entre Transformers/PyTorch et mlx-lm.
 
 Usage:
   cd nodeAndWorker
-  VRYX_COMPARE_MODEL=Qwen/Qwen3.5-9B ./scripts/compare_qwen_logits.py
+  ./scripts/compare_qwen_logits.py
 
-Le script est volontairement hors du chemin P2P : il sert de référence qualité/logits
-avant de valider le backend worker visible dans le chat.
+Le script échoue si un modèle ne conserve pas le même top-10 de tokens sur les prompts fixes.
 """
 from __future__ import annotations
 
@@ -14,6 +13,14 @@ import json
 import os
 import time
 from typing import Any
+
+
+DEFAULT_MODELS = ("Qwen/Qwen2-0.5B-Instruct", "Qwen/Qwen3.5-9B")
+DEFAULT_PROMPTS = (
+    "<|im_start|>user\nWhat is 1+1? Answer only 2.\n<|im_end|>\n<|im_start|>assistant\n",
+    "<|im_start|>user\nRéponds en français : explique le rôle d'un cache KV en une phrase.\n<|im_end|>\n<|im_start|>assistant\n",
+    "<|im_start|>user\nReturn exactly this JSON shape: {\"ok\": true, \"n\": 3}\n<|im_end|>\n<|im_start|>assistant\n",
+)
 
 
 def topk(values: Any, k: int = 10) -> list[dict[str, float | int]]:
@@ -95,15 +102,18 @@ def run_mlx_lm(model_id: str, prompt: str, max_new_tokens: int) -> dict[str, Any
     }
 
 
-def main() -> int:
-    model_id = os.environ.get("VRYX_COMPARE_MODEL", "Qwen/Qwen3.5-9B")
-    prompt = os.environ.get(
-        "VRYX_COMPARE_PROMPT",
-        "<|im_start|>user\nWhat is 1+1? Answer only 2.\n<|im_end|>\n<|im_start|>assistant\n",
-    )
-    max_new_tokens = int(os.environ.get("VRYX_COMPARE_MAX_NEW_TOKENS", "8"))
+def _top_ids(rows: list[dict[str, float | int]]) -> list[int]:
+    return [int(x["id"]) for x in rows]
 
-    result: dict[str, Any] = {"model": model_id, "prompt": prompt, "max_new_tokens": max_new_tokens}
+
+def compare_one(model_id: str, prompt: str, prompt_index: int, max_new_tokens: int) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "model": model_id,
+        "prompt_index": prompt_index,
+        "prompt": prompt,
+        "max_new_tokens": max_new_tokens,
+        "ok": False,
+    }
     errors: list[dict[str, str]] = []
     for name, fn in (("transformers", run_transformers), ("mlx_lm", run_mlx_lm)):
         try:
@@ -115,14 +125,42 @@ def main() -> int:
     a = result.get("transformers", {}).get("top_logits") if isinstance(result.get("transformers"), dict) else None
     b = result.get("mlx_lm", {}).get("top_logits") if isinstance(result.get("mlx_lm"), dict) else None
     if a and b:
+        tf_ids = _top_ids(a)
+        mlx_ids = _top_ids(b)
         result["compare"] = {
-            "top1_match": int(a[0]["id"]) == int(b[0]["id"]),
-            "transformers_top1": a[0],
-            "mlx_lm_top1": b[0],
-            "top10_overlap": len({int(x["id"]) for x in a} & {int(x["id"]) for x in b}),
+            "top10_exact_match": tf_ids == mlx_ids,
+            "top1_match": tf_ids[:1] == mlx_ids[:1],
+            "top10_overlap": len(set(tf_ids) & set(mlx_ids)),
+            "transformers_top10_ids": tf_ids,
+            "mlx_lm_top10_ids": mlx_ids,
         }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if not errors else 2
+        result["ok"] = bool(tf_ids == mlx_ids)
+    return result
+
+
+def main() -> int:
+    models = tuple(
+        x.strip()
+        for x in os.environ.get("VRYX_COMPARE_MODELS", ",".join(DEFAULT_MODELS)).split(",")
+        if x.strip()
+    )
+    prompt_override = os.environ.get("VRYX_COMPARE_PROMPT")
+    prompts = (prompt_override,) if prompt_override else DEFAULT_PROMPTS
+    max_new_tokens = int(os.environ.get("VRYX_COMPARE_MAX_NEW_TOKENS", "8"))
+
+    cases = [
+        compare_one(model_id, prompt, i, max_new_tokens)
+        for model_id in models
+        for i, prompt in enumerate(prompts, start=1)
+    ]
+    summary = {
+        "ok": all(bool(case.get("ok")) for case in cases),
+        "models": models,
+        "prompt_count": len(prompts),
+        "cases": cases,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if summary["ok"] else 2
 
 
 if __name__ == "__main__":
