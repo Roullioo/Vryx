@@ -239,23 +239,28 @@ function StatusDot({ online }: { online: boolean }) {
 }
 
 function WorkerApplicationDownloads() {
+  const workerDownloads = {
+    mac: '/downloads/Vryx-Worker-latest-mac.zip',
+    winX64: '/downloads/Vryx-Worker-Setup-latest-x64.exe',
+    winArm64: '/downloads/Vryx-Worker-Setup-latest-arm64.exe',
+  }
   const builds = [
     {
       name: 'macOS',
       detail: 'ZIP avec app + installateur Gatekeeper pour Apple Silicon / Intel',
-      href: '/downloads/Vryx-Worker-mac-20260518.zip',
+      href: workerDownloads.mac,
       cta: 'Télécharger Mac',
     },
     {
       name: 'Windows',
       detail: 'Installeur Windows x64. Signature Authenticode requise pour Smart App Control.',
-      href: '/downloads/Vryx-Worker-Setup-x64.exe',
+      href: workerDownloads.winX64,
       cta: 'Télécharger Windows x64',
     },
     {
       name: 'Windows ARM64',
       detail: 'Installeur Windows ARM64. Signature Authenticode requise pour Smart App Control.',
-      href: '/downloads/Vryx-Worker-Setup-arm64.exe',
+      href: workerDownloads.winArm64,
       cta: 'Télécharger ARM64',
     },
   ]
@@ -290,6 +295,10 @@ function WorkerApplicationDownloads() {
       <p className="mt-4 rounded-xl border border-warning/25 bg-warning/10 px-4 py-3 text-xs leading-5 text-warning">
         Windows Smart App Control bloque les builds non signés. Pour une distribution publique,
         publier uniquement un installateur généré avec <span className="font-mono">npm run build:win:signed</span>.
+      </p>
+      <p className="mt-3 rounded-xl border border-accent/20 bg-accent/10 px-4 py-3 text-xs leading-5 text-muted">
+        macOS peut marquer un ZIP non notarise en quarantaine. Apres extraction, retirer l’attribut avec{' '}
+        <span className="font-mono text-fg">xattr -dr com.apple.quarantine /Applications/Vryx.app</span>.
       </p>
     </section>
   )
@@ -330,9 +339,9 @@ function WorkerReleasePanel() {
       body: JSON.stringify({
         version: nextVersion,
         channel: 'stable',
-        macUrl: release?.macUrl || '/downloads/Vryx-Worker-mac-20260518.zip',
-        winX64Url: release?.winX64Url || '/downloads/Vryx-Worker-Setup-x64.exe',
-        winArm64Url: release?.winArm64Url || '/downloads/Vryx-Worker-Setup-arm64.exe',
+        macUrl: release?.macUrl || '/downloads/Vryx-Worker-latest-mac.zip',
+        winX64Url: release?.winX64Url || '/downloads/Vryx-Worker-Setup-latest-x64.exe',
+        winArm64Url: release?.winArm64Url || '/downloads/Vryx-Worker-Setup-latest-arm64.exe',
         runtimeUrl: release?.runtimeUrl || null,
         mandatory,
         notes: notes.trim() || null,
