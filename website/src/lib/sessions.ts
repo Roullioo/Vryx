@@ -14,7 +14,8 @@ export type SessionTokenStep = {
   tokenIndex: number
   totalMs: number
   hopCount: number
-  byte?: number
+  tps?: number
+  cumulativeTps?: number
 }
 
 export type SessionLoadStep = {
@@ -26,10 +27,13 @@ export type SessionLoadStep = {
 export type WorkSession = {
   id: string
   timestamp: number
+  /** Contenu volontairement masqué: les sessions conservent les métriques, pas les tokens lisibles. */
   prompt: string
   response: string
   /** Total latence client→réponse (ms) */
   latencyMs: number
+  /** Ping/aller-retour P2P estimé ou mesuré (ms), contenu token toujours masqué. */
+  pingMs?: number
   vpsDelegateMs: number
   workerComputeMs: number
   /** Proto `compute_time_ms` (télémétrie réelle worker). */
@@ -113,12 +117,157 @@ function asStr(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback
 }
 
+function asNumOrNull(v: unknown): number | null {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function firstNum(values: unknown[]): number | null {
+  for (const value of values) {
+    const n = asNumOrNull(value)
+    if (n !== null) return n
+  }
+  return null
+}
+
+function asStringArray(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((item): item is string => typeof item === 'string' && item.length > 0) : []
+}
+
+function normalizeTokenSteps(v: unknown): SessionTokenStep[] {
+  if (!Array.isArray(v)) return []
+  return v
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    .map((item, index) => ({
+      tokenIndex: asNum(item.tokenIndex ?? item.token_index, index + 1),
+      totalMs: Math.max(0, asNum(item.totalMs ?? item.total_ms)),
+      hopCount: Math.max(0, asNum(item.hopCount ?? item.hop_count, 1)),
+      tps: asNumOrNull(item.tps) ?? undefined,
+      cumulativeTps: asNumOrNull(item.cumulativeTps ?? item.cumulative_tps) ?? undefined,
+    }))
+}
+
+function normalizeLoadSteps(v: unknown): SessionLoadStep[] {
+  if (!Array.isArray(v)) return []
+  return v
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => ({
+      rank: asNum(item.rank),
+      peerId: asStr(item.peerId ?? item.peer ?? item.peer_id),
+      loadMs: Math.max(0, asNum(item.loadMs ?? item.load_ms)),
+    }))
+    .filter((step) => step.peerId.length > 0)
+}
+
+function normalizeWorkerSteps(v: unknown): SessionWorkerStep[] {
+  if (!Array.isArray(v)) return []
+  return v
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => ({
+      rank: asNum(item.rank),
+      peerId: asStr(item.peerId ?? item.peer ?? item.peer_id),
+      role: asStr(item.role, 'étape'),
+      latencyMs: Math.max(0, asNum(item.latencyMs ?? item.latency_ms)),
+      outRows: asNumOrNull(item.outRows ?? item.out_rows) ?? undefined,
+    }))
+    .filter((step) => step.peerId.length > 0)
+}
+
+function normalizeQuantization(v: unknown): WorkSession['requestedQuantization'] {
+  return v === 'q4' || v === 'int8' || v === 'fp16' ? v : undefined
+}
+
+function normalizePoolPreference(v: unknown): WorkSession['poolPreference'] {
+  return v === 'auto' || v === 'velocity_mlx' || v === 'velocity_vllm' || v === 'legacy_pytorch'
+    ? v
+    : undefined
+}
+
+export function normalizeSession(raw: unknown): WorkSession {
+  const s = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {}
+  const peers = asStringArray(s.peers)
+  const workerPeerId = asStr(s.workerPeerId ?? s.worker_peer_id)
+  const primaryWorkerPeerId = asStr(s.primaryWorkerPeerId ?? s.primary_worker_peer_id)
+  const routingPath = asStringArray(s.routingPath ?? s.routing_path)
+  const tokenSteps = normalizeTokenSteps(s.tokenSteps ?? s.token_steps)
+  const loadSteps = normalizeLoadSteps(s.loadSteps ?? s.load_steps)
+  const workerSteps = normalizeWorkerSteps(s.workerSteps ?? s.worker_steps)
+  const fallbackPeers =
+    peers.length > 0 ? peers : routingPath.length > 0 ? routingPath : workerSteps.length > 0 ? workerSteps.map((w) => w.peerId) : workerPeerId ? [workerPeerId] : []
+
+  return {
+    id: asStr(s.id, `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
+    timestamp: asNum(s.timestamp, Date.now()),
+    prompt: asStr(s.prompt),
+    response: asStr(s.response),
+    latencyMs: Math.max(0, asNum(s.latencyMs ?? s.latency_ms)),
+    pingMs: asNumOrNull(s.pingMs ?? s.ping_ms) ?? undefined,
+    vpsDelegateMs: Math.max(0, asNum(s.vpsDelegateMs ?? s.vps_delegate_ms)),
+    workerComputeMs: Math.max(0, asNum(s.workerComputeMs ?? s.worker_compute_ms)),
+    computeTimeMs: asNumOrNull(s.computeTimeMs ?? s.compute_time_ms) ?? undefined,
+    routingPath: routingPath.length > 0 ? routingPath : undefined,
+    promptTokens: Math.max(0, asNum(s.promptTokens ?? s.prompt_tokens)),
+    completionTokens: Math.max(0, asNum(s.completionTokens ?? s.completion_tokens ?? s.tokens_generated)),
+    totalTokens: Math.max(
+      0,
+      asNum(
+        s.totalTokens ?? s.total_tokens,
+        asNum(s.promptTokens ?? s.prompt_tokens) + asNum(s.completionTokens ?? s.completion_tokens ?? s.tokens_generated),
+      ),
+    ),
+    p2pMessagesIn: Math.max(0, asNum(s.p2pMessagesIn ?? s.p2p_messages_in)),
+    p2pMessagesOut: Math.max(0, asNum(s.p2pMessagesOut ?? s.p2p_messages_out)),
+    mode: asStr(s.mode, 'P2P'),
+    workerPeerId,
+    primaryWorkerPeerId,
+    schedulerWorkersUsed: Math.max(0, asNum(s.schedulerWorkersUsed ?? s.scheduler_workers_used)),
+    schedulerWarmupSent: Math.max(0, asNum(s.schedulerWarmupSent ?? s.scheduler_warmup_sent)),
+    pipelineLayout: asStr(s.pipelineLayout ?? s.pipeline_layout),
+    pipelineOk: Boolean(s.pipelineOk ?? s.pipeline_ok),
+    peers: fallbackPeers,
+    tokenSteps,
+    loadSteps,
+    workerSteps,
+    workerInfo: s.workerInfo && typeof s.workerInfo === 'object' && !Array.isArray(s.workerInfo)
+      ? s.workerInfo as WorkSession['workerInfo']
+      : undefined,
+    quicUsed: s.quicUsed != null || s.quic_used != null ? Boolean(s.quicUsed ?? s.quic_used) : undefined,
+    kvCacheUsed: s.kvCacheUsed != null || s.kv_cache_used != null ? Boolean(s.kvCacheUsed ?? s.kv_cache_used) : undefined,
+    hiddenTransport: asStr(s.hiddenTransport ?? s.hidden_transport) || undefined,
+    avgMsPerToken: asNumOrNull(s.avgMsPerToken ?? s.avg_ms_per_token) ?? undefined,
+    hotPathTps: asNumOrNull(s.hotPathTps ?? s.hot_path_tps) ?? undefined,
+    stopReason: s.stopReason != null || s.stop_reason != null ? String(s.stopReason ?? s.stop_reason) || null : undefined,
+    prefixCacheHit: s.prefixCacheHit != null || s.prefix_cache_hit != null ? Boolean(s.prefixCacheHit ?? s.prefix_cache_hit) : undefined,
+    prefixCacheTokens: asNumOrNull(s.prefixCacheTokens ?? s.prefix_cache_tokens) ?? undefined,
+    setupMs: asNumOrNull(s.setupMs ?? s.setup_ms) ?? undefined,
+    benchmarkActualTps: asNumOrNull(s.benchmarkActualTps ?? s.benchmark_actual_tps) ?? undefined,
+    requestedQuantization: normalizeQuantization(s.requestedQuantization ?? s.requested_quantization),
+    effectiveQuantization: asStr(s.effectiveQuantization ?? s.effective_quantization) || undefined,
+    quantizationFallbackReason: s.quantizationFallbackReason != null || s.quantization_fallback_reason != null
+      ? String(s.quantizationFallbackReason ?? s.quantization_fallback_reason) || null
+      : undefined,
+    poolPreference: normalizePoolPreference(s.poolPreference ?? s.pool_preference),
+    poolClass: asStr(s.poolClass ?? s.pool_class) || undefined,
+    poolFallbackReason: s.poolFallbackReason != null || s.pool_fallback_reason != null
+      ? String(s.poolFallbackReason ?? s.pool_fallback_reason) || null
+      : undefined,
+    batching: s.batching && typeof s.batching === 'object' && !Array.isArray(s.batching)
+      ? s.batching as Record<string, unknown>
+      : null,
+    overlap: s.overlap && typeof s.overlap === 'object' && !Array.isArray(s.overlap)
+      ? s.overlap as Record<string, unknown>
+      : null,
+  }
+}
+
 export function loadSessions(): WorkSession[] {
   try {
     const raw = localStorage.getItem(KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? (parsed as WorkSession[]) : []
+    return Array.isArray(parsed) ? parsed.map(normalizeSession) : []
   } catch {
     return []
   }
@@ -126,9 +275,10 @@ export function loadSessions(): WorkSession[] {
 
 export function saveSession(s: WorkSession): void {
   try {
+    const normalized = normalizeSession(s)
     const sessions = loadSessions()
-    const filtered = sessions.filter((x) => x.id !== s.id)
-    const updated = [s, ...filtered].slice(0, MAX)
+    const filtered = sessions.filter((x) => x.id !== normalized.id)
+    const updated = [normalized, ...filtered].slice(0, MAX)
     localStorage.setItem(KEY, JSON.stringify(updated))
   } catch {
     /* quota exceeded, ignore */
@@ -155,7 +305,7 @@ export function clearSessions(): void {
 export async function fetchSessionsFromDb(): Promise<WorkSession[]> {
   const r = await apiJson<{ ok?: boolean; sessions?: WorkSession[] }>('/api/admin/sessions')
   if (r.ok !== true) return loadSessions()
-  const sessions = Array.isArray(r.data.sessions) ? r.data.sessions : []
+  const sessions = Array.isArray(r.data.sessions) ? r.data.sessions.map(normalizeSession) : []
   try {
     localStorage.setItem(KEY, JSON.stringify(sessions.slice(0, MAX)))
   } catch {
@@ -167,13 +317,13 @@ export async function fetchSessionsFromDb(): Promise<WorkSession[]> {
 export async function fetchSessionFromDb(id: string): Promise<WorkSession | null> {
   const r = await apiJson<{ ok?: boolean; session?: WorkSession }>(`/api/admin/sessions/${encodeURIComponent(id)}`)
   if (r.ok !== true || !r.data.session) return null
-  return r.data.session
+  return normalizeSession(r.data.session)
 }
 
 export async function saveSessionToDb(s: WorkSession): Promise<void> {
   await apiJson('/api/admin/sessions', {
     method: 'POST',
-    body: JSON.stringify({ session: s }),
+    body: JSON.stringify({ session: normalizeSession(s) }),
   })
 }
 
@@ -203,6 +353,12 @@ export function buildSession(params: {
   const metrics = t?.metrics && typeof t.metrics === 'object' && !Array.isArray(t.metrics)
     ? (t.metrics as Record<string, unknown>)
     : null
+  const dataRecord = data as Record<string, unknown>
+  const traceMetrics =
+    metrics ||
+    (dataRecord.metrics && typeof dataRecord.metrics === 'object' && !Array.isArray(dataRecord.metrics)
+      ? (dataRecord.metrics as Record<string, unknown>)
+      : null)
 
   let peers: string[] = Array.isArray(t?.peers)
     ? (t!.peers as unknown[]).filter((p): p is string => typeof p === 'string')
@@ -233,7 +389,28 @@ export function buildSession(params: {
     const ti = typeof o.token_index === 'number' ? o.token_index : Number(o.token_index)
     if (Number.isNaN(ti)) continue
     const hops = Array.isArray(o.hop_ms) ? (o.hop_ms as unknown[]).filter((x): x is number => typeof x === 'number') : []
-    tokenSteps.push({ tokenIndex: ti, totalMs: hops.reduce((a, b) => a + b, 0), hopCount: hops.length, byte: typeof o.byte === 'number' ? o.byte : undefined })
+    tokenSteps.push({ tokenIndex: ti, totalMs: hops.reduce((a, b) => a + b, 0), hopCount: hops.length })
+  }
+
+  // mlx-lm direct : évènements déjà redacted côté API; on ne conserve que timing/index/TPS.
+  if (tokenSteps.length === 0) {
+    const events = Array.isArray(t?.token_events) ? t!.token_events as unknown[] : []
+    let prevElapsed = 0
+    for (const item of events) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      const o = item as Record<string, unknown>
+      const ti = asNum(o.index, tokenSteps.length + 1)
+      const elapsed = asNum(o.elapsed_ms)
+      const stepMs = Math.max(0, elapsed - prevElapsed)
+      prevElapsed = Math.max(prevElapsed, elapsed)
+      tokenSteps.push({
+        tokenIndex: ti,
+        totalMs: stepMs || elapsed,
+        hopCount: 1,
+        tps: stepMs > 0 ? Math.round((1000 / stepMs) * 1000) / 1000 : undefined,
+        cumulativeTps: elapsed > 0 ? Math.round((ti * 1000 / elapsed) * 1000) / 1000 : undefined,
+      })
+    }
   }
 
   // Fallback token steps depuis pipelineWorkers
@@ -243,7 +420,7 @@ export function buildSession(params: {
       const o = item as Record<string, unknown>
       if (typeof o.token_index !== 'number') continue
       const hops = Array.isArray(o.hop_ms) ? (o.hop_ms as unknown[]).filter((x): x is number => typeof x === 'number') : []
-      tokenSteps.push({ tokenIndex: o.token_index, totalMs: hops.reduce((a, b) => a + b, 0), hopCount: hops.length, byte: typeof o.byte === 'number' ? o.byte : undefined })
+      tokenSteps.push({ tokenIndex: o.token_index, totalMs: hops.reduce((a, b) => a + b, 0), hopCount: hops.length })
     }
   }
 
@@ -271,20 +448,52 @@ export function buildSession(params: {
   const dataCompute = asNum((data as Record<string, unknown>).computeTimeMs)
   const computeTimeMs =
     dataCompute > 0 ? dataCompute : traceCompute > 0 ? traceCompute : undefined
+  const completionCandidates = firstNum([
+    dataRecord.completionTokens,
+    dataRecord.completion_tokens,
+    dataRecord.tokens_generated,
+    (traceMetrics as Record<string, unknown> | null)?.completion_tokens,
+    (traceMetrics as Record<string, unknown> | null)?.completionTokens,
+    t?.tokens_generated,
+    t?.tokensGenerated,
+  ])
+  const promptCandidates = firstNum([
+    dataRecord.promptTokens,
+    dataRecord.prompt_tokens,
+    (traceMetrics as Record<string, unknown> | null)?.prompt_tokens,
+    (traceMetrics as Record<string, unknown> | null)?.promptTokens,
+    t?.prompt_tokens,
+    t?.promptTokens,
+  ])
+  const totalCandidates = firstNum([
+    dataRecord.totalTokens,
+    dataRecord.total_tokens,
+    (traceMetrics as Record<string, unknown> | null)?.total_tokens,
+    (traceMetrics as Record<string, unknown> | null)?.totalTokens,
+    t?.total_tokens,
+    t?.totalTokens,
+  ])
+  const completionTokens = completionCandidates ?? 0
+  const promptTokens = promptCandidates ?? 0
+  const totalTokens = totalCandidates ?? promptTokens + completionTokens
 
   return {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: Date.now(),
-    prompt,
-    response,
+    prompt: prompt ? '[contenu masque]' : '',
+    response: response ? '[contenu masque]' : '',
     latencyMs: asNum(data.latencyMs),
+    pingMs: asNum(data.pingMs) || asNum(t?.relay_ms) ||
+      (t?.benchmark && typeof t.benchmark === 'object' && !Array.isArray(t.benchmark)
+        ? asNum((t.benchmark as Record<string, unknown>).relay_ms)
+        : 0) || undefined,
     vpsDelegateMs: asNum(data.vpsDelegateMs),
     workerComputeMs: asNum(data.workerComputeMs),
     computeTimeMs,
     routingPath: routingPath.length > 0 ? routingPath : undefined,
-    promptTokens: asNum(data.promptTokens) || asNum(metrics?.prompt_tokens),
-    completionTokens: asNum(data.completionTokens) || asNum(metrics?.completion_tokens),
-    totalTokens: asNum(data.totalTokens) || asNum(metrics?.total_tokens),
+    promptTokens,
+    completionTokens,
+    totalTokens,
     p2pMessagesIn: asNum(data.p2pMessagesIn),
     p2pMessagesOut: asNum(data.p2pMessagesOut),
     mode: asStr(data.mode, 'P2P'),
@@ -304,11 +513,14 @@ export function buildSession(params: {
     hiddenTransport: asStr(data.hiddenTransport) || asStr(t?.hidden_transport) || undefined,
     avgMsPerToken: asNum(data.avgMsPerToken) || asNum(t?.avg_ms_per_token) || undefined,
     hotPathTps: asNum(data.hotPathTps) || asNum(t?.hot_path_tps) || undefined,
-    stopReason: data.stopReason != null
-      ? String(data.stopReason) || null
-      : (t?.generation_control && typeof t.generation_control === 'object' && !Array.isArray(t.generation_control))
-        ? String((t.generation_control as Record<string, unknown>).stop_reason ?? '') || null
-        : undefined,
+    stopReason:
+      data.stopReason != null
+        ? String(data.stopReason) || null
+        : t?.stop_reason != null
+          ? String(t.stop_reason) || null
+          : t?.generation_control && typeof t.generation_control === 'object' && !Array.isArray(t.generation_control)
+            ? String((t.generation_control as Record<string, unknown>).stop_reason ?? '') || null
+            : undefined,
     prefixCacheHit: data.prefixCacheHit != null
       ? Boolean(data.prefixCacheHit)
       : t?.prefix_cache && typeof t.prefix_cache === 'object' && !Array.isArray(t.prefix_cache)
@@ -321,9 +533,9 @@ export function buildSession(params: {
     setupMs: asNum(data.setupMs) || asNum(t?.setup_ms) || undefined,
     benchmarkActualTps: asNum(data.benchmarkActualTps) || asNum(t?.hot_path_tps) || undefined,
     requestedQuantization:
-      data.requestedQuantization === 'q4' || data.requestedQuantization === 'int8'
+      data.requestedQuantization === 'q4' || data.requestedQuantization === 'int8' || data.requestedQuantization === 'fp16'
         ? data.requestedQuantization
-        : t?.requested_quantization === 'q4' || t?.requested_quantization === 'int8'
+        : t?.requested_quantization === 'q4' || t?.requested_quantization === 'int8' || t?.requested_quantization === 'fp16'
           ? t.requested_quantization
           : undefined,
     effectiveQuantization: asStr(data.effectiveQuantization) || asStr(t?.effective_quantization) || undefined,

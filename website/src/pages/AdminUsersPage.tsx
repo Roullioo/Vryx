@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import { Link, useParams } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
 import { ConfirmDialog } from '../components/admin/ConfirmDialog'
 import { apiJson } from '../lib/api'
@@ -11,6 +12,63 @@ type AdminUser = {
   balanceEuro: number
   createdAt: string | null
   lastLoginAt: string | null
+}
+
+type AdminUserDetail = {
+  user: AdminUser & {
+    googleLinked?: boolean
+    updatedAt?: string | null
+  }
+  usage: {
+    apiRequests: number
+    promptTokens: number
+    completionTokens: number
+    totalTokens: number
+    costEur: number
+    avgLatencyMs: number
+    sessionCount: number
+    sessionCompletionTokens: number
+    avgSessionTps: number
+  }
+  workers: Array<{
+    peerId: string
+    mode: string
+    publicIp: string | null
+    model: string | null
+    gpuName: string | null
+    allocatedVramMb: number | null
+    gpuVramMb: number | null
+    runtimeBackend: string | null
+    tokensGenerated: number
+    desiredState: string
+    desiredModel: string | null
+    lastCommandStatus: string | null
+    lastHeartbeatAt: string | null
+    online: boolean
+    secondsSinceHeartbeat: number
+  }>
+  apiKeys: Array<{
+    id: string
+    name: string
+    keyPrefix: string
+    createdAt: string | null
+    lastUsedAt: string | null
+    revokedAt: string | null
+    requestCount: number
+    totalTokens: number
+    costEur: number
+  }>
+  sessions: Array<{
+    id: string
+    createdAt: string | null
+    metrics: {
+      completionTokens?: number
+      hotPathTps?: number
+      latencyMs?: number
+      modelId?: string
+      pipelineLayout?: string
+    }
+  }>
 }
 
 type Pending =
@@ -32,6 +90,15 @@ function formatDate(d: string | null) {
   } catch {
     return d
   }
+}
+
+function fmt(n: number) {
+  return Number(n || 0).toLocaleString('fr-FR')
+}
+
+function fmtGb(mb?: number | null) {
+  if (!mb) return '—'
+  return `${Math.round((mb / 1024) * 10) / 10} Go`
 }
 
 export function AdminUsersPage() {
@@ -154,13 +221,13 @@ export function AdminUsersPage() {
             <tbody>
               {loading && users.length === 0 ? (
                 <tr>
-                  <td className="px-5 py-6 text-muted" colSpan={5}>
+                  <td className="px-5 py-6 text-muted" colSpan={6}>
                     Chargement…
                   </td>
                 </tr>
               ) : users.length === 0 ? (
                 <tr>
-                  <td className="px-5 py-6 text-muted" colSpan={5}>
+                  <td className="px-5 py-6 text-muted" colSpan={6}>
                     Aucun utilisateur trouvé.
                   </td>
                 </tr>
@@ -170,7 +237,9 @@ export function AdminUsersPage() {
                   return (
                     <tr key={u.id} className="border-b border-border/70 hover:bg-surface/40">
                       <td className="px-4 py-3 pl-5">
-                        <div className="font-medium text-fg">{u.email}</div>
+                        <Link to={`/admin/utilisateurs/${u.id}`} className="font-medium text-fg hover:text-accent">
+                          {u.email}
+                        </Link>
                         <div className="font-mono text-[11px] text-muted">id {u.id}</div>
                       </td>
                       <td className="px-4 py-3 text-center">
@@ -221,6 +290,12 @@ export function AdminUsersPage() {
                               Promouvoir admin
                             </button>
                           )}
+                          <Link
+                            to={`/admin/utilisateurs/${u.id}`}
+                            className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-fg hover:border-accent/40 hover:text-accent"
+                          >
+                            Détail
+                          </Link>
                           <button
                             type="button"
                             onClick={() => setPending({ kind: 'delete', user: u })}
@@ -295,6 +370,169 @@ export function AdminUsersPage() {
         onConfirm={performPending}
         onCancel={() => setPending(null)}
       />
+    </AdminShell>
+  )
+}
+
+export function AdminUserDetailPage() {
+  const { id } = useParams<{ id: string }>()
+  const [detail, setDetail] = useState<AdminUserDetail | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!id) return
+    setLoading(true)
+    apiJson<AdminUserDetail>(`/api/admin/users/${encodeURIComponent(id)}`).then((r) => {
+      setLoading(false)
+      if (r.ok) {
+        setDetail(r.data)
+        setError(null)
+      } else {
+        setError(r.error)
+      }
+    })
+  }, [id])
+
+  if (loading) {
+    return (
+      <AdminShell title="Détail utilisateur">
+        <div className="space-y-4">
+          {[1, 2, 3].map((i) => <div key={i} className="h-28 animate-pulse rounded-3xl border border-border bg-card" />)}
+        </div>
+      </AdminShell>
+    )
+  }
+
+  if (!detail || error) {
+    return (
+      <AdminShell title="Détail utilisateur">
+        <div className="rounded-3xl border border-border bg-card p-12 text-center">
+          <p className="text-sm text-muted">{error || 'Utilisateur introuvable.'}</p>
+          <Link to="/admin/utilisateurs" className="mt-3 inline-block text-sm text-accent hover:underline">
+            Retour aux utilisateurs
+          </Link>
+        </div>
+      </AdminShell>
+    )
+  }
+
+  const { user, usage, workers, apiKeys, sessions } = detail
+  return (
+    <AdminShell
+      title={user.email}
+      subtitle={`Compte #${user.id} · ${user.isAdmin ? 'administrateur' : 'utilisateur'} · Google ${user.googleLinked ? 'lié' : 'non lié'}`}
+      actions={
+        <Link to="/admin/utilisateurs" className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface">
+          ← Retour
+        </Link>
+      }
+    >
+      <div className="space-y-6">
+        <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+          {[
+            ['Requêtes API', fmt(usage.apiRequests)],
+            ['Tokens API', fmt(usage.totalTokens)],
+            ['Coût API', `${Number(usage.costEur || 0).toFixed(4)} €`],
+            ['Sessions P2P', fmt(usage.sessionCount)],
+            ['Tokens sessions', fmt(usage.sessionCompletionTokens)],
+            ['TPS moyen', usage.avgSessionTps ? usage.avgSessionTps.toFixed(2) : '—'],
+          ].map(([label, value]) => (
+            <div key={label} className="rounded-3xl border border-white/10 bg-card/80 p-4 shadow-sm backdrop-blur-xl">
+              <p className="text-[11px] text-muted">{label}</p>
+              <p className="mt-1 font-display text-xl font-bold text-fg">{value}</p>
+            </div>
+          ))}
+        </section>
+
+        <section className="grid gap-4 xl:grid-cols-[1fr_1.2fr]">
+          <div className="rounded-3xl border border-border bg-card p-5 shadow-sm">
+            <p className="mb-4 text-sm font-semibold text-fg">Identité</p>
+            <dl className="space-y-2 text-[12px]">
+              {[
+                ['Email', user.email],
+                ['ID', user.id],
+                ['Rôle', user.isAdmin ? 'Administrateur' : 'Utilisateur'],
+                ['Google OAuth', user.googleLinked ? 'Oui' : 'Non'],
+                ['Créé le', formatDate(user.createdAt)],
+                ['Mis à jour', formatDate(user.updatedAt || null)],
+                ['Dernière connexion', formatDate(user.lastLoginAt)],
+              ].map(([label, value]) => (
+                <div key={label} className="flex justify-between gap-4 border-b border-border/50 py-2 last:border-0">
+                  <dt className="text-muted">{label}</dt>
+                  <dd className="max-w-[65%] break-all text-right text-fg">{value}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+
+          <div className="rounded-3xl border border-border bg-card p-5 shadow-sm">
+            <p className="mb-4 text-sm font-semibold text-fg">Clés API</p>
+            <div className="space-y-2">
+              {apiKeys.length === 0 ? (
+                <p className="text-[12px] text-muted">Aucune clé API.</p>
+              ) : apiKeys.map((key) => (
+                <div key={key.id} className="rounded-2xl border border-border/70 bg-surface/60 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="font-medium text-fg">{key.name}</p>
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${key.revokedAt ? 'bg-alert/10 text-alert' : 'bg-success/10 text-success'}`}>
+                      {key.revokedAt ? 'révoquée' : 'active'}
+                    </span>
+                  </div>
+                  <p className="mt-1 font-mono text-[11px] text-muted">{key.keyPrefix}</p>
+                  <p className="mt-2 text-[11px] text-muted">
+                    {fmt(key.requestCount)} req · {fmt(key.totalTokens)} tok · {Number(key.costEur || 0).toFixed(4)} €
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-border bg-card p-5 shadow-sm">
+          <div className="mb-4 flex items-center justify-between">
+            <p className="text-sm font-semibold text-fg">Workers liés ({workers.length})</p>
+            <Link to="/admin/workers" className="text-[12px] text-accent hover:underline">Voir tous</Link>
+          </div>
+          <div className="grid gap-3 lg:grid-cols-2">
+            {workers.length === 0 ? (
+              <p className="text-[12px] text-muted">Aucun worker lié.</p>
+            ) : workers.map((w) => (
+              <Link key={w.peerId} to={`/admin/workers/${encodeURIComponent(w.peerId)}`} className="rounded-2xl border border-border/70 bg-surface/60 p-4 hover:border-accent/40">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-[11px] font-semibold text-fg">{w.peerId}</p>
+                    <p className="mt-1 text-[12px] text-muted">{w.gpuName || 'GPU inconnu'} · {fmtGb(w.allocatedVramMb || w.gpuVramMb)}</p>
+                    <p className="mt-1 text-[11px] text-muted">{w.model || 'Modèle non déclaré'}</p>
+                  </div>
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${w.online ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
+                    {w.online ? 'online' : 'offline'}
+                  </span>
+                </div>
+                <p className="mt-3 text-[11px] text-muted">
+                  {fmt(w.tokensGenerated)} tokens · état {w.desiredState || 'active'} · commande {w.lastCommandStatus || '—'}
+                </p>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-border bg-card p-5 shadow-sm">
+          <p className="mb-4 text-sm font-semibold text-fg">Dernières sessions</p>
+          <div className="space-y-2">
+            {sessions.length === 0 ? (
+              <p className="text-[12px] text-muted">Aucune session.</p>
+            ) : sessions.map((session) => (
+              <Link key={session.id} to={`/admin/sessions/${session.id}`} className="grid gap-2 rounded-2xl border border-border/70 bg-surface/60 p-3 text-[12px] hover:border-accent/40 sm:grid-cols-[1fr_120px_120px_150px]">
+                <span className="font-mono text-fg">{session.id}</span>
+                <span className="text-muted">{fmt(Number(session.metrics?.completionTokens || 0))} tokens</span>
+                <span className="text-muted">{session.metrics?.hotPathTps ? `${Number(session.metrics.hotPathTps).toFixed(2)} TPS` : '—'}</span>
+                <span className="text-right text-muted">{formatDate(session.createdAt)}</span>
+              </Link>
+            ))}
+          </div>
+        </section>
+      </div>
     </AdminShell>
   )
 }

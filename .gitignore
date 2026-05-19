@@ -3,6 +3,7 @@
 
 # Builds
 **/dist/
+**/build/
 **/target/
 **/.vite/
 **/__pycache__/
@@ -29,14 +30,22 @@
 **/local-worker-logs/
 nodeAndWorker/logs/
 worker_daemon.log
+nodeAndWorker/bin/
 
 # Electron / releases
 AppMacos/release/
+Application/
+Application/**
 
 # Artefacts divers
 *.local
 *.tar.gz
 *.tgz
+*.dmg
+*.exe
+*.msi
+*.pkg
+*.zip
 
 # Clés libp2p générées en local (start-3-workers-mac.sh)
 **/.vryx-keys-mac/

@@ -209,7 +209,7 @@ export function SimulatorPage() {
             </p>
             <div className="mt-9 flex w-full flex-col gap-3 sm:mx-auto sm:max-w-xl sm:flex-row sm:justify-center sm:gap-4">
               <Link
-                to="/compte#facturation"
+                to="/compte/facturation"
                 className="inline-flex min-h-11 flex-1 items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:flex-none sm:px-8 sm:text-base"
               >
                 Acheter des crédits

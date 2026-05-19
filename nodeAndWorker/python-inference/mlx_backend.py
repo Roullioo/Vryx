@@ -127,8 +127,10 @@ def _mx_gqa_forward(
     use_cache: bool,
 ) -> tuple[Any, Any | None, Any | None]:
     B, L, _ = hidden.shape
-    # Qwen3.5 full_attention: q_proj sort 2×num_heads×head_dim (gated queries: [q, gate])
-    # On détecte: q_proj.out = 2 × k_proj.out × (num_heads_q / num_kv_heads)
+    # Qwen3.5 full_attention: q_proj sort 2×num_heads×head_dim (gated queries: [q, gate]).
+    # Llama/Mistral GQA can also have q_out/k_out as an even ratio (for example
+    # Llama2 70B: 8192/1024 = 8), so ratio parity is not enough. Only enable the
+    # gated path when q_proj is exactly twice the expected query width.
     k_out = int(k_w.shape[0])   # = num_kv_heads × head_dim
     q_out = int(q_w.shape[0])   # = num_heads_q × head_dim  OU  2 × num_heads_q × head_dim
     # Heuristique: si q_out = 2 × num_kv_heads × head_dim × ratio → utiliser gated
@@ -136,11 +138,13 @@ def _mx_gqa_forward(
     # Vérifier si q_out est un multiple pair de k_out
     is_gated_q = False
     gate_q = None
+    expected_q_width = int(num_heads) * int(head_dim)
+    if expected_q_width > 0 and q_out == expected_q_width * 2:
+        is_gated_q = True
     if k_out > 0 and q_out % k_out == 0:
         ratio = q_out // k_out
-        if ratio % 2 == 0:
+        if is_gated_q:
             # q_out = 2 × num_heads × head_dim : gated attention
-            is_gated_q = True
             head_dim = k_out // num_kv_heads if num_kv_heads > 0 else head_dim
             num_heads = (q_out // 2) // head_dim if head_dim > 0 else num_heads
         else:
@@ -479,8 +483,11 @@ class MLXBackend:
             n_heads_here = num_heads
             head_dim_here = head_dim  # évite de muter outer scope définitivement
             num_kv_heads_here = num_kv_heads
+            eval_every = max(1, int(os.environ.get("VRYX_MLX_EVAL_EVERY_LAYERS", "1")))
+            progress_every = max(0, int(os.environ.get("VRYX_MLX_PROGRESS_EVERY_LAYERS", "4")))
             for local_i in range(n_layers_here):
                 prefix = f"layers.{local_i}"
+                layer_t0 = time.perf_counter()
                 norm1_w = self._w(f"{prefix}.input_layernorm.weight")
                 norm2_w = self._w(f"{prefix}.post_attention_layernorm.weight")
                 gate_w = self._w(f"{prefix}.mlp.gate_proj.weight")
@@ -540,6 +547,14 @@ class MLXBackend:
                 h = h + attn_out
                 normed2 = _mx_rms_norm(mx, h, norm2_w, rms_eps)
                 h = h + _mx_mlp(mx, normed2, gate_w, up_w, down_w)
+                if eval_every and ((local_i + 1) % eval_every == 0 or local_i + 1 == n_layers_here):
+                    mx.eval(h)
+                if progress_every and ((local_i + 1) % progress_every == 0 or local_i + 1 == n_layers_here):
+                    print(
+                        f"[mlx] layer {local_i + 1}/{n_layers_here} "
+                        f"sid={sid[:12]} ms={int((time.perf_counter() - layer_t0) * 1000)} "
+                        f"shape={tuple(h.shape)}"
+                    )
 
             mx.eval(h)
             self.shard.seq_position = seq_pos_run + seq_len_run

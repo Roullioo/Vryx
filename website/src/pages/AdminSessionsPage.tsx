@@ -9,6 +9,7 @@ import {
   fetchSessionFromDb,
   fetchSessionsFromDb,
   loadSessions,
+  normalizeSession,
   type WorkSession,
 } from '../lib/sessions'
 
@@ -31,8 +32,180 @@ function relativeTime(ts: number) {
   return new Date(ts).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: '2-digit' })
 }
 
+function avg(values: number[]) {
+  const clean = values.filter((v) => Number.isFinite(v) && v > 0)
+  if (clean.length === 0) return 0
+  return clean.reduce((sum, value) => sum + value, 0) / clean.length
+}
+
+function percentile(values: number[], p: number) {
+  const clean = values.filter((v) => Number.isFinite(v) && v > 0).sort((a, b) => a - b)
+  if (clean.length === 0) return 0
+  const idx = Math.min(clean.length - 1, Math.max(0, Math.ceil((p / 100) * clean.length) - 1))
+  return clean[idx]
+}
+
+function sessionStats(session: WorkSession) {
+  const s = normalizeSession(session)
+  const computeMs = Math.max(s.workerComputeMs || 0, s.computeTimeMs || 0)
+  const activeMs = computeMs > 0 ? computeMs : s.latencyMs || 0
+  const tokenLatencies = s.tokenSteps.map((step) => step.totalMs).filter((v) => Number.isFinite(v) && v > 0)
+  const instantTps = s.tokenSteps
+    .map((step) => (step.tps && step.tps > 0 ? step.tps : step.totalMs > 0 ? 1000 / step.totalMs : 0))
+    .filter((v) => Number.isFinite(v) && v > 0)
+  const avgActiveTps =
+    s.hotPathTps && s.hotPathTps > 0
+      ? s.hotPathTps
+      : s.completionTokens > 0 && activeMs > 0
+        ? s.completionTokens / (activeMs / 1000)
+        : avg(instantTps)
+  const networkMs = Math.max(0, (s.latencyMs || 0) - (s.vpsDelegateMs || 0) - computeMs)
+  return {
+    activeMs,
+    computeMs,
+    networkMs,
+    avgActiveTps,
+    avgInstantTps: avg(instantTps),
+    maxInstantTps: Math.max(0, ...instantTps),
+    minInstantTps: instantTps.length ? Math.min(...instantTps) : 0,
+    firstTokenMs: tokenLatencies[0] || 0,
+    p50TokenMs: percentile(tokenLatencies, 50),
+    p95TokenMs: percentile(tokenLatencies, 95),
+  }
+}
+
+function SessionsOverview({ sessions: rawSessions }: { sessions: WorkSession[] }) {
+  const sessions = rawSessions.map(normalizeSession)
+  const active = sessions.filter((s) => s.completionTokens > 0)
+  const totalTokens = active.reduce((sum, s) => sum + (s.completionTokens || 0), 0)
+  const avgTps = avg(active.map((s) => sessionStats(s).avgActiveTps))
+  const avgPing = avg(active.map((s) => s.pingMs || 0))
+  const avgLatency = avg(active.map((s) => s.latencyMs || 0))
+  const best = active.reduce<WorkSession | null>((winner, s) => {
+    if (!winner) return s
+    return sessionStats(s).avgActiveTps > sessionStats(winner).avgActiveTps ? s : winner
+  }, null)
+  return (
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+      {[
+        { label: 'Sessions actives', value: fmt(active.length), hint: `${sessions.length} enregistrée${sessions.length > 1 ? 's' : ''}` },
+        { label: 'Tokens générés', value: fmt(totalTokens), hint: 'contenu jamais stocké' },
+        { label: 'TPS moyen actif', value: avgTps ? avgTps.toFixed(2) : '—', hint: 'hors périodes idle' },
+        { label: 'Ping moyen', value: avgPing ? ms(Math.round(avgPing)) : '—', hint: 'P2P / relay' },
+        { label: 'Meilleure session', value: best ? `${sessionStats(best).avgActiveTps.toFixed(2)} TPS` : '—', hint: best ? relativeTime(best.timestamp) : 'aucune' },
+      ].map((card) => (
+        <div key={card.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
+          <p className="text-xs text-muted">{card.label}</p>
+          <p className="mt-1 font-display text-2xl font-bold text-fg">{card.value}</p>
+          <p className="mt-1 text-[11px] text-muted">{card.hint}</p>
+        </div>
+      ))}
+      <div className="rounded-2xl border border-border bg-card p-4 shadow-sm sm:col-span-2 xl:col-span-5">
+        <div className="flex flex-wrap gap-4 text-[11px] text-muted">
+          <span>Latence moyenne <strong className="font-mono text-fg">{avgLatency ? ms(Math.round(avgLatency)) : '—'}</strong></span>
+          <span>TPS calculé uniquement sur les sessions avec génération réelle</span>
+          <span>Les graphes ne contiennent aucun token lisible</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function MiniBarChart({
+  title,
+  points,
+  unit,
+  tone = 'bg-electric',
+}: {
+  title: string
+  points: { label: string; value: number }[]
+  unit: string
+  tone?: string
+}) {
+  const max = Math.max(1, ...points.map((p) => p.value))
+  return (
+    <div className="rounded-xl border border-border bg-surface p-4 dark:bg-elevated">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-muted">{title}</p>
+        <p className="font-mono text-[11px] text-fg">
+          moy. {avg(points.map((p) => p.value)).toFixed(unit === 'TPS' ? 2 : 0)} {unit}
+        </p>
+      </div>
+      {points.length === 0 ? (
+        <p className="text-xs text-muted">Pas assez de points pour ce graphe.</p>
+      ) : (
+        <div className="flex h-36 items-end gap-1.5 overflow-x-auto border-b border-border/60 pb-2">
+          {points.slice(0, 80).map((p, i) => (
+            <div key={`${p.label}-${i}`} className="flex min-w-5 flex-1 flex-col items-center gap-1">
+              <div
+                className={`w-full rounded-t ${tone}`}
+                title={`${p.label}: ${p.value.toFixed(unit === 'TPS' ? 2 : 0)} ${unit}`}
+                style={{ height: `${Math.max(4, (p.value / max) * 120)}px` }}
+              />
+              {points.length <= 24 && <span className="text-[8px] text-muted">{p.label}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SessionMetricGraphs({ session }: { session: WorkSession }) {
+  const s = normalizeSession(session)
+  const stats = sessionStats(s)
+  const tpsPoints = s.tokenSteps.map((step) => {
+    const tps = step.tps && step.tps > 0 ? step.tps : step.totalMs > 0 ? 1000 / step.totalMs : 0
+    return { label: `#${step.tokenIndex}`, value: tps }
+  })
+  const latencyPoints = s.tokenSteps.map((step) => ({ label: `#${step.tokenIndex}`, value: step.totalMs }))
+  const infrastructurePoints = [
+    { label: 'Ping', value: s.pingMs || 0 },
+    { label: 'VPS', value: s.vpsDelegateMs || 0 },
+    { label: 'Worker', value: Math.max(s.workerComputeMs || 0, s.computeTimeMs || 0) },
+    { label: 'Total', value: s.latencyMs || 0 },
+  ].filter((p) => p.value > 0)
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="text-xs text-muted">TPS moyen actif</p>
+          <p className="mt-1 font-display text-2xl font-bold text-success">{stats.avgActiveTps.toFixed(2)}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="text-xs text-muted">Ping P2P</p>
+          <p className="mt-1 font-display text-2xl font-bold text-fg">{s.pingMs ? ms(Math.round(s.pingMs)) : '—'}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="text-xs text-muted">P50 token</p>
+          <p className="mt-1 font-display text-2xl font-bold text-fg">{stats.p50TokenMs ? ms(Math.round(stats.p50TokenMs)) : '—'}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="text-xs text-muted">P95 token</p>
+          <p className="mt-1 font-display text-2xl font-bold text-fg">{stats.p95TokenMs ? ms(Math.round(stats.p95TokenMs)) : '—'}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="text-xs text-muted">TPS max instant.</p>
+          <p className="mt-1 font-display text-2xl font-bold text-fg">{stats.maxInstantTps ? stats.maxInstantTps.toFixed(2) : '—'}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <p className="text-xs text-muted">Confidentialité</p>
+          <p className="mt-1 text-sm font-semibold text-success">Tokens masqués</p>
+        </div>
+      </div>
+      <div className="grid gap-4 xl:grid-cols-3">
+        <MiniBarChart title="TPS par point généré" points={tpsPoints} unit="TPS" tone="bg-success" />
+        <MiniBarChart title="Latence par point" points={latencyPoints} unit="ms" tone="bg-electric" />
+        <MiniBarChart title="Ping & temps système" points={infrastructurePoints} unit="ms" tone="bg-accent" />
+      </div>
+    </div>
+  )
+}
+
 /* ─── Diagramme de flux ──────────────────────────────────────────────────── */
-function FlowDiagram({ session: s }: { session: WorkSession }) {
+function FlowDiagram({ session }: { session: WorkSession }) {
+  const s = normalizeSession(session)
   const totalMs = Math.max(1, s.latencyMs)
   const vps = s.vpsDelegateMs
   const wrk = Math.max(s.workerComputeMs, s.computeTimeMs ?? 0)
@@ -301,7 +474,9 @@ function FlowDiagram({ session: s }: { session: WorkSession }) {
 }
 
 /* ─── Carte session ──────────────────────────────────────────────────────── */
-function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete: () => void }) {
+function SessionCard({ session, onDelete }: { session: WorkSession; onDelete: () => void }) {
+  const s = normalizeSession(session)
+  const stats = sessionStats(s)
   return (
     <div className="group rounded-2xl border border-border bg-card shadow-sm transition-shadow hover:shadow-md">
       <div className="flex items-start justify-between gap-3 p-4">
@@ -312,13 +487,13 @@ function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete:
             <span>{relativeTime(s.timestamp)}</span>
             <span className="rounded-full bg-border/50 px-1.5 py-0.5 text-[10px]">{s.mode}</span>
           </div>
-          <p className="mt-1.5 truncate text-sm font-medium text-fg">{s.prompt}</p>
-          <p className="mt-0.5 truncate text-[12px] text-muted">{s.response}</p>
+          <p className="mt-1.5 truncate text-sm font-medium text-fg">Session P2P sécurisée</p>
+          <p className="mt-0.5 truncate text-[12px] text-muted">Contenu masqué, métriques conservées</p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
           <div className="text-right">
-            <p className="font-mono text-sm font-bold text-fg">{fmt(s.latencyMs)} ms</p>
-            <p className="text-[10px] text-muted">{fmt(s.completionTokens)} tok.</p>
+            <p className="font-mono text-sm font-bold text-fg">{stats.avgActiveTps ? stats.avgActiveTps.toFixed(2) : '—'} TPS</p>
+            <p className="text-[10px] text-muted">{fmt(s.completionTokens)} tok. · {fmt(s.latencyMs)} ms</p>
           </div>
           <button
             onClick={(e) => { e.stopPropagation(); onDelete() }}
@@ -334,7 +509,9 @@ function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete:
       <div className="border-t border-border/50 px-4 py-2.5">
         <div className="flex flex-wrap gap-3 text-[10px] text-muted">
           <span>VPS <span className="font-mono text-fg">{fmt(s.vpsDelegateMs)} ms</span></span>
-          <span>Worker <span className="font-mono text-fg">{fmt(s.workerComputeMs)} ms</span></span>
+          <span>Worker <span className="font-mono text-fg">{fmt(stats.computeMs)} ms</span></span>
+          <span>Ping <span className="font-mono text-fg">{s.pingMs ? fmt(Math.round(s.pingMs)) : '—'} ms</span></span>
+          <span>P95 tok <span className="font-mono text-fg">{stats.p95TokenMs ? fmt(Math.round(stats.p95TokenMs)) : '—'} ms</span></span>
           <span>Prompt <span className="font-mono text-fg">{fmt(s.promptTokens)}</span></span>
           <span>Complétion <span className="font-mono text-fg">{fmt(s.completionTokens)}</span></span>
           {s.peers.length > 0 && <span><span className="font-mono text-fg">{s.peers.length}</span> pair(s)</span>}
@@ -406,6 +583,7 @@ function SessionCard({ session: s, onDelete }: { session: WorkSession; onDelete:
 export function AdminSessionsPage() {
   const [sessions, setSessions] = useState<WorkSession[]>(() => loadSessions())
   const [loading, setLoading] = useState(true)
+  const safeSessions = (Array.isArray(sessions) ? sessions : []).map(normalizeSession)
 
   async function refresh() {
     setLoading(true)
@@ -435,9 +613,9 @@ export function AdminSessionsPage() {
   return (
     <AdminShell
       title="Sessions"
-      subtitle={`${sessions.length} session${sessions.length > 1 ? 's' : ''} enregistrée${sessions.length > 1 ? 's' : ''}${loading ? ' · synchronisation DB…' : ''}`}
+      subtitle={`${safeSessions.length} session${safeSessions.length > 1 ? 's' : ''} enregistrée${safeSessions.length > 1 ? 's' : ''}${loading ? ' · synchronisation DB…' : ''}`}
       actions={
-        sessions.length > 0 ? (
+        safeSessions.length > 0 ? (
           <button
             onClick={handleClear}
             className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted hover:border-alert/40 hover:text-alert"
@@ -447,7 +625,7 @@ export function AdminSessionsPage() {
         ) : undefined
       }
     >
-      {sessions.length === 0 ? (
+      {safeSessions.length === 0 ? (
         <div className="rounded-2xl border border-border bg-card p-12 text-center">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} className="mx-auto mb-4 h-10 w-10 text-muted/40">
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -461,10 +639,13 @@ export function AdminSessionsPage() {
           </p>
         </div>
       ) : (
-        <div className="space-y-3">
-          {sessions.map((s) => (
-            <SessionCard key={s.id} session={s} onDelete={() => handleDelete(s.id)} />
-          ))}
+        <div className="space-y-4">
+          <SessionsOverview sessions={safeSessions} />
+          <div className="space-y-3">
+            {safeSessions.map((s) => (
+              <SessionCard key={s.id} session={s} onDelete={() => handleDelete(s.id)} />
+            ))}
+          </div>
         </div>
       )}
     </AdminShell>
@@ -498,10 +679,13 @@ export function AdminSessionDetailPage() {
     </AdminShell>
   )
 
+  const safeSession = normalizeSession(session)
+  const stats = sessionStats(safeSession)
+
   return (
     <AdminShell
       title="Détail de session"
-      subtitle={new Date(session.timestamp).toLocaleString('fr-FR', { weekday: 'long', day: '2-digit', month: 'long', hour: '2-digit', minute: '2-digit' })}
+      subtitle={new Date(safeSession.timestamp).toLocaleString('fr-FR', { weekday: 'long', day: '2-digit', month: 'long', hour: '2-digit', minute: '2-digit' })}
       actions={
         <Link to="/admin/sessions" className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-fg hover:bg-surface">
           ← Retour
@@ -509,25 +693,27 @@ export function AdminSessionDetailPage() {
       }
     >
       <div className="space-y-5">
-        {/* Prompt / réponse */}
+        {/* Confidentialité contenu */}
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">Prompt</p>
-            <p className="text-sm leading-relaxed text-fg">{session.prompt}</p>
+            <p className="text-sm leading-relaxed text-fg">Contenu masqué pour ne pas rendre les tokens lisibles dans l’historique.</p>
           </div>
           <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted">Réponse</p>
-            <p className="text-sm leading-relaxed text-fg">{session.response}</p>
+            <p className="text-sm leading-relaxed text-fg">Seules les métriques de performance sont conservées.</p>
           </div>
         </div>
 
         {/* Métriques clés */}
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           {[
-            { label: 'Latence totale', value: ms(session.latencyMs), accent: false },
-            { label: 'VPS (orch.)', value: ms(session.vpsDelegateMs) },
-            { label: 'Worker (calcul)', value: ms(session.workerComputeMs) },
-            { label: 'Tokens générés', value: fmt(session.completionTokens) },
+            { label: 'Latence totale', value: ms(safeSession.latencyMs), accent: false },
+            { label: 'Ping P2P', value: safeSession.pingMs ? ms(Math.round(safeSession.pingMs)) : '—' },
+            { label: 'VPS (orch.)', value: ms(safeSession.vpsDelegateMs) },
+            { label: 'Worker actif', value: ms(stats.computeMs) },
+            { label: 'TPS moyen actif', value: stats.avgActiveTps ? `${stats.avgActiveTps.toFixed(2)}` : '—' },
+            { label: 'Points générés', value: fmt(safeSession.completionTokens) },
           ].map((m) => (
             <div key={m.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
               <p className="text-xs text-muted">{m.label}</p>
@@ -538,67 +724,67 @@ export function AdminSessionDetailPage() {
 
         {/* Badges transport & performance */}
         <div className="flex flex-wrap gap-2 rounded-2xl border border-border bg-card p-4 shadow-sm">
-          {session.hotPathTps != null && session.hotPathTps > 0 && (
+          {safeSession.hotPathTps != null && safeSession.hotPathTps > 0 && (
             <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-3 py-1 text-xs font-bold text-success">
               <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5" aria-hidden><circle cx="8" cy="8" r="3"/></svg>
-              {session.hotPathTps.toFixed(3)} TPS
+              {safeSession.hotPathTps.toFixed(3)} TPS
             </span>
           )}
-          {session.avgMsPerToken != null && session.avgMsPerToken > 0 && (
+          {safeSession.avgMsPerToken != null && safeSession.avgMsPerToken > 0 && (
             <span className="inline-flex items-center gap-1 rounded-full bg-border/40 px-3 py-1 text-xs font-semibold text-muted">
-              {session.avgMsPerToken} ms/tok
+              {safeSession.avgMsPerToken} ms/tok
             </span>
           )}
-          {session.quicUsed != null && (
-            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${session.quicUsed ? 'bg-success/10 text-success' : 'bg-border/40 text-muted'}`}>
-              {session.quicUsed ? 'QUIC UDP' : 'TCP'}
+          {safeSession.quicUsed != null && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${safeSession.quicUsed ? 'bg-success/10 text-success' : 'bg-border/40 text-muted'}`}>
+              {safeSession.quicUsed ? 'QUIC UDP' : 'TCP'}
             </span>
           )}
-          {session.kvCacheUsed != null && (
-            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${session.kvCacheUsed ? 'bg-electric/10 text-electric' : 'bg-border/40 text-muted'}`}>
-              {session.kvCacheUsed ? 'KV Cache ON' : 'KV Cache OFF'}
+          {safeSession.kvCacheUsed != null && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${safeSession.kvCacheUsed ? 'bg-electric/10 text-electric' : 'bg-border/40 text-muted'}`}>
+              {safeSession.kvCacheUsed ? 'KV Cache ON' : 'KV Cache OFF'}
             </span>
           )}
-          {session.hiddenTransport && (
+          {safeSession.hiddenTransport && (
             <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-3 py-1 text-xs font-bold text-accent">
-              {session.hiddenTransport}
+              {safeSession.hiddenTransport}
             </span>
           )}
-          {session.requestedQuantization && (
+          {safeSession.requestedQuantization && (
             <span className="inline-flex items-center gap-1 rounded-full bg-electric/10 px-3 py-1 text-xs font-bold text-electric">
-              Demandé : {quantizationLabel(session.requestedQuantization)}
+              Demandé : {quantizationLabel(safeSession.requestedQuantization)}
             </span>
           )}
-          {session.effectiveQuantization && (
+          {safeSession.effectiveQuantization && (
             <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-3 py-1 text-xs font-bold text-success">
-              Effectif : {session.effectiveQuantization}
+              Effectif : {safeSession.effectiveQuantization}
             </span>
           )}
-          {session.quantizationFallbackReason && (
+          {safeSession.quantizationFallbackReason && (
             <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
-              Fallback : {session.quantizationFallbackReason}
+              Fallback : {safeSession.quantizationFallbackReason}
             </span>
           )}
-          {session.poolClass && (
+          {safeSession.poolClass && (
             <span className="inline-flex items-center gap-1 rounded-full bg-success/10 px-3 py-1 text-xs font-bold text-success">
-              Pool : {session.poolClass}
+              Pool : {safeSession.poolClass}
             </span>
           )}
-          {session.poolFallbackReason && (
+          {safeSession.poolFallbackReason && (
             <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
-              Pool fallback : {session.poolFallbackReason}
+              Pool fallback : {safeSession.poolFallbackReason}
             </span>
           )}
-          {session.prefixCacheHit != null && (
-            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${session.prefixCacheHit ? 'bg-primary/10 text-primary' : 'bg-border/40 text-muted'}`}>
-              {session.prefixCacheHit
-                ? `Prefix Cache HIT${session.prefixCacheTokens ? ` (${fmt(session.prefixCacheTokens)} tok)` : ''}`
+          {safeSession.prefixCacheHit != null && (
+            <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-bold ${safeSession.prefixCacheHit ? 'bg-primary/10 text-primary' : 'bg-border/40 text-muted'}`}>
+              {safeSession.prefixCacheHit
+                ? `Prefix Cache HIT${safeSession.prefixCacheTokens ? ` (${fmt(safeSession.prefixCacheTokens)} tok)` : ''}`
                 : 'Prefix Cache MISS'}
             </span>
           )}
-          {session.stopReason && session.stopReason !== 'null' && (
+          {safeSession.stopReason && safeSession.stopReason !== 'null' && (
             <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
-              arrêt : {session.stopReason}
+              arrêt : {safeSession.stopReason}
             </span>
           )}
         </div>
@@ -607,18 +793,18 @@ export function AdminSessionDetailPage() {
         <div className="rounded-2xl border border-border bg-surface p-5 dark:border-border dark:bg-elevated">
           <h3 className="text-sm font-semibold text-fg">Comprendre ce traitement</h3>
           <p className="mt-2 text-xs leading-relaxed text-muted">
-            {session.pipelineLayout === 'pipeline_relay_daisy_chain' ? (
+            {safeSession.pipelineLayout === 'pipeline_relay_daisy_chain' ? (
               <>
                 <strong>Pipeline Parallelism (Daisy Chain) :</strong> Les tenseurs ont traversé les nœuds dans l&apos;ordre du{' '}
                 <span className="font-mono">routing_path</span> : chaque pair calcule son segment puis passe au suivant (relais séquentiel), 
                 sans passer par une API Web2 centralisée.
               </>
-            ) : session.pipelineLayout === 'row_split_tensor_parallel' ? (
+            ) : safeSession.pipelineLayout === 'row_split_tensor_parallel' ? (
               <>
                 <strong>Ancienne trace Tensor Parallelism :</strong> ce layout row-split est conservé seulement pour lire les anciennes sessions.
                 Le chat admin actuel utilise la chaîne de relais Daisy Chain via <span className="font-mono">routing_path</span>.
               </>
-            ) : session.pipelineLayout === 'distributed_fanout' ? (
+            ) : safeSession.pipelineLayout === 'distributed_fanout' ? (
               <>
                 <strong>Fan-out distribué :</strong> Le prompt a été envoyé à plusieurs workers en même temps. 
                 Le premier worker à répondre a "gagné" et sa réponse a été utilisée. Les autres workers ont été contactés mais leur résultat a été ignoré car ils étaient plus lents.
@@ -635,30 +821,33 @@ export function AdminSessionDetailPage() {
         {/* Diagramme complet */}
         <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
           <p className="mb-4 text-sm font-semibold text-fg">Analyse détaillée</p>
-          <FlowDiagram session={session} />
+          <SessionMetricGraphs session={safeSession} />
+          <div className="mt-5">
+          <FlowDiagram session={safeSession} />
+          </div>
         </div>
 
         {/* Infos worker */}
-        {(session.primaryWorkerPeerId || session.workerPeerId) && (
+        {(safeSession.primaryWorkerPeerId || safeSession.workerPeerId) && (
           <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
             <p className="mb-3 text-sm font-semibold text-fg">Informations worker</p>
             <dl className="space-y-2">
               {[
-                { label: 'Peer ID principal', value: session.primaryWorkerPeerId || session.workerPeerId, mono: true },
-                { label: 'Mode', value: session.mode },
-                { label: 'Layout pipeline', value: session.pipelineLayout || '—' },
-                { label: 'Pipeline OK', value: session.pipelineLayout ? (session.pipelineOk ? 'Oui' : 'Non') : '—' },
-                { label: 'Workers contactés', value: String(session.schedulerWorkersUsed) },
-                { label: 'Warmup historique', value: String(session.schedulerWarmupSent) },
-                { label: 'Messages P2P in', value: String(session.p2pMessagesIn) },
-                { label: 'Messages P2P out', value: String(session.p2pMessagesOut) },
-                { label: 'Prompt tokens', value: fmt(session.promptTokens) },
-                { label: 'Complétion tokens', value: fmt(session.completionTokens) },
-                { label: 'Total tokens', value: fmt(session.totalTokens) },
-                ...(session.setupMs != null && session.setupMs > 0 ? [{ label: 'Setup pipeline', value: ms(session.setupMs) }] : []),
-                ...(session.avgMsPerToken != null && session.avgMsPerToken > 0 ? [{ label: 'Moy. ms/token', value: `${session.avgMsPerToken} ms` }] : []),
-                ...(session.hotPathTps != null && session.hotPathTps > 0 ? [{ label: 'TPS mesuré', value: `${session.hotPathTps.toFixed(3)} tok/s` }] : []),
-                ...(session.benchmarkActualTps != null && session.benchmarkActualTps > 0 ? [{ label: 'TPS benchmark', value: `${session.benchmarkActualTps.toFixed(3)} tok/s (cible : 15)` }] : []),
+                { label: 'Peer ID principal', value: safeSession.primaryWorkerPeerId || safeSession.workerPeerId, mono: true },
+                { label: 'Mode', value: safeSession.mode },
+                { label: 'Layout pipeline', value: safeSession.pipelineLayout || '—' },
+                { label: 'Pipeline OK', value: safeSession.pipelineLayout ? (safeSession.pipelineOk ? 'Oui' : 'Non') : '—' },
+                { label: 'Workers contactés', value: String(safeSession.schedulerWorkersUsed) },
+                { label: 'Warmup historique', value: String(safeSession.schedulerWarmupSent) },
+                { label: 'Messages P2P in', value: String(safeSession.p2pMessagesIn) },
+                { label: 'Messages P2P out', value: String(safeSession.p2pMessagesOut) },
+                { label: 'Prompt tokens', value: fmt(safeSession.promptTokens) },
+                { label: 'Complétion tokens', value: fmt(safeSession.completionTokens) },
+                { label: 'Total tokens', value: fmt(safeSession.totalTokens) },
+                ...(safeSession.setupMs != null && safeSession.setupMs > 0 ? [{ label: 'Setup pipeline', value: ms(safeSession.setupMs) }] : []),
+                ...(safeSession.avgMsPerToken != null && safeSession.avgMsPerToken > 0 ? [{ label: 'Moy. ms/token', value: `${safeSession.avgMsPerToken} ms` }] : []),
+                ...(safeSession.hotPathTps != null && safeSession.hotPathTps > 0 ? [{ label: 'TPS mesuré', value: `${safeSession.hotPathTps.toFixed(3)} tok/s` }] : []),
+                ...(safeSession.benchmarkActualTps != null && safeSession.benchmarkActualTps > 0 ? [{ label: 'TPS benchmark', value: `${safeSession.benchmarkActualTps.toFixed(3)} tok/s (cible : 15)` }] : []),
               ].map((r) => (
                 <div key={r.label} className="flex justify-between border-b border-border/40 py-1.5 text-[12px] last:border-0">
                   <dt className="text-muted">{r.label}</dt>
@@ -670,11 +859,11 @@ export function AdminSessionDetailPage() {
         )}
 
         {/* Pairs */}
-        {session.peers.length > 0 && (
+        {safeSession.peers.length > 0 && (
           <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
-            <p className="mb-3 text-sm font-semibold text-fg">Pairs impliqués ({session.peers.length})</p>
+            <p className="mb-3 text-sm font-semibold text-fg">Pairs impliqués ({safeSession.peers.length})</p>
             <ul className="space-y-1">
-              {session.peers.map((p, i) => (
+              {safeSession.peers.map((p, i) => (
                 <li key={p} className="flex items-center gap-2 text-[11px]">
                   <span className="rounded bg-success/10 px-1.5 py-0.5 text-[9px] font-bold text-success">#{i + 1}</span>
                   <span className="font-mono text-fg">{p}</span>

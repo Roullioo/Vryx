@@ -1,6 +1,6 @@
 import { NavLink, Navigate, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { VryxLogo } from '../brand/VryxLogo'
 import { useAuth } from '../../context/AuthContext'
 
@@ -45,6 +45,13 @@ function IconUsers() {
     </svg>
   )
 }
+function IconPulse() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
+      <path d="M3 12h4l3-8 4 16 3-8h4" />
+    </svg>
+  )
+}
 function IconChat() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
@@ -84,6 +91,7 @@ const navItems: NavItem[] = [
   { to: '/admin/chat-p2p', label: 'Chat P2P', icon: <IconChat /> },
   { to: '/admin/workers', label: 'Workers', icon: <IconWorkers /> },
   { to: '/admin/sessions', label: 'Sessions', icon: <IconSessions /> },
+  { to: '/admin/observabilite', label: 'Observabilité', icon: <IconPulse /> },
   { to: '/admin/utilisateurs', label: 'Utilisateurs', icon: <IconUsers /> },
 ]
 
@@ -111,7 +119,7 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
       {/* Sidebar */}
       <aside
         style={{ width: SIDEBAR_W }}
-        className={`fixed inset-y-0 left-0 z-50 flex flex-col bg-admin-sidebar transition-transform duration-300 lg:translate-x-0 ${
+        className={`admin-sidebar fixed inset-y-0 left-0 z-50 flex flex-col bg-admin-sidebar transition-transform duration-300 lg:translate-x-0 ${
           open ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -207,6 +215,7 @@ export function AdminShell({
 }: AdminShellProps) {
   const { user, loading } = useAuth()
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const closeSidebar = useCallback(() => setSidebarOpen(false), [])
 
   if (loading) {
     return (
@@ -235,15 +244,13 @@ export function AdminShell({
   }
 
   return (
-    <div className="flex min-h-dvh bg-admin-canvas">
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+    <div className="admin-ultimate flex h-dvh max-h-dvh min-h-0 overflow-hidden bg-admin-canvas">
+      <Sidebar open={sidebarOpen} onClose={closeSidebar} />
 
       {/* Main */}
-      <div
-        className="flex min-h-0 min-w-0 flex-1 flex-col lg:pl-[220px]"
-      >
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden lg:pl-[220px]">
         {/* Top bar mobile */}
-        <header className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-border bg-[var(--color-admin-mobile-header)] px-4 backdrop-blur-md lg:hidden">
+        <header className="admin-topbar z-30 flex h-14 shrink-0 items-center gap-3 border-b border-border bg-[var(--color-admin-mobile-header)] px-4 backdrop-blur-md lg:hidden">
           <button
             onClick={() => setSidebarOpen(true)}
             className="rounded-lg p-1.5 text-muted hover:bg-surface hover:text-fg"
@@ -255,7 +262,7 @@ export function AdminShell({
         </header>
 
         {showDesktopTitleBar ? (
-          <div className="hidden border-b border-border bg-card px-6 py-4 lg:block lg:px-8">
+          <div className="admin-titlebar hidden border-b border-border bg-card px-6 py-4 lg:block lg:px-8">
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h1 className="font-display text-xl font-bold text-fg lg:text-2xl">{title}</h1>

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run VRYX multi-worker readiness watcher every 2 minutes
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=2min
+AccuracySec=20s
+Unit=vryx-multiworker-readiness.service
+
+[Install]
+WantedBy=timers.target

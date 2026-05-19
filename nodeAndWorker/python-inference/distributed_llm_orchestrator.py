@@ -14,7 +14,7 @@ Côté VPS / Initiateur :
 
 Variables :
   VRYX_DIST_MODEL          Modèle HuggingFace (défaut : Qwen/Qwen3.5-9B — aligné VPS prod)
-  VRYX_DIST_MAX_TOKENS     Tokens max générés (défaut : 512)
+  VRYX_DIST_MAX_TOKENS     Tokens max générés (défaut : 32768)
   VRYX_P2P_RELAY_URL       URL du daemon Rust initiateur (défaut : http://127.0.0.1:3031)
   VRYX_DIST_MAX_WORKERS    Workers max utilisés dans la Daisy Chain lorsque tous les compatibles sont pris sans surcoût dédié ; voir aussi VRYX_DIST_USE_ALL_COMPATIBLE_PEERS.
   VRYX_DIST_USE_ALL_COMPATIBLE_PEERS  1 = utiliser jusqu’à VRYX_DIST_HARD_CAP_PEERS workers parmi les pairs découverts (après match modèle) pour répartir toutes les couches (test mono-machine multi-process ; pas de mini-plafond 2 pour les 0.5B).
@@ -45,6 +45,13 @@ Variables :
   VRYX_PUBLIC_WORKER_CATALOG      Défaut 1 : catalogue placement (VRAM, runtime) depuis la même route si :48953/:4000 échouent.
   VRYX_MLX_ALLOW_Q4_HIDDEN   Si 1, autorise transport hidden q4/int8 avec pool velocity_mlx ; sinon ils sont ramenés à fp16 (qualité des logits).
   VRYX_FULL_WORKER_RTT_MATRIX  Si 1, mesure tous les pings worker↔worker (exact mais lent). Défaut 0 : estimation via RTT VPS→workers (cold setup bien plus rapide).
+  HF_TOKEN                     Token Hugging Face (si vide, utilise HF_TOKEN_FILE)
+  HF_TOKEN_FILE                Fichier token HF (par défaut {HF_HOME}/token)
+  HF_HOME                      Répertoire HF (par défaut ~/.cache/huggingface)
+  HF_HUB_CACHE                 Répertoire HF hub cache explicite
+  HF_REVISION                  Révision HF (défaut « main »)
+  HF_DOWNLOAD_MAX_WORKERS      Concurrence de téléchargement HF (défaut 8)
+  HF_DOWNLOAD_ALLOW_PATTERNS   Liste CSV de patterns de snapshot à télécharger
 
 """
 from __future__ import annotations
@@ -55,12 +62,14 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import urllib.error
 import urllib.request
@@ -71,8 +80,29 @@ from batching import BatchQueue, batching_trace
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MODEL_ID = os.environ.get("VRYX_DIST_MODEL", "Qwen/Qwen3.5-9B")
-MAX_NEW_TOKENS = int(os.environ.get("VRYX_DIST_MAX_TOKENS", "512"))
+MODEL_ID_DEFAULT = os.environ.get("VRYX_DIST_MODEL", "Qwen/Qwen3.5-9B")
+MODEL_ID = MODEL_ID_DEFAULT
+try:
+    MAX_NEW_TOKENS = int(os.environ.get("VRYX_DIST_MAX_TOKENS", "32768"))
+except (TypeError, ValueError):
+    MAX_NEW_TOKENS = 32768
+MAX_NEW_TOKENS = max(1, min(32768, MAX_NEW_TOKENS))
+HF_HOME = os.path.expanduser(os.environ.get("HF_HOME", "~/.cache/huggingface").strip() or "~/.cache/huggingface")
+HF_HUB_CACHE = os.environ.get("HF_HUB_CACHE", "").strip()
+HF_TOKEN_FILE = os.environ.get("HF_TOKEN_FILE", os.path.join(HF_HOME, "token")).strip()
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_REVISION = os.environ.get("HF_REVISION", None)
+MODEL_SNAPSHOT_DIR = os.environ.get("VRYX_MODEL_SNAPSHOT_DIR", "").strip()
+MODEL_LOCAL_ONLY = os.environ.get("VRYX_MODEL_LOCAL_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+HF_DOWNLOAD_MAX_WORKERS = max(1, min(32, int(os.environ.get("HF_DOWNLOAD_MAX_WORKERS", "8") or 8)))
+HF_DOWNLOAD_ALLOW_PATTERNS = [
+    p.strip()
+    for p in os.environ.get(
+        "HF_DOWNLOAD_ALLOW_PATTERNS",
+        "*.json,*.safetensors,tokenizer*,*.model,*.tiktoken,merges.txt,vocab.*,special_tokens_map.json,generation_config.json",
+    ).split(",")
+    if p.strip()
+]
 RELAY_URL = os.environ.get("VRYX_P2P_RELAY_URL", "http://127.0.0.1:3031").rstrip("/")
 DECODE_MICROBATCH = os.environ.get("VRYX_DECODE_MICROBATCH", "1").strip().lower() not in ("0", "false", "no", "off")
 try:
@@ -80,8 +110,149 @@ try:
 except (TypeError, ValueError):
     DECODE_MICROBATCH_CAP = 32
 MLX_LM_DIRECT = os.environ.get("VRYX_MLX_LM_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
+LLAMA_CPP_DIRECT = os.environ.get("VRYX_LLAMA_CPP_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
 
 RELAY_TLS = threading.local()
+
+
+def _emit_stream_callback_async(
+    callback_url: str,
+    stream_id: str,
+    stream_secret: str,
+    event: str,
+    payload: Optional[dict[str, Any]] = None,
+) -> None:
+    if not callback_url or not stream_id or not stream_secret or not event:
+        return
+
+    body_obj = {"stream_id": stream_id, "event": event}
+    if isinstance(payload, dict) and payload:
+        body_obj.update(payload)
+    body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+
+    def _post() -> None:
+        try:
+            req = urllib.request.Request(
+                callback_url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {stream_secret}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=0.6) as resp:
+                resp.read(128)
+        except Exception:
+            pass
+
+    threading.Thread(target=_post, daemon=True).start()
+
+
+def _resolve_hf_token() -> tuple[Optional[str], str]:
+    """Résout le token Hugging Face depuis HF_TOKEN puis HF_TOKEN_FILE.
+
+    Returns:
+        (token, source): token vide -> None; source : "HF_TOKEN", "HF_TOKEN_FILE" ou "none".
+    """
+    if HF_TOKEN:
+        token = HF_TOKEN.strip()
+        if token:
+            return token, "HF_TOKEN"
+
+    token_path = os.path.expanduser(HF_TOKEN_FILE)
+    if token_path and os.path.isfile(token_path):
+        try:
+            with open(token_path, "r", encoding="utf-8") as fp:
+                line = fp.readline().strip()
+            if line:
+                return line, "HF_TOKEN_FILE"
+        except Exception as exc:
+            print(f"[VPS] impossible de lire HF_TOKEN_FILE={token_path!r} : {exc}")
+    return None, "none"
+
+
+def _prepare_hf_cache_env() -> None:
+    """Assure un cache HF prévisible et crée les dossiers si nécessaire."""
+    if HF_HOME:
+        os.environ["HF_HOME"] = HF_HOME
+        try:
+            os.makedirs(HF_HOME, exist_ok=True)
+        except Exception:
+            pass
+
+    if HF_HUB_CACHE:
+        os.environ["HF_HUB_CACHE"] = HF_HUB_CACHE
+        try:
+            os.makedirs(HF_HUB_CACHE, exist_ok=True)
+        except Exception:
+            pass
+
+
+def _hf_snapshot_download_kwargs(token: Optional[str]) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "allow_patterns": HF_DOWNLOAD_ALLOW_PATTERNS,
+        "max_workers": HF_DOWNLOAD_MAX_WORKERS,
+        "resume_download": True,
+        "local_dir_use_symlinks": False,
+        "token": token,
+    }
+    if HF_REVISION:
+        kwargs["revision"] = HF_REVISION.strip()
+    if HF_HUB_CACHE:
+        kwargs["cache_dir"] = HF_HUB_CACHE
+    if not kwargs["allow_patterns"]:
+        kwargs.pop("allow_patterns", None)
+    return kwargs
+
+
+def _hf_download_error_hint(exc: BaseException) -> str:
+    """Retourne une recommandation lisible en cas d'échec de snapshot_download."""
+    msg = str(exc).lower()
+    if "gated repo" in msg or "not in the authorized list" in msg:
+        return (
+            "Ce modèle est gated: vérifie que ton token HF est valide, actif et a bien accès "
+            f"au repo {MODEL_ID!r}."
+            " Sans ça, l'accès retourne 403/401."
+        )
+    try:
+        import huggingface_hub.errors as hf_errors
+    except Exception:
+        return str(exc)
+
+    # Note: on s'adapte aux variantes de versions HF.
+    if isinstance(exc, getattr(hf_errors, "GatedRepoError", tuple())):
+        return (
+            "Ce modèle est gated: vérifie que ton token HF est valide, actif et a bien accès "
+            f"au repo {MODEL_ID!r}."
+            " Sans ça, l'accès retourne 403."
+        )
+    if isinstance(exc, getattr(hf_errors, "RepositoryNotFoundError", tuple())):
+        return (
+            "Le repo Hugging Face est introuvable (id invalide ou privé). "
+            f"Check MODEL_ID={MODEL_ID!r}."
+        )
+    if isinstance(exc, getattr(hf_errors, "EntryNotFoundError", tuple())):
+        return (
+            f"Aucun fichier ne correspond aux motifs autorisés (patterns={HF_DOWNLOAD_ALLOW_PATTERNS}). "
+            "Réduis la liste de patterns si nécessaire."
+        )
+    if isinstance(exc, getattr(hf_errors, "HTTPError", tuple())):
+        msg = str(exc)
+        if "401" in msg:
+            return (
+                "Authentification refusée (401). Utilise un token Hugging Face valide "
+                "(HF_TOKEN ou HF_TOKEN_FILE)."
+            )
+        if "403" in msg:
+            return (
+                f"Accès refusé (403) pour {MODEL_ID!r}. Modèle gated ou IP interdite "
+                "(vérifie le token + autorisation repo)."
+            )
+        if "404" in msg:
+            return f"Ressource introuvable (404) pour {MODEL_ID!r}."
+        return f"Erreur HTTP HF: {msg}"
+    return str(exc)
 
 
 def _default_max_workers_for_model() -> int:
@@ -112,6 +283,49 @@ except ValueError:
     _min_default = 1
 MIN_WORKERS = max(1, min(_min_default, MAX_WORKERS))
 
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+DIST_WAIT_FOR_MIN_WORKERS = _env_bool("VRYX_DIST_WAIT_FOR_MIN_WORKERS", "0")
+try:
+    DIST_WAIT_FOR_MIN_WORKERS_TIMEOUT_SEC = max(
+        0.0,
+        float(os.environ.get("VRYX_DIST_WAIT_FOR_MIN_WORKERS_TIMEOUT_SEC", "120") or 120),
+    )
+except (TypeError, ValueError):
+    DIST_WAIT_FOR_MIN_WORKERS_TIMEOUT_SEC = 120.0
+try:
+    DIST_WAIT_FOR_MIN_WORKERS_POLL_SEC = max(
+        0.1,
+        float(os.environ.get("VRYX_DIST_WAIT_FOR_MIN_WORKERS_POLL_SEC", "2.0") or 2.0),
+    )
+except (TypeError, ValueError):
+    DIST_WAIT_FOR_MIN_WORKERS_POLL_SEC = 2.0
+try:
+    ADMIN_STREAM_WORKER_WAIT_SEC = max(
+        0.0,
+        float(os.environ.get("VRYX_ADMIN_STREAM_WORKER_WAIT_SEC", "8") or 8),
+    )
+except (TypeError, ValueError):
+    ADMIN_STREAM_WORKER_WAIT_SEC = 8.0
+try:
+    DIST_MIN_SHARDED_WORKERS = int(os.environ.get("VRYX_DIST_MIN_SHARDED_WORKERS", "2") or 2)
+except (TypeError, ValueError):
+    DIST_MIN_SHARDED_WORKERS = 2
+ALLOW_SINGLE_WORKER_LARGE_LLAMA = _env_bool("VRYX_ALLOW_SINGLE_WORKER_LARGE_LLAMA", "0")
+ALLOW_EXPERIMENTAL_LLAMA70B_DIRECT = _env_bool("VRYX_ALLOW_EXPERIMENTAL_LLAMA70B_DIRECT", "0")
+try:
+    DIST_CONTEXT_SAFETY_TOKENS = int(os.environ.get("VRYX_DIST_CONTEXT_SAFETY_TOKENS", "16") or 16)
+except (TypeError, ValueError):
+    DIST_CONTEXT_SAFETY_TOKENS = 16
+try:
+    LLAMA70B_Q4_MIN_WORKING_SET_MB = max(
+        40960.0,
+        float(os.environ.get("VRYX_LLAMA70B_Q4_MIN_WORKING_SET_MB", "57344") or 57344),
+    )
+except (TypeError, ValueError):
+    LLAMA70B_Q4_MIN_WORKING_SET_MB = 57344.0
+
 
 def _filter_workers_by_catalog_public_ip_optional(peers: list[str], catalog: dict[str, dict]) -> list[str]:
     """Restreindre aux workers annonçant la même IP publique (plusieurs daemon sur une machine)."""
@@ -135,23 +349,26 @@ def _filter_workers_by_catalog_public_ip_optional(peers: list[str], catalog: dic
     return out
 
 
-def _routing_pipeline_width(peers_online: int) -> int:
+def _routing_pipeline_width(peers_online: int, min_workers: int = 1) -> int:
     """Nombre maximal de peers embarqués pour couvrir num_hidden_layers_total (avec plafonds)."""
     peers_online = max(0, int(peers_online))
+    min_workers = max(1, int(min_workers))
+    if peers_online < min_workers:
+        return peers_online
     use_all = os.environ.get("VRYX_DIST_USE_ALL_COMPATIBLE_PEERS", "").strip().lower() in ("1", "true", "yes")
     if use_all:
         try:
             cap = int(float(os.environ.get("VRYX_DIST_HARD_CAP_PEERS", "48") or 48))
         except (TypeError, ValueError):
             cap = 48
-        cap = max(cap, MIN_WORKERS)
+        cap = max(cap, min_workers)
         width = min(peers_online, cap)
         print(f"[VPS] Daisy Chain largeur dynamique USE_ALL_COMPATIBLE_PEERS → {width} peer(s) (cap={cap}, en ligne={peers_online})")
         return width
-    return min(peers_online, MAX_WORKERS)
+    return max(min_workers, min(peers_online, MAX_WORKERS))
 
 
-def _timeout_sec(name: str, default: float, floor: float = 600.0) -> float:
+def _timeout_sec(name: str, default: float, floor: float = 1.0) -> float:
     raw = os.environ.get(name)
     try:
         value = float(raw) if raw is not None else float(default)
@@ -161,18 +378,22 @@ def _timeout_sec(name: str, default: float, floor: float = 600.0) -> float:
 
 
 TIMEOUT = _timeout_sec("VRYX_DIST_TIMEOUT_SEC", 600.0)
-# Une étape pipeline (surtout prefill MLX froid) peut dépasser 240 s ; ne plus plafonner à 240.
-# Si un override prod est resté à 120 s, on garde un plancher runtime à 600 s.
 PIPELINE_STEP_TIMEOUT = _timeout_sec("VRYX_PIPELINE_STEP_TIMEOUT_SEC", max(TIMEOUT, 600.0))
 SHARD_INIT_TIMEOUT = _timeout_sec("VRYX_SHARD_INIT_TIMEOUT_SEC", 600.0)
 SHARD_LOAD_TIMEOUT = _timeout_sec("VRYX_SHARD_LOAD_TIMEOUT_SEC", 600.0)
 SHARD_BUILD_TIMEOUT = _timeout_sec("VRYX_SHARD_BUILD_TIMEOUT_SEC", 600.0)
+SHARD_READY_TIMEOUT = _timeout_sec("VRYX_SHARD_READY_TIMEOUT_SEC", min(180.0, SHARD_BUILD_TIMEOUT), floor=5.0)
 SHARD_STATUS_TIMEOUT = _timeout_sec("VRYX_SHARD_STATUS_TIMEOUT_SEC", 120.0, floor=20.0)
+MLX_DIRECT_RELAY_TIMEOUT = _timeout_sec("VRYX_MLX_DIRECT_RELAY_TIMEOUT_SEC", 30.0, floor=5.0)
 SHARD_TTL = int(os.environ.get("VRYX_DIST_SHARD_TTL", "1800"))
 POOL_TTL = int(os.environ.get("VRYX_POOL_TTL_SEC", str(max(SHARD_TTL, 24 * 3600))))
 KEEP_POOL_SHARDS = os.environ.get("VRYX_POOL_KEEP_SHARDS", "true").lower() not in ("0", "false", "no")
 POOL_REPLICATION_FACTOR = max(0, int(os.environ.get("VRYX_POOL_REPLICATION_FACTOR", "1")))
 SHARD_BASE_DIR = os.environ.get("VRYX_SHARD_BASE_DIR", "/var/lib/vryx-shards")
+try:
+    SHARD_MIN_FREE_MB = max(0, int(os.environ.get("VRYX_MIN_SHARD_FREE_MB", "10240")))
+except (TypeError, ValueError):
+    SHARD_MIN_FREE_MB = 10240
 # WAN / relais : 25 ms exclut la plupart des workers domicile → défaut plus large (override possible).
 HOT_POOL_MAX_RTT_MS = float(os.environ.get("VRYX_HOT_POOL_MAX_RTT_MS", "2000"))
 HOT_POOL_IDEAL_RTT_MS = float(os.environ.get("VRYX_HOT_POOL_IDEAL_RTT_MS", "80"))
@@ -180,16 +401,19 @@ MICROBATCH_RTT_TARGET_MS = float(os.environ.get("VRYX_MICROBATCH_RTT_TARGET_MS",
 HIDDEN_TRANSPORT = os.environ.get("VRYX_HIDDEN_TRANSPORT", "int8").lower()
 PIPELINE_STREAM_MODE = os.environ.get("VRYX_PIPELINE_STREAM_MODE", "hot_session").lower()
 WORKER_KV_CACHE = os.environ.get("VRYX_WORKER_KV_CACHE", "true").lower() not in ("0", "false", "no")
-SAMPLING_TEMPERATURE = float(os.environ.get("VRYX_SAMPLING_TEMPERATURE", "0.35"))
-SAMPLING_TOP_P = float(os.environ.get("VRYX_SAMPLING_TOP_P", "0.75"))
+SAMPLING_TEMPERATURE = float(os.environ.get("VRYX_SAMPLING_TEMPERATURE", "0"))
+SAMPLING_TOP_P = float(os.environ.get("VRYX_SAMPLING_TOP_P", "0.65"))
 SAMPLING_TOP_K = int(os.environ.get("VRYX_SAMPLING_TOP_K", "20"))
-REPETITION_PENALTY = float(os.environ.get("VRYX_REPETITION_PENALTY", "1.0"))
+REPETITION_PENALTY = float(os.environ.get("VRYX_REPETITION_PENALTY", "1.08"))
 REPETITION_GUARD = os.environ.get("VRYX_REPETITION_GUARD", "true").lower() not in ("0", "false", "no")
 HIDDEN_QUIC = os.environ.get("VRYX_HIDDEN_QUIC", "0").lower() in ("1", "true", "yes")
 PREFIX_CACHE = os.environ.get("VRYX_PREFIX_CACHE", "1").lower() not in ("0", "false", "no")
 PREFIX_CACHE_TTL_SEC = int(os.environ.get("VRYX_PREFIX_CACHE_TTL_SEC", str(24 * 3600)))
 PREFIX_CACHE_MIN_TOKENS = int(os.environ.get("VRYX_PREFIX_CACHE_MIN_TOKENS", "32"))
 PREFIX_CACHE_DIR = os.environ.get("VRYX_PREFIX_CACHE_DIR", os.path.join(SHARD_BASE_DIR, "prefix-cache"))
+SHARD_TRANSFER_MODE = os.environ.get("VRYX_SHARD_TRANSFER_MODE", "range").strip().lower()
+GGUF_PREPARED_SESSION = os.environ.get("VRYX_GGUF_PREPARED_SESSION", "").strip()
+GGUF_PREPARED_SESSION_DIR = os.environ.get("VRYX_GGUF_PREPARED_SESSION_DIR", "").strip()
 SPECULATIVE_HEADS = os.environ.get("VRYX_SPECULATIVE_HEADS", "off").lower()
 CONTINUOUS_BATCHING = os.environ.get("VRYX_CONTINUOUS_BATCHING", "0").lower() in ("1", "true", "yes")
 BATCH_MAX_SIZE = max(1, int(os.environ.get("VRYX_BATCH_MAX_SIZE", "8")))
@@ -287,6 +511,73 @@ def _shard_ready_sleep_sec(poll_n: int) -> float:
 _latency_cache: dict[str, dict[str, Any]] = {}
 _latency_lock = threading.Lock()
 _prefix_cache_lock = threading.Lock()
+_mlx_lm_direct_lock = threading.Lock()
+_mlx_lm_direct_leases: dict[str, float] = {}
+_mlx_lm_peer_busy_until: dict[str, float] = {}
+_mlx_lm_peer_next_index = 0
+
+
+def _prune_mlx_direct_leases(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    for peer, until in list(_mlx_lm_direct_leases.items()):
+        if until <= now:
+            _mlx_lm_direct_leases.pop(peer, None)
+    for peer, until in list(_mlx_lm_peer_busy_until.items()):
+        if until <= now:
+            _mlx_lm_peer_busy_until.pop(peer, None)
+
+
+def _try_acquire_mlx_direct_peer(peer: str, lease_sec: float) -> tuple[bool, str, int]:
+    now = time.time()
+    with _mlx_lm_direct_lock:
+        _prune_mlx_direct_leases(now)
+        busy_until = float(_mlx_lm_peer_busy_until.get(peer) or 0.0)
+        if busy_until > now:
+            return False, "worker_busy", int(max(1, (busy_until - now) * 1000))
+        leased_until = float(_mlx_lm_direct_leases.get(peer) or 0.0)
+        if leased_until > now:
+            return False, "worker_leased", int(max(1, (leased_until - now) * 1000))
+        _mlx_lm_direct_leases[peer] = now + max(5.0, lease_sec)
+        return True, "leased", 0
+
+
+def _release_mlx_direct_peer(peer: str) -> None:
+    with _mlx_lm_direct_lock:
+        _mlx_lm_direct_leases.pop(peer, None)
+
+
+def _mark_mlx_direct_peer_busy(peer: str, busy_sec: float = 12.0) -> None:
+    with _mlx_lm_direct_lock:
+        _mlx_lm_peer_busy_until[peer] = time.time() + max(2.0, busy_sec)
+        _mlx_lm_direct_leases.pop(peer, None)
+
+
+def _mlx_direct_ready_peers(peers: list[str]) -> tuple[list[str], int]:
+    now = time.time()
+    ready: list[str] = []
+    retry_after_ms = 0
+    with _mlx_lm_direct_lock:
+        _prune_mlx_direct_leases(now)
+        for peer in peers:
+            blocked_until = max(
+                float(_mlx_lm_direct_leases.get(peer) or 0.0),
+                float(_mlx_lm_peer_busy_until.get(peer) or 0.0),
+            )
+            if blocked_until > now:
+                retry_after_ms = max(retry_after_ms, int((blocked_until - now) * 1000))
+                continue
+            ready.append(peer)
+    return ready, retry_after_ms
+
+
+def _rotate_direct_ready_peers(peers: list[str]) -> list[str]:
+    global _mlx_lm_peer_next_index
+    if len(peers) <= 1:
+        return peers
+    with _mlx_lm_direct_lock:
+        offset = _mlx_lm_peer_next_index % len(peers)
+        _mlx_lm_peer_next_index += 1
+    return peers[offset:] + peers[:offset]
 
 
 def _normalize_hidden_transport(value: Any) -> str:
@@ -320,7 +611,7 @@ def _worker_pool_class(worker: dict[str, Any]) -> str:
     runtime = str(worker.get("runtimeBackend") or worker.get("runtime_backend") or "pytorch").lower()
     supports_mlx = bool(worker.get("supportsMlx") or worker.get("supports_mlx"))
     supports_vllm = bool(worker.get("supportsVllm") or worker.get("supports_vllm"))
-    if runtime == "mlx" and supports_mlx:
+    if runtime in ("mlx", "mlx_lm") and (supports_mlx or runtime == "mlx_lm"):
         return "velocity_mlx"
     if runtime == "vllm" and supports_vllm:
         return "velocity_vllm"
@@ -329,7 +620,8 @@ def _worker_pool_class(worker: dict[str, Any]) -> str:
 
 def _runtime_for_pool(pool_class: str, worker: dict[str, Any] | None = None) -> str:
     if pool_class == "velocity_mlx":
-        return "mlx"
+        runtime = str((worker or {}).get("runtimeBackend") or (worker or {}).get("runtime_backend") or "").lower()
+        return runtime if runtime in ("mlx", "mlx_lm") else "mlx"
     if pool_class == "velocity_vllm":
         return "vllm"
     return str((worker or {}).get("runtimeBackend") or (worker or {}).get("runtime_backend") or "pytorch").lower()
@@ -347,12 +639,102 @@ def _model_key(value: Any) -> str:
     return str(value or "").strip().lower().replace("_", "-")
 
 
-def _worker_matches_model(worker: dict[str, Any], model_id: str = MODEL_ID) -> bool:
-    advertised = _model_key(worker.get("model") or worker.get("model_id"))
-    expected = _model_key(model_id)
+def _normalize_model_id(value: Any) -> str | None:
+    norm = _model_key(value)
+    if not norm:
+        return None
+    if len(norm) > 140:
+        return None
+    # On enlève quelques préfixes d'origine qui peuvent varier selon la source d'annonce.
+    if norm.startswith("hf://"):
+        norm = norm[len("hf://"):]
+    if norm.startswith("huggingface.co/"):
+        norm = norm[len("huggingface.co/"):]
+    if not norm:
+        return None
+    return norm
+
+
+def _model_tail(value: Any) -> str:
+    norm = _normalize_model_id(value) or ""
+    if not norm:
+        return ""
+    return norm.split("/")[-1]
+
+
+def _worker_matches_model(worker: dict[str, Any], model_id: Optional[str] = None) -> bool:
+    advertised = _model_tail(worker.get("model") or worker.get("model_id"))
+    expected = _model_tail(model_id or MODEL_ID)
     if not advertised:
         return False
-    return advertised == expected or advertised.endswith("/" + expected.split("/")[-1])
+    return advertised == expected or expected in advertised or advertised.endswith(f"/{expected}")
+
+
+def _requires_distributed_shards(model_id: Optional[str] = None) -> bool:
+    if LLAMA_CPP_DIRECT:
+        return False
+    norm = _model_key(model_id or MODEL_ID)
+    tail = _model_tail(norm)
+    # Les très gros modèles ne doivent jamais passer par le chemin direct
+    # `mlx_lm.generate` : un worker tenterait de charger le modèle complet,
+    # puis répondrait "shard-only", ce qui finit côté UI en "Réponse vide".
+    if (
+        "llama-2-70b" in norm
+        or "llama2-70b" in norm
+        or tail in {"llama-2-70b-hf", "llama-2-70b-chat-hf"}
+        or "70b" in tail
+    ):
+        return True
+    return (
+        _env_bool("VRYX_WORKER_SHARD_ONLY", "0")
+        or _env_bool("VRYX_EXPECT_MODEL_SHARDS_ONLY", "0")
+        or _env_bool("VRYX_DISABLE_MLX_LM_DIRECT", "0")
+    )
+
+
+def _required_min_workers_for_model(model_id: Optional[str] = None) -> int:
+    if _requires_distributed_shards(model_id):
+        if ALLOW_SINGLE_WORKER_LARGE_LLAMA:
+            return max(1, min(1, DIST_MIN_SHARDED_WORKERS))
+        return max(2, DIST_MIN_SHARDED_WORKERS)
+    return 1
+
+
+def _max_context_tokens(model_config: Optional[dict[str, Any]]) -> int:
+    if not isinstance(model_config, dict):
+        return 4096
+    for key in (
+        "max_position_embeddings",
+        "n_positions",
+        "max_seq_len",
+        "max_sequence_length",
+        "seq_length",
+    ):
+        value = model_config.get(key)
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            continue
+        if ivalue > 0:
+            return ivalue
+    return 4096
+
+
+def _clamp_decode_cap(prompt_token_count: int, decode_cap: int, model_config: Optional[dict[str, Any]]) -> int:
+    context_window = _max_context_tokens(model_config)
+    safe_cap = max(0, context_window - max(0, prompt_token_count) - max(0, DIST_CONTEXT_SAFETY_TOKENS))
+    if safe_cap <= 0:
+        return 0
+    requested_env_cap = os.environ.get("VRYX_DIST_MAX_CONTEXT_TOKENS")
+    if requested_env_cap:
+        try:
+            cap = int(requested_env_cap)
+            if cap > 0:
+                context_window = min(context_window, cap)
+                safe_cap = max(0, context_window - max(0, prompt_token_count) - max(0, DIST_CONTEXT_SAFETY_TOKENS))
+        except (TypeError, ValueError):
+            pass
+    return max(0, min(decode_cap, safe_cap))
 
 
 def _public_api_base() -> str:
@@ -407,22 +789,165 @@ def _catalog_from_public_status() -> dict[str, dict]:
     return out
 
 
-def _select_pool_peers(peers: list[str], catalog: dict[str, dict], preference: str) -> tuple[list[str], str, str | None]:
+def _select_pool_peers(
+    peers: list[str],
+    catalog: dict[str, dict],
+    preference: str,
+    min_workers: int | None = None,
+) -> tuple[list[str], str, str | None]:
+    min_workers = max(1, int(min_workers or MIN_WORKERS))
     by_class: dict[str, list[str]] = {"velocity_mlx": [], "velocity_vllm": [], "legacy_pytorch": []}
     for peer in peers:
         by_class.setdefault(_worker_pool_class(catalog.get(peer) or {}), []).append(peer)
     if preference in ("velocity_mlx", "velocity_vllm", "legacy_pytorch"):
         selected = by_class.get(preference, [])
-        if len(selected) >= MIN_WORKERS:
+        if len(selected) >= min_workers:
             return selected, preference, None
-        if preference != "legacy_pytorch" and len(by_class["legacy_pytorch"]) >= MIN_WORKERS:
+        if preference != "legacy_pytorch" and len(by_class["legacy_pytorch"]) >= min_workers:
             return by_class["legacy_pytorch"], "legacy_pytorch", f"{preference}_insufficient_workers"
         return selected, preference, f"{preference}_insufficient_workers"
-    if len(by_class["velocity_vllm"]) >= MIN_WORKERS:
+    if len(by_class["velocity_vllm"]) >= min_workers:
         return by_class["velocity_vllm"], "velocity_vllm", None
-    if len(by_class["velocity_mlx"]) >= MIN_WORKERS:
+    if len(by_class["velocity_mlx"]) >= min_workers:
         return by_class["velocity_mlx"], "velocity_mlx", None
     return by_class["legacy_pytorch"] or peers, "legacy_pytorch", "velocity_pool_unavailable"
+
+
+def _normalize_preferred_worker_peer_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        peer = str(item or "").strip()
+        if not peer or peer in seen:
+            continue
+        seen.add(peer)
+        out.append(peer)
+    return out[:32]
+
+
+def _apply_preferred_worker_order(
+    peers: list[str],
+    preferred_workers: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    if not preferred_workers:
+        return peers, [], []
+    available = set(peers)
+    ordered = [peer for peer in preferred_workers if peer in available]
+    missing = [peer for peer in preferred_workers if peer not in available]
+    return ordered, ordered, missing
+
+
+def _large_model_requires_real_accelerators() -> bool:
+    if os.environ.get("VRYX_ALLOW_SHARED_ACCELERATOR_PEERS", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    mid = str(MODEL_ID or "").lower()
+    return any(marker in mid for marker in ("65b", "70b", "72b", "405b"))
+
+
+def _is_llama70b_family(model_id: Optional[str] = None) -> bool:
+    mid = str(model_id or MODEL_ID or "").lower()
+    return "llama" in mid and any(marker in mid for marker in ("65b", "70b", "72b"))
+
+
+def _large_llama_direct_preflight_error(peers: list[str], catalog: dict[str, dict]) -> Optional[dict[str, Any]]:
+    if not LLAMA_CPP_DIRECT or ALLOW_EXPERIMENTAL_LLAMA70B_DIRECT or not _is_llama70b_family(MODEL_ID):
+        return None
+    rows = [(peer, catalog.get(peer) or {}) for peer in peers]
+    if not rows:
+        return {
+            "reason": "no_worker",
+            "detail": "Aucun worker compatible Llama n'est connecté.",
+            "required_mb": LLAMA70B_Q4_MIN_WORKING_SET_MB,
+        }
+    budgets = []
+    for peer, worker in rows:
+        budget = _worker_memory_budget_mb(worker)
+        budgets.append((peer, worker, budget))
+    best_peer, best_worker, best_budget = max(budgets, key=lambda item: item[2])
+    if best_budget >= LLAMA70B_Q4_MIN_WORKING_SET_MB:
+        return None
+    return {
+        "reason": "insufficient_single_accelerator_memory",
+        "detail": (
+            "Llama 2 70B Q4 en mode llama.cpp direct demande un seul accélérateur capable "
+            f"d'encaisser environ {LLAMA70B_Q4_MIN_WORKING_SET_MB / 1024:.1f} Go "
+            "modèle + KV/cache/overhead. "
+            f"Le meilleur worker visible annonce {best_budget / 1024:.1f} Go."
+        ),
+        "hint": (
+            "Deux workers sur le même Mac ne doublent pas la VRAM. Pour ce modèle, il faut "
+            "soit un vrai backend llama.cpp RPC/tensor-split sur plusieurs machines physiques, "
+            "soit un worker unique avec plus de mémoire, soit un modèle Llama plus petit."
+        ),
+        "required_mb": LLAMA70B_Q4_MIN_WORKING_SET_MB,
+        "best_peer": best_peer,
+        "best_gpu": best_worker.get("gpuName") or best_worker.get("gpu_name") or "unknown",
+        "best_budget_mb": best_budget,
+    }
+
+
+def _worker_accelerator_group(peer_id: str, worker: dict[str, Any]) -> str:
+    """
+    Identifiant conservateur d'un accélérateur physique.
+
+    Le heartbeat actuel n'expose pas encore de UUID GPU stable côté macOS. Pour
+    éviter de compter deux processus worker sur le même Mac comme deux VRAM
+    indépendantes, on regroupe donc publicIp + nom GPU. Si un futur heartbeat
+    expose gpuUuid/deviceId/hostId, il sera utilisé automatiquement.
+    """
+    gpu_uuid = str(worker.get("gpuUuid") or worker.get("gpu_uuid") or "").strip().lower()
+    if gpu_uuid:
+        return f"gpu:{gpu_uuid}"
+    device_id = str(worker.get("deviceId") or worker.get("device_id") or "").strip().lower()
+    host_id = str(worker.get("hostId") or worker.get("host_id") or worker.get("hostname") or "").strip().lower()
+    if device_id and host_id:
+        return f"host-device:{host_id}:{device_id}"
+    public_ip = str(worker.get("publicIp") or worker.get("public_ip") or worker.get("ip") or "").strip().lower()
+    gpu_name = str(worker.get("gpuName") or worker.get("gpu_name") or "").strip().lower()
+    if public_ip and gpu_name:
+        return f"public-gpu:{public_ip}:{gpu_name}"
+    return f"peer:{peer_id}"
+
+
+def _coalesce_shared_accelerator_peers(
+    peers: list[str],
+    catalog: dict[str, dict],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    if not peers or not catalog or not _large_model_requires_real_accelerators():
+        return peers, []
+
+    groups: dict[str, list[str]] = {}
+    for peer in peers:
+        groups.setdefault(_worker_accelerator_group(peer, catalog.get(peer) or {}), []).append(peer)
+
+    kept: list[str] = []
+    coalesced: list[dict[str, Any]] = []
+    for group, group_peers in groups.items():
+        ranked = sorted(group_peers, key=lambda p: (-_worker_weight(p, catalog), p))
+        winner = ranked[0]
+        kept.append(winner)
+        if len(ranked) > 1:
+            sample = catalog.get(winner) or {}
+            coalesced.append({
+                "group": group,
+                "kept_peer": winner,
+                "ignored_peers": ranked[1:],
+                "gpu": sample.get("gpuName") or sample.get("gpu_name") or "unknown",
+                "public_ip": sample.get("publicIp") or sample.get("public_ip") or sample.get("ip") or "",
+                "reason": "shared_physical_accelerator",
+            })
+    if coalesced:
+        print(
+            "[VPS] Placement gros modèle : workers fusionnés car ils partagent le même accélérateur physique : "
+            + "; ".join(
+                f"{str(item['kept_peer'])[:12]}… garde {len(item['ignored_peers'])} doublon(s) "
+                f"sur {item.get('gpu') or 'GPU'}"
+                for item in coalesced
+            )
+        )
+    return sorted(kept), coalesced
 
 
 def _vps_rtt_ms(peer_id: str, latency_matrix: dict[str, Any]) -> Optional[int]:
@@ -460,7 +985,11 @@ def _microbatch_cap_for_rtt(routing_path: list[str], latency_matrix: dict[str, A
 
 def _requires_mlx_lm_direct_guard() -> bool:
     normalized = MODEL_ID.lower().replace("_", "-")
-    return MLX_LM_DIRECT and ("qwen3.5" in normalized or "qwen3-5" in normalized)
+    return (
+        MLX_LM_DIRECT
+        and ("qwen3.5" in normalized or "qwen3-5" in normalized or "qwen3.6" in normalized or "qwen3-6" in normalized)
+        and not _requires_distributed_shards(MODEL_ID)
+    )
 
 
 def _now_ms() -> int:
@@ -469,6 +998,23 @@ def _now_ms() -> int:
 
 def _short(peer_id: str) -> str:
     return (peer_id or "")[:16]
+
+
+def _assert_shard_cache_disk() -> tuple[bool, str]:
+    """Vérifie l'espace disque du répertoire de cache shards avant préparation."""
+    if SHARD_MIN_FREE_MB <= 0:
+        return True, ""
+    try:
+        usage = shutil.disk_usage(SHARD_BASE_DIR)
+    except Exception as exc:
+        return False, f"[ERR] Impossible de lire l'espace disque sur {SHARD_BASE_DIR}: {exc}"
+    available_mb = usage.free // (1024 * 1024)
+    if available_mb < SHARD_MIN_FREE_MB:
+        return (
+            False,
+            f"[ERR] Pas assez d'espace disque pour le cache shards ({available_mb} MB < {SHARD_MIN_FREE_MB} MB) sur {SHARD_BASE_DIR}",
+        )
+    return True, f"[OK] Espace disque shard suffisant : {available_mb} MB disponibles sur {SHARD_BASE_DIR}"
 
 
 def _relay_timeout_payload(
@@ -507,8 +1053,81 @@ def _relay_timeout_payload(
 
 _model = None
 _tokenizer = None
-_model_lock = threading.Lock()
+_model_lock = threading.RLock()
+_model_runtime_lock = threading.RLock()
 _model_config_cache: Optional[dict] = None
+_model_cache_by_id: dict[str, tuple[Any, Any, Optional[dict]]] = {}
+
+
+def _normalize_runtime_model_id(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    model_id = value.strip()
+    if not model_id or len(model_id) > 120:
+        return None
+    if not re.match(r"^[A-Za-z0-9._/:-]+$", model_id):
+        return None
+    return model_id
+
+
+def _canonical_runtime_model_id(model_id: Optional[str]) -> Optional[str]:
+    if not model_id:
+        return None
+    key = _model_key(model_id)
+    tail = _model_tail(key)
+    # Le repo Meta officiel peut être gated même avec un token HF. Pour le pipeline
+    # shard-only, on utilise le miroir public comme source de poids, tout en gardant
+    # la compatibilité workers via _worker_matches_model() qui compare le nom final.
+    if key.startswith("meta-llama/") and tail in {"llama-2-70b-hf", "llama-2-70b-chat-hf"}:
+        return f"NousResearch/{tail}"
+    return model_id
+
+
+def _activate_model_id(model_id: Any) -> str:
+    global MODEL_ID, _model, _tokenizer, _model_config_cache
+    requested = _canonical_runtime_model_id(_normalize_runtime_model_id(model_id))
+    if not requested or _model_key(requested) == _model_key(MODEL_ID):
+        return MODEL_ID
+    with _model_lock:
+        if _model is not None or _tokenizer is not None or _model_config_cache is not None:
+            _model_cache_by_id[MODEL_ID] = (_model, _tokenizer, _model_config_cache)
+        MODEL_ID = requested
+        cached = _model_cache_by_id.get(MODEL_ID)
+        if cached:
+            _model, _tokenizer, _model_config_cache = cached
+        else:
+            _model = None
+            _tokenizer = None
+            _model_config_cache = None
+        print(f"[VPS] Modèle actif demandé par la session : {MODEL_ID}", flush=True)
+    return MODEL_ID
+
+
+def _live_worker_model_id() -> Optional[str]:
+    scores: dict[str, tuple[int, float]] = {}
+    for worker in _fetch_workers_public_status_payload():
+        if str(worker.get("mode") or "").lower() != "worker":
+            continue
+        model_id = _normalize_runtime_model_id(worker.get("model") or worker.get("model_id"))
+        if not model_id:
+            continue
+        try:
+            heartbeat_age = float(worker.get("secondsSinceHeartbeat") or 0)
+        except (TypeError, ValueError):
+            heartbeat_age = 0.0
+        if heartbeat_age > 120:
+            continue
+        count, best_age = scores.get(model_id, (0, 999999.0))
+        scores[model_id] = (count + 1, min(best_age, heartbeat_age))
+    if not scores:
+        return None
+    return sorted(scores.items(), key=lambda item: (-item[1][0], item[1][1]))[0][0]
+
+
+def _activate_model_from_options(options: Optional[dict[str, Any]]) -> str:
+    opts = options or {}
+    requested = opts.get("model_id") or opts.get("modelId") or _live_worker_model_id()
+    return _activate_model_id(requested)
 
 
 def _jsonable(value: Any) -> Any:
@@ -624,6 +1243,61 @@ def _decode_generated_token_ids(tokenizer: Any, ids: list[int]) -> str:
     return ""
 
 
+def _format_prompt_for_model(
+    prompt: str,
+    tokenizer: Any,
+    model_config: Optional[dict[str, Any]] = None,
+) -> str:
+    """
+    Formatte le prompt selon le style attendu par le modèle (chat template si disponible).
+
+    On réutilise la même logique pour le mode direct et le mode pipeline afin que la
+    tokenisation, la limite de contexte et les métriques soient cohérentes.
+    """
+    model_type = (model_config or {}).get("model_type", "gpt2")
+    if model_type == "gpt2":
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        return f"Question: {prompt}\nRéponse:"
+
+    system_msg = (
+        "Tu es l'assistant Vryx, une interface de chat connectée au réseau de calcul Vryx. "
+        f"Le modèle LLM actuellement utilisé est {MODEL_ID}. "
+        "Si l'utilisateur demande qui tu es, quel LLM te fait tourner, ton cerveau ou ton modèle, "
+        "réponds honnêtement avec ce modèle et précise que Vryx est l'interface/réseau, pas le nom du LLM. "
+        "Réponds directement dans la langue de l'utilisateur. "
+        "Ne montre pas de raisonnement interne et arrête-toi après la réponse."
+    )
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        return f"{prompt}\n"
+
+
+def _tokenize_prompt(prompt: str, tokenizer: Any, model_config: Optional[dict[str, Any]] = None) -> tuple[str, list[int]]:
+    """Retourne le prompt formaté et ses token_ids."""
+    formatted = _format_prompt_for_model(prompt, tokenizer, model_config)
+    try:
+        ids = tokenizer.encode(formatted, add_special_tokens=True)
+        if isinstance(ids, int):
+            ids = [ids]
+    except Exception:
+        ids = []
+    return formatted, ids
+
+
 def _detect_repetition_loop(text: str) -> bool:
     if not REPETITION_GUARD:
         return False
@@ -677,10 +1351,27 @@ def _build_model_config(cfg: Any) -> dict:
         "embd_pdrop": getattr(text_cfg, "embd_pdrop", 0.1),
         # Qwen/LLaMA-style
         "rms_norm_eps": getattr(text_cfg, "rms_norm_eps", 1e-6),
+        "hidden_act": getattr(text_cfg, "hidden_act", "silu"),
+        "attention_bias": bool(getattr(text_cfg, "attention_bias", False)),
+        "mlp_bias": bool(getattr(text_cfg, "mlp_bias", False)),
+        "tie_word_embeddings": bool(getattr(text_cfg, "tie_word_embeddings", False)),
         "rope_theta": rope_theta,
         "max_position_embeddings": getattr(text_cfg, "max_position_embeddings", None) or getattr(text_cfg, "n_positions", 1024),
         "layer_types": _jsonable(getattr(text_cfg, "layer_types", None)),
         "rope_parameters": rope_parameters,
+        # Qwen3.6 / Qwen3.5 MoE fields
+        "head_dim": getattr(text_cfg, "head_dim", None),
+        "linear_conv_kernel_dim": getattr(text_cfg, "linear_conv_kernel_dim", None),
+        "linear_key_head_dim": getattr(text_cfg, "linear_key_head_dim", None),
+        "linear_value_head_dim": getattr(text_cfg, "linear_value_head_dim", None),
+        "linear_num_key_heads": getattr(text_cfg, "linear_num_key_heads", None),
+        "linear_num_value_heads": getattr(text_cfg, "linear_num_value_heads", None),
+        "moe_intermediate_size": getattr(text_cfg, "moe_intermediate_size", None),
+        "shared_expert_intermediate_size": getattr(text_cfg, "shared_expert_intermediate_size", None),
+        "num_experts": getattr(text_cfg, "num_experts", None),
+        "num_experts_per_tok": getattr(text_cfg, "num_experts_per_tok", None),
+        "output_router_logits": bool(getattr(text_cfg, "output_router_logits", False)),
+        "router_aux_loss_coef": getattr(text_cfg, "router_aux_loss_coef", 0.001),
     }
 
 
@@ -712,45 +1403,270 @@ def _load_safetensor_weight_map(snapshot_dir: str) -> dict[str, str]:
     return weight_map
 
 
+def _local_model_snapshot_dir() -> str:
+    raw = MODEL_SNAPSHOT_DIR.strip()
+    if not raw:
+        return ""
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def _direct_mlx_tokenizer_model_id() -> str:
+    override = os.environ.get("VRYX_MLX_LM_MODEL_ID", "").strip()
+    if override:
+        return override
+    normalized = MODEL_ID.lower()
+    if "qwen3.6-35b-a3b" in normalized or "qwen3-6-35b-a3b" in normalized:
+        return "mlx-community/Qwen3.6-35B-A3B-4bit"
+    if "llama-2-70b" in normalized or "llama2-70b" in normalized or "70b" in normalized:
+        return "mlx-community/llama2-70b-qnt4bit"
+    return MODEL_ID
+
+
+def _direct_mlx_worker_load_model_id() -> str:
+    normalized = MODEL_ID.lower()
+    if "qwen3.6-35b-a3b" in normalized or "qwen3-6-35b-a3b" in normalized:
+        return "mlx-community/Qwen3.6-35B-A3B-4bit"
+    if "qwen3.5-9b" in normalized or "qwen3-5-9b" in normalized:
+        return "mlx-community/Qwen3.5-9B-4bit"
+    if "llama-2-70b" in normalized or "llama2-70b" in normalized or "70b" in normalized:
+        return "mlx-community/llama2-70b-qnt4bit"
+    return os.environ.get("VRYX_MLX_LM_MODEL_ID", "").strip()
+
+
+def _can_use_tokenizer_only_for_direct_mlx() -> bool:
+    return bool(
+        (
+            (MLX_LM_DIRECT or LLAMA_CPP_DIRECT)
+            and not _requires_distributed_shards(MODEL_ID)
+        )
+        or _prepared_gguf_session_dir()
+    )
+
+
+_SAFETENSOR_NUMPY_DTYPES = {
+    "F16": "float16",
+    "F32": "float32",
+    "F64": "float64",
+    "I8": "int8",
+    "I16": "int16",
+    "I32": "int32",
+    "I64": "int64",
+    "U8": "uint8",
+    "U16": "uint16",
+    "U32": "uint32",
+    "U64": "uint64",
+    "BOOL": "bool",
+}
+
+
+def _read_safetensor_offsets(path: str) -> dict[str, dict[str, Any]]:
+    """Lit seulement le header safetensors pour obtenir les offsets bruts des tenseurs."""
+    with open(path, "rb") as fp:
+        raw_len = fp.read(8)
+        if len(raw_len) != 8:
+            raise RuntimeError(f"safetensors invalide (header absent): {path}")
+        header_len = struct.unpack("<Q", raw_len)[0]
+        header = json.loads(fp.read(header_len).decode("utf-8"))
+    data_base = 8 + int(header_len)
+    out: dict[str, dict[str, Any]] = {}
+    for name, meta in header.items():
+        if name == "__metadata__" or not isinstance(meta, dict):
+            continue
+        dtype_code = str(meta.get("dtype") or "")
+        numpy_dtype = _SAFETENSOR_NUMPY_DTYPES.get(dtype_code)
+        if not numpy_dtype:
+            raise RuntimeError(
+                f"dtype safetensors non supporté pour transfert range ({dtype_code}) dans {os.path.basename(path)}"
+            )
+        offsets = meta.get("data_offsets") or []
+        if len(offsets) != 2:
+            raise RuntimeError(f"offsets safetensors invalides pour {name}")
+        start, end = int(offsets[0]), int(offsets[1])
+        out[name] = {
+            "shape": [int(x) for x in (meta.get("shape") or [])],
+            "dtype": numpy_dtype,
+            "source_offset": data_base + start,
+            "nbytes": end - start,
+        }
+    return out
+
+
+def _stage_safetensor_source(shard_dir: str, snapshot_dir: str, rel_path: str) -> str:
+    """Expose un fichier HF dans le dossier shard sans le recopier (hardlink puis symlink)."""
+    clean_rel = os.path.normpath(str(rel_path)).replace("\\", "/")
+    if clean_rel.startswith("../") or clean_rel == ".." or os.path.isabs(clean_rel):
+        raise RuntimeError(f"chemin safetensors invalide: {rel_path}")
+    src = os.path.abspath(os.path.join(snapshot_dir, clean_rel))
+    snapshot_abs = os.path.abspath(snapshot_dir)
+    if not src.startswith(snapshot_abs + os.sep):
+        raise RuntimeError(f"chemin safetensors hors snapshot: {rel_path}")
+    dst = os.path.join(shard_dir, "sources", clean_rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst):
+        return clean_rel
+    try:
+        os.link(src, dst)
+    except OSError:
+        os.symlink(src, dst)
+    return clean_rel
+
+
 def _ensure_model():
     global _model, _tokenizer, _model_config_cache
     with _model_lock:
         if _model is not None:
             return _model, _tokenizer
         try:
+            _prepare_hf_cache_env()
+            token, token_source = _resolve_hf_token()
+            token_hint = "avec token" if token is not None else "sans token"
             from huggingface_hub import snapshot_download
             from transformers import AutoConfig, AutoTokenizer
-            print(f"[VPS] Chargement léger {MODEL_ID} : tokenizer + config + poids disque…")
             t0 = time.perf_counter()
-            _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-            cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-            snapshot_dir = snapshot_download(
-                MODEL_ID,
-                allow_patterns=[
-                    "*.json",
-                    "*.safetensors",
-                    "tokenizer*",
-                    "*.model",
-                    "*.tiktoken",
-                    "merges.txt",
-                    "vocab.*",
-                    "special_tokens_map.json",
-                    "generation_config.json",
-                ],
-            )
+            local_snapshot = _local_model_snapshot_dir()
+            if _prepared_gguf_session_dir():
+                source_id = _direct_mlx_tokenizer_model_id()
+                print(
+                    f"[VPS] Mode GGUF préparé : aucun poids HF côté VPS; "
+                    f"chargement tokenizer/config léger depuis {source_id}."
+                )
+                _tokenizer = AutoTokenizer.from_pretrained(source_id, trust_remote_code=True, token=token)
+                cfg = AutoConfig.from_pretrained(source_id, trust_remote_code=True, token=token)
+                snapshot_dir = snapshot_download(
+                    source_id,
+                    token=token,
+                    local_files_only=False,
+                    allow_patterns=[
+                        "*.json",
+                        "tokenizer*",
+                        "*.model",
+                        "*.tiktoken",
+                        "merges.txt",
+                        "vocab.*",
+                        "special_tokens_map.json",
+                        "generation_config.json",
+                    ],
+                )
+            elif local_snapshot and _can_use_tokenizer_only_for_direct_mlx():
+                source_id = _direct_mlx_tokenizer_model_id()
+                print(
+                    f"[VPS] Mode direct MLX: snapshot poids ignoré côté VPS; "
+                    f"chargement tokenizer/config léger depuis {source_id}."
+                )
+                _tokenizer = AutoTokenizer.from_pretrained(source_id, trust_remote_code=True, token=token)
+                cfg = AutoConfig.from_pretrained(source_id, trust_remote_code=True, token=token)
+                snapshot_dir = snapshot_download(
+                    source_id,
+                    token=token,
+                    local_files_only=False,
+                    allow_patterns=[
+                        "*.json",
+                        "tokenizer*",
+                        "*.model",
+                        "*.tiktoken",
+                        "merges.txt",
+                        "vocab.*",
+                        "special_tokens_map.json",
+                        "generation_config.json",
+                    ],
+                )
+            elif local_snapshot:
+                if not os.path.isdir(local_snapshot):
+                    if not _can_use_tokenizer_only_for_direct_mlx():
+                        raise RuntimeError(
+                            f"snapshot local introuvable: {local_snapshot}. "
+                            "Place config/tokenizer/safetensors ici ou retire VRYX_MODEL_SNAPSHOT_DIR."
+                        )
+                    source_id = _direct_mlx_tokenizer_model_id()
+                    print(
+                        f"[VPS] Snapshot local absent ({local_snapshot}); mode direct MLX: "
+                        f"chargement tokenizer/config léger depuis {source_id}."
+                    )
+                    _tokenizer = AutoTokenizer.from_pretrained(source_id, trust_remote_code=True, token=token)
+                    cfg = AutoConfig.from_pretrained(source_id, trust_remote_code=True, token=token)
+                    snapshot_dir = snapshot_download(
+                        source_id,
+                        token=token,
+                        local_files_only=False,
+                        allow_patterns=[
+                            "*.json",
+                            "tokenizer*",
+                            "*.model",
+                            "*.tiktoken",
+                            "merges.txt",
+                            "vocab.*",
+                            "special_tokens_map.json",
+                            "generation_config.json",
+                        ],
+                    )
+                else:
+                    print(f"[VPS] Chargement {MODEL_ID} depuis snapshot local : {local_snapshot}")
+                    _tokenizer = AutoTokenizer.from_pretrained(
+                        local_snapshot,
+                        trust_remote_code=True,
+                        local_files_only=True,
+                    )
+                    cfg = AutoConfig.from_pretrained(
+                        local_snapshot,
+                        trust_remote_code=True,
+                        local_files_only=True,
+                    )
+                    snapshot_dir = local_snapshot
+            else:
+                if MODEL_LOCAL_ONLY:
+                    if not _can_use_tokenizer_only_for_direct_mlx():
+                        raise RuntimeError(
+                            "VRYX_MODEL_LOCAL_ONLY=1 mais VRYX_MODEL_SNAPSHOT_DIR est vide. "
+                            "Aucun appel Hugging Face ne sera fait."
+                        )
+                    source_id = _direct_mlx_tokenizer_model_id()
+                    print(
+                        f"[VPS] Mode direct MLX tokenizer-only : chargement tokenizer/config léger depuis {source_id}."
+                    )
+                    _tokenizer = AutoTokenizer.from_pretrained(source_id, trust_remote_code=True, token=token)
+                    cfg = AutoConfig.from_pretrained(source_id, trust_remote_code=True, token=token)
+                    snapshot_dir = snapshot_download(
+                        source_id,
+                        token=token,
+                        local_files_only=False,
+                        allow_patterns=[
+                            "*.json",
+                            "tokenizer*",
+                            "*.model",
+                            "*.tiktoken",
+                            "merges.txt",
+                            "vocab.*",
+                            "special_tokens_map.json",
+                            "generation_config.json",
+                        ],
+                    )
+                else:
+                    print(f"[VPS] Chargement {MODEL_ID} : authentification {token_hint} ({token_source}).")
+                    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, token=token)
+                    cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, token=token)
+                    snapshot_dir = snapshot_download(MODEL_ID, **_hf_snapshot_download_kwargs(token))
             weight_map = _load_safetensor_weight_map(snapshot_dir)
             if not weight_map:
-                raise RuntimeError("aucun poids safetensors trouvé dans le snapshot HF")
+                if not _can_use_tokenizer_only_for_direct_mlx():
+                    raise RuntimeError("aucun poids safetensors trouvé dans le snapshot modèle")
+                print("[VPS] Mode direct MLX: aucun poids requis côté VPS, tokenizer/config seulement.")
             _model_config_cache = _build_model_config(cfg)
             _model = {
                 "snapshot_dir": snapshot_dir,
                 "weight_map": weight_map,
                 "config": _model_config_cache,
+                "tokenizer_only": not bool(weight_map),
             }
             elapsed = int((time.perf_counter() - t0) * 1000)
-            print(f"[VPS] Manifeste modèle prêt : {len(weight_map)} tenseurs sur disque, {elapsed}ms")
+            if weight_map:
+                print(f"[VPS] Manifeste modèle prêt : {len(weight_map)} tenseurs sur disque, {elapsed}ms")
+            else:
+                print(f"[VPS] Tokenizer/config prêts pour direct MLX worker, {elapsed}ms")
         except Exception as e:
+            hint = _hf_download_error_hint(e)
             print(f"[VPS] Impossible de charger {MODEL_ID} : {e}")
+            if hint != str(e):
+                print(f"[VPS] Détails : {hint}")
             _model = None
             _tokenizer = None
     return _model, _tokenizer
@@ -758,12 +1674,20 @@ def _ensure_model():
 
 # ── Découverte des workers ─────────────────────────────────────────────────────
 
-def _discover_live_peers() -> list[str]:
-    # 0. Variable d'environnement explicite (priorité maximale)
-    explicit = os.environ.get("VRYX_DIST_PEER_IDS", "").strip()
-    if explicit:
-        return [p.strip() for p in explicit.split(",") if p.strip()]
-    # 1. API Express interne
+def _discover_tp_peers() -> tuple[bool, list[str]]:
+    try:
+        req = urllib.request.Request(f"{RELAY_URL}/api/tp-peers", method="GET")
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            j = json.loads(resp.read().decode("utf-8"))
+        if j.get("ok") and isinstance(j.get("peers"), list):
+            peers = [p for p in j["peers"] if isinstance(p, str) and p.strip()]
+            return True, peers
+        return True, []
+    except Exception:
+        return False, []
+
+
+def _discover_local_heartbeat_peers() -> list[str]:
     for port in (48953, 4000):
         try:
             req = urllib.request.Request(
@@ -779,18 +1703,25 @@ def _discover_live_peers() -> list[str]:
                     return peers
         except Exception:
             continue
-    # 2. Relay Rust /api/tp-peers (pairs déjà dans le swarm initiateur ; peut rester vide si les dials WAN sont retardés).
-    try:
-        req = urllib.request.Request(f"{RELAY_URL}/api/tp-peers", method="GET")
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            j = json.loads(resp.read().decode("utf-8"))
-        if j.get("ok") and isinstance(j.get("peers"), list):
-            peers = [p for p in j["peers"] if isinstance(p, str) and p.strip()]
-            if peers:
-                return peers
-    except Exception:
-        pass
-    # 3. Heartbeat HTTPS : les workers sont visibles avant la connexion P2P active ; le daemon ouvre souvent le circuit au 1ᵉʳ relay.
+    return []
+
+
+def _discover_live_peers() -> list[str]:
+    # 0. Variable d'environnement explicite (priorité maximale)
+    explicit = os.environ.get("VRYX_DIST_PEER_IDS", "").strip()
+    if explicit:
+        return [p.strip() for p in explicit.split(",") if p.strip()]
+    # 1. Relay Rust /api/tp-peers : seule source qui prouve une connexion P2P utilisable.
+    tp_available, tp_peers = _discover_tp_peers()
+    if tp_available:
+        if not tp_peers:
+            print("[VPS] Découverte pairs : /api/tp-peers vide ; fail rapide sans fallback heartbeat.")
+        return tp_peers
+    # 2. Fallbacks de compatibilité uniquement si l'endpoint P2P n'est pas joignable.
+    local = _discover_local_heartbeat_peers()
+    if local:
+        print("[VPS] Découverte pairs : fallback heartbeat local utilisé car /api/tp-peers est indisponible.")
+        return local
     return _peers_public_registry_live()
 
 
@@ -835,10 +1766,16 @@ def _gpu_compute_hint(worker: dict) -> float:
 
 def _implicit_vram_mb_for_weight(worker: dict[str, Any]) -> float:
     """
-    Si le heartbeat n'envoie pas gpuVramMb (souvent MPS / Apple), on estime selon le modèle
-    annoncé pour ne pas sur-pondérer un Mac 0.5B comme une machine 8 Go discrète.
+    Utilise d'abord la mémoire réellement allouée au worker. Si le heartbeat ne
+    l'envoie pas, on retombe sur la VRAM totale puis sur une estimation prudente.
     """
-    raw = float(worker.get("gpuVramMb") or worker.get("gpu_vram_mb") or 0)
+    raw = float(
+        worker.get("allocatedVramMb")
+        or worker.get("allocated_vram_mb")
+        or worker.get("gpuVramMb")
+        or worker.get("gpu_vram_mb")
+        or 0
+    )
     if raw > 0:
         return raw
     mid = str(worker.get("model") or worker.get("model_id") or MODEL_ID).lower()
@@ -846,7 +1783,7 @@ def _implicit_vram_mb_for_weight(worker: dict[str, Any]) -> float:
         return 6144.0
     if any(x in mid for x in ("9b", "8b", "7b")):
         return 16384.0
-    if any(x in mid for x in ("32b", "34b")):
+    if any(x in mid for x in ("32b", "34b", "35b")):
         return 49152.0
     if any(x in mid for x in ("72b", "70b", "65b")):
         return 98304.0
@@ -857,6 +1794,33 @@ def _worker_weight(peer_id: str, catalog: dict[str, dict]) -> float:
     w = catalog.get(peer_id) or {}
     vram_mb = _implicit_vram_mb_for_weight(w)
     return max(1.0, (vram_mb / 1024.0) * _gpu_compute_hint(w))
+
+
+def _worker_memory_budget_mb(worker: dict[str, Any]) -> float:
+    allocated = worker.get("allocatedVramMb") or worker.get("allocated_vram_mb")
+    try:
+        allocated_mb = float(allocated or 0)
+    except (TypeError, ValueError):
+        allocated_mb = 0.0
+    if allocated_mb > 0:
+        return allocated_mb
+
+    try:
+        gpu_mb = float(worker.get("gpuVramMb") or worker.get("gpu_vram_mb") or 0)
+    except (TypeError, ValueError):
+        gpu_mb = 0.0
+    try:
+        pct = float(worker.get("memoryLimitPercent") or worker.get("memory_limit_percent") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    if gpu_mb > 0 and pct > 0:
+        return gpu_mb * max(1.0, min(100.0, pct)) / 100.0
+    return gpu_mb
+
+
+def _safe_weight_budget_mb(worker: dict[str, Any]) -> float:
+    # Garde de la place pour activations, KV cache, process Python/MLX et fragmentation mémoire.
+    return max(0.0, _worker_memory_budget_mb(worker) * 0.72)
 
 
 def _weighted_counts(total_layers: int, workers: list[str], catalog: dict[str, dict]) -> list[int]:
@@ -1323,6 +2287,8 @@ def _purge_old_shards(keep_session: str = "") -> None:
     for entry in os.listdir(base_dir):
         if entry == keep_session:
             continue
+        if entry == "models" or entry == GGUF_PREPARED_SESSION or entry.startswith("prepared-"):
+            continue
         full = os.path.join(base_dir, entry)
         if os.path.isdir(full):
             try:
@@ -1481,6 +2447,59 @@ def _save_shard_to_disk_from_safetensors(
     weight_map = dict(model_manifest["weight_map"])
     selected = _selected_tensor_names(model_config, weight_map, layer_start, layer_end, has_embedding, has_lm_head)
 
+    if SHARD_TRANSFER_MODE not in ("packed", "bin", "binary"):
+        api_base = _worker_shard_download_base_url()
+        header_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        tensor_sources: list[dict[str, Any]] = []
+        staged_files: set[str] = set()
+        total_bytes = 0
+        for src_name, dst_name in selected:
+            rel_file = weight_map[src_name]
+            if rel_file not in header_cache:
+                full_path = os.path.join(snapshot_dir, rel_file)
+                header_cache[rel_file] = _read_safetensor_offsets(full_path)
+            tensor_meta = header_cache[rel_file].get(src_name)
+            if tensor_meta is None:
+                raise RuntimeError(f"poids absent du header safetensors : {src_name}")
+            staged_rel = _stage_safetensor_source(shard_dir, snapshot_dir, rel_file)
+            staged_files.add(staged_rel)
+            nbytes = int(tensor_meta["nbytes"])
+            total_bytes += nbytes
+            file_url = f"{api_base}/api/internal/shard-serve/{session_id}/sources/{quote(staged_rel, safe='/')}"
+            tensor_sources.append({
+                "name": dst_name,
+                "source_name": src_name,
+                "shape": tensor_meta["shape"],
+                "dtype": tensor_meta["dtype"],
+                "source_url": file_url,
+                "source_file": staged_rel,
+                "source_offset": int(tensor_meta["source_offset"]),
+                "nbytes": nbytes,
+            })
+
+        manifest = {
+            "format": "safetensors-ranges-v1",
+            "session_id": session_id,
+            "layer_start": layer_start,
+            "layer_end": layer_end,
+            "model_config": model_config,
+            "has_embedding": has_embedding,
+            "has_lm_head": has_lm_head,
+            "ttl_sec": SHARD_TTL,
+            "binary_total_bytes": total_bytes,
+            "tensor_sources": tensor_sources,
+            "source_files": sorted(staged_files),
+        }
+        with open(json_filepath, "w") as f:
+            json.dump(manifest, f)
+
+        json_kb = os.path.getsize(json_filepath) / 1e3
+        print(
+            f"[VPS] Shard worker-{peer_idx} ranges : {total_bytes / 1e6:.1f} MB référencés "
+            f"+ {json_kb:.1f} KB manifeste ({len(tensor_sources)} params, {len(staged_files)} fichiers source)"
+        )
+        return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}"
+
     index = []
     offset = 0
     with open(bin_filepath, "wb") as out:
@@ -1529,6 +2548,139 @@ def _save_shard_to_disk_from_safetensors(
         f"{json_kb:.1f} KB manifeste ({len(index)} params)"
     )
     return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}"
+
+
+def _prepared_gguf_session_dir() -> str:
+    if GGUF_PREPARED_SESSION_DIR:
+        return os.path.abspath(os.path.expanduser(GGUF_PREPARED_SESSION_DIR))
+    if GGUF_PREPARED_SESSION:
+        return os.path.join(SHARD_BASE_DIR, GGUF_PREPARED_SESSION)
+    return ""
+
+
+def _save_shard_to_disk_from_prepared_gguf(
+    session_id: str,
+    peer_idx: Any,
+    peer_id: str,
+    model_config: dict,
+) -> tuple[str, int, int, bool, bool]:
+    """
+    Recycle un manifeste GGUF préparé hors requête.
+
+    Le manifeste garde les ranges vers le .gguf source ; on le copie seulement
+    dans le dossier de session courant en ajoutant le `model_config` chargé par
+    l'initiateur. Aucun poids n'est chargé sur le VPS.
+    """
+    prepared_dir = _prepared_gguf_session_dir()
+    if not prepared_dir or not os.path.isdir(prepared_dir):
+        raise RuntimeError(
+            "VRYX_GGUF_PREPARED_SESSION(_DIR) manquant ou introuvable. "
+            "Lance prepare_gguf_worker_manifests.py avant Llama 70B Q4."
+        )
+    candidates: list[tuple[int, str, dict[str, Any]]] = []
+    for file_name in sorted(os.listdir(prepared_dir)):
+        if not (file_name.startswith("worker-") and file_name.endswith(".json")):
+            continue
+        path = os.path.join(prepared_dir, file_name)
+        try:
+            data = json.load(open(path, "r", encoding="utf-8"))
+        except Exception:
+            continue
+        try:
+            rank = int(data.get("rank") if data.get("rank") is not None else file_name.split("-", 1)[1].split(".", 1)[0])
+        except Exception:
+            rank = len(candidates)
+        candidates.append((rank, path, data))
+    if not candidates:
+        raise RuntimeError(f"aucun manifeste GGUF worker-*.json dans {prepared_dir}")
+
+    selected: tuple[int, str, dict[str, Any]] | None = None
+    for item in candidates:
+        target = str(item[2].get("target_peer_id") or "")
+        if target and target == peer_id:
+            selected = item
+            break
+    if selected is None:
+        rank_idx = int(peer_idx) if isinstance(peer_idx, int) or str(peer_idx).isdigit() else len(candidates)
+        for item in candidates:
+            if item[0] == rank_idx:
+                selected = item
+                break
+    if selected is None:
+        raise RuntimeError(f"manifeste GGUF introuvable pour peer={peer_id[:16]} rank={peer_idx}")
+
+    _rank, _path, manifest = selected
+    shard_dir = os.path.join(SHARD_BASE_DIR, session_id)
+    os.makedirs(shard_dir, exist_ok=True)
+    out_path = os.path.join(shard_dir, f"worker-{peer_idx}.json")
+    out = dict(manifest)
+    out.update({
+        "session_id": session_id,
+        "model_config": model_config,
+        "ttl_sec": SHARD_TTL,
+    })
+    # Normaliser ces valeurs depuis le manifeste préparé ; elles remplacent le
+    # découpage pondéré HF car le placement Q4 est VRAM-aware.
+    layer_start = int(out.get("layer_start") or 0)
+    layer_end = int(out.get("layer_end") or layer_start)
+    has_embedding = bool(out.get("has_embedding"))
+    has_lm_head = bool(out.get("has_lm_head"))
+    with open(out_path, "w", encoding="utf-8") as fp:
+        json.dump(out, fp, ensure_ascii=False)
+    api_base = _worker_shard_download_base_url()
+    print(
+        f"[VPS] Shard GGUF préparé worker-{peer_idx}: peer={peer_id[:16]} "
+        f"layers {layer_start}-{layer_end}, {int(out.get('binary_total_bytes') or 0) / 1e9:.2f}GB"
+    )
+    return (
+        f"{api_base}/api/internal/shard-serve/{session_id}/worker-{peer_idx}.json",
+        layer_start,
+        layer_end,
+        has_embedding,
+        has_lm_head,
+    )
+
+
+def _prepared_gguf_assignments_for_peers(peers: list[str]) -> list[tuple[str, int, int, bool, bool]] | None:
+    prepared_dir = _prepared_gguf_session_dir()
+    if not prepared_dir or not os.path.isdir(prepared_dir):
+        return None
+    manifests: list[tuple[int, dict[str, Any]]] = []
+    for file_name in sorted(os.listdir(prepared_dir)):
+        if not (file_name.startswith("worker-") and file_name.endswith(".json")):
+            continue
+        try:
+            data = json.load(open(os.path.join(prepared_dir, file_name), "r", encoding="utf-8"))
+        except Exception:
+            continue
+        try:
+            rank = int(data.get("rank") if data.get("rank") is not None else file_name.split("-", 1)[1].split(".", 1)[0])
+        except Exception:
+            rank = len(manifests)
+        manifests.append((rank, data))
+    if not manifests:
+        return None
+    manifests.sort(key=lambda x: x[0])
+    by_peer = {str(m.get("target_peer_id") or ""): m for _, m in manifests if str(m.get("target_peer_id") or "")}
+    out: list[tuple[str, int, int, bool, bool]] = []
+    used: set[str] = set()
+    for _rank, manifest in manifests:
+        target = str(manifest.get("target_peer_id") or "")
+        peer = target if target in peers else ""
+        if not peer:
+            remaining = [p for p in peers if p not in used]
+            if not remaining:
+                break
+            peer = remaining[0]
+        used.add(peer)
+        out.append((
+            peer,
+            int(manifest.get("layer_start") or 0),
+            int(manifest.get("layer_end") or 0),
+            bool(manifest.get("has_embedding")),
+            bool(manifest.get("has_lm_head")),
+        ))
+    return out if len(out) >= min(len(peers), len(manifests)) else None
 
 
 def _delete_temp_shard_files(session_id: str, peer_idx: Any) -> None:
@@ -1629,7 +2781,7 @@ _pool_registry: Dict[str, dict] = {}
 _pool_registry_lock = threading.Lock()
 
 # Incrémenter si la sémantique de la clé ou l'ordre des tranches change (sinon cache désaligné).
-_SESSION_CACHE_KEY_VERSION = "v3-pool-registry"
+_SESSION_CACHE_KEY_VERSION = "v4-gguf-lazy-pool-registry"
 
 
 def _model_fingerprint(model_config: dict) -> str:
@@ -1911,7 +3063,11 @@ def _is_unknown_session_error(value: Any) -> bool:
     return "session" in text and ("inconnue" in text or "unknown" in text or "not found" in text)
 
 
-def _session_ready_from_status(status: dict[str, Any], session_id: str) -> tuple[bool, str | None, dict[str, Any] | None]:
+def _session_ready_from_status(
+    status: dict[str, Any],
+    session_id: str,
+    expected_model_id: Optional[str] = None,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
     if not status.get("ok", True):
         return False, str(status.get("error") or "status_unavailable"), None
     shards = status.get("shards") if isinstance(status, dict) else []
@@ -1920,6 +3076,9 @@ def _session_ready_from_status(status: dict[str, Any], session_id: str) -> tuple
     for shard in shards:
         if not isinstance(shard, dict) or shard.get("session_id") != session_id:
             continue
+        if expected_model_id and isinstance(shard.get("model_id"), str):
+            if not _worker_matches_model({"model": shard.get("model_id")}, expected_model_id):
+                return False, "shard_model_mismatch", shard
         ready = bool(shard.get("ready") or shard.get("built") or shard.get("build_ready"))
         weights_loaded = int(shard.get("weights_loaded") or 0)
         if ready and weights_loaded > 0:
@@ -1928,7 +3087,12 @@ def _session_ready_from_status(status: dict[str, Any], session_id: str) -> tuple
     return False, "session_unknown_on_worker", None
 
 
-def _classify_runtime_pool(statuses: list[dict[str, Any]], session_id: str, requested_pool_class: str) -> dict[str, Any]:
+def _classify_runtime_pool(
+    statuses: list[dict[str, Any]],
+    session_id: str,
+    requested_pool_class: str,
+    expected_model_id: Optional[str] = None,
+) -> dict[str, Any]:
     worker_runtime: dict[str, str] = {}
     worker_attention: dict[str, str] = {}
     worker_linear_ready: dict[str, bool] = {}
@@ -1937,7 +3101,7 @@ def _classify_runtime_pool(statuses: list[dict[str, Any]], session_id: str, requ
 
     for status in statuses:
         peer = str(status.get("peer_id") or "")
-        ready, reason, shard = _session_ready_from_status(status, session_id)
+        ready, reason, shard = _session_ready_from_status(status, session_id, expected_model_id)
         if ready:
             ready_workers += 1
         elif reason:
@@ -1986,9 +3150,14 @@ def _classify_runtime_pool(statuses: list[dict[str, Any]], session_id: str, requ
     }
 
 
-def _validate_cached_session(peers: list[str], session_id: str, requested_pool_class: str) -> dict[str, Any]:
+def _validate_cached_session(
+    peers: list[str],
+    session_id: str,
+    requested_pool_class: str,
+    expected_model_id: Optional[str] = None,
+) -> dict[str, Any]:
     statuses = [_query_worker_status(peer, session_id) for peer in peers]
-    truth = _classify_runtime_pool(statuses, session_id, requested_pool_class)
+    truth = _classify_runtime_pool(statuses, session_id, requested_pool_class, expected_model_id)
     truth["worker_statuses"] = statuses
     truth["cache_valid"] = bool(truth["ready"])
     return truth
@@ -2028,7 +3197,7 @@ def get_pool_snapshot() -> dict:
             pool["worker_statuses"] = statuses
             pool["ready_workers"] = sum(1 for s in statuses if s.get("ok") and s.get("count", 0) > 0)
             pool["ready"] = pool["ready_workers"] >= len(pool.get("routing_path") or [])
-    total_vram = sum(int((catalog.get(p) or {}).get("gpuVramMb") or 0) for p in peers)
+    total_vram = sum(int((catalog.get(p) or {}).get("allocatedVramMb") or (catalog.get(p) or {}).get("gpuVramMb") or 0) for p in peers)
     return {
         "ok": True,
         "model_id": MODEL_ID,
@@ -2111,7 +3280,7 @@ def _get_or_create_session(
             with _pool_registry_lock:
                 existing_pool = dict(_pool_registry.get(pool_id, {}))
             sticky_path = list(existing_pool.get("routing_path") or peers)
-            validation = _validate_cached_session(sticky_path, session_id, pool_class)
+            validation = _validate_cached_session(sticky_path, session_id, pool_class, MODEL_ID)
             if not validation.get("cache_valid"):
                 reason = validation.get("fallback_reason") or "cached_session_not_ready"
                 print(f"[VPS] Session hot obsolète {session_id[:16]}… invalidée : {reason}")
@@ -2154,32 +3323,38 @@ def _get_or_create_session(
         n = len(peers)
         total_layers = model_config["num_hidden_layers_total"]
         # Hot Pool Placement : latence d'abord, puis VRAM/GPU. Le dernier worker garde lm_head.
-        ranked = sorted(peers, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True)
-        if n >= 2:
-            last_peer = ranked[0]
-            first_peer = ranked[1]
-            middle = [p for p in ranked[2:] if p not in (first_peer, last_peer)]
-            ordered = [first_peer] + sorted(middle, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True) + [last_peer]
+        prepared_gguf_assignments = _prepared_gguf_assignments_for_peers(peers)
+        if prepared_gguf_assignments:
+            assignments = prepared_gguf_assignments
+            peers[:] = [a[0] for a in assignments]
+            print(f"[VPS] Placement GGUF préparé actif ({len(assignments)} workers) : {[p[:12] for p in peers]}")
         else:
-            ordered = ranked
-        counts = _weighted_counts(total_layers, ordered, catalog)
-        if n >= 3 and model_config.get("model_type") != "gpt2":
-            # Le dernier worker porte aussi norm + lm_head : on évite de lui ajouter trop de couches.
-            max_last_layers = min(2, total_layers)
-            if counts[-1] > max_last_layers:
-                overflow = counts[-1] - max_last_layers
-                counts[-1] = max_last_layers
-                for j in range(overflow):
-                    counts[j % (n - 1)] += 1
+            ranked = sorted(peers, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True)
+            if n >= 2:
+                last_peer = ranked[0]
+                first_peer = ranked[1]
+                middle = [p for p in ranked[2:] if p not in (first_peer, last_peer)]
+                ordered = [first_peer] + sorted(middle, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True) + [last_peer]
+            else:
+                ordered = ranked
+            counts = _weighted_counts(total_layers, ordered, catalog)
+            if n >= 3 and model_config.get("model_type") != "gpt2":
+                # Le dernier worker porte aussi norm + lm_head : on évite de lui ajouter trop de couches.
+                max_last_layers = min(2, total_layers)
+                if counts[-1] > max_last_layers:
+                    overflow = counts[-1] - max_last_layers
+                    counts[-1] = max_last_layers
+                    for j in range(overflow):
+                        counts[j % (n - 1)] += 1
 
-        assignments = []
-        start = 0
-        for i, peer in enumerate(ordered):
-            n_layers = counts[i]
-            end = start + n_layers - 1
-            assignments.append((peer, start, end, i == 0, i == n - 1))
-            start = end + 1
-        peers[:] = ordered
+            assignments = []
+            start = 0
+            for i, peer in enumerate(ordered):
+                n_layers = counts[i]
+                end = start + n_layers - 1
+                assignments.append((peer, start, end, i == 0, i == n - 1))
+                start = end + 1
+            peers[:] = ordered
 
         # Purge des anciens shards pour libérer /tmp avant d'écrire les nouveaux
         _purge_old_shards(keep_session=session_id)
@@ -2209,6 +3384,8 @@ def _get_or_create_session(
                     "vps_rtt_ms": (latency_matrix.get("vps_to_worker", {}).get(peer) or {}).get("vps_rtt_ms"),
                     "gpu": (catalog.get(peer) or {}).get("gpuName"),
                     "vram_mb": (catalog.get(peer) or {}).get("gpuVramMb"),
+                    "allocated_vram_mb": (catalog.get(peer) or {}).get("allocatedVramMb"),
+                    "memory_limit_percent": (catalog.get(peer) or {}).get("memoryLimitPercent"),
                     "runtime_backend": _runtime_for_pool(pool_class, catalog.get(peer) or {}),
                     "weight_quantization": (catalog.get(peer) or {}).get("weightQuantization") or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16"),
                     "attention_backend": _attention_for_pool(pool_class),
@@ -2268,14 +3445,18 @@ def _get_or_create_session(
             relay_ok = False
             r: dict[str, Any] = {}
             elapsed = 0
-            for attempt in range(6):
+            init_attempts = max(1, int(os.environ.get("VRYX_SHARD_INIT_ATTEMPTS", "2")))
+            for attempt in range(init_attempts):
                 t0 = time.perf_counter()
-                r = _relay_raw(peer, "vryx.shard.init", init_payload, timeout=TIMEOUT * 2)
+                r = _relay_raw(peer, "vryx.shard.init", init_payload, timeout=SHARD_INIT_TIMEOUT)
                 elapsed = int((time.perf_counter() - t0) * 1000)
                 relay_ok = r.get("ok") is not False and not str(r.get("error") or "").strip()
                 if relay_ok:
                     break
-                print(f"[VPS] Worker {i} ({peer[:16]}) relay failed (attempt {attempt+1}/6) : {r.get('error')}")
+                print(
+                    f"[VPS] Worker {i} ({peer[:16]}) relay failed "
+                    f"(attempt {attempt+1}/{init_attempts}, timeout={int(SHARD_INIT_TIMEOUT)}s) : {r.get('error')}"
+                )
                 time.sleep(min(12.0, 1.5 * (attempt + 1)))
                 
             if relay_ok:
@@ -2304,9 +3485,9 @@ def _get_or_create_session(
                     wait_started = time.perf_counter()
                     poll_n = 0
                     last_reason: str | None = None
-                    while time.perf_counter() - wait_started < max(TIMEOUT * 2, 1800.0):
+                    while time.perf_counter() - wait_started < SHARD_READY_TIMEOUT:
                         status = _query_worker_status(peer, session_id)
-                        ready, reason, shard_hit = _session_ready_from_status(status, session_id)
+                        ready, reason, shard_hit = _session_ready_from_status(status, session_id, MODEL_ID)
                         if ready and shard_hit is not None:
                             weights_loaded = shard_hit.get("weights_loaded", weights_loaded)
                             print(
@@ -2319,12 +3500,18 @@ def _get_or_create_session(
                         )
                         poll_n += 1
                         time.sleep(_shard_ready_sleep_sec(poll_n))
-                    print(f"[VPS] Worker {i} ({peer[:16]}) timeout readiness après init")
+                    print(
+                        f"[VPS] Worker {i} ({peer[:16]}) timeout readiness après init "
+                        f"({int(SHARD_READY_TIMEOUT)}s)"
+                    )
                     diag.append({
                         "worker_index": i,
                         "peer": peer[:48],
                         "phase": "ready_poll_timeout",
-                        "detail": (last_reason or "session_not_ready")[:500],
+                        "detail": (
+                            f"worker_not_ready_after_{int(SHARD_READY_TIMEOUT)}s: "
+                            f"{last_reason or 'session_not_ready'}"
+                        )[:500],
                         "manifest_url_preview": download_url[:120],
                     })
                     return False
@@ -2348,11 +3535,57 @@ def _get_or_create_session(
                 return False
 
         init_jobs: list[tuple[Any, str, int, int, bool, bool, str]] = []
+        capacity_errors: list[dict[str, Any]] = []
         for i, (peer, ls, le, has_emb, has_head) in enumerate(assignments):
-            download_url = _save_shard_to_disk_from_safetensors(
-                session_id, i, ls, le, has_emb, has_head, model_manifest, model_config
-            )
+            if _prepared_gguf_session_dir():
+                download_url, ls, le, has_emb, has_head = _save_shard_to_disk_from_prepared_gguf(
+                    session_id, i, peer, model_config
+                )
+            else:
+                download_url = _save_shard_to_disk_from_safetensors(
+                    session_id, i, ls, le, has_emb, has_head, model_manifest, model_config
+                )
+            try:
+                manifest_path = os.path.join(SHARD_BASE_DIR, session_id, f"worker-{i}.json")
+                with open(manifest_path, "r", encoding="utf-8") as fp:
+                    manifest_bytes = int((json.load(fp) or {}).get("binary_total_bytes") or 0)
+            except Exception:
+                manifest_bytes = 0
+            worker_info = catalog.get(peer) or {}
+            safe_mb = _safe_weight_budget_mb(worker_info)
+            required_mb = manifest_bytes / 1024 / 1024
+            if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb and not _prepared_gguf_session_dir():
+                capacity_errors.append({
+                    "worker_index": i,
+                    "peer": peer[:48],
+                    "gpu": worker_info.get("gpuName") or worker_info.get("gpu_name") or "unknown",
+                    "layers": f"{ls}-{le}",
+                    "required_weight_mb": round(required_mb, 1),
+                    "safe_weight_budget_mb": round(safe_mb, 1),
+                    "allocated_vram_mb": _worker_memory_budget_mb(worker_info),
+                    "weight_quantization": os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower(),
+                })
             init_jobs.append((i, peer, ls, le, has_emb, has_head, download_url))
+
+        if capacity_errors:
+            detail = "; ".join(
+                f"w{e['worker_index']} {e['gpu']} layers {e['layers']}: "
+                f"{e['required_weight_mb']}MB requis > {e['safe_weight_budget_mb']}MB sûrs"
+                for e in capacity_errors[:4]
+            )
+            prep_diag.append({
+                "worker_index": "capacity",
+                "phase": "worker_vram_capacity",
+                "detail": detail,
+                "workers": capacity_errors,
+                "hint": (
+                    "Llama 2 70B fp16 ne tient pas sur cette chaîne. "
+                    "Utilise un backend de poids Q4/Q8 shardé ou ajoute des workers/VRAM avant de lancer le dispatch."
+                ),
+            })
+            print(f"[VPS] Dispatch refusé: capacité worker insuffisante. {detail}")
+            _register_pool(pool_id, {"status": "failed", "session_status": "failed", "shard_prep_diag": prep_diag})
+            return None, "failed", prep_diag
 
         def _run_init_job(job: tuple[Any, str, int, int, bool, bool, str]) -> bool:
             ij, peer_j, ls_j, le_j, emb_j, head_j, url_j = job
@@ -2397,7 +3630,7 @@ def _get_or_create_session(
                     "source": "critical_lm_head",
                 })
 
-        validation = _validate_cached_session(peers, session_id, pool_class)
+        validation = _validate_cached_session(peers, session_id, pool_class, MODEL_ID)
         actual_pool_class = str(validation.get("actual_pool_class") or pool_class)
         validation_reason = validation.get("fallback_reason")
         if pool_class == "velocity_mlx" and actual_pool_class != "velocity_mlx":
@@ -2431,26 +3664,140 @@ def _get_or_create_session(
 def _run_mlx_lm_direct_chat(
     prompt: str,
     tokenizer: Any,
+    prompt_token_count: int,
     peers: list[str],
     decode_cap: int,
     requested_quantization: str,
     pool_preference: str,
+    formatted_prompt: str | None = None,
+    options: Optional[dict[str, Any]] = None,
+    latency_matrix: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    if not MLX_LM_DIRECT or not peers:
+    direct_enabled = MLX_LM_DIRECT or LLAMA_CPP_DIRECT
+    if not direct_enabled or not peers:
         return None
-    peer = peers[0]
+    catalog = _fetch_worker_catalog()
+    ready_peers, retry_after_ms = _mlx_direct_ready_peers(list(peers))
+    lock_t0 = time.perf_counter()
+    lock_timeout = max(1.0, min(float(PIPELINE_STEP_TIMEOUT), 120.0) - 1.0)
+    if not ready_peers:
+        first_peer = peers[0]
+        return {
+            "ok": False,
+            "text": "",
+            "error": "mlx_lm_no_available_worker: tous les workers compatibles sont occupés",
+            "trace": {
+                "layout": "mlx_lm_direct_p2p",
+                "ok": False,
+                "routing_path": [first_peer],
+                "peers": list(peers),
+                "failure_stage": "mlx_lm_direct_admission",
+                "queue_wait_ms": int((time.perf_counter() - lock_t0) * 1000),
+                "retry_after_ms": retry_after_ms,
+            },
+            "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+        }
+    ready_peers = _rotate_direct_ready_peers(ready_peers)
+    peer = None
+    acquire_reason = "none"
+    for candidate in ready_peers:
+        acquired, acquire_reason, retry_after_ms = _try_acquire_mlx_direct_peer(
+            candidate,
+            lease_sec=max(float(PIPELINE_STEP_TIMEOUT), float(MLX_DIRECT_RELAY_TIMEOUT)) + 15.0,
+        )
+        if acquired:
+            peer = candidate
+            break
+    if not peer:
+        first_peer = ready_peers[0]
+        return {
+            "ok": False,
+            "text": "",
+            "error": f"mlx_lm_no_available_worker: admission refusée ({acquire_reason})",
+            "trace": {
+                "layout": "mlx_lm_direct_p2p",
+                "ok": False,
+                "routing_path": [first_peer],
+                "peers": list(peers),
+                "failure_stage": "mlx_lm_direct_admission",
+                "queue_wait_ms": int((time.perf_counter() - lock_t0) * 1000),
+                "retry_after_ms": retry_after_ms,
+            },
+            "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+        }
+    worker_row = catalog.get(peer) or {}
+    worker_runtime = str(
+        worker_row.get("runtimeBackend") or worker_row.get("runtime_backend") or ""
+    ).strip().lower()
+    if "llama" in worker_runtime or "gguf" in worker_runtime:
+        direct_backend = "llama_cpp"
+    elif "mlx" in worker_runtime:
+        direct_backend = "mlx_lm"
+    elif LLAMA_CPP_DIRECT and any(marker in str(MODEL_ID).lower() for marker in ("llama", "gemma")):
+        direct_backend = "llama_cpp"
+    else:
+        direct_backend = "mlx_lm"
+    resolved_prompt = formatted_prompt if isinstance(formatted_prompt, str) and formatted_prompt.strip() else prompt
     payload = {
         "model_id": MODEL_ID,
-        "prompt": prompt,
+        "prompt": resolved_prompt,
+        "formatted_prompt": bool(isinstance(formatted_prompt, str) and formatted_prompt.strip()),
         "max_new_tokens": decode_cap,
         "temperature": SAMPLING_TEMPERATURE,
         "top_p": SAMPLING_TOP_P,
         "top_k": SAMPLING_TOP_K,
+        "repetition_penalty": REPETITION_PENALTY,
     }
-    t0 = time.perf_counter()
-    relay = _relay_raw(peer, "vryx.mlx_lm.generate", json.dumps(payload, ensure_ascii=False).encode("utf-8"), timeout=PIPELINE_STEP_TIMEOUT)
-    wall_ms = max(1, int((time.perf_counter() - t0) * 1000))
-    response = _decode_pipeline_response(relay)
+    load_model_id = _direct_mlx_worker_load_model_id()
+    if direct_backend == "mlx_lm" and load_model_id:
+        payload["load_model_id"] = load_model_id
+    if direct_backend == "llama_cpp":
+        payload["load_model_id"] = os.environ.get("VRYX_LLAMA_CPP_MODEL", "vryx-llama2-70b-q4").strip() or "vryx-llama2-70b-q4"
+        payload["use_generate"] = os.environ.get("VRYX_LLAMA_CPP_USE_GENERATE", "1").strip().lower() not in ("0", "false", "no", "off")
+        payload["keep_alive"] = os.environ.get("VRYX_LLAMA_CPP_KEEP_ALIVE", "30m").strip() or "30m"
+        payload["num_ctx"] = int(os.environ.get("VRYX_LLAMA_CPP_NUM_CTX", "2048") or "2048")
+        payload["num_batch"] = int(os.environ.get("VRYX_LLAMA_CPP_NUM_BATCH", "512") or "512")
+    for key in ("stream_id", "stream_secret", "stream_callback_url"):
+        value = options.get(key) if isinstance(options, dict) else None
+        if value:
+            payload[key] = str(value)
+    try:
+        response: Optional[dict[str, Any]] = None
+        relay: dict[str, Any] = {}
+        t0 = time.perf_counter()
+        direct_dtype = "vryx.llama_cpp.generate" if direct_backend == "llama_cpp" else "vryx.mlx_lm.generate"
+        relay = _relay_raw(
+            peer,
+            direct_dtype,
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            timeout=min(float(PIPELINE_STEP_TIMEOUT), float(MLX_DIRECT_RELAY_TIMEOUT)),
+        )
+        response = _decode_pipeline_response(relay)
+        wall_ms = max(1, int((time.perf_counter() - t0) * 1000))
+    finally:
+        _release_mlx_direct_peer(peer)
+    response = response or {}
+    error_text = str(response.get("error") or "")
+    if error_text.startswith("mlx_lm_busy") or error_text.startswith("llama_cpp_busy"):
+        _mark_mlx_direct_peer_busy(peer, busy_sec=12.0)
+        remaining_peers = [p for p in peers if p != peer]
+        if remaining_peers:
+            rerouted = _run_mlx_lm_direct_chat(
+                prompt,
+                tokenizer,
+                prompt_token_count,
+                remaining_peers,
+                decode_cap,
+                requested_quantization,
+                pool_preference,
+                formatted_prompt=formatted_prompt,
+                options=options,
+                latency_matrix=latency_matrix,
+            )
+            if rerouted:
+                rerouted_trace = rerouted.setdefault("trace", {})
+                rerouted_trace["rerouted_after_busy_peer"] = peer
+                return rerouted
     relay_ms = int(relay.get("relay_ms") or wall_ms)
     if not response:
         return {
@@ -2486,25 +3833,36 @@ def _run_mlx_lm_direct_chat(
 
     text = str(response.get("text") or "")
     completion_tokens = int(response.get("completion_tokens") or 0)
-    try:
-        prompt_tokens = len(tokenizer.encode(prompt))
-    except Exception:
-        prompt_tokens = 0
+    prompt_tokens = max(0, int(prompt_token_count))
+    if prompt_tokens <= 0:
+        try:
+            prompt_tokens = len(tokenizer.encode(resolved_prompt))
+        except Exception:
+            prompt_tokens = 0
     generation_ms = max(1, int(response.get("generation_ms") or wall_ms))
-    actual_tps = round(completion_tokens * 1000.0 / generation_ms, 3) if completion_tokens else 0
+    decode_ms = max(1, int(response.get("eval_ms") or response.get("decode_ms") or generation_ms))
+    response_actual_tps = float(response.get("actual_tps") or 0.0)
+    actual_tps = response_actual_tps if response_actual_tps > 0 else (
+        round(completion_tokens * 1000.0 / decode_ms, 3) if completion_tokens else 0
+    )
     trace = {
-        "layout": "mlx_lm_direct_p2p",
+        "layout": "llama_cpp_direct_p2p" if direct_backend == "llama_cpp" else "mlx_lm_direct_p2p",
         "ok": True,
         "routing_path": [peer],
         "peers": [peer],
         "model_id": MODEL_ID,
-        "runtime_backend_per_worker": {peer: "mlx_lm"},
+        "runtime_backend_per_worker": {peer: direct_backend},
         "pool_preference": pool_preference,
+        "peer_latency_matrix": latency_matrix or {},
         "requested_quantization": requested_quantization,
-        "effective_quantization": "mlx_lm_native",
-        "compute_time_ms": generation_ms,
+        "effective_quantization": "gguf_q4_native" if direct_backend == "llama_cpp" else "mlx_lm_native",
+        "compute_time_ms": decode_ms if direct_backend == "llama_cpp" else generation_ms,
+        "wall_time_ms": wall_ms,
+        "generation_wall_ms": generation_ms,
         "relay_ms": relay_ms,
         "setup_ms": int(response.get("load_ms") or 0),
+        "eval_ms": int(response.get("eval_ms") or 0),
+        "prompt_eval_ms": int(response.get("prompt_eval_ms") or 0),
         "mlx_lm_load_ms": int(response.get("mlx_lm_load_ms") or response.get("load_ms") or 0),
         "mlx_lm_cache_hit": bool(response.get("cache_hit")),
         "mlx_lm_cache_status": response.get("cache_status") or ("hit" if response.get("cache_hit") else "loaded"),
@@ -2512,19 +3870,26 @@ def _run_mlx_lm_direct_chat(
         "model_cache_size": int(response.get("model_cache_size") or 0),
         "token_events": response.get("token_events") if isinstance(response.get("token_events"), list) else [],
         "tokens_generated": completion_tokens,
+        "requested_max_tokens": response.get("requested_max_tokens"),
+        "effective_max_tokens": response.get("effective_max_tokens"),
+        "stop_reason": response.get("stop_reason"),
         "hot_path_tps": actual_tps,
         "benchmark": {
             "target_tps": 15,
             "target_ms_per_token": 66,
-            "actual_ms_per_token": int(generation_ms / completion_tokens) if completion_tokens else 0,
+            "actual_ms_per_token": int(decode_ms / completion_tokens) if completion_tokens else 0,
             "actual_tps": actual_tps,
-            "decode_mode": response.get("decode_mode") or "mlx_lm_direct_stream_generate",
+            "decode_mode": response.get("decode_mode") or ("llama_cpp_ollama_generate" if LLAMA_CPP_DIRECT else "mlx_lm_direct_stream_generate"),
             "routing_hops": 1,
             "relay_ms": relay_ms,
             "ttft_ms": response.get("ttft_ms"),
             "load_ms": response.get("load_ms"),
+            "eval_ms": response.get("eval_ms"),
+            "prompt_eval_ms": response.get("prompt_eval_ms"),
             "cache_hit": bool(response.get("cache_hit")),
-            "runtime_backend": "mlx_lm",
+            "runtime_backend": "llama_cpp" if LLAMA_CPP_DIRECT else "mlx_lm",
+            "stop_reason": response.get("stop_reason"),
+            "effective_max_tokens": response.get("effective_max_tokens"),
         },
         "metrics": {
             "prompt_tokens": prompt_tokens,
@@ -2550,6 +3915,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
       - VPS dé-tokenise, boucle jusqu'à EOS
     """
     options = options or {}
+    stream_id = str(options.get("stream_id") or "")
+    stream_secret = str(options.get("stream_secret") or "")
+    stream_callback_url = str(options.get("stream_callback_url") or "")
+    _activate_model_from_options(options)
     requested_quantization = _normalize_hidden_transport(
         options.get("hidden_transport") or options.get("quantization") or HIDDEN_TRANSPORT
     )
@@ -2557,6 +3926,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     quantization_fallback_reason: Optional[str] = None
     pool_preference = _normalize_pool_preference(options.get("pool_preference"))
     pool_fallback_reason: Optional[str] = None
+    scheduler_job_id = str(options.get("scheduler_job_id") or "").strip()
+    preferred_worker_peer_ids = _normalize_preferred_worker_peer_ids(options.get("preferred_worker_peer_ids"))
+    preferred_workers_applied: list[str] = []
+    preferred_workers_missing: list[str] = []
 
     decode_cap = MAX_NEW_TOKENS
     _mnt = options.get("max_new_tokens")
@@ -2568,8 +3941,34 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         except (TypeError, ValueError):
             pass
 
-    model_manifest, tokenizer = _ensure_model()
-    if model_manifest is None or tokenizer is None:
+    requires_distributed_shards = _requires_distributed_shards(MODEL_ID)
+    min_workers_required = _required_min_workers_for_model(MODEL_ID)
+    wait_for_min = DIST_WAIT_FOR_MIN_WORKERS or requires_distributed_shards
+    if requires_distributed_shards:
+        disk_ok, disk_msg = _assert_shard_cache_disk()
+        print(disk_msg)
+        if not disk_ok:
+            return {
+                "ok": False,
+                "text": "",
+                "error": f"Erreur prérequis disque : {disk_msg}",
+                "trace": {
+                    "layout": "pipeline_relay_daisy_chain",
+                    "ok": False,
+                    "failure_stage": "shard_disk_precheck",
+                    "requirements": {
+                        "shard_base_dir": SHARD_BASE_DIR,
+                        "required_free_mb": SHARD_MIN_FREE_MB,
+                    },
+                },
+                "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+
+    if LLAMA_CPP_DIRECT:
+        model_manifest, tokenizer = {"model_id": MODEL_ID, "source": "llama_cpp_direct"}, None
+    else:
+        model_manifest, tokenizer = _ensure_model()
+    if model_manifest is None or (tokenizer is None and not LLAMA_CPP_DIRECT):
         return {
             "ok": False,
             "text": "",
@@ -2578,69 +3977,197 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
-    peers_raw = _discover_live_peers()
-    # Ordre canonique : même ordre à chaque requête et pour les tranches shard.init (embedding → … → lm_head).
-    # Sinon la clé de cache (sorted) peut correspondre à une autre permutation et le 1er hop reçoit token_ids
-    # sur un worker « milieu » → pas de next_token_id, texte vide, message générique côté API.
-    peers_sorted = sorted(peers_raw)
-    catalog = _fetch_worker_catalog()
+    peers_sorted: list[str] = []
+    selection_latency_matrix = {"vps_to_worker": {}, "worker_to_worker": {}}
+    catalog: dict[str, dict] = {}
+    pool_class = "legacy_pytorch"
+    pool_fallback_reason = None
     incompatible_model_peers: list[dict[str, Any]] = []
-    if REQUIRE_WORKER_MODEL_MATCH and catalog:
-        compatible_peers: list[str] = []
-        for peer in peers_sorted:
-            worker = catalog.get(peer) or {}
-            if _worker_matches_model(worker):
-                compatible_peers.append(peer)
+    shared_accelerator_groups: list[dict[str, Any]] = []
+    worker_wait_timeout = DIST_WAIT_FOR_MIN_WORKERS_TIMEOUT_SEC
+    if isinstance(options, dict) and options.get("stream_id"):
+        worker_wait_timeout = min(worker_wait_timeout, ADMIN_STREAM_WORKER_WAIT_SEC)
+    wait_deadline = time.perf_counter() + max(0.0, worker_wait_timeout)
+    discovery_attempt = 0
+
+    while True:
+        discovery_attempt += 1
+        peers_raw = _discover_live_peers()
+        peers_sorted = sorted(set(peers_raw))
+        catalog = _fetch_worker_catalog()
+
+        # Ordre canonique : même ordre à chaque requête et pour les tranches shard.init (embedding → … → lm_head).
+        # Sinon la clé de cache (sorted) peut correspondre à une autre permutation et le 1er hop reçoit token_ids
+        # sur un worker « milieu » → pas de next_token_id, texte vide, message générique côté API.
+        incompatible_model_peers = []
+        if REQUIRE_WORKER_MODEL_MATCH and catalog:
+            compatible_peers: list[str] = []
+            for peer in peers_sorted:
+                worker = catalog.get(peer) or {}
+                if _worker_matches_model(worker):
+                    compatible_peers.append(peer)
+                else:
+                    incompatible_model_peers.append({
+                        "peer_id": peer,
+                        "model": worker.get("model") or worker.get("model_id") or "unknown",
+                        "runtime": worker.get("runtimeBackend") or worker.get("runtime_backend") or "unknown",
+                    })
+            peers_sorted = compatible_peers
+
+        selected_peers, pool_class, pool_fallback_reason = _select_pool_peers(
+            peers_sorted,
+            catalog,
+            pool_preference,
+            min_workers=min_workers_required,
+        )
+        peers_sorted = sorted(selected_peers)
+        if preferred_worker_peer_ids:
+            peers_sorted, preferred_workers_applied, preferred_workers_missing = _apply_preferred_worker_order(
+                peers_sorted,
+                preferred_worker_peer_ids,
+            )
+            if preferred_workers_applied:
+                pool_fallback_reason = None
             else:
-                incompatible_model_peers.append({
-                    "peer_id": peer,
-                    "model": worker.get("model") or worker.get("model_id") or "unknown",
-                    "runtime": worker.get("runtimeBackend") or worker.get("runtime_backend") or "unknown",
-                })
-        peers_sorted = compatible_peers
-    selected_peers, pool_class, pool_fallback_reason = _select_pool_peers(peers_sorted, catalog, pool_preference)
-    peers_sorted = sorted(selected_peers)
-    peers_sorted = _filter_workers_by_catalog_public_ip_optional(peers_sorted, catalog)
-    selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
-    peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
-    if len(peers_sorted) < MIN_WORKERS:
-        # Pas assez de workers : retourne une ERREUR explicite (le VPS ne calcule jamais)
+                pool_fallback_reason = "scheduler_preferred_workers_unavailable"
+        peers_sorted = _filter_workers_by_catalog_public_ip_optional(peers_sorted, catalog)
+        selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
+        peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
+        peers_sorted, shared_accelerator_groups = _coalesce_shared_accelerator_peers(peers_sorted, catalog)
+        selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
+        peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
+
+        if len(peers_sorted) >= min_workers_required:
+            break
+
+        if not wait_for_min:
+            break
+        if time.perf_counter() >= wait_deadline:
+            break
+        print(
+            f"[VPS] En attente de workers prêts pour le modèle {MODEL_ID} : "
+            f"{len(peers_sorted)}/{min_workers_required} (tentative {discovery_attempt})"
+        )
+        time.sleep(DIST_WAIT_FOR_MIN_WORKERS_POLL_SEC)
+
+    if len(peers_sorted) < min_workers_required:
         mismatch_note = ""
         if incompatible_model_peers:
             advertised = ", ".join(
                 f"{str(p['peer_id'])[:12]}…={p['model']}" for p in incompatible_model_peers[:4]
             )
             mismatch_note = f" Workers incompatibles ignorés : {advertised}."
+        timeout_suffix = ""
+        if wait_for_min and time.perf_counter() >= wait_deadline:
+            timeout_suffix = (
+                f" J'ai attendu {worker_wait_timeout:g}s "
+                "mais les workers nécessaires ne sont pas prêts."
+            )
+        shared_note = ""
+        if shared_accelerator_groups:
+            shared_note = (
+                " Plusieurs workers détectés partagent le même GPU/foyer et ne sont comptés qu'une fois "
+                "pour éviter de surévaluer la VRAM disponible."
+            )
         return {
             "ok": False,
             "text": "",
             "error": (
-                f"Pas assez de workers connectés ({len(peers_sorted)}/{MIN_WORKERS} minimum). "
+                f"Pas assez de workers connectés ({len(peers_sorted)}/{min_workers_required} minimum). "
                 f"Vérifiez les heartbeats vers l’API, le bootstrap P2P et le modèle déclaré ({MODEL_ID})."
-                f"{mismatch_note}"
+                f"{mismatch_note}{shared_note}{timeout_suffix}"
             ),
             "trace": {
                 "layout": "pipeline_relay_daisy_chain",
                 "ok": False,
                 "peers": peers_sorted,
                 "routing_path": peers_sorted,
-                "min_workers_required": MIN_WORKERS,
+                "min_workers_required": min_workers_required,
                 "required_model": MODEL_ID,
+                "scheduler_job_id": scheduler_job_id or None,
+                "preferred_worker_peer_ids": preferred_worker_peer_ids,
+                "preferred_workers_applied": preferred_workers_applied,
+                "preferred_workers_missing": preferred_workers_missing,
                 "incompatible_model_peers": incompatible_model_peers,
+                "shared_accelerator_groups": shared_accelerator_groups,
                 "peer_latency_matrix": selection_latency_matrix,
             },
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
-    direct_result = _run_mlx_lm_direct_chat(
-        prompt,
-        tokenizer,
-        peers_sorted,
-        decode_cap,
-        requested_quantization,
-        pool_preference,
-    )
+    # Tokenisation + mise en forme communes (cohérence directe + pipeline).
+    model_config = _model_config_cache or {}
+    if LLAMA_CPP_DIRECT and tokenizer is None:
+        model_config = {
+            "model_type": "llama_cpp_direct",
+            "max_position_embeddings": int(os.environ.get("VRYX_LLAMA_CPP_NUM_CTX", "4096") or "4096"),
+        }
+        formatted_prompt, input_ids = prompt, []
+    else:
+        formatted_prompt, input_ids = _tokenize_prompt(prompt, tokenizer, model_config)
+        decode_cap = _clamp_decode_cap(len(input_ids), decode_cap, model_config)
+    if decode_cap <= 0:
+        return {
+            "ok": False,
+            "text": "",
+            "error": (
+                "Prompt trop long pour la fenêtre de contexte de ce modèle. "
+                "Réduis le prompt, ou baisse la taille du batch."
+            ),
+            "trace": {
+                "layout": "pipeline_relay_daisy_chain",
+                "ok": False,
+                "routing_path": peers_sorted,
+                "peers": peers_sorted,
+                "failure_stage": "context_limit_exceeded",
+                "prompt_tokens": len(input_ids),
+                "shared_accelerator_groups": shared_accelerator_groups,
+            },
+            "metrics": {"prompt_tokens": len(input_ids), "completion_tokens": 0, "total_tokens": len(input_ids)},
+        }
+
+    direct_result = None
+    if not requires_distributed_shards:
+        direct_preflight_error = _large_llama_direct_preflight_error(peers_sorted, catalog)
+        if direct_preflight_error:
+            return {
+                "ok": False,
+                "text": "",
+                "error": (
+                    "Llama 70B Q4 ne peut pas être lancé de façon fiable sur la configuration worker actuelle. "
+                    f"{direct_preflight_error.get('detail')} {direct_preflight_error.get('hint')}"
+                ),
+                "trace": {
+                    "layout": "llama_cpp_direct_p2p",
+                    "ok": False,
+                    "routing_path": peers_sorted[:1],
+                    "peers": peers_sorted,
+                    "failure_stage": "llama70b_direct_capacity_preflight",
+                    "capacity": direct_preflight_error,
+                    "shared_accelerator_groups": shared_accelerator_groups,
+                    "peer_latency_matrix": selection_latency_matrix,
+                },
+                "metrics": {"prompt_tokens": len(input_ids), "completion_tokens": 0, "total_tokens": len(input_ids)},
+            }
+        direct_result = _run_mlx_lm_direct_chat(
+            prompt,
+            tokenizer,
+            len(input_ids),
+            peers_sorted,
+            decode_cap,
+            requested_quantization,
+            pool_preference,
+            formatted_prompt,
+            options,
+            selection_latency_matrix,
+        )
     if direct_result is not None:
+        trace = direct_result.get("trace")
+        if isinstance(trace, dict):
+            trace["scheduler_job_id"] = scheduler_job_id or None
+            trace["preferred_worker_peer_ids"] = preferred_worker_peer_ids
+            trace["preferred_workers_applied"] = preferred_workers_applied
+            trace["preferred_workers_missing"] = preferred_workers_missing
         return direct_result
     if _requires_mlx_lm_direct_guard():
         return {
@@ -2658,14 +4185,18 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "failure_stage": "mlx_lm_direct_guard",
                 "fallback_blocked": True,
                 "model_id": MODEL_ID,
+                "scheduler_job_id": scheduler_job_id or None,
+                "preferred_worker_peer_ids": preferred_worker_peer_ids,
+                "preferred_workers_applied": preferred_workers_applied,
+                "preferred_workers_missing": preferred_workers_missing,
+                "shared_accelerator_groups": shared_accelerator_groups,
                 "peer_latency_matrix": selection_latency_matrix,
             },
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
-    n = _routing_pipeline_width(len(peers_sorted))
+    n = _routing_pipeline_width(len(peers_sorted), min_workers=min_workers_required)
     peers = peers_sorted[:n]
-    model_config = _model_config_cache
 
     # Sur runtime MLX, hidden q4/int8 compresse les états ; la restauration peut brouiller fortement
     # les logits alors que les poids sont en fp16 → texte multilingue aberrant. fp16 coûte plus de
@@ -2686,20 +4217,33 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     setup_ms = int((time.perf_counter() - t_setup) * 1000)
     if sess_status == "failed" or session_id is None:
         detail_hint = ""
+        capacity_diag = next(
+            (d for d in (shard_prep_diag or []) if d.get("phase") == "worker_vram_capacity"),
+            None,
+        )
         if shard_prep_diag:
             chunk = "; ".join(
                 f"w{d.get('worker_index')}:{d.get('phase')}:{str(d.get('detail',''))[:100]}"
                 for d in shard_prep_diag[:3]
             )
             detail_hint = f" Diagnostics orchestrateur : {chunk}."
-        return {
-            "ok": False,
-            "text": "",
-            "error": (
+        if capacity_diag:
+            error_msg = (
+                "Dispatch Llama 70B impossible avec la mémoire worker actuelle. "
+                f"{capacity_diag.get('detail')}. "
+                "Le pipeline a été arrêté avant téléchargement/build pour éviter une réponse vide ou un transport error. "
+                f"{capacity_diag.get('hint') or ''}"
+            )
+        else:
+            error_msg = (
                 "Échec de préparation des shards sur les workers (téléchargement ou build). "
                 "Vérifier les workers, l'espace disque VPS (VRYX_SHARD_BASE_DIR) et les URLs téléchargeables depuis les GPUs "
                 "(VRYX_SHARD_DOWNLOAD_BASE_URL / domaine exposant /api/internal/shard-serve/…)." + detail_hint
-            ),
+            )
+        return {
+            "ok": False,
+            "text": "",
+            "error": error_msg,
             "trace": {
                 "layout": "pipeline_relay_daisy_chain",
                 "ok": False,
@@ -2708,6 +4252,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "setup_ms": setup_ms,
                 "session_status": sess_status,
                 "shard_prep_diag": shard_prep_diag,
+                "shared_accelerator_groups": shared_accelerator_groups,
             },
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
@@ -2755,7 +4300,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         runtime_by_peer[peer] = peer_runtime
         attention_by_peer[peer] = peer_attention
         linear_attn_ready = linear_attn_ready and peer_linear_ready
-    pool_validation = _classify_runtime_pool(worker_statuses, session_id, pool_class)
+    pool_validation = _classify_runtime_pool(worker_statuses, session_id, pool_class, MODEL_ID)
     actual_pool_class = str(pool_validation.get("actual_pool_class") or pool_class)
     if actual_pool_class != pool_class:
         pool_fallback_reason = pool_validation.get("fallback_reason") or pool_fallback_reason or "runtime_status_mismatch"
@@ -2769,36 +4314,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "ready": bool(pool_validation.get("ready")),
     })
 
-    # Tokeniser le prompt (adapté selon le modèle)
-    model_type = model_config.get("model_type", "gpt2")
-    if model_type == "gpt2":
-        # GPT-2 : pas de chat template, prompt brut
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        formatted = f"Question: {prompt}\nRéponse:"
-    else:
-        system_msg = (
-            "Tu es Vryx, un assistant IA concis. Réponds directement dans la langue de l'utilisateur. "
-            "Ne montre pas de raisonnement interne et arrête-toi après la réponse."
-        )
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            try:
-                formatted = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
-            except TypeError:
-                formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            formatted = f"{prompt}\n"
-
-    input_ids = tokenizer.encode(formatted, return_tensors="pt")[0].tolist()
+    # Réutilise la version tokenisée commune (alignement avec métriques / clamp contextuel).
+    formatted = formatted_prompt
     eos_id = tokenizer.eos_token_id
     stop_ids = _stop_token_ids(tokenizer)
     routing_path = list(pool_info.get("routing_path") or peers)  # [w1, w2, w3]
@@ -2840,6 +4357,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     print(f"[VPS] Inférence : {len(input_ids)} tokens prompt, {n} workers, routing={[p[:12] for p in routing_path]}, max_new_tokens={decode_cap}")
 
     generated_ids = []
+    streamed_text_sent = ""
     step_latencies = []
     batch_traces = []
     relay_metrics: list[dict[str, Any]] = []
@@ -3040,6 +4558,21 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             break
 
         partial_text = _decode_generated_token_ids(tokenizer, generated_ids)
+        if stream_id and stream_secret and stream_callback_url and partial_text.startswith(streamed_text_sent):
+            delta_text = partial_text[len(streamed_text_sent):]
+            if delta_text:
+                _emit_stream_callback_async(
+                    stream_callback_url,
+                    stream_id,
+                    stream_secret,
+                    "token",
+                    {
+                        "token": delta_text,
+                        "index": len(generated_ids),
+                        "elapsed_ms": int((time.perf_counter() - t_infer) * 1000),
+                    },
+                )
+                streamed_text_sent = partial_text
         if _detect_repetition_loop(partial_text):
             stop_reason = "repetition_guard"
             break
@@ -3125,6 +4658,20 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         _write_prefix_cache_manifest(model_key, manifest)
         prefix_cache_save = {"enabled": True, "saved": save_result.get("ok", False), "manifest": manifest, "results": save_result.get("results", [])}
     response_text = _decode_generated_token_ids(tokenizer, generated_ids)
+    if stream_id and stream_secret and stream_callback_url and response_text.startswith(streamed_text_sent):
+        tail_text = response_text[len(streamed_text_sent):]
+        if tail_text:
+            _emit_stream_callback_async(
+                stream_callback_url,
+                stream_id,
+                stream_secret,
+                "token",
+                {
+                    "token": tail_text,
+                    "index": len(generated_ids),
+                    "elapsed_ms": int((time.perf_counter() - t_infer) * 1000),
+                },
+            )
     avg_ms = int(sum(step_latencies) / len(step_latencies)) if step_latencies else 0
     relay_ms_total = sum(int(m.get("relay_ms") or 0) for m in relay_metrics)
     serialization_ms_total = sum(int(m.get("serialization_ms") or 0) for m in relay_metrics)
@@ -3159,6 +4706,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "pool_validation": pool_validation,
         "pool_preference": pool_preference,
         "pool_fallback_reason": pool_fallback_reason,
+        "scheduler_job_id": scheduler_job_id or None,
+        "preferred_worker_peer_ids": preferred_worker_peer_ids,
+        "preferred_workers_applied": preferred_workers_applied,
+        "preferred_workers_missing": preferred_workers_missing,
         "pool_status": pool_info.get("status"),
         "shard_init_tuning": {
             "ready_poll_fast_sec": _SHARD_READY_POLL_FAST,
@@ -3169,6 +4720,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         },
         "assignments": pool_info.get("assignments") or [],
         "replicas": pool_info.get("replicas") or [],
+        "shared_accelerator_groups": shared_accelerator_groups,
         "peer_latency_matrix": pool_info.get("peer_latency_matrix") or {},
         "hidden_transport": hidden_transport,
         "requested_quantization": requested_quantization,
@@ -3384,6 +4936,27 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             },
         }
 
+    if not response_text.strip():
+        err = (
+            "Décodage vide malgré des jetons générés : le modèle a probablement émis "
+            "uniquement des tokens de fin/spéciaux, ou le tokenizer ne correspond pas au shard chargé."
+        )
+        base_trace["ok"] = False
+        base_trace["error"] = err
+        base_trace["generated_token_ids_sample"] = generated_ids[:32]
+        return {
+            "ok": False,
+            "text": "",
+            "error": err,
+            "trace": base_trace,
+            "metrics": {
+                "prompt_tokens": len(input_ids),
+                "completion_tokens": len(generated_ids),
+                "total_tokens": len(input_ids) + len(generated_ids),
+                "vps_delegate_ms": 0,
+            },
+        }
+
     base_trace["ok"] = True
     return {
         "ok": True,
@@ -3400,42 +4973,47 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
 def maybe_run_worker_only_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> dict:
     """Point d'entrée depuis inference_server.py."""
-    peers = _discover_live_peers()
-    if not peers:
-        return {
-            "ok": False,
-            "text": "",
-            "error": (
-                "Aucun pair worker joignable depuis le stage1 (liste vide après découverte). "
-                "Vérifier `/api/internal/live-peers`, les heartbeats `/api/workers/status` "
-                "et la reconnexion P2P bootstrap des workers après redémarrage initiateur."
-            ),
-            "trace": {
-                "layout": "pipeline_relay_daisy_chain",
+    options = options or {}
+    with _model_runtime_lock:
+        _activate_model_from_options(options)
+        peers = _discover_live_peers()
+        if not peers:
+            return {
                 "ok": False,
-                "routing_path": [],
-                "peers": [],
-                "failure_stage": "discover_live_peers_empty",
-            },
-            "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
-        }
+                "text": "",
+                "error": (
+                    "Aucun pair worker joignable depuis le stage1 (liste vide après découverte). "
+                    "Vérifier `/api/internal/live-peers`, les heartbeats `/api/workers/status` "
+                    "et la reconnexion P2P bootstrap des workers après redémarrage initiateur."
+                ),
+                "trace": {
+                    "layout": "pipeline_relay_daisy_chain",
+                    "ok": False,
+                    "routing_path": [],
+                    "peers": [],
+                    "failure_stage": "discover_live_peers_empty",
+                    "required_model": MODEL_ID,
+                },
+                "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+            }
 
-    result = run_pipeline_chat(prompt, options)
-    if result is None:
-        return {
-            "ok": False,
-            "text": "",
-            "error": "Orchestre pipeline : aucun résultat (abort interne). Consulter les logs stage1.",
-            "trace": {
-                "layout": "pipeline_relay_daisy_chain",
+        result = run_pipeline_chat(prompt, options)
+        if result is None:
+            return {
                 "ok": False,
-                "routing_path": sorted(peers),
-                "peers": sorted(peers),
-                "failure_stage": "run_pipeline_chat_none",
-            },
-            "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
-        }
+                "text": "",
+                "error": "Orchestre pipeline : aucun résultat (abort interne). Consulter les logs stage1.",
+                "trace": {
+                    "layout": "pipeline_relay_daisy_chain",
+                    "ok": False,
+                    "routing_path": sorted(peers),
+                    "peers": sorted(peers),
+                    "failure_stage": "run_pipeline_chat_none",
+                    "required_model": MODEL_ID,
+                },
+                "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+            }
 
-    if result.get("trace") and result["trace"].get("layout") != "mlx_lm_direct_p2p":
-        result["trace"]["layout"] = "pipeline_relay_daisy_chain"
-    return result
+        if result.get("trace") and result["trace"].get("layout") != "mlx_lm_direct_p2p":
+            result["trace"]["layout"] = "pipeline_relay_daisy_chain"
+        return result

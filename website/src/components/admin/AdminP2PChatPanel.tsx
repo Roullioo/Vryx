@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { WorkerRoundMetrics } from './workerRoundMetrics'
 import { WorkerComputeReport } from './WorkerComputeReport'
 import { ChatMarkdown } from './ChatMarkdown'
@@ -7,15 +7,63 @@ import { buildSession, saveSession, saveSessionToDb } from '../../lib/sessions'
 type QuantizationMode = 'int8' | 'q4' | 'fp16'
 type PoolPreference = 'auto' | 'velocity_mlx' | 'velocity_vllm' | 'legacy_pytorch'
 
-/** Aligné sur `VRYX_P2P_ADMIN_MAX_NEW_TOKENS` côté API (défaut 16384). */
-export const P2P_ADMIN_MAX_NEW_TOKENS = 16384
-const P2P_ADMIN_MIN_NEW_TOKENS = 64
+/** Plafond interactif: ajusté selon le modèle live, avec garde-fou côté serveur. */
+export const P2P_ADMIN_MAX_NEW_TOKENS = 32768
+const P2P_ADMIN_MIN_NEW_TOKENS = 16
 const P2P_ADMIN_TOKEN_STEP = 64
 
-function clampTokens(n: number) {
+function modelTokenBudget(model?: string | null) {
+  const m = String(model || '').toLowerCase()
+  if (m.includes('llama') && m.includes('70')) return 4096
+  if (m.includes('llama-2') || m.includes('llama 2')) return 4096
+  if (m.includes('qwen')) return 16384
+  if (m.includes('mistral') || m.includes('mixtral')) return 8192
+  return 8192
+}
+
+function modelSelectionTokenBudget(model?: string | null, fallbackWorkers: LiveWorker[] = []) {
+  if (model) {
+    return modelTokenBudget(model)
+  }
+  return poolTokenBudget(fallbackWorkers)
+}
+
+function poolTokenBudget(workers: LiveWorker[]) {
+  const budgets = workers
+    .map((worker) => modelTokenBudget(worker.model))
+    .filter((n) => Number.isFinite(n) && n > 0)
+  return Math.min(P2P_ADMIN_MAX_NEW_TOKENS, Math.max(2048, ...(budgets.length ? budgets : [8192])))
+}
+
+function requiredWorkersForModel(model?: string | null) {
+  const m = String(model || '').toLowerCase()
+  if (m.includes('llama-2-70b') || m.includes('llama2-70b') || m.includes('70b')) return 2
+  return 1
+}
+
+function availableWorkerModelOptions(workers: LiveWorker[]) {
+  const counts = new Map<string, number>()
+  for (const worker of workers) {
+    const model = worker.model?.trim()
+    if (!model) continue
+    counts.set(model, (counts.get(model) ?? 0) + 1)
+  }
+  return [...counts.entries()]
+    .map(([model, count]) => {
+      const required = requiredWorkersForModel(model)
+      return { model, count, required, runnable: count >= required }
+    })
+    .sort((a, b) => Number(b.runnable) - Number(a.runnable) || b.count - a.count)
+}
+
+function defaultTokenBudget(max: number) {
+  return Math.min(max, 2048)
+}
+
+function clampTokens(n: number, max = P2P_ADMIN_MAX_NEW_TOKENS) {
   const raw = Number.isFinite(n) ? Math.floor(n) : P2P_ADMIN_MIN_NEW_TOKENS
   const stepped = Math.round(raw / P2P_ADMIN_TOKEN_STEP) * P2P_ADMIN_TOKEN_STEP
-  return Math.min(P2P_ADMIN_MAX_NEW_TOKENS, Math.max(P2P_ADMIN_MIN_NEW_TOKENS, stepped))
+  return Math.min(max, Math.max(P2P_ADMIN_MIN_NEW_TOKENS, stepped))
 }
 
 /** Workers avec heartbeat récent (route admin `/workers/live`). */
@@ -49,6 +97,7 @@ export type LiveWorker = {
 type TraceData = {
   worker: string
   latencyMs: number
+  pingMs?: number
   mode: string
   tokensIn?: number
   tokensOut?: number
@@ -105,6 +154,7 @@ function roundMetricsFromTrace(t: TraceData): WorkerRoundMetrics {
     vpsDelegateMs: Number(t.vpsDelegateMs ?? 0) || 0,
     workerComputeMs: Number(t.workerComputeMs ?? 0) || 0,
     computeTimeMs: Number(t.computeTimeMs ?? 0) || 0,
+    pingMs: t.pingMs,
     routingPath: Array.isArray(t.routingPath) ? t.routingPath : [],
     promptTokens: t.promptTokens,
     completionTokens: t.completionTokens,
@@ -183,6 +233,7 @@ export function AdminP2PChatPanel({
   aside?: ReactNode
   layout?: 'card' | 'full'
 }) {
+  const [selectedModelId, setSelectedModelId] = useState('')
   const [prompt, setPrompt] = useState('')
   const [messages, setMessages] = useState<{
     role: 'user' | 'ai'
@@ -195,7 +246,11 @@ export function AdminP2PChatPanel({
   // fp16 défaut : qualité logits fiable avec MLX/Vélocité ; q4 coupe la bande passante mais peut brouiller les activités.
   const [quantization, setQuantization] = useState<QuantizationMode>('fp16')
   const [poolPreference, setPoolPreference] = useState<PoolPreference>('auto')
-  const [maxNewTokens, setMaxNewTokens] = useState(1024)
+  const modelOptions = useMemo(() => availableWorkerModelOptions(liveWorkers), [liveWorkers])
+  const runnableModelOptions = useMemo(() => modelOptions.filter((model) => model.runnable), [modelOptions])
+  const chatModelId = selectedModelId || runnableModelOptions[0]?.model || ''
+  const activeTokenBudget = modelSelectionTokenBudget(chatModelId, liveWorkers)
+  const [maxNewTokens, setMaxNewTokens] = useState(defaultTokenBudget(activeTokenBudget))
   const chatAbortRef = useRef<AbortController | null>(null)
   const [isWideLayout, setIsWideLayout] = useState(
     typeof window !== 'undefined' ? window.matchMedia('(min-width: 1024px)').matches : true,
@@ -209,6 +264,24 @@ export function AdminP2PChatPanel({
     return () => mq.removeEventListener('change', sync)
   }, [])
 
+  useEffect(() => {
+    setMaxNewTokens((current) => clampTokens(Math.min(current, activeTokenBudget), activeTokenBudget))
+  }, [activeTokenBudget])
+
+  useEffect(() => {
+    const nextModel = runnableModelOptions[0]?.model || ''
+    if (!nextModel) {
+      setSelectedModelId('')
+      return
+    }
+    if (selectedModelId && runnableModelOptions.some((option) => option.model === selectedModelId)) {
+      return
+    }
+    if (!selectedModelId) {
+      setSelectedModelId(nextModel)
+    }
+  }, [selectedModelId, runnableModelOptions])
+
   function cancelGeneration() {
     chatAbortRef.current?.abort()
     chatAbortRef.current = null
@@ -216,6 +289,18 @@ export function AdminP2PChatPanel({
 
   async function send() {
     if (!prompt.trim() || loading) return
+    if (!chatModelId) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'ai',
+          content:
+            'Aucun modèle exécutable pour le moment. Llama2 70B demande 2 workers compatibles en ligne ; le pool actuel est incomplet, donc je bloque l’envoi au lieu de lancer un faux calcul à 0 TPS.',
+          trace: { worker: '—', latencyMs: 0, mode: 'Pool incomplet' },
+        },
+      ])
+      return
+    }
     const userMsg = prompt.trim()
     setPrompt('')
     setMessages((prev) => [...prev, { role: 'user', content: userMsg }, { role: 'ai', content: '' }])
@@ -229,7 +314,13 @@ export function AdminP2PChatPanel({
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         signal: ac.signal,
-        body: JSON.stringify({ prompt: userMsg, quantization, pool_preference: poolPreference, maxNewTokens }),
+        body: JSON.stringify({
+          prompt: userMsg,
+          quantization,
+          pool_preference: poolPreference,
+          maxNewTokens,
+          model_id: chatModelId,
+        }),
       })
 
       if (!response.ok) throw new Error('Erreur chat P2P')
@@ -258,6 +349,7 @@ export function AdminP2PChatPanel({
               done?: boolean
               workerPeerId?: string
               latencyMs?: number | null
+              pingMs?: number | null
               tokensIn?: number
               tokensOut?: number
               promptTokens?: number
@@ -315,12 +407,13 @@ export function AdminP2PChatPanel({
               setMessages((prev) => {
                 const last = prev[prev.length - 1]
                 const rest = prev.slice(0, -1)
+                const errorText = data.error || 'Erreur P2P.'
                 return [
                   ...rest,
                   {
                     ...last,
                     streamLog: undefined,
-                    content: last.content || data.error || 'Erreur P2P.',
+                    content: errorText,
                     trace: {
                       worker: '—',
                       latencyMs: data.latencyMs ?? 0,
@@ -362,6 +455,7 @@ export function AdminP2PChatPanel({
                   : 'Réseau P2P'
               const roundMetrics: WorkerRoundMetrics = {
                 latencyMs: Number(data.latencyMs ?? 0) || 0,
+                pingMs: Number(data.pingMs ?? 0) || undefined,
                 vpsDelegateMs: Number(data.vpsDelegateMs ?? 0) || 0,
                 workerComputeMs: Number(data.workerComputeMs ?? 0) || 0,
                 computeTimeMs: Number(data.computeTimeMs ?? 0) || 0,
@@ -437,6 +531,7 @@ export function AdminP2PChatPanel({
                     trace: {
                       worker: label,
                       latencyMs: data.latencyMs ?? 0,
+                      pingMs: data.pingMs ?? 0,
                       mode: data.mode || 'Pipeline P2P natif',
                       tokensIn: data.tokensIn ?? data.worker?.tokensIn,
                       tokensOut: data.tokensOut ?? data.worker?.tokensOut,
@@ -515,137 +610,136 @@ export function AdminP2PChatPanel({
   }
 
   const pipelineSettingsControls = (
-    <>
-      <div className="rounded-xl border border-border/80 bg-card/90 p-2 shadow-sm sm:p-2.5">
-        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted">Transport P2P</p>
-        <div className="-mx-1 flex snap-x snap-mandatory gap-2 overflow-x-auto pb-1 sm:mx-0 sm:grid sm:grid-cols-3 sm:overflow-visible sm:pb-0">
+    <div className="flex flex-col gap-1.5 lg:flex-row lg:flex-wrap lg:items-stretch lg:gap-2 lg:overflow-visible">
+      <div className="flex min-w-0 flex-1 flex-col gap-1 rounded-lg border border-border/80 bg-card/90 p-1.5 shadow-sm lg:min-w-0">
+        <p className="text-[9px] font-semibold uppercase tracking-wide text-muted leading-none">Modèle</p>
+        {modelOptions.length === 0 ? (
+          <div className="rounded-md border border-dashed border-border/60 px-2 py-2 text-[10px] text-muted">
+            Aucun modèle worker disponible
+          </div>
+        ) : (
+          <select
+            value={chatModelId || ''}
+            onChange={(ev) => setSelectedModelId(ev.target.value)}
+            disabled={loading || runnableModelOptions.length === 0}
+            className="h-9 rounded-md border border-border bg-surface px-2 text-sm text-fg outline-none focus:border-accent focus:ring-1 focus:ring-accent/30"
+          >
+            {runnableModelOptions.length > 0 ? <option value="">Sélection automatique</option> : null}
+            {modelOptions.map((option) => (
+              <option key={option.model} value={option.model} disabled={!option.runnable}>
+                {option.model}
+                {option.runnable ? '' : ` — attente ${option.count}/${option.required} worker(s)`}
+              </option>
+            ))}
+          </select>
+        )}
+        <p className="text-[10px] text-muted">Modèle actif : {chatModelId || '—'}</p>
+      </div>
+      <div className="flex min-w-0 flex-1 flex-col gap-1 rounded-lg border border-border/80 bg-card/90 p-1.5 shadow-sm lg:min-w-0">
+        <p className="text-[9px] font-semibold uppercase tracking-wide text-muted leading-none">Transport P2P</p>
+        <div className="grid grid-cols-3 gap-1">
           {[
-            {
-              id: 'q4' as const,
-              title: 'Q4 transport',
-              desc: 'Débit filaire privilégié (workers MLX).',
-            },
-            {
-              id: 'int8' as const,
-              title: 'INT8 transport',
-              desc: 'Alternative entière 8 bits.',
-            },
-            {
-              id: 'fp16' as const,
-              title: 'FP16 transport',
-              desc: 'Meilleure fidélité, plus lourd sur le réseau.',
-            },
+            { id: 'q4' as const, short: 'Q4', title: 'Q4 transport', desc: 'Débit filaire privilégié (workers MLX).' },
+            { id: 'int8' as const, short: 'INT8', title: 'INT8 transport', desc: 'Alternative entière 8 bits.' },
+            { id: 'fp16' as const, short: 'FP16', title: 'FP16 transport', desc: 'Meilleure fidélité, plus lourd sur le réseau.' },
           ].map((item) => {
             const selected = quantization === item.id
             return (
               <button
                 key={item.id}
                 type="button"
+                title={`${item.title} — ${item.desc}`}
                 onClick={() => setQuantization(item.id)}
                 disabled={loading}
-                className={`min-w-[9.5rem] shrink-0 snap-start rounded-lg border px-3 py-2.5 text-left transition-colors sm:min-w-0 ${
+                className={`rounded-md border px-1.5 py-1 text-left transition-colors ${
                   selected
                     ? 'border-accent/60 bg-accent/10 text-fg'
                     : 'border-border bg-surface text-muted hover:border-accent/30 hover:text-fg'
                 } disabled:cursor-not-allowed disabled:opacity-60`}
                 aria-pressed={selected}
               >
-                <span className="flex items-center justify-between gap-2 text-[12px] font-semibold">
-                  {item.title}
+                <span className="flex items-center justify-between gap-1 text-[10px] font-semibold leading-tight">
+                  <span className="truncate">{item.short}</span>
                   {selected ? (
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={2} className="h-3.5 w-3.5 text-accent" aria-hidden>
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={2} className="h-3 w-3 shrink-0 text-accent" aria-hidden>
                       <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
                     </svg>
                   ) : null}
                 </span>
-                <span className="mt-0.5 block text-[10px] leading-snug text-muted">{item.desc}</span>
               </button>
             )
           })}
         </div>
       </div>
-      <div className="mt-3 rounded-xl border border-border/80 bg-card/90 p-2 shadow-sm sm:mt-3 sm:p-2.5">
-        <p className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-muted">Pool de calcul</p>
-        <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+      <div className="flex min-w-0 flex-1 flex-col gap-1 rounded-lg border border-border/80 bg-card/90 p-1.5 shadow-sm lg:min-w-0">
+        <p className="text-[9px] font-semibold uppercase tracking-wide text-muted leading-none">Pool de calcul</p>
+        <div className="grid grid-cols-2 gap-1 sm:grid-cols-4">
           {[
-            { id: 'auto' as const, title: 'Auto', desc: 'Velocity si saine, sinon legacy.' },
-            { id: 'velocity_mlx' as const, title: 'Velocity MLX', desc: 'Pool Mac optimisée.' },
-            { id: 'velocity_vllm' as const, title: 'Velocity vLLM', desc: 'Pool Nvidia PagedAttention.' },
-            { id: 'legacy_pytorch' as const, title: 'Legacy PyTorch', desc: 'Chemin stable actuel.' },
+            { id: 'auto' as const, short: 'Auto', title: 'Auto', desc: 'Velocity si saine, sinon legacy.' },
+            { id: 'velocity_mlx' as const, short: 'MLX', title: 'Velocity MLX', desc: 'Pool Mac optimisée.' },
+            { id: 'velocity_vllm' as const, short: 'vLLM', title: 'Velocity vLLM', desc: 'Pool Nvidia PagedAttention.' },
+            { id: 'legacy_pytorch' as const, short: 'PyTorch', title: 'Legacy PyTorch', desc: 'Chemin stable actuel.' },
           ].map((item) => {
             const selected = poolPreference === item.id
             return (
               <button
                 key={item.id}
                 type="button"
+                title={`${item.title} — ${item.desc}`}
                 onClick={() => setPoolPreference(item.id)}
                 disabled={loading}
-                className={`rounded-lg border px-2.5 py-2 text-left transition-colors sm:px-3 sm:py-2.5 ${
+                className={`rounded-md border px-1.5 py-1 text-left transition-colors ${
                   selected
                     ? 'border-success/60 bg-success/10 text-fg'
                     : 'border-border bg-surface text-muted hover:border-success/30 hover:text-fg'
                 } disabled:cursor-not-allowed disabled:opacity-60`}
                 aria-pressed={selected}
               >
-                <span className="block text-[12px] font-semibold">{item.title}</span>
-                <span className="mt-0.5 block text-[10px] leading-snug text-muted">{item.desc}</span>
+                <span className="block text-[10px] font-semibold leading-tight">{item.short}</span>
               </button>
             )
           })}
         </div>
       </div>
-      <div className="mt-3 rounded-xl border border-accent/25 bg-gradient-to-br from-accent/[0.07] to-card p-3 sm:p-3.5">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-          <div className="min-w-0 flex-1">
-            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Budget de génération</p>
-            <p className="mt-1 text-[11px] leading-relaxed text-muted sm:text-xs">
-              Contrôle <span className="font-mono text-fg/90">max_new_tokens</span> envoyé à l&apos;initiateur (plafond UI{' '}
-              {P2P_ADMIN_MAX_NEW_TOKENS.toLocaleString('fr-FR')} jetons). Le stage1 peut encore appliquer{' '}
-              <span className="font-mono text-fg/90">VRYX_DIST_MAX_TOKENS</span> côté VPS.
-            </p>
-          </div>
-          <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:gap-3 lg:w-auto lg:min-w-[min(100%,24rem)]">
+      <div
+        className="flex min-w-0 shrink-0 flex-col gap-1 rounded-lg border border-accent/25 bg-gradient-to-br from-accent/[0.06] to-card p-1.5 lg:w-[min(100%,18rem)] xl:w-80"
+        title={`max_new_tokens côté initiateur ; plafond modèle actif ${activeTokenBudget.toLocaleString('fr-FR')} jetons. Le serveur applique aussi son garde-fou.`}
+      >
+        <p className="text-[9px] font-semibold uppercase tracking-wide text-muted leading-none">Budget jetons</p>
+        <div className="flex items-center gap-2">
+          <input
+            type="range"
+            min={P2P_ADMIN_MIN_NEW_TOKENS}
+            max={activeTokenBudget}
+            step={P2P_ADMIN_TOKEN_STEP}
+            value={maxNewTokens}
+            onChange={(e) => setMaxNewTokens(clampTokens(Number(e.target.value), activeTokenBudget))}
+            disabled={loading}
+            className="h-2 min-h-0 min-w-0 flex-1 cursor-pointer accent-accent"
+            aria-valuemin={P2P_ADMIN_MIN_NEW_TOKENS}
+            aria-valuemax={activeTokenBudget}
+            aria-valuenow={maxNewTokens}
+            aria-label="Nombre maximum de tokens à générer"
+          />
+          <label className="flex shrink-0 items-center gap-1">
+            <span className="sr-only">Valeur exacte</span>
             <input
-              type="range"
+              type="number"
               min={P2P_ADMIN_MIN_NEW_TOKENS}
-              max={P2P_ADMIN_MAX_NEW_TOKENS}
+              max={activeTokenBudget}
               step={P2P_ADMIN_TOKEN_STEP}
               value={maxNewTokens}
-              onChange={(e) => setMaxNewTokens(clampTokens(Number(e.target.value)))}
+              onChange={(e) => setMaxNewTokens(clampTokens(Number(e.target.value), activeTokenBudget))}
               disabled={loading}
-              className="min-h-[44px] min-w-0 flex-1 cursor-pointer accent-accent"
-              aria-valuemin={P2P_ADMIN_MIN_NEW_TOKENS}
-              aria-valuemax={P2P_ADMIN_MAX_NEW_TOKENS}
-              aria-valuenow={maxNewTokens}
-              aria-label="Nombre maximum de tokens à générer"
+              className="w-16 rounded-md border border-border bg-card px-1 py-1 text-center font-mono text-xs font-semibold text-fg tabular-nums"
             />
-            <label className="flex items-center gap-2 sm:shrink-0">
-              <span className="sr-only">Valeur exacte</span>
-              <input
-                type="number"
-                min={P2P_ADMIN_MIN_NEW_TOKENS}
-                max={P2P_ADMIN_MAX_NEW_TOKENS}
-                step={P2P_ADMIN_TOKEN_STEP}
-                value={maxNewTokens}
-                onChange={(e) => setMaxNewTokens(clampTokens(Number(e.target.value)))}
-                disabled={loading}
-                className="w-full rounded-lg border border-border bg-card px-2 py-2 text-center font-mono text-sm font-semibold text-fg tabular-nums sm:w-24"
-              />
-            </label>
-          </div>
+          </label>
         </div>
       </div>
       {loading && (
-        <p className="mt-2 flex items-start gap-2 rounded-lg border border-accent/20 bg-accent/5 px-2 py-2 text-[11px] font-medium leading-snug text-accent sm:items-center sm:text-xs">
-          <svg className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin sm:mt-0" viewBox="0 0 24 24" fill="none" aria-hidden>
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path
-              className="opacity-90"
-              fill="currentColor"
-              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-            />
-          </svg>
-          <span>
+        <p className="flex w-full min-w-0 basis-full items-center gap-2 rounded-xl border border-accent/20 bg-accent/5 px-2 py-1.5 text-[10px] font-medium leading-tight text-accent">
+          <span className="vryx-mini-loader shrink-0" aria-hidden />
+          <span className="min-w-0 truncate">
             {(() => {
               const tail = messages[messages.length - 1]
               const lastLine =
@@ -654,18 +748,18 @@ export function AdminP2PChatPanel({
                   : null
               if (lastLine) return lastLine
               return liveWorkers.length > 0
-                ? 'Routage initiateur : les étapes détaillées s’affichent sous la bulle assistant.'
-                : 'Recherche d’un worker P2P actif ; les étapes s’affichent sous la bulle assistant.'
+                ? 'Routage initiateur : étapes sous la bulle assistant.'
+                : 'Recherche worker P2P ; étapes sous la bulle assistant.'
             })()}
           </span>
         </p>
       )}
       {!loading && activeChatPeerId && (
-        <p className="mt-2 text-[10px] text-muted">
-          Dernier pair actif : <span className="font-mono text-fg">{activeChatPeerId.slice(0, 20)}…</span>
+        <p className="w-full basis-full text-[9px] text-muted">
+          Pair : <span className="font-mono text-fg">{activeChatPeerId.slice(0, 18)}…</span>
         </p>
       )}
-    </>
+    </div>
   )
 
   const isFull = layout === 'full'
@@ -711,15 +805,8 @@ export function AdminP2PChatPanel({
               </span>
             </div>
             {loading ? (
-              <div className="flex shrink-0 items-center gap-1.5 rounded-full border border-accent/25 bg-accent/8 px-2.5 py-1 text-[10px] font-semibold text-accent">
-                <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path
-                    className="opacity-90"
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                  />
-                </svg>
+              <div className="flex shrink-0 items-center gap-2 rounded-full border border-accent/25 bg-accent/8 px-2.5 py-1 text-[10px] font-semibold text-accent">
+                <span className="vryx-mini-loader scale-75" aria-hidden />
                 En cours
               </div>
             ) : null}
@@ -762,18 +849,18 @@ export function AdminP2PChatPanel({
       </header>
 
       {isWideLayout ? (
-        <div className="shrink-0 max-h-[min(28vh,15rem)] overflow-y-auto overscroll-contain border-b border-border/70 bg-muted/35 px-3 py-2.5 sm:max-h-[min(30vh,16rem)] sm:px-4 md:py-3">
+        <div className="shrink-0 border-b border-border/70 bg-muted/35 px-2 py-1.5 sm:px-3">
           {pipelineSettingsControls}
         </div>
       ) : (
         <details className="shrink-0 border-b border-border/70 bg-muted/35">
-          <summary className="flex min-h-[44px] cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-sm font-semibold text-fg [&::-webkit-details-marker]:hidden sm:px-4">
-            <svg className="h-4 w-4 shrink-0 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden>
+          <summary className="flex min-h-[40px] cursor-pointer list-none items-center gap-2 px-2 py-1.5 text-xs font-semibold text-fg [&::-webkit-details-marker]:hidden sm:px-3 sm:text-sm">
+            <svg className="h-3.5 w-3.5 shrink-0 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden>
               <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 12h10M4 18h16" />
             </svg>
             Réglages du pipeline
           </summary>
-          <div className="max-h-[min(62vh,28rem)] overflow-y-auto overscroll-contain border-t border-border/50 px-3 pb-3 pt-2 sm:px-4">
+          <div className="border-t border-border/50 px-2 pb-2 pt-1.5 sm:px-3">
             {pipelineSettingsControls}
           </div>
         </details>
@@ -783,8 +870,8 @@ export function AdminP2PChatPanel({
         <div
           className={
             isFull
-              ? 'min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-y-contain bg-gradient-to-b from-zinc-100/95 to-zinc-100/80 px-3 py-4 sm:px-5 sm:py-5 dark:from-zinc-900/90 dark:to-zinc-950/85 dark:ring-1 dark:ring-inset dark:ring-zinc-800/80'
-              : 'min-h-[min(52dvh,22rem)] flex-1 space-y-6 overflow-y-auto overscroll-y-contain bg-gradient-to-b from-zinc-100/95 to-zinc-100/80 px-3 py-4 sm:min-h-[min(48dvh,24rem)] sm:px-5 sm:py-5 dark:from-zinc-900/90 dark:to-zinc-950/85 dark:ring-1 dark:ring-inset dark:ring-zinc-800/80'
+              ? 'min-h-0 flex-1 touch-pan-y space-y-6 overflow-y-auto overscroll-y-contain bg-gradient-to-b from-zinc-100/95 to-zinc-100/80 px-3 py-4 sm:px-5 sm:py-5 dark:from-zinc-900/90 dark:to-zinc-950/85 dark:ring-1 dark:ring-inset dark:ring-zinc-800/80'
+              : 'min-h-[min(52dvh,22rem)] flex-1 touch-pan-y space-y-6 overflow-y-auto overscroll-y-contain bg-gradient-to-b from-zinc-100/95 to-zinc-100/80 px-3 py-4 sm:min-h-[min(48dvh,24rem)] sm:px-5 sm:py-5 dark:from-zinc-900/90 dark:to-zinc-950/85 dark:ring-1 dark:ring-inset dark:ring-zinc-800/80'
           }
         >
         {messages.length === 0 ? (
@@ -854,9 +941,7 @@ export function AdminP2PChatPanel({
               >
                 {m.role === 'ai' && !m.content && loading && i === messages.length - 1 ? (
                   <span className="inline-flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
-                    <svg className="h-4 w-4 shrink-0 animate-pulse text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} aria-hidden>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                    </svg>
+                    <span className="vryx-mini-loader shrink-0" aria-hidden />
                     En attente des premiers jetons…
                   </span>
                 ) : m.content?.trim() ? (
@@ -952,6 +1037,12 @@ export function AdminP2PChatPanel({
                       <span className="text-muted">Latence</span>
                       <span className="text-fg">{m.trace.latencyMs} ms</span>
                     </div>
+                    {(m.trace.pingMs ?? 0) > 0 && (
+                      <div className="flex justify-between">
+                        <span className="text-muted">Ping P2P</span>
+                        <span className="text-fg">{Math.round(m.trace.pingMs ?? 0)} ms</span>
+                      </div>
+                    )}
                     {(m.trace.setupMs != null && m.trace.setupMs > 0) && (
                       <div className="flex justify-between">
                         <span className="text-muted">Setup pipeline</span>
@@ -1134,7 +1225,7 @@ export function AdminP2PChatPanel({
           <button
             type="button"
             onClick={send}
-            disabled={loading || !prompt.trim()}
+            disabled={loading || !prompt.trim() || !chatModelId}
             className="absolute bottom-2.5 right-2.5 flex h-11 w-11 items-center justify-center rounded-full bg-chat-self text-chat-self-fg shadow-md transition-opacity hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-45 sm:bottom-3 sm:right-3 sm:h-12 sm:w-12"
             aria-label="Envoyer"
           >

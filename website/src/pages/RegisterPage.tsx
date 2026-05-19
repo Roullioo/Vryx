@@ -6,6 +6,10 @@ export function RegisterPage() {
   const { register } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
+  const searchNext =
+    typeof location.search === 'string'
+      ? new URLSearchParams(location.search).get('next')
+      : null
   const from =
     typeof location.state === 'object' &&
     location.state !== null &&
@@ -30,6 +34,11 @@ export function RegisterPage() {
       return
     }
     setError(r.error)
+  }
+
+  function startGoogle() {
+    const redirect = searchNext && searchNext.startsWith('/') ? searchNext : from && from.startsWith('/') ? from : '/compte'
+    window.location.href = `/api/auth/google/start?next=${encodeURIComponent(redirect)}`
   }
 
   return (
@@ -89,6 +98,17 @@ export function RegisterPage() {
               {submitting ? 'Création…' : 'Créer mon compte'}
             </button>
           </form>
+
+          <div className="mt-6">
+            <button
+              type="button"
+              className="btn-secondary relative flex w-full items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold"
+              onClick={startGoogle}
+            >
+              <img src="/google.png" alt="" className="h-5 w-5" />
+              Créer avec Google
+            </button>
+          </div>
 
           <p className="mt-8 text-center text-sm text-muted">
             Déjà inscrit ?{' '}

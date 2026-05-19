@@ -1,0 +1,7 @@
+[Unit]
+Description=Vryx initiator API healthcheck
+After=vryx-initiator.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vryx-initiator-healthcheck.sh

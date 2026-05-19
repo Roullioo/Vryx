@@ -1,0 +1,17 @@
+[Unit]
+Description=VRYX multi-worker readiness watcher
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/vryx/server
+EnvironmentFile=/var/www/vryx/server/.env
+Environment=VRYX_ROOT_DIR=/var/www/vryx
+Environment=VRYX_MULTIWORKER_REPORT=/var/log/vryx/multiworker-readiness.json
+Environment=VRYX_MULTIWORKER_STATE=/var/lib/vryx/multiworker-readiness-state.json
+Environment=VRYX_MULTIWORKER_MODEL=gemma4:31b
+Environment=VRYX_MULTIWORKER_TARGET_TPS=10
+Environment=VRYX_MULTIWORKER_STALE_SEC=90
+Environment=VRYX_MULTIWORKER_COOLDOWN_SEC=1800
+ExecStart=/usr/bin/node scripts/multiworker-readiness-watch.mjs

@@ -2,7 +2,7 @@
   "name": "vryx-desktop",
   "productName": "Vryx",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.2",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -14,7 +14,12 @@
     "electron:dev": "concurrently -k \"cross-env BROWSER=none npm run dev\" \"wait-on http://localhost:5173 && npm run electron:start\"",
     "electron:build": "npm run build && electron-builder",
     "build:win": "npm run build && electron-builder --win",
-    "build:mac": "npm run build && electron-builder --mac"
+    "build:win:installer": "npm run build && electron-builder --win nsis",
+    "build:win:signed": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && electron-builder --win nsis -c electron-builder.win-signed.cjs && node electron/verify-win-signature.cjs",
+    "verify:win-signature": "node electron/verify-win-signature.cjs",
+    "build:mac": "npm run build && electron-builder --mac",
+    "build:mac:unsigned": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && electron-builder --mac --dir -c.mac.identity=null",
+    "build:mac:signed": "npm run build && electron-builder --mac dmg zip"
   },
   "dependencies": {
     "lucide-react": "^1.14.0",
@@ -24,6 +29,7 @@
     "tailwindcss": "^4.0.0"
   },
   "devDependencies": {
+    "@electron/notarize": "^3.0.4",
     "@eslint/js": "^10.0.1",
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^24.12.2",
@@ -54,16 +60,40 @@
       "electron/**/*",
       "package.json"
     ],
+    "afterPack": "electron/clean-xattrs.cjs",
+    "afterSign": "electron/notarize.cjs",
     "mac": {
+      "icon": "build/icon.icns",
       "category": "public.app-category.utilities",
-      "target": ["dmg", "zip"]
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "target": [
+        "dmg",
+        "zip"
+      ]
     },
     "win": {
-      "target": "nsis"
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "Vryx-Worker-Setup-${version}-${arch}.${ext}"
     },
     "nsis": {
-      "oneClick": true,
-      "allowToChangeInstallationDirectory": false
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Vryx Worker",
+      "deleteAppDataOnUninstall": false
     },
     "extraResources": [
       {
@@ -73,7 +103,26 @@
           "**/*",
           "!**/target/**",
           "!**/venv/**",
-          "!**/.git/**"
+          "!**/.git/**",
+          "!**/.DS_Store",
+          "!Cargo.*",
+          "!*.md",
+          "!*.ps1",
+          "!mac_setup.sh",
+          "!quick-local-p2p.sh",
+          "!run_*",
+          "!test_*",
+          "!start-3-workers-*",
+          "!start-initiator.sh",
+          "!start-mac-*",
+          "!stop-3-workers-*",
+          "!vps_deploy.py",
+          "!**/.vryx-keys/**",
+          "!**/.vryx-keys-mac/**",
+          "!**/logs/**",
+          "!**/*.log",
+          "!**/__pycache__/**",
+          "!**/.pytest_cache/**"
         ]
       }
     ]

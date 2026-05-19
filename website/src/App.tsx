@@ -10,12 +10,14 @@ import { AccountPage } from './pages/AccountPage'
 import { RacePoolPage } from './pages/RacePoolPage'
 import { ClientsPage } from './pages/ClientsPage'
 import { WorkersPage } from './pages/WorkersPage'
+import { StatusPage } from './pages/StatusPage'
 import { AdminOverviewPage } from './pages/AdminOverviewPage'
-import { AdminUsersPage } from './pages/AdminUsersPage'
+import { AdminUserDetailPage, AdminUsersPage } from './pages/AdminUsersPage'
 import { AdminNodePage } from './pages/AdminNodePage'
 import { AdminP2PChatPage } from './pages/AdminP2PChatPage'
 import { AdminWorkersPage, AdminWorkerDetailPage } from './pages/AdminWorkersPage'
 import { AdminSessionsPage, AdminSessionDetailPage } from './pages/AdminSessionsPage'
+import { AdminObservabilityPage } from './pages/AdminObservabilityPage'
 
 export default function App() {
   return (
@@ -27,16 +29,19 @@ export default function App() {
         <Route path="race-pool" element={<RacePoolPage />} />
         <Route path="simulateur" element={<SimulatorPage />} />
         <Route path="comparatif" element={<ComparePage />} />
-        <Route path="compte" element={<AccountPage />} />
+        <Route path="status" element={<StatusPage />} />
+        <Route path="compte/*" element={<AccountPage />} />
         <Route path="panel/modeles" element={<ModelsPanelPage />} />
         <Route path="admin" element={<AdminOverviewPage />} />
         <Route path="admin/utilisateurs" element={<AdminUsersPage />} />
+        <Route path="admin/utilisateurs/:id" element={<AdminUserDetailPage />} />
         <Route path="admin/noeud" element={<AdminNodePage />} />
         <Route path="admin/chat-p2p" element={<AdminP2PChatPage />} />
         <Route path="admin/workers" element={<AdminWorkersPage />} />
         <Route path="admin/workers/:peerId" element={<AdminWorkerDetailPage />} />
         <Route path="admin/sessions" element={<AdminSessionsPage />} />
         <Route path="admin/sessions/:sessionId" element={<AdminSessionDetailPage />} />
+        <Route path="admin/observabilite" element={<AdminObservabilityPage />} />
         <Route path="connexion" element={<LoginPage />} />
         <Route path="inscription" element={<RegisterPage />} />
       </Route>

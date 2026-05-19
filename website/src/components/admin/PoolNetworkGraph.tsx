@@ -19,6 +19,10 @@ export type PoolGraphNode = {
   vramMbUsed?: number | null
   publicIp?: string | null
   model?: string | null
+  runtimeBackend?: string | null
+  tokensGeneratedTotal?: number
+  tokensGenerated1h?: number
+  tokensGenerated24h?: number
   x?: number
   y?: number
   z?: number
@@ -43,6 +47,15 @@ type Props = {
 }
 
 const ORCH_ID = 'vps-core'
+
+function IconCloseX({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className={className ?? 'h-5 w-5'} aria-hidden>
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  )
+}
 
 function hueFromString(s: string): number {
   let h = 0
@@ -76,7 +89,50 @@ function truncatePeer(id: string, n = 14) {
   return id.length > n ? `${id.slice(0, n)}…` : id
 }
 
+function fmtTokens(n: number | undefined) {
+  const v = Number(n) || 0
+  return v.toLocaleString('fr-FR')
+}
+
+function fmtVramFromNode(n: PoolGraphNode): string {
+  if (n.vramMbUsed != null && n.vramMbTotal != null) {
+    return `${Math.round(n.vramMbUsed)} / ${Math.round(n.vramMbTotal)} Mo`
+  }
+  if (n.vramMbTotal != null && n.vramMbTotal > 0) {
+    const gb = n.vramMbTotal / 1024
+    const rounded = Math.round(gb * 10) / 10
+    const mlx = String(n.runtimeBackend || '').toLowerCase().includes('mlx')
+    if (mlx) {
+      return `${rounded} Go (mémoire unifiée, valeur indicative)`
+    }
+    return `${rounded} Go (déclaré)`
+  }
+  if (n.vram != null && n.vram > 0) {
+    return `${n.vram} Go (déclaré)`
+  }
+  return 'Non renseigné'
+}
+
+function workerStatusLabel(n: PoolGraphNode): string {
+  if (n.id === ORCH_ID) {
+    return n.status === 'computing' ? 'Orchestration active' : 'Orchestrateur au repos'
+  }
+  if (n.status === 'computing') return 'Calcul en cours'
+  if (n.status === 'timeout') return 'Timeout / hors ligne'
+  if (n.status === 'idle') return 'En veille (connecté)'
+  return n.status || '—'
+}
+
+function probeMethodLabel(method: string | undefined | null): string {
+  if (method === 'tcp_grpc') return 'TCP (gRPC)'
+  if (method === 'tcp_p2p') return 'TCP (P2P)'
+  if (method === 'icmp') return 'ICMP'
+  return ''
+}
+
 export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, pipelineActive }: Props) {
+  const safeIncomingNodes = Array.isArray(incomingNodes) ? incomingNodes : []
+  const safeIncomingLinks = Array.isArray(incomingLinks) ? incomingLinks : []
   const fgRef = useRef<any>(null)
   const mouseRef = useRef({ x: 0, y: 0 })
   const posRef = useRef<Map<string, { x: number; y: number; vx?: number; vy?: number }>>(new Map())
@@ -92,21 +148,26 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
     hardware: string
     poolLabel: string
     pingLabel: string
+    modelLine?: string | null
   } | null>(null)
   const [selected, setSelected] = useState<PoolGraphNode | null>(null)
   const [confirmAction, setConfirmAction] = useState<'disconnect' | 'change_pool' | null>(null)
   const [actionMessage, setActionMessage] = useState<string | null>(null)
   const [actionBusy, setActionBusy] = useState(false)
+  const [livePingMs, setLivePingMs] = useState<number | null>(null)
+  const [livePingMethod, setLivePingMethod] = useState<string | null>(null)
+  const [livePingErr, setLivePingErr] = useState<string | null>(null)
+  const [livePingBusy, setLivePingBusy] = useState(false)
 
   useEffect(() => {
     const prev = posRef.current
-    const incomingIds = new Set(incomingNodes.map((n) => n.id))
+    const incomingIds = new Set(safeIncomingNodes.map((n) => n.id))
     for (const id of [...prev.keys()]) {
       if (!incomingIds.has(id)) prev.delete(id)
     }
 
     const byGroup = new Map<string, PoolGraphNode[]>()
-    for (const n of incomingNodes) {
+    for (const n of safeIncomingNodes) {
       if (n.id === ORCH_ID) continue
       const g = n.group || 'pool'
       if (!byGroup.has(g)) byGroup.set(g, [])
@@ -117,7 +178,7 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
     const sectorSpan = (2 * Math.PI) / nSectors
     const groupIndex = new Map(groupKeys.map((g, i) => [g, i]))
 
-    const nodes = incomingNodes.map((n) => {
+    const nodes = safeIncomingNodes.map((n) => {
       const old = prev.get(n.id)
       const base: PoolGraphNode = { ...n }
       if (old && typeof old.x === 'number' && typeof old.y === 'number') {
@@ -146,9 +207,58 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
       return base
     })
 
-    const links = incomingLinks.map((l) => ({ ...l }))
+    const links = safeIncomingLinks.map((l) => ({ ...l }))
     setGraphData({ nodes, links })
-  }, [incomingNodes, incomingLinks])
+  }, [safeIncomingNodes, safeIncomingLinks])
+
+  useEffect(() => {
+    if (!selected || selected.id === ORCH_ID) {
+      setLivePingMs(null)
+      setLivePingMethod(null)
+      setLivePingErr(null)
+      setLivePingBusy(false)
+      return
+    }
+    const peerId = selected.id
+    let cancelled = false
+    let errorStreak = 0
+    const run = async () => {
+      setLivePingBusy(true)
+      const r = await apiJson<{
+        ok?: boolean
+        latencyMs?: number
+        method?: string
+        error?: string
+      }>(`/api/admin/workers/${encodeURIComponent(peerId)}/ping`)
+      if (cancelled) return
+      setLivePingBusy(false)
+      if (r.ok === true && r.data?.ok === true && typeof r.data.latencyMs === 'number') {
+        setLivePingMs(r.data.latencyMs)
+        setLivePingMethod(r.data.method ?? null)
+        setLivePingErr(null)
+      } else {
+        setLivePingMs(null)
+        setLivePingMethod(null)
+        errorStreak += 1
+        const msg =
+          r.ok === true && r.data && typeof r.data.error === 'string'
+            ? r.data.error
+            : r.ok === false
+              ? r.error
+              : 'Mesure indisponible.'
+        setLivePingErr(msg)
+      }
+    }
+    void run()
+    const iv = window.setInterval(() => {
+      if (errorStreak >= 2) return
+      void run()
+    }, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(iv)
+    }
+  }, [selected?.id])
 
   const backgroundPaint = useCallback(
     (ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -192,8 +302,18 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
       setSelected(node)
       const fg = fgRef.current
       if (fg && node.x != null && node.y != null) {
-        fg.centerAt(node.x, node.y, 400)
-        fg.zoom(2.2, 400)
+        if (typeof fg.centerAt === 'function') {
+          fg.centerAt(node.x, node.y, 400)
+        }
+        if (typeof fg.zoom === 'function') {
+          fg.zoom(2.2, 400)
+        } else if (typeof fg.cameraPosition === 'function') {
+          fg.cameraPosition(
+            { x: node.x, y: node.y, z: 260 },
+            { x: node.x, y: node.y, z: 0 },
+            500,
+          )
+        }
       }
     },
     [],
@@ -270,6 +390,12 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
         hardware: node.hardware || '—',
         poolLabel: node.poolId ? `Pool : ${truncatePeer(node.poolId, 28)}` : 'Pool : —',
         pingLabel: pingLabel(node),
+        modelLine:
+          node.id !== ORCH_ID && node.model
+            ? `Modèle : ${node.model}`
+            : node.id !== ORCH_ID
+              ? 'Modèle : non déclaré'
+              : null,
       })
     },
     onNodeClick: (node: PoolGraphNode) => handleClick(node),
@@ -380,29 +506,41 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
             <p className="font-mono text-[10px] text-fg">{truncatePeer(hover.id, 22)}</p>
             <p className="mt-1 font-mono text-[10px] text-accent">{hover.poolLabel}</p>
             <p className="mt-0.5 text-muted">{hover.hardware}</p>
+            {hover.modelLine ? <p className="mt-0.5 text-[10px] text-muted">{hover.modelLine}</p> : null}
             <p className="text-muted">{hover.pingLabel}</p>
           </div>
         )}
       </div>
 
-      {/* Panneau diagnostic (au-dessus de tout le shell admin) */}
+      {/* Panneau diagnostic : z-index au-dessus du header admin mobile (z-30) */}
       <aside
-        className={`fixed inset-y-0 right-0 z-[100] w-full max-w-md transform border-l border-border bg-card shadow-2xl transition-transform duration-300 ease-out sm:max-w-lg ${
+        className={`fixed inset-y-0 right-0 z-[180] flex w-full max-w-md flex-col border-l border-border bg-card shadow-2xl transition-transform duration-300 ease-out sm:max-w-lg ${
           selected ? 'translate-x-0' : 'translate-x-full'
         }`}
         aria-hidden={!selected}
       >
         {selected && (
-          <div className="flex h-full flex-col overflow-y-auto overscroll-contain p-5 pt-16 sm:pt-14">
-            <button
-              type="button"
-              className="absolute right-4 top-4 z-[1] rounded-lg border border-border bg-card px-3 py-1.5 text-[11px] font-medium text-muted hover:bg-surface hover:text-fg"
-              onClick={() => setSelected(null)}
-            >
-              Fermer
-            </button>
-            <h4 className="pr-16 font-mono text-xs font-semibold leading-snug text-fg">{truncatePeer(selected.id, 36)}</h4>
-            <p className="mt-1 text-[11px] text-muted">{selected.hardware || '—'}</p>
+          <>
+            <div className="flex shrink-0 items-center gap-2 border-b border-border bg-card px-3 py-3 pt-[max(0.75rem,env(safe-area-inset-top))] pe-[max(0.5rem,env(safe-area-inset-right))] sm:gap-3 sm:px-5 sm:py-4">
+              <h4 className="min-w-0 flex-1 font-mono text-xs font-semibold leading-snug text-fg sm:text-sm">
+                {truncatePeer(selected.id, 28)}
+              </h4>
+              <button
+                type="button"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border bg-surface text-fg shadow-sm hover:bg-border/50 active:scale-[0.98]"
+                onClick={() => setSelected(null)}
+                aria-label="Fermer le panneau"
+              >
+                <IconCloseX />
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 pb-[max(1rem,env(safe-area-inset-bottom))] pt-3 sm:px-5 sm:pb-5 sm:pt-4">
+            <p className="text-[11px] text-muted">{selected.hardware || '—'}</p>
+            {selected.runtimeBackend && selected.id !== ORCH_ID && (
+              <p className="mt-1 text-[10px] text-muted">
+                Runtime : <span className="font-mono text-fg">{selected.runtimeBackend}</span>
+              </p>
+            )}
 
             <dl className="mt-6 space-y-3 text-[12px]">
               {selected.poolId && (
@@ -415,26 +553,42 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
               )}
               <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
                 <dt className="text-muted">Statut</dt>
-                <dd className="text-right font-medium text-fg">
-                  {selected.status === 'computing'
-                    ? 'Calcul'
-                    : selected.status === 'timeout'
-                      ? 'Timeout / hors ligne'
-                      : selected.id === ORCH_ID
-                        ? 'Orchestrateur'
-                        : 'Inactif'}
-                </dd>
+                <dd className="text-right font-medium text-fg">{workerStatusLabel(selected)}</dd>
               </div>
+              {selected.id !== ORCH_ID && (
+                <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                  <dt className="text-muted">Modèle chargé</dt>
+                  <dd className="max-w-[58%] break-words text-right text-[11px] text-fg">
+                    {selected.model?.trim() ? selected.model : 'Non déclaré'}
+                  </dd>
+                </div>
+              )}
               <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
                 <dt className="text-muted">VRAM</dt>
-                <dd className="text-right text-fg">
-                  {selected.vramMbUsed != null && selected.vramMbTotal != null
-                    ? `${Math.round(selected.vramMbUsed)} / ${Math.round(selected.vramMbTotal)} Mo`
-                    : selected.vram != null
-                      ? `${selected.vram} Go (total déclaré)`
-                      : '—'}
-                </dd>
+                <dd className="max-w-[58%] text-right text-fg">{fmtVramFromNode(selected)}</dd>
               </div>
+              {selected.id !== ORCH_ID && (
+                <>
+                  <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                    <dt className="text-muted">Tokens générés (total)</dt>
+                    <dd className="text-right font-mono text-[11px] text-fg">
+                      {fmtTokens(selected.tokensGeneratedTotal)}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                    <dt className="text-muted">Tokens (1 h)</dt>
+                    <dd className="text-right font-mono text-[11px] text-fg">
+                      {fmtTokens(selected.tokensGenerated1h)}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                    <dt className="text-muted">Tokens (24 h)</dt>
+                    <dd className="text-right font-mono text-[11px] text-fg">
+                      {fmtTokens(selected.tokensGenerated24h)}
+                    </dd>
+                  </div>
+                </>
+              )}
               <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
                 <dt className="text-muted">Shards (estimation)</dt>
                 <dd className="max-w-[55%] text-right font-mono text-[11px] text-fg">{selected.shards || '—'}</dd>
@@ -443,6 +597,27 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
                 <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
                   <dt className="text-muted">IP</dt>
                   <dd className="font-mono text-[11px] text-fg">{selected.publicIp}</dd>
+                </div>
+              )}
+              {selected.id !== ORCH_ID && (
+                <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                  <dt className="text-muted">Ping VPS → nœud</dt>
+                  <dd className="max-w-[58%] text-right font-mono text-[11px] text-fg">
+                    {livePingBusy && livePingMs == null && !livePingErr ? (
+                      <span className="text-muted">Mesure…</span>
+                    ) : livePingMs != null ? (
+                      <>
+                        {livePingMs} ms
+                        {livePingMethod ? (
+                          <span className="mt-0.5 block text-[10px] font-sans text-muted">
+                            {probeMethodLabel(livePingMethod)}
+                          </span>
+                        ) : null}
+                      </>
+                    ) : (
+                      <span className="text-warning">{livePingErr ?? '—'}</span>
+                    )}
+                  </dd>
                 </div>
               )}
             </dl>
@@ -469,21 +644,22 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
             {actionMessage && (
               <p className="mt-4 rounded-lg border border-border bg-surface px-3 py-2 text-[11px] text-muted">{actionMessage}</p>
             )}
-          </div>
+            </div>
+          </>
         )}
       </aside>
 
       {selected && (
         <button
           type="button"
-          className="fixed inset-0 z-[95] bg-black/45 backdrop-blur-[2px] sm:hidden"
+          className="fixed inset-0 z-[170] bg-black/45 backdrop-blur-[2px] sm:hidden"
           aria-label="Fermer le panneau"
           onClick={() => setSelected(null)}
         />
       )}
 
       {confirmAction && selected && selected.id !== ORCH_ID && (
-        <div className="fixed inset-0 z-[120] flex items-end justify-center bg-black/55 p-4 backdrop-blur-sm sm:items-center">
+        <div className="fixed inset-0 z-[200] flex items-end justify-center bg-black/55 p-4 backdrop-blur-sm sm:items-center">
           <div className="w-full max-w-md rounded-2xl border border-border bg-card p-5 shadow-xl">
             <p className="text-sm font-semibold text-fg">
               {confirmAction === 'disconnect' ? 'Forcer la déconnexion ?' : 'Changer de pool ?'}

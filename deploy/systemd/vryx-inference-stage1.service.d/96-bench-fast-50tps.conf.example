@@ -1,0 +1,21 @@
+[Service]
+# Profil de benchmark reversible pour verifier que le pipeline depasse 50 TPS
+# quand le modele ne sature pas le worker. Ne pas activer comme profil produit
+# Qwen3.5-9B : ce fichier sert aux mesures de capacite du transport/orchestrateur.
+Environment=VRYX_MLX_LM_DIRECT=1
+Environment=VRYX_DIST_MODEL=Qwen/Qwen2-0.5B-Instruct
+Environment=VRYX_DIST_MIN_WORKERS=1
+Environment=VRYX_DIST_MAX_WORKERS=1
+Environment=VRYX_DIST_MAX_TOKENS=4096
+Environment=VRYX_DIST_TIMEOUT_SEC=120
+Environment=VRYX_PIPELINE_STEP_TIMEOUT_SEC=120
+Environment=VRYX_SHARD_READY_TIMEOUT_SEC=120
+Environment=VRYX_POOL_PREFERENCE=auto
+Environment=VRYX_REQUIRE_WORKER_MODEL_MATCH=0
+Environment=VRYX_HIDDEN_TRANSPORT=fp16
+Environment=VRYX_HIDDEN_QUIC=0
+Environment=VRYX_SAMPLING_TEMPERATURE=0
+Environment=VRYX_DECODE_MICROBATCH=1
+Environment=VRYX_DECODE_MICROBATCH_CAP=64
+Environment=VRYX_PREFIX_CACHE=1
+Environment=VRYX_PREFIX_CACHE_MIN_TOKENS=16

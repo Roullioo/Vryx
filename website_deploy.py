@@ -77,14 +77,21 @@ def make_tarball(path: Path) -> None:
 
     print(f"[*] Archive : {path}")
     srv = WEBSITE / "server"
+
+    def tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        # macOS metadata files must never be deployed as web assets.
+        if Path(info.name).name.startswith("._"):
+            return None
+        return info
+
     with tarfile.open(path, "w:gz") as tar:
-        tar.add(WEBSITE / "dist", arcname="dist")
+        tar.add(WEBSITE / "dist", arcname="dist", filter=tar_filter)
         for rel in ("package.json", "package-lock.json", "src"):
             p = srv / rel
             if not p.exists():
                 print(f"[!] Fichier requis manquant : {p}", file=sys.stderr)
                 sys.exit(1)
-            tar.add(p, arcname=f"server/{rel}")
+            tar.add(p, arcname=f"server/{rel}", filter=tar_filter)
 
 
 def ssh_connect() -> paramiko.SSHClient:
@@ -166,9 +173,13 @@ SHARD_DIR="${{VRYX_SHARD_BASE_DIR:-/var/lib/vryx-shards}}"
 MIN_FREE_MB="${{VRYX_DEPLOY_MIN_FREE_MB:-10240}}"
 sudo mkdir -p "$SHARD_DIR"
 free_mb="$(df -Pm "$SHARD_DIR" | awk 'NR==2 {{print $4}}')"
-if [[ -z "$free_mb" || "$free_mb" -lt "$MIN_FREE_MB" ]]; then
+if [[ ! "$free_mb" =~ ^[0-9]+$ ]] || (( free_mb < MIN_FREE_MB )); then
   echo "[remote] ERREUR: espace disque insuffisant pour shards (${{free_mb:-0}} Mo libres, minimum $MIN_FREE_MB Mo) sur $SHARD_DIR" >&2
   exit 1
+fi
+OLD_ASSETS="$(mktemp -d)"
+if [[ -d "$REMOTE/dist/assets" ]]; then
+  cp -a "$REMOTE/dist/assets/." "$OLD_ASSETS/" || true
 fi
 rm -rf "$REMOTE/dist"
 ENV_BACKUP="$(mktemp)"
@@ -178,6 +189,13 @@ fi
 rm -rf "$REMOTE/server"
 tar -xzf "{remote_tar_path}" -C "$REMOTE"
 rm -f "{remote_tar_path}"
+if [[ -d "$REMOTE/dist/assets" && -d "$OLD_ASSETS" ]]; then
+  # Keep only non-bundled static assets. Old hashed JS/CSS chunks must not survive,
+  # otherwise browsers can keep executing stale admin code after a deploy.
+  find "$OLD_ASSETS" -maxdepth 1 -type f ! -name '._*' ! -name '*.js' ! -name '*.css' ! -name '*.map' -exec cp --update=none {{}} "$REMOTE/dist/assets/" \\; || true
+fi
+rm -rf "$OLD_ASSETS"
+find "$REMOTE/dist" -name '._*' -delete 2>/dev/null || true
 if [[ -s "$ENV_BACKUP" ]]; then
   mv "$ENV_BACKUP" "$REMOTE/server/.env"
 else

@@ -15,6 +15,8 @@ function ScrollToTopOnPathname() {
 export function MainLayout() {
   const { pathname } = useLocation()
   const isAdmin = pathname.startsWith('/admin')
+  const normalizedPathname = pathname.replace(/\/+$/, '') || '/'
+  const hideMarketingChrome = isAdmin || normalizedPathname === '/compte' || normalizedPathname.startsWith('/compte/')
   const topDarkHero =
     pathname === '/' ||
     pathname === '/clients' ||
@@ -31,11 +33,11 @@ export function MainLayout() {
       }`}
     >
       <ScrollToTopOnPathname />
-      {!isAdmin && <Navbar />}
-      <main className={`relative z-0 ${isAdmin ? 'min-h-dvh' : ''}`}>
+      {!hideMarketingChrome && <Navbar />}
+      <main className={`relative z-0 ${hideMarketingChrome ? 'min-h-dvh' : ''}`}>
         <Outlet />
       </main>
-      {!isAdmin && <Footer />}
+      {!hideMarketingChrome && <Footer />}
     </div>
   )
 }

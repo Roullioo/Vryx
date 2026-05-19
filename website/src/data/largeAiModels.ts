@@ -56,6 +56,17 @@ export const LARGE_AI_MODELS: LargeAiModel[] = [
     openWeights: true,
   },
   {
+    id: 'qwen3-6-35b-a3b',
+    name: 'Qwen3.6-35B-A3B',
+    provider: 'Alibaba',
+    family: 'Qwen',
+    paramsNote: '35B (3B actifs)',
+    contextTokens: 262_144,
+    modalities: ['Texte', 'Code', 'Raisonnement', 'MoE'],
+    openWeights: true,
+    weightGb: 19,
+  },
+  {
     id: 'qwen3-32b',
     name: 'Qwen3-32B',
     provider: 'Alibaba',

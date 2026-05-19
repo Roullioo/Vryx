@@ -267,6 +267,36 @@ fn env_u64_clamped(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .clamp(min, max)
 }
 
+fn env_f64_positive(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().replace(',', ".").parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+fn heartbeat_allocated_vram_mb(gpu_vram_mb: Option<u64>) -> (Option<u64>, Option<u8>) {
+    let limit_from_gb = env_f64_positive("VRYX_WORKER_MEMORY_LIMIT_GB")
+        .map(|gb| (gb * 1024.0).round() as u64)
+        .filter(|mb| *mb > 0);
+    let percent = env_f64_positive("VRYX_WORKER_MEMORY_LIMIT_PERCENT")
+        .map(|p| p.round().clamp(1.0, 100.0) as u8);
+    let limit_from_percent = match (gpu_vram_mb, percent) {
+        (Some(vram), Some(pct)) if vram > 0 => Some(((vram as f64) * (pct as f64 / 100.0)).round() as u64),
+        _ => None,
+    };
+
+    let mut allocated = match (limit_from_gb, limit_from_percent) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => gpu_vram_mb,
+    };
+    if let (Some(vram), Some(value)) = (gpu_vram_mb, allocated) {
+        allocated = Some(value.min(vram));
+    }
+    (allocated.filter(|mb| *mb > 0), percent)
+}
+
 mod base64_vec {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use base64::{Engine as _, engine::general_purpose};
@@ -312,15 +342,14 @@ pub mod vryx {
 use vryx::inference_service_client::InferenceServiceClient;
 use tonic::transport::Channel;
 
-static GRPC_CHANNELS: OnceLock<Mutex<HashMap<u16, Channel>>> = OnceLock::new();
-
-fn grpc_drop_cached_channel(port: u16) {
-    if let Some(cache) = GRPC_CHANNELS.get() {
-        let removed = cache.lock().unwrap().remove(&port).is_some();
-        if removed {
-            eprintln!("[*] Canal gRPC local port {} retiré du cache (reconnexion).", port);
-        }
-    }
+async fn connect_local_inference_channel(port: u16) -> Result<Channel, Box<dyn Error + Send + Sync>> {
+    // Le serveur Python peut redémarrer pendant le chargement du modèle. Un canal tonic réutilisé
+    // garde parfois une socket morte et se traduit par un "transport error" côté P2P.
+    let endpoint = Channel::from_shared(format!("http://127.0.0.1:{}", port))?
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(900))
+        .tcp_nodelay(true);
+    Ok(endpoint.connect().await?)
 }
 
 // ============================================================
@@ -362,6 +391,80 @@ struct LlmMetrics {
     pipeline_trace_json: String,
 }
 
+fn estimate_chat_token_deltas(data: &[u8]) -> (u64, u64) {
+    let text = String::from_utf8_lossy(data);
+    let find_number = |key: &str| -> u64 {
+        let Some(pos) = text.find(key) else {
+            return 0;
+        };
+        let tail = &text[pos + key.len()..];
+        let digits: String = tail
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse::<u64>().unwrap_or(0)
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return (0, find_number("max_new_tokens").max(find_number("maxNewTokens")));
+    };
+    let prompt_tokens = v
+        .get("prompt")
+        .and_then(|x| x.as_str())
+        .map(|s| {
+            let by_words = s.split_whitespace().count() as u64;
+            let by_chars = ((s.chars().count() as u64) / 4).max(1);
+            by_words.max(by_chars)
+        })
+        .unwrap_or(0);
+    let completion_tokens = v
+        .get("max_new_tokens")
+        .or_else(|| v.get("maxNewTokens"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    (prompt_tokens, completion_tokens)
+}
+
+fn estimate_text_tokens(data: &[u8]) -> u64 {
+    let Ok(text) = std::str::from_utf8(data) else {
+        return 0;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let by_words = trimmed.split_whitespace().count() as u64;
+    let by_chars = ((trimmed.chars().count() as u64) / 4).max(1);
+    by_words.max(by_chars)
+}
+
+fn completion_tokens_from_response_data(data: &[u8]) -> u64 {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return 0;
+    };
+    if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
+        return 0;
+    }
+    v.get("completion_tokens")
+        .or_else(|| v.get("tokens_generated"))
+        .or_else(|| v.get("metrics").and_then(|m| m.get("completion_tokens")))
+        .or_else(|| v.get("metrics").and_then(|m| m.get("tokens_generated")))
+        .and_then(|x| x.as_u64())
+        .or_else(|| {
+            v.get("token_events")
+                .and_then(|x| x.as_array())
+                .map(|arr| arr.len() as u64)
+        })
+        .unwrap_or(0)
+}
+
+fn response_data_is_error(data: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+        == Some(false)
+}
+
 async fn call_local_inference_once(
     port: u16,
     data: Vec<u8>,
@@ -369,20 +472,7 @@ async fn call_local_inference_once(
     routing_path: Vec<String>,
     session_id: String,
 ) -> Result<(Vec<u8>, u64, u64, LlmMetrics, u64), Box<dyn Error + Send + Sync>> {
-    let maybe_channel = {
-        let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-        cache.lock().unwrap().get(&port).cloned()
-    };
-    let channel = match maybe_channel {
-        Some(ch) => ch,
-        None => {
-            let endpoint = Channel::from_shared(format!("http://127.0.0.1:{}", port))?;
-            let ch = endpoint.connect().await?;
-            let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-            cache.lock().unwrap().insert(port, ch.clone());
-            ch
-        }
-    };
+    let channel = connect_local_inference_channel(port).await?;
     let mut client = InferenceServiceClient::new(channel)
         // Aligné avec `inference_server.py` (grpc.aio.server 1 Go) : un init shard / forward
         // peut dépasser 100 Mo (config, métriques, réponses protobuf) sous peine de « transport error » tonic.
@@ -408,6 +498,24 @@ async fn call_local_inference_once(
         shard_layer_id: response.shard_layer_id,
         pipeline_trace_json: response.pipeline_trace_json.clone(),
     };
+    if (m.prompt_tokens == 0 || m.completion_tokens == 0) && !m.pipeline_trace_json.is_empty() {
+        if let Ok(trace) = serde_json::from_str::<serde_json::Value>(&m.pipeline_trace_json) {
+            let metrics = trace.get("metrics").unwrap_or(&trace);
+            if m.prompt_tokens == 0 {
+                m.prompt_tokens = metrics.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+            if m.completion_tokens == 0 {
+                m.completion_tokens = metrics
+                    .get("completion_tokens")
+                    .or_else(|| metrics.get("tokens_generated"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+            }
+            if m.total_tokens == 0 {
+                m.total_tokens = metrics.get("total_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+            }
+        }
+    }
     if m.total_tokens == 0 && (m.prompt_tokens > 0 || m.completion_tokens > 0) {
         m.total_tokens = m.prompt_tokens.saturating_add(m.completion_tokens);
     }
@@ -420,8 +528,8 @@ async fn call_local_inference_once(
     ))
 }
 
-/// Après redémarrage du `inference_server.py` local, le canal tonic mis en cache devient invalide
-/// (« transport error », « connection refused », etc.). On purge le cache et on réessaie.
+/// Après redémarrage du `inference_server.py` local, une première connexion peut tomber pendant
+/// le chargement du modèle. On réessaie avec un canal neuf à chaque tentative.
 async fn call_local_inference(
     port: u16,
     data: Vec<u8>,
@@ -433,7 +541,6 @@ async fn call_local_inference(
     let mut last_msg = String::new();
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            grpc_drop_cached_channel(port);
             tokio::time::sleep(std::time::Duration::from_millis(200 + u64::from(attempt) * 400)).await;
         }
         match call_local_inference_once(
@@ -488,20 +595,7 @@ async fn call_local_inference_stream(
     routing_path: Vec<String>,
     session_id: String,
 ) -> Result<tonic::Streaming<vryx::StreamChunk>, Box<dyn Error + Send + Sync>> {
-    let maybe_channel = {
-        let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-        cache.lock().unwrap().get(&port).cloned()
-    };
-    let channel = match maybe_channel {
-        Some(ch) => ch,
-        None => {
-            let endpoint = Channel::from_shared(format!("http://127.0.0.1:{}", port))?;
-            let ch = endpoint.connect().await?;
-            let cache = GRPC_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
-            cache.lock().unwrap().insert(port, ch.clone());
-            ch
-        }
-    };
+    let channel = connect_local_inference_channel(port).await?;
     let mut client = InferenceServiceClient::new(channel)
         .max_decoding_message_size(1024 * 1024 * 1024)
         .max_encoding_message_size(1024 * 1024 * 1024);
@@ -522,26 +616,221 @@ async fn call_local_inference_stream(
 //  Heartbeat → API Vryx
 // ============================================================
 
+/// Lecture `sysctl -n <key>` (une ligne, sans unité).
+fn sysctl_n_trimmed(key: &str) -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Mémoire physique (MiB) — utile comme repli VRAM sur Apple Silicon (mémoire unifiée).
+fn sysctl_hw_memsize_mib() -> Option<u64> {
+    sysctl_n_trimmed("hw.memsize")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|b| b / (1024 * 1024))
+}
+
+/// Interprète `spdisplays_vram` ou équivalent (« 16 Go », « 16384 Mo », « 8192 », …) → MiB.
+fn parse_vram_human(s: &str) -> Option<u64> {
+    let lower = s.to_lowercase();
+    let mut buf = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() || c == '.' || c == ',' {
+            buf.push(if c == ',' { '.' } else { c });
+        } else if !buf.is_empty() {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    let n: f64 = buf.parse().ok()?;
+    if lower.contains("gb") || lower.contains("gib") {
+        return Some((n * 1024.0).round().max(1.0) as u64);
+    }
+    if lower.contains("mb") || lower.contains("mib") || lower.contains(" mo") {
+        return Some(n.round().max(1.0) as u64);
+    }
+    // Nombre nu : souvent des MiB côté Apple (ex. 16384 = 16 GiB).
+    if n >= 512.0 {
+        return Some(n.round() as u64);
+    }
+    if n >= 4.0 && n <= 256.0 {
+        return Some((n * 1024.0).round() as u64);
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_spdisplays_model_is_gpu(name: &str) -> bool {
+    let u = name.to_uppercase();
+    if u.contains("COLOR LCD") || u == "DISPLAY" {
+        return false;
+    }
+    u.contains("APPLE M")
+        || u.contains("AMD")
+        || u.contains("RADEON")
+        || u.contains("NVIDIA")
+        || u.contains("INTEL")
+        || u.contains("IRIS")
+        || u.contains("UHD")
+        || u.contains("ARC ")
+        || u.contains("VEGA")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_gpu_name_rank(name: &str) -> i32 {
+    let u = name.to_uppercase();
+    if u.contains("APPLE M") {
+        100
+    } else if u.contains("NVIDIA") || u.contains("RADEON") || u.contains("AMD") {
+        80
+    } else if u.contains("INTEL") || u.contains("IRIS") || u.contains("UHD") {
+        50
+    } else {
+        10
+    }
+}
+
+/// macOS : GPU via `system_profiler SPDisplaysDataType -json` (vrai nom puce / carte + VRAM déclarée).
+#[cfg(target_os = "macos")]
+fn macos_system_profiler_gpu() -> (Option<String>, Option<u64>) {
+    let out = match std::process::Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+    {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+        _ => return (None, None),
+    };
+    let root: serde_json::Value = match serde_json::from_slice(&out) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let Some(arr) = root.get("SPDisplaysDataType").and_then(|x| x.as_array()) else {
+        return (None, None);
+    };
+    let mut best: Option<(String, Option<u64>, i32)> = None;
+    for item in arr {
+        let nm = item
+            .get("sppci_model")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.get("chip_model").and_then(|x| x.as_str()))
+            .or_else(|| item.get("_name").and_then(|x| x.as_str()))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && macos_spdisplays_model_is_gpu(s));
+        let Some(name) = nm else {
+            continue;
+        };
+        let vr = item
+            .get("spdisplays_vram")
+            .and_then(|x| x.as_str())
+            .and_then(parse_vram_human);
+        let rank = macos_gpu_name_rank(&name);
+        let replace = best
+            .as_ref()
+            .map(|(_, _, r)| rank > *r || (rank == *r && vr.is_some()))
+            .unwrap_or(true);
+        if replace {
+            best = Some((name, vr, rank));
+        }
+    }
+    match best {
+        Some((n, v, _)) => (Some(n), v),
+        None => (None, None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_nvidia_smi_gpu() -> (Option<String>, Option<u64>) {
+    let out = match std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+        _ => return (None, None),
+    };
+    let stdout = String::from_utf8_lossy(&out);
+    let Some(line) = stdout.lines().find(|l| !l.trim().is_empty()) else {
+        return (None, None);
+    };
+    let line = line.trim();
+    let mut parts = line.split(',').map(|s| s.trim());
+    let Some(name) = parts.next().map(str::to_string).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let Some(mib) = parts.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) else {
+        return (None, None);
+    };
+    (Some(name), Some(mib))
+}
+
+/// Détection matérielle pour le heartbeat (une fois par processus).
+fn detect_heartbeat_gpu_hardware() -> (Option<String>, Option<u64>) {
+    #[cfg(target_os = "macos")]
+    {
+        let (prof_n, prof_v) = macos_system_profiler_gpu();
+        let name = prof_n.or_else(|| sysctl_n_trimmed("machdep.cpu.brand_string"));
+        let vram = prof_v.or_else(sysctl_hw_memsize_mib);
+        (name, vram)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_nvidia_smi_gpu()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (None, None)
+    }
+}
+
+static HEARTBEAT_GPU_HW: OnceLock<(Option<String>, Option<u64>)> = OnceLock::new();
+
+fn heartbeat_gpu_hints_cached() -> (Option<String>, Option<u64>) {
+    HEARTBEAT_GPU_HW.get_or_init(detect_heartbeat_gpu_hardware).clone()
+}
+
 #[derive(Debug, Serialize)]
 struct HeartbeatPayload {
     peer_id: String,
     mode: String,
     grpc_port: Option<u16>,
     p2p_port: Option<u16>,
-    version: &'static str,
+    version: String,
     user_id: Option<u64>,
     tokens_in: u64,
     tokens_out: u64,
     tokens_generated: u64,
     p2p_peers: usize,
     model: Option<String>,
+    /// Absent du JSON si inconnu : évite d’effacer la BDD avec `null` à chaque heartbeat.
+    #[serde(skip_serializing_if = "Option::is_none")]
     gpu_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     gpu_vram_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocated_vram_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_limit_percent: Option<u8>,
     runtime_backend: Option<String>,
     weight_quantization: Option<String>,
     supports_q4_weights: bool,
     supports_mlx: bool,
     supports_vllm: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_info: Option<serde_json::Value>,
 }
 
 async fn send_heartbeat(
@@ -552,7 +841,19 @@ async fn send_heartbeat(
     let url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
     match client.post(&url).json(payload).send().await {
         Ok(r) if r.status().is_success() => {
-            println!("[*] Heartbeat OK → {}", url);
+            match r.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    println!("[*] Heartbeat OK → {}", url);
+                    if let Some(command) = body.get("command").filter(|c| !c.is_null()) {
+                        let event = serde_json::json!({
+                            "peer_id": payload.peer_id,
+                            "command": command,
+                        });
+                        println!("[VRYX_REMOTE_COMMAND] {}", event);
+                    }
+                }
+                Err(_) => println!("[*] Heartbeat OK → {}", url),
+            }
         }
         Ok(r) => {
             eprintln!("[!] Heartbeat HTTP {} → {}", r.status(), url);
@@ -575,6 +876,7 @@ async fn initiator_pull_workers_from_api_now(
     discovered_peers: &mut HashSet<PeerId>,
     active_peers: &Arc<Mutex<HashSet<PeerId>>>,
     registry_worker_count: Option<&Arc<AtomicUsize>>,
+    registry_worker_peers: Option<&Arc<Mutex<HashSet<PeerId>>>>,
     log_origin: &'static str,
 ) {
     let Some(boot_addr_str) = bootstrap_node.map(|s| s.as_str()) else {
@@ -614,6 +916,7 @@ async fn initiator_pull_workers_from_api_now(
         None => return,
     };
     let mut registry_count = 0usize;
+    let mut registry_peers = HashSet::<PeerId>::new();
     for worker in workers {
         if worker.get("mode").and_then(|v| v.as_str()) != Some("worker") {
             continue;
@@ -631,11 +934,13 @@ async fn initiator_pull_workers_from_api_now(
             continue;
         }
         registry_count += 1;
+        registry_peers.insert(peer_id);
         let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", boot_addr_str, peer_id);
         let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() else {
             continue;
         };
         swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
+        swarm.add_peer_address(peer_id, relay_addr.clone());
         let newly_discovered = discovered_peers.insert(peer_id);
         if newly_discovered {
             match log_origin {
@@ -659,6 +964,9 @@ async fn initiator_pull_workers_from_api_now(
     }
     if let Some(atom) = registry_worker_count {
         atom.store(registry_count, Ordering::Relaxed);
+    }
+    if let Some(peers) = registry_worker_peers {
+        *peers.lock().unwrap() = registry_peers;
     }
 }
 
@@ -869,6 +1177,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let peer_connection_count = Arc::new(Mutex::new(HashMap::<PeerId, u32>::new()));
     // Dernier nombre de workers mode « worker » vus via GET /api/workers/status (aligné sur la base / heartbeat).
     let initiator_registry_workers = Arc::new(AtomicUsize::new(0));
+    let initiator_registry_worker_peers = Arc::new(Mutex::new(HashSet::<PeerId>::new()));
     let tokens_in = Arc::new(AtomicU64::new(0));
     let tokens_out = Arc::new(AtomicU64::new(0));
     let tokens_generated = Arc::new(AtomicU64::new(0));
@@ -906,7 +1215,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let active_status_peers = Arc::clone(&active_peers);
         let active_relay_peers = Arc::clone(&active_peers);
         let active_tp_peers = Arc::clone(&active_peers);
+        let registry_tp_peers = Arc::clone(&initiator_registry_worker_peers);
         let status_peer_transports = Arc::clone(&peer_transports);
+        let grpc_shard_status = args.grpc_port;
         let relay_peer_transports = Arc::clone(&peer_transports);
         let quic_requested_status = hidden_quic_requested;
         let registry_status_peers = Arc::clone(&initiator_registry_workers);
@@ -969,6 +1280,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Json(j)
                 }
             }))
+            .route("/api/shards", get(move || {
+                let grpc_port = grpc_shard_status;
+                async move {
+                    let call = call_local_inference_once(
+                        grpc_port,
+                        b"{}".to_vec(),
+                        "vryx.shard.status".to_string(),
+                        vec![],
+                        String::new(),
+                    );
+                    match tokio::time::timeout(Duration::from_millis(1500), call).await {
+                        Ok(Ok((data, _, _, _, _))) => {
+                            let body = serde_json::from_slice::<serde_json::Value>(&data)
+                                .unwrap_or_else(|_| serde_json::json!({
+                                    "ok": false,
+                                    "error": String::from_utf8_lossy(&data).to_string(),
+                                }));
+                            (StatusCode::OK, Json(body))
+                        }
+                        Ok(Err(e)) => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": e.to_string(),
+                            })),
+                        ),
+                        Err(_) => (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": "shard_status_timeout",
+                            })),
+                        ),
+                    }
+                }
+            }))
             .route(
                 "/api/tp-peers",
                 get({
@@ -996,7 +1343,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .filter(|p| Some(*p) != boot && *p != me)
                             .map(|p| p.to_string())
                             .collect();
+                        ids.extend(
+                            registry_tp_peers
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .copied()
+                                .filter(|p| Some(*p) != boot && *p != me)
+                                .map(|p| p.to_string()),
+                        );
                         ids.sort();
+                        ids.dedup();
                         let n = ids.len();
                         (
                             StatusCode::OK,
@@ -1042,9 +1399,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     })
                                 })
                             })
-                            .filter(|&mt| mt >= 1 && mt <= 4096)
+                            .filter(|&mt| mt >= 1 && mt <= 32768)
                     {
                         request_obj["max_new_tokens"] = serde_json::json!(mt);
+                    }
+                    if let Some(model_id) = payload
+                        .get("model_id")
+                        .or_else(|| payload.get("modelId"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty() && s.len() <= 120)
+                    {
+                        request_obj["model_id"] = serde_json::json!(model_id);
+                    }
+                    if let Some(preferred_workers) = payload
+                        .get("preferred_worker_peer_ids")
+                        .or_else(|| payload.get("preferredWorkerPeerIds"))
+                        .filter(|v| v.is_array())
+                    {
+                        request_obj["preferred_worker_peer_ids"] = preferred_workers.clone();
+                    }
+                    if let Some(scheduler_job_id) = payload
+                        .get("scheduler_job_id")
+                        .or_else(|| payload.get("schedulerJobId"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty() && s.len() <= 100)
+                    {
+                        request_obj["scheduler_job_id"] = serde_json::json!(scheduler_job_id);
+                    }
+                    for key in ["stream_id", "stream_secret", "stream_callback_url"] {
+                        if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            request_obj[key] = serde_json::json!(value);
+                        }
+                    }
+                    for key in ["temperature", "top_p", "top_k", "repetition_penalty"] {
+                        if let Some(value) = payload.get(key) {
+                            if value.is_number() {
+                                request_obj[key] = value.clone();
+                            }
+                        }
                     }
                     let request_payload = request_obj.to_string();
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1106,9 +1500,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(mt) = payload
                     .get("max_new_tokens")
                     .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 1 { Some(i as u64) } else { None })))
-                    .filter(|&mt| mt >= 1 && mt <= 4096)
+                    .filter(|&mt| mt >= 1 && mt <= 32768)
                 {
                     request_obj["max_new_tokens"] = serde_json::json!(mt);
+                }
+                if let Some(model_id) = payload
+                    .get("model_id")
+                    .or_else(|| payload.get("modelId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && s.len() <= 120)
+                {
+                    request_obj["model_id"] = serde_json::json!(model_id);
+                }
+                if let Some(preferred_workers) = payload
+                    .get("preferred_worker_peer_ids")
+                    .or_else(|| payload.get("preferredWorkerPeerIds"))
+                    .filter(|v| v.is_array())
+                {
+                    request_obj["preferred_worker_peer_ids"] = preferred_workers.clone();
+                }
+                if let Some(scheduler_job_id) = payload
+                    .get("scheduler_job_id")
+                    .or_else(|| payload.get("schedulerJobId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && s.len() <= 100)
+                {
+                    request_obj["scheduler_job_id"] = serde_json::json!(scheduler_job_id);
+                }
+                for key in ["stream_id", "stream_secret", "stream_callback_url"] {
+                    if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        request_obj[key] = serde_json::json!(value);
+                    }
+                }
+                for key in ["temperature", "top_p", "top_k", "repetition_penalty"] {
+                    if let Some(value) = payload.get(key) {
+                        if value.is_number() {
+                            request_obj[key] = value.clone();
+                        }
+                    }
                 }
                 match call_local_inference_stream(
                     grpc_chat_stream,
@@ -1488,7 +1919,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }));
                 } else {
                     eprintln!(
-                        "[P2P] Relais HTTP vers {} avant connexion P2P : dial circuit bootstrap + mise en file (payload ~ {:.1} Ko)",
+                        "[P2P] Relais HTTP vers {} avant connexion P2P : dial circuit bootstrap + envoi opportuniste (payload ~ {:.1} Ko)",
                         peer,
                         hidden_bytes as f64 / 1024.0
                     );
@@ -1502,15 +1933,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), peer);
                         if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
                             swarm.behaviour_mut().kad.add_address(&peer, ma.clone());
+                            swarm.add_peer_address(peer, ma.clone());
                             if let Err(e) = swarm.dial(ma) {
                                 eprintln!("[!] Relais dial circuit vers worker : {:?}", e);
                             }
                         }
                     }
-                    pending_relay_until_connected
-                        .entry(peer)
-                        .or_default()
-                        .push_back((req, reply_tx, Instant::now()));
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, req);
+                    pending_requests.insert(req_id, (req_clone, PendingMeta::P2pRelayReply {
+                        reply_tx,
+                        relay_started,
+                        hidden_bytes,
+                        persistent_relay,
+                        connection_reuse,
+                    }));
                 }
             }
 
@@ -1606,6 +2045,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             &mut discovered_peers,
                             &active_peers,
                             Some(&initiator_registry_workers),
+                            Some(&initiator_registry_worker_peers),
                             "chat",
                         )
                         .await;
@@ -1690,6 +2130,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         (pt, ct, tt, vps_ms)
                                     })
                                     .unwrap_or((0, 0, 0, 0));
+                                if pt > 0 {
+                                    tokens_in.fetch_add(pt, Ordering::Relaxed);
+                                }
+                                if ct > 0 {
+                                    tokens_out.fetch_add(ct, Ordering::Relaxed);
+                                    tokens_generated.fetch_add(ct, Ordering::Relaxed);
+                                }
 
                                 let response_tx = continuation_response_tx.or_else(|| {
                                     match &mut chat_state {
@@ -1726,7 +2173,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "p2p_messages_out": 0_u64,
                                         "tokens_in": 0,
                                         "tokens_out": 0,
-                                        "tokens_generated": ct.max(1),
+                                        "tokens_generated": ct,
                                         "cumulative_tokens_in": tokens_in.load(Ordering::Relaxed),
                                         "cumulative_tokens_out": tokens_out.load(Ordering::Relaxed),
                                         "cumulative_tokens_generated": tokens_generated.load(Ordering::Relaxed),
@@ -1773,7 +2220,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         InferenceResult::Stage2 { channel, data, c, s, metrics, compute_time_ms } => {
                             let w_ms = compute_time_ms;
-                            let _ = swarm.behaviour_mut().request_response.send_response(
+                            let data_len = data.len();
+                            let send_result = swarm.behaviour_mut().request_response.send_response(
                                 channel,
                                 TensorResponse {
                                     data,
@@ -1788,8 +2236,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     ..Default::default()
                                 },
                             );
-                            tokens_out.fetch_add(1, Ordering::Relaxed);
-                            tokens_generated.fetch_add(1, Ordering::Relaxed);
+                            match send_result {
+                                Ok(()) => eprintln!(
+                                    "[P2P] Réponse Stage2 envoyée au demandeur bytes={} compute_ms={} completion={}",
+                                    data_len,
+                                    compute_time_ms,
+                                    metrics.completion_tokens
+                                ),
+                                Err(_) => eprintln!(
+                                    "[P2P] Échec send_response Stage2 : canal déjà fermé bytes={} compute_ms={}",
+                                    data_len,
+                                    compute_time_ms
+                                ),
+                            }
                         }
                         InferenceResult::Stage2Error { channel, message } => {
                             eprintln!("[!] Inférence Stage 2 échouée : {}", message);
@@ -1928,7 +2387,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         })
                         .to_lowercase();
-                    let supports_mlx = runtime_backend == "mlx"
+                    let supports_mlx = matches!(runtime_backend.as_str(), "mlx" | "mlx_lm")
                         || std::env::var("VRYX_SUPPORTS_MLX")
                             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
                             .unwrap_or(false)
@@ -1945,20 +2404,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         || std::env::var("VRYX_SUPPORTS_Q4_WEIGHTS")
                             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
                             .unwrap_or(false);
+                    let mut gpu_name = std::env::var("VRYX_GPU_NAME").ok();
+                    let mut gpu_vram_mb = std::env::var("VRYX_GPU_VRAM_MB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok());
+                    if gpu_name.is_none() || gpu_vram_mb.is_none() {
+                        let (hint_name, hint_vram) = heartbeat_gpu_hints_cached();
+                        if gpu_name.is_none() {
+                            gpu_name = hint_name;
+                        }
+                        if gpu_vram_mb.is_none() {
+                            gpu_vram_mb = hint_vram;
+                        }
+                    }
+                    let (allocated_vram_mb, memory_limit_percent) = heartbeat_allocated_vram_mb(gpu_vram_mb);
+                    let machine_info = std::env::var("VRYX_MACHINE_INFO")
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                        .filter(|v| v.is_object());
                     let payload = HeartbeatPayload {
                         peer_id: my_peer_id.to_string(),
                         mode: args.mode.clone(),
                         grpc_port: if args.mode == "worker" { Some(args.grpc_port) } else { None },
                         p2p_port: if args.p2p_port > 0 { Some(args.p2p_port) } else { None },
-                        version: env!("CARGO_PKG_VERSION"),
+                        version: std::env::var("VRYX_WORKER_VERSION")
+                            .ok()
+                            .filter(|v| !v.trim().is_empty())
+                            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
                         user_id: args.user_id,
                         tokens_in: tokens_in.load(Ordering::Relaxed),
                         tokens_out: tokens_out.load(Ordering::Relaxed),
                         tokens_generated: tokens_generated.load(Ordering::Relaxed),
                         p2p_peers: active_peers.lock().unwrap().len(),
                         model: model_name.clone(),
-                        gpu_name: std::env::var("VRYX_GPU_NAME").ok(),
-                        gpu_vram_mb: std::env::var("VRYX_GPU_VRAM_MB").ok().and_then(|v| v.parse::<u64>().ok()),
+                        gpu_name,
+                        gpu_vram_mb,
+                        allocated_vram_mb,
+                        memory_limit_percent,
                         runtime_backend: Some(runtime_backend),
                         weight_quantization: Some(weight_quantization),
                         supports_q4_weights,
@@ -1966,6 +2448,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         supports_vllm: std::env::var("VRYX_SUPPORTS_VLLM")
                             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
                             .unwrap_or(false),
+                        machine_info,
                     };
                     send_heartbeat(&http_client, api_url, &payload).await;
 
@@ -1981,6 +2464,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             &mut discovered_peers,
                             &active_peers,
                             Some(&initiator_registry_workers),
+                            Some(&initiator_registry_worker_peers),
                             "heartbeat",
                         )
                         .await;
@@ -2109,6 +2593,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let is_bootstrap = bootstrap_peer_id.map_or(false, |id| id == peer_id);
                     for addr in info.listen_addrs {
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                        swarm.add_peer_address(peer_id, addr.clone());
                         if !is_bootstrap {
                             println!("[P2P] Adresse ajoutée pour {} : {}", peer_id, addr);
                         }
@@ -2116,6 +2601,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     if info.protocols.iter().any(|p| p.as_ref().starts_with("/vryx/")) {
                         if !is_bootstrap && discovered_peers.insert(peer_id) {
                             println!("[P2P] Vryx worker découvert (Identify) : {}", peer_id);
+                        }
+                        if args.mode == "initiator" && !is_bootstrap && peer_id != my_peer_id {
+                            if let Some(q) = pending_relay_until_connected.remove(&peer_id) {
+                                if !q.is_empty() {
+                                    eprintln!(
+                                        "[P2P] Identify worker {} → envoi de {} requête(s) relay retardée(s)",
+                                        peer_id,
+                                        q.len()
+                                    );
+                                    for (r, rtx, _) in q {
+                                        let r_clone = r.clone();
+                                        let relay_started_i = Instant::now();
+                                        let hidden_b = r_clone.data.len() as u64;
+                                        let req_id_i = swarm
+                                            .behaviour_mut()
+                                            .request_response
+                                            .send_request(&peer_id, r);
+                                        pending_requests.insert(
+                                            req_id_i,
+                                            (
+                                                r_clone,
+                                                PendingMeta::P2pRelayReply {
+                                                    reply_tx: rtx,
+                                                    relay_started: relay_started_i,
+                                                    hidden_bytes: hidden_b,
+                                                    persistent_relay: true,
+                                                    connection_reuse: false,
+                                                },
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2163,8 +2681,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     },
                 )) => {
                     if args.mode == "bootstrap" { continue; }
-                    println!("[<] Requête P2P reçue de {}", peer);
-                    tokens_in.fetch_add(1, Ordering::Relaxed);
+                    println!("[<] Requête P2P reçue de {} ({})", peer, request.dtype);
                     let tx_stage2 = tx.clone();
                     let grpc_port = args.grpc_port;
                     let dtype_in = request.dtype.clone();
@@ -2172,12 +2689,75 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let trace_shard = Arc::clone(&last_shard_trace);
                     let mut routing_path = request.routing_path.clone();
                     let session_id = request.session_id.clone();
+                    let (estimated_prompt_tokens, _estimated_completion_tokens) =
+                        estimate_chat_token_deltas(&request.data);
+                    let tokens_in_stage2 = Arc::clone(&tokens_in);
+                    let tokens_out_stage2 = Arc::clone(&tokens_out);
+                    let tokens_generated_stage2 = Arc::clone(&tokens_generated);
 
                     tokio::spawn(async move {
                         match call_local_inference(grpc_port, request.data, request.dtype, routing_path.clone(), session_id.clone()).await {
-                            Ok((data, c, s, metrics, c_ms)) => {
+                            Ok((data, c, s, mut metrics, c_ms)) => {
+                                eprintln!(
+                                    "[P2P] Inférence locale terminée dtype={} bytes={} compute_ms={} prompt={} completion={} total={}",
+                                    dtype_in,
+                                    data.len(),
+                                    c_ms,
+                                    metrics.prompt_tokens,
+                                    metrics.completion_tokens,
+                                    metrics.total_tokens
+                                );
+                                let response_is_error = response_data_is_error(&data);
+                                let count_llm_tokens = matches!(
+                                    dtype_in.as_str(),
+                                    "vryx.mlx_lm.generate"
+                                        | "vryx.llama_cpp.generate"
+                                        | "vryx.llm.generate"
+                                        | "vryx.chat.generate"
+                                );
+                                let prompt_delta = if response_is_error || !count_llm_tokens {
+                                    0
+                                } else {
+                                    metrics.prompt_tokens.max(estimated_prompt_tokens)
+                                };
+                                let parsed_completion_tokens = completion_tokens_from_response_data(&data);
+                                let completion_delta = if response_is_error || !count_llm_tokens {
+                                    0
+                                } else if metrics.completion_tokens > 0 {
+                                    metrics.completion_tokens
+                                } else if parsed_completion_tokens > 0 {
+                                    parsed_completion_tokens
+                                } else {
+                                    estimate_text_tokens(&data).min(64)
+                                };
+                                if prompt_delta > 0 {
+                                    tokens_in_stage2.fetch_add(prompt_delta, Ordering::Relaxed);
+                                }
+                                if completion_delta > 0 {
+                                    tokens_out_stage2.fetch_add(completion_delta, Ordering::Relaxed);
+                                    tokens_generated_stage2.fetch_add(completion_delta, Ordering::Relaxed);
+                                }
+                                if count_llm_tokens && !response_is_error {
+                                    if metrics.prompt_tokens == 0 && prompt_delta > 0 {
+                                        metrics.prompt_tokens = prompt_delta;
+                                    }
+                                    if metrics.completion_tokens == 0 && completion_delta > 0 {
+                                        metrics.completion_tokens = completion_delta;
+                                    }
+                                    if metrics.total_tokens == 0
+                                        && (metrics.prompt_tokens > 0 || metrics.completion_tokens > 0)
+                                    {
+                                        metrics.total_tokens = metrics
+                                            .prompt_tokens
+                                            .saturating_add(metrics.completion_tokens);
+                                    }
+                                }
                                 let total_compute_ns = prior_compute_ns.saturating_add(c);
-                                let total_compute_ms = (total_compute_ns / 1_000_000).max(c_ms);
+                                let total_compute_ms = if dtype_in == "vryx.mlx_lm.generate" && c_ms > 0 {
+                                    c_ms
+                                } else {
+                                    (total_compute_ns / 1_000_000).max(c_ms)
+                                };
                                 if dtype_in.starts_with("vryx.shard.")
                                     || dtype_in.starts_with("vryx.tp.")
                                     || dtype_in.starts_with("vryx.dist.")
@@ -2215,16 +2795,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     }
                                 }
 
-                                let _ = tx_stage2.send(InferenceResult::Stage2 {
+                                if let Err(e) = tx_stage2.send(InferenceResult::Stage2 {
                                     channel,
                                     data,
                                     c: total_compute_ns,
                                     s,
                                     metrics,
                                     compute_time_ms: total_compute_ms,
-                                });
+                                }) {
+                                    eprintln!("[P2P] Impossible de remettre la réponse Stage2 au swarm: {}", e);
+                                }
                             }
                             Err(e) => {
+                                eprintln!("[P2P] Inférence locale échouée dtype={} : {}", dtype_in, e);
                                 let _ = tx_stage2.send(InferenceResult::Stage2Error {
                                     channel,
                                     message: e.to_string(),

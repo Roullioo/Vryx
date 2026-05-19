@@ -23,6 +23,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -62,7 +63,9 @@ def _default_model(stage: int) -> str:
 
 
 _SYSTEM_PROMPT = (
-    "Tu es Vryx, un assistant IA concis et direct. "
+    "Tu es l'assistant Vryx, une interface de chat connectée au réseau de calcul Vryx. "
+    "Si l'utilisateur demande qui tu es ou quel LLM te fait tourner, "
+    "dis honnêtement que Vryx est l'interface/réseau et indique le modèle configuré quand il est connu. "
     "Réponds toujours dans la même langue que l'utilisateur. "
     "Sois précis et utile."
 )
@@ -150,11 +153,76 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                 "[*] Stage 1 (initiateur) — Pipeline Parallelism P2P : "
                 "tokenizer/config côté VPS, shards safetensors servis aux workers."
             )
+            if os.environ.get("VRYX_STAGE1_PREWARM", "1").strip().lower() not in ("0", "false", "no", "off"):
+                def _prewarm() -> None:
+                    try:
+                        print("[*] Préwarm stage1 : chargement léger tokenizer/config en arrière-plan…")
+                        distributed_llm_orchestrator._ensure_model()
+                    except Exception as exc:
+                        print(f"[!] Préwarm stage1 ignoré : {exc}")
+                threading.Thread(target=_prewarm, daemon=True).start()
         else:
-            print(
-                f"[*] Stage 2 (worker) — reçoit poids depuis VPS et exécute "
-                f"des couches Qwen/Qwen3 via gRPC (vryx.shard.*). Aucun modèle local requis."
+            direct_disabled = os.environ.get("VRYX_DISABLE_MLX_LM_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
+            shard_only = os.environ.get("VRYX_WORKER_SHARD_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+            llama_cpp_direct = os.environ.get("VRYX_LLAMA_CPP_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
+            model_id = os.environ.get("VRYX_WORKER_MODEL") or os.environ.get("VRYX_MLX_LM_MODEL_ID") or self.model
+            if llama_cpp_direct:
+                llama_model = os.environ.get("VRYX_LLAMA_CPP_MODEL") or model_id
+                print(f"[*] Stage 2 (worker) — backend llama.cpp/Ollama direct actif : {llama_model}.")
+                prewarm_llama = os.environ.get("VRYX_LLAMA_CPP_PREWARM", "1").strip().lower() not in (
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                )
+                if prewarm_llama:
+                    def _prewarm_llama_cpp() -> None:
+                        try:
+                            print(f"[*] Préwarm llama.cpp/Ollama : chargement résident de {llama_model}…")
+                            payload = json.dumps({
+                                "model_id": model_id,
+                                "load_model_id": llama_model,
+                                "prompt": "Réponds uniquement OK.",
+                                "max_new_tokens": 1,
+                                "keep_alive": os.environ.get("VRYX_LLAMA_CPP_KEEP_ALIVE", "24h"),
+                                "temperature": 0,
+                                "top_p": 0.2,
+                            }, ensure_ascii=False).encode("utf-8")
+                            shard_runtime.llama_cpp_direct_generate(payload)
+                            print("[+] Préwarm llama.cpp/Ollama terminé : modèle résident.")
+                        except Exception as exc:
+                            print(f"[!] Préwarm llama.cpp/Ollama ignoré : {exc}")
+                    threading.Thread(target=_prewarm_llama_cpp, daemon=True).start()
+            elif shard_only:
+                print(f"[*] Stage 2 (worker) — mode shard-only : exécution de couches distribuées pour {model_id}.")
+            else:
+                print(f"[*] Stage 2 (worker) — backend MLX direct résident pour {model_id}.")
+            prewarm_enabled = os.environ.get("VRYX_MLX_PREWARM", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
             )
+            if not llama_cpp_direct and not direct_disabled and not shard_only and prewarm_enabled:
+                def _prewarm_direct_mlx() -> None:
+                    try:
+                        print(f"[*] Préwarm worker MLX : chargement résident de {model_id} en arrière-plan…")
+                        payload = json.dumps({
+                            "model_id": model_id,
+                            "prompt": "Bonjour.",
+                            "max_new_tokens": 1,
+                            "quantization": os.environ.get("VRYX_HIDDEN_TRANSPORT") or "auto",
+                        }, ensure_ascii=False).encode("utf-8")
+                        shard_runtime.mlx_lm_direct_generate(payload)
+                        print("[+] Préwarm worker MLX terminé : premier jeton prêt.")
+                    except Exception as exc:
+                        print(f"[!] Préwarm worker MLX ignoré : {exc}")
+                threading.Thread(target=_prewarm_direct_mlx, daemon=True).start()
+            elif not llama_cpp_direct and not direct_disabled and not shard_only:
+                print(
+                    "[*] Préwarm worker MLX désactivé : le modèle sera chargé au premier appel "
+                    "ou basculé en shard si la mémoire allouée ne suffit pas."
+                )
 
     async def ReportCapabilities(self, request, context):
         ram = int(request.ram_available_mb or 0)
@@ -254,11 +322,41 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             }
             return _proto_from_bytes(json.dumps(result, ensure_ascii=False).encode(), start, 0)
 
+        # ── Préchargement direct mlx-lm officiel ──────────────────────────────
+        if dtype == "vryx.mlx_lm.preload":
+            t0 = time.perf_counter()
+            out_bytes = await asyncio.to_thread(shard_runtime.mlx_lm_preload, raw)
+            compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            return _proto_from_bytes(out_bytes, start, compute_ms, sid=session_id or "")
+
         # ── Génération directe mlx-lm officiel ────────────────────────────────
         if dtype == "vryx.mlx_lm.generate":
             t0 = time.perf_counter()
-            out_bytes = shard_runtime.mlx_lm_direct_generate(raw)
+            # mlx-lm/Metal est bloquant. Le lancer directement dans cette coroutine
+            # fige le serveur grpc.aio et transforme les requêtes concurrentes en
+            # "transport error" côté daemon Rust. Le lock modèle reste dans
+            # shard_runtime; ici on garde juste l'event loop gRPC réactive.
+            out_bytes = await asyncio.to_thread(shard_runtime.mlx_lm_direct_generate, raw)
             compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            try:
+                direct_meta = json.loads(out_bytes.decode("utf-8", errors="replace"))
+                if isinstance(direct_meta, dict) and int(direct_meta.get("generation_ms") or 0) > 0:
+                    compute_ms = int(direct_meta.get("generation_ms") or compute_ms)
+            except Exception:
+                pass
+            return _proto_from_bytes(out_bytes, start, compute_ms, sid=session_id or "")
+
+        # ── Génération directe llama.cpp/Ollama GGUF natif ────────────────────
+        if dtype == "vryx.llama_cpp.generate":
+            t0 = time.perf_counter()
+            out_bytes = await asyncio.to_thread(shard_runtime.llama_cpp_direct_generate, raw)
+            compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            try:
+                direct_meta = json.loads(out_bytes.decode("utf-8", errors="replace"))
+                if isinstance(direct_meta, dict) and int(direct_meta.get("generation_ms") or 0) > 0:
+                    compute_ms = int(direct_meta.get("generation_ms") or compute_ms)
+            except Exception:
+                pass
             return _proto_from_bytes(out_bytes, start, compute_ms, sid=session_id or "")
 
         # ── vryx.shard.init ───────────────────────────────────────────────────
@@ -355,7 +453,21 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                         "hidden_transport": maybe_payload.get("hidden_transport") or maybe_payload.get("quantization"),
                         "quantization": maybe_payload.get("quantization") or maybe_payload.get("hidden_transport"),
                         "pool_preference": maybe_payload.get("pool_preference"),
+                        "stream_id": maybe_payload.get("stream_id"),
+                        "stream_secret": maybe_payload.get("stream_secret"),
+                        "stream_callback_url": maybe_payload.get("stream_callback_url"),
                     }
+                    if maybe_payload.get("model_id") or maybe_payload.get("modelId"):
+                        request_options["model_id"] = maybe_payload.get("model_id") or maybe_payload.get("modelId")
+                    preferred_workers = maybe_payload.get("preferred_worker_peer_ids") or maybe_payload.get("preferredWorkerPeerIds")
+                    if isinstance(preferred_workers, list):
+                        request_options["preferred_worker_peer_ids"] = [
+                            str(peer).strip()
+                            for peer in preferred_workers
+                            if str(peer).strip()
+                        ]
+                    if maybe_payload.get("scheduler_job_id") or maybe_payload.get("schedulerJobId"):
+                        request_options["scheduler_job_id"] = maybe_payload.get("scheduler_job_id") or maybe_payload.get("schedulerJobId")
                     if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
                         request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
             except Exception:
@@ -437,15 +549,40 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                     "Vérifier le chat template et les stop tokens.]"
                 )
             trace_obj = pr.get("trace") or {}
-            trace_obj["compute_time_ms"] = compute_ms
+            trace_compute_ms = 0
+            try:
+                trace_compute_ms = int(
+                    trace_obj.get("generation_ms")
+                    or trace_obj.get("compute_time_ms")
+                    or trace_obj.get("worker_compute_ms")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                trace_compute_ms = 0
+            # Direct MLX already reports the GPU decode time from the worker. Keep
+            # that hot-path value instead of replacing it with relay/callback wall time.
+            effective_compute_ms = (
+                trace_compute_ms
+                if str(trace_obj.get("layout") or "") == "mlx_lm_direct_p2p" and trace_compute_ms > 0
+                else compute_ms
+            )
+            trace_obj["compute_time_ms"] = effective_compute_ms
+            if ct > 0 and effective_compute_ms > 0:
+                actual_tps = round(ct * 1000.0 / effective_compute_ms, 3)
+                actual_ms_per_token = int(effective_compute_ms / ct)
+                trace_obj["hot_path_tps"] = actual_tps
+                trace_obj["avg_ms_per_token"] = actual_ms_per_token
+                if isinstance(trace_obj.get("benchmark"), dict):
+                    trace_obj["benchmark"]["actual_tps"] = actual_tps
+                    trace_obj["benchmark"]["actual_ms_per_token"] = actual_ms_per_token
             trace_obj["ok"] = True
             trace_obj.pop("error", None)
             pipeline_trace_json = json.dumps(trace_obj, ensure_ascii=False)
-            print(f"[>] Pipeline OK : {len(text_out)} chars, {compute_ms}ms")
+            print(f"[>] Pipeline OK : {len(text_out)} chars, hot={effective_compute_ms}ms wall={compute_ms}ms")
             return _proto_from_text(
                 text_out, start, metrics,
                 pipeline_trace_json=pipeline_trace_json,
-                compute_time_ms=compute_ms,
+                compute_time_ms=effective_compute_ms,
             )
 
         # Pipeline a échoué — le VPS NE CALCULE PAS, on remonte l'erreur explicite.
@@ -480,6 +617,12 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
 
     async def ProcessStream(self, request, context):
         start = time.perf_counter()
+        native_callback_stream = False
+        try:
+            meta = json.loads(bytes(request.data or b"").decode("utf-8", errors="replace"))
+            native_callback_stream = bool(meta.get("stream_id") and meta.get("stream_callback_url"))
+        except Exception:
+            native_callback_stream = False
         yield vryx_pb2.StreamChunk(
             event="stage",
             json=json.dumps({"stage": "stage1_started", "status": "Pipeline P2P démarré"}, ensure_ascii=False),
@@ -503,7 +646,13 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             trace = {}
         text = bytes(response.data or b"").decode("utf-8", errors="replace")
         token_events = trace.get("token_events") if isinstance(trace, dict) else None
-        if isinstance(token_events, list) and token_events:
+        if native_callback_stream:
+            yield vryx_pb2.StreamChunk(
+                event="stage",
+                json=json.dumps({"stage": "native_worker_stream_done", "status": "Flux worker terminé, finalisation des métriques…"}, ensure_ascii=False),
+                elapsed_ms=elapsed_ms,
+            )
+        elif isinstance(token_events, list) and token_events:
             for event in token_events:
                 if not isinstance(event, dict):
                     continue

@@ -34,7 +34,15 @@ const labels: Record<ThemePreference, string> = {
   system: 'Thème système',
 }
 
-export function ThemeToggle({ navOnDarkHero = false }: { navOnDarkHero?: boolean }) {
+export function ThemeToggle({
+  navOnDarkHero = false,
+  menuPlacement = 'down',
+  menuAlign = 'right',
+}: {
+  navOnDarkHero?: boolean
+  menuPlacement?: 'up' | 'down'
+  menuAlign?: 'left' | 'right'
+}) {
   const { preference, setPreference } = useTheme()
   const [open, setOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -78,7 +86,11 @@ export function ThemeToggle({ navOnDarkHero = false }: { navOnDarkHero?: boolean
       </button>
       {open && (
         <ul
-          className="absolute right-0 z-[60] mt-2 min-w-[11rem] rounded-xl border border-border bg-card py-1 shadow-lg dark:shadow-black/40"
+        className={`absolute z-[60] min-w-[11rem] rounded-xl border border-white/25 bg-white/70 py-1 shadow-[0_24px_80px_rgba(15,23,42,.18)] backdrop-blur-2xl dark:border-white/12 dark:bg-zinc-950/72 dark:shadow-black/50 ${
+            menuAlign === 'left' ? 'left-0' : 'right-0'
+          } ${
+            menuPlacement === 'up' ? 'bottom-full mb-2' : 'mt-2'
+          }`}
           role="listbox"
           aria-label="Thème d’affichage"
         >

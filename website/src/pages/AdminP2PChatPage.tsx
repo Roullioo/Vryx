@@ -122,7 +122,7 @@ export function AdminP2PChatPage() {
 
   return (
     <AdminShell title="Chat P2P" mainSpacing="none" showDesktopTitleBar={false}>
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <AdminP2PChatPanel
           layout="full"
           aside={aside}

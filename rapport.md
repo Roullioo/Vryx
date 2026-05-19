@@ -293,6 +293,9 @@ Objectif **Qwen3.5 9B >15 TPS** atteint sur un vrai appel P2P VPS. Le chemin pro
 
 - **Avant** : pastille « VX » et titre « Vryx Admin ».
 - **Maintenant** : même pictogramme que le site public (`/logo-withoutbg.png` via `VryxLogo`) et libellé **Virtualized Remote Yield eXchange** à côté ; le pictogramme renvoie vers l’accueil (`/`).
+- **Menu mobile (sidebar)** : le callback `onClose` était recréé à chaque rendu de `AdminShell`, ce qui relançait l’effet `useEffect` dans `Sidebar` et **refermait la sidebar tout de suite**. Stabilisation avec `useCallback` sur `closeSidebar`.
+- **Hauteur admin + Chat P2P** : le shell utilisait seulement `min-h-dvh`, la colonne dépassait le viewport et le **scroll global** prenait le pas sur la zone messages (`overflow-y-auto`). Passage à **`h-dvh max-h-dvh overflow-hidden`** sur la racine admin, **`overflow-hidden`** sur la colonne principale, en-tête mobile en **`shrink-0`** (sans `sticky`), conteneur page Chat P2P **`min-w-0 overflow-hidden`**, zone messages avec **`touch-pan-y`** pour le défilement tactile.
+- **Workers / graphe — panneau détail mobile** : en-tête du tiroir avec **icône X** (cible 44 px), marges **safe-area**, **z-index** relevé (`aside` 180, voile 170, modale 200) pour rester au-dessus du header admin ; corps du panneau scrollable séparément.
 
 ---
 
@@ -301,3 +304,29 @@ Objectif **Qwen3.5 9B >15 TPS** atteint sur un vrai appel P2P VPS. Le chemin pro
 - **Procédure** : `python3 website_deploy.py` depuis la racine du dépôt (build `website`, archive `dist` + `server`, SFTP vers le VPS, `npm ci --omit=dev` dans `/var/www/vryx/server`, redémarrage PM2 `vryx-api`, contrôle `http://127.0.0.1:4000/api/health`).
 - **Résultat** : déploiement réussi sur le VPS cible ; API **online** après `pm2 save`.
 - **Secrets** : utiliser `VRYX_VPS_SSH_PASSWORD` (ou clé `VRYX_VPS_SSH_KEY`) en variable d’environnement locale, sans commiter de mot de passe.
+
+## Mise à jour : `/admin/workers` (graphe + cartes + GPU / VRAM) — 15 mai 2026
+
+### Ce qu’il se passait avant
+
+- Graphe : **VRAM** affichée à **0,5 Go** par défaut quand `gpuVramMb` était absent (valeur de repli dans `buildPoolGraphPayload`).
+- Panneau nœud : statut **« Inactif »** pour les workers pourtant **en ligne** en veille (`status: idle`), GPU souvent **« inconnu »**, peu d’infos sur le **modèle** et **aucune** statistique de tokens sur 1 h / 24 h dans le graphe.
+- Liste : pas de colonnes dédiées **tokens 1 h / 24 h** (ledger), **runtime** ni libellé VRAM cohérent pour MLX.
+
+### Ce qu’il se passe maintenant
+
+- **API / graphe** : plus de VRAM fictive à 0,5 Go ; `hardware` dérivé de `gpuName`, ou **Apple Silicon (Metal / MLX)** si backend MLX sans nom ; nœuds enrichis (**modèle**, **runtime**, **tokens** total / 1 h / 24 h). Snapshot pool et SSE alignés sur la même requête workers + sous-requêtes `worker_token_ledger`.
+- **UI graphe** (`PoolNetworkGraph`) : statut **« En veille (connecté) »** pour `idle`, libellé VRAM **« non renseigné »** ou **mémoire unifiée (indicative)** pour MLX quand la VRAM vient des Mo totaux ; infobulle et panneau latéral avec **modèle chargé** et compteurs de tokens.
+- **UI liste** (`AdminWorkersPage`) : cartes avec **tokens total / 1 h / 24 h**, **modèle**, **runtime**, **VRAM** formatée ; bandeau de stats réseau (**tokens 24 h** et **1 h** cumulés sur tous les workers enregistrés).
+- **Daemon Rust (macOS)** : si `VRYX_GPU_NAME` / `VRYX_GPU_VRAM_MB` sont absents, le heartbeat envoie **`machdep.cpu.brand_string`** et la taille **`hw.memsize`** (Mo, approximation mémoire unifiée pour l’admin).
+- **Détection renforcée (15 mai 2026, suite)** : lecture **`system_profiler SPDisplaysDataType -json`** pour le **vrai nom GPU** (`sppci_model`, ex. `Apple M4 Max`) et la VRAM annoncée quand `spdisplays_vram` est présent ; sinon repli **`hw.memsize`**. **Linux** : **`nvidia-smi`** (nom + mémoire). Cache **`OnceLock`** par processus. Champs `gpu_*` **absents du JSON** quand inconnus (`skip_serializing_if`) pour ne plus écraser la BDD avec `null` à chaque pulse.
+- **Déploiement** : `website_deploy.py` exécuté avec succès (build, transfert, PM2 `vryx-api` redémarré, health OK).
+
+### Ping temps réel (worker sélectionné / fiche détail)
+
+- **Route** `GET /api/admin/workers/:peerId/ping` (admin, rate-limit 60/min) : le VPS mesure la latence vers l’`public_ip` du worker en base — **TCP** vers le port **gRPC** puis **P2P**, sinon **ICMP** ; refuse loopback / lien-local.
+- **UI** : sur `/admin/workers/:id`, carte « Latence temps réel » avec polling **2,5 s** uniquement sur cette fiche ; dans le graphe Nerve Center, panneau latéral idem **uniquement pour le nœud sélectionné** (pas de rafraîchissement global du graphe pour le ping).
+
+### Côté worker (hors site)
+
+Pour que la base affiche tout de suite les nouvelles colonnes GPU/VRAM sur une machine déjà en prod : **redémarrer** le binaire `rust-daemon` worker après mise à jour (les heartbeats suivants mettront à jour `workers`).

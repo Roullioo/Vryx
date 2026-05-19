@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test:inference-metrics": "node scripts/inference-metrics-test.mjs",
+    "test:p2p-stream": "node scripts/p2p-stream-e2e.mjs",
+    "test:worker-command": "node scripts/worker-command-e2e.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

@@ -1,11 +1,11 @@
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, NavLink, useLocation } from 'react-router-dom'
 import { IconChevronDown } from '../icons/Icons'
 import { VryxLogo } from '../brand/VryxLogo'
 import { useAuth } from '../../context/AuthContext'
 import { useTheme } from '../../context/ThemeContext'
-import { MOCK_ACCOUNT } from '../../data/accountMock'
 import { ThemeToggle } from './ThemeToggle'
+import { fetchAccountOverview, type AccountOverview } from '../../lib/account'
 
 const routeLinks = [
   { to: '/clients', label: 'Clients' },
@@ -13,10 +13,14 @@ const routeLinks = [
   { to: '/simulateur', label: 'Simulateur' },
   { to: '/comparatif', label: 'Gains solo / pool' },
   { to: '/workers', label: 'Workers' },
+  { to: '/status', label: 'Status' },
 ]
 
 export function Navbar() {
   const [menuOpen, setMenuOpen] = useState(false)
+  const [accountOverview, setAccountOverview] = useState<AccountOverview | null>(null)
+  const [accountOverviewLoading, setAccountOverviewLoading] = useState(false)
+  const [accountOverviewError, setAccountOverviewError] = useState('')
   const { pathname } = useLocation()
   const { user, loading, logout } = useAuth()
   const { resolvedTheme } = useTheme()
@@ -29,6 +33,7 @@ export function Navbar() {
     pathname === '/simulateur' ||
     pathname === '/comparatif' ||
     pathname === '/workers' ||
+    pathname === '/status' ||
     pathname === '/panel/modeles'
 
   /** Pastilles blanches sur hero uniquement en thème clair résolu. */
@@ -46,10 +51,32 @@ export function Navbar() {
           : 'text-muted hover:text-fg',
     ].join(' ')
 
-  async function handleLogout() {
+  const handleLogout = useCallback(async () => {
     await logout()
     setMenuOpen(false)
-  }
+  }, [logout])
+
+  const loadAccountOverview = useCallback(async () => {
+    if (!user) {
+      setAccountOverview(null)
+      return
+    }
+    setAccountOverviewLoading(true)
+    setAccountOverviewError('')
+    const result = await fetchAccountOverview()
+    if (!result.ok) {
+      setAccountOverviewError(result.error)
+      setAccountOverview(null)
+      setAccountOverviewLoading(false)
+      return
+    }
+    setAccountOverview(result.data)
+    setAccountOverviewLoading(false)
+  }, [user])
+
+  useEffect(() => {
+    void loadAccountOverview()
+  }, [loadAccountOverview])
 
   return (
     <header className="relative z-30 w-full bg-transparent">
@@ -97,27 +124,38 @@ export function Navbar() {
                   <p className="truncate text-xs font-medium text-muted" title={user.email}>
                     {user.email}
                   </p>
-                  <p className="mt-1 text-[0.65rem] uppercase tracking-wide text-muted">Forfait {MOCK_ACCOUNT.plan}</p>
+                  <p className="mt-1 text-[0.65rem] uppercase tracking-wide text-muted">
+                    Forfait {accountOverview?.plan ?? '—'}
+                  </p>
                   <dl className="mt-4 grid grid-cols-2 gap-3 text-xs">
                     <div className="rounded-lg border border-border bg-surface p-3">
                       <dt className="text-muted">Solde</dt>
                       <dd className="mt-0.5 font-mono font-semibold text-success">
-                        {MOCK_ACCOUNT.balanceCredits.toLocaleString('fr-FR', {
+                        {accountOverview?.balanceCredits.toLocaleString('fr-FR', {
                           minimumFractionDigits: 0,
                           maximumFractionDigits: 0,
                         })}{' '}
-                        crédits
+                        € TTC
                       </dd>
                     </div>
                     <div className="rounded-lg border border-border bg-surface p-3">
                       <dt className="text-muted">Usage mois</dt>
-                      <dd className="mt-0.5 font-mono font-semibold text-electric">{MOCK_ACCOUNT.usagePercent} %</dd>
+                      <dd className="mt-0.5 font-mono font-semibold text-electric">
+                        {accountOverviewLoading ? '...' : `${accountOverview?.usagePercent ?? 0} %`}
+                      </dd>
                     </div>
                     <div className="col-span-2 rounded-lg bg-surface/80 p-2.5">
                       <dt className="text-muted">Clés API actives</dt>
-                      <dd className="mt-0.5 font-mono font-semibold text-fg">{MOCK_ACCOUNT.activeApiKeys}</dd>
+                      <dd className="mt-0.5 font-mono font-semibold text-fg">
+                        {accountOverviewLoading ? '...' : accountOverview?.activeApiKeys ?? 0}
+                      </dd>
                     </div>
                   </dl>
+                  {accountOverviewError ? (
+                    <p className="mt-3 rounded-md border border-alert/40 bg-alert/10 p-2 text-[11px] text-alert">
+                      {accountOverviewError}
+                    </p>
+                  ) : null}
                   <Link
                     to="/compte"
                     className="btn-secondary mt-4 flex w-full justify-center rounded-lg py-2.5 text-sm font-semibold"

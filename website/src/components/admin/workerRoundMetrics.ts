@@ -2,6 +2,8 @@
 
 export type WorkerRoundMetrics = {
   latencyMs: number
+  /** Ping/aller-retour P2P estimé ou mesuré pour le tour (ms), sans contenu token. */
+  pingMs?: number
   vpsDelegateMs: number
   workerComputeMs: number
   /** Temps réel de calcul rapporté par le worker (proto `compute_time_ms`, champ 12). */

@@ -27,7 +27,8 @@ export function VryxLogo({
   markSize = 'md',
   labelledBy,
 }: VryxLogoProps) {
-  const wordmarkClass = tone === 'light' ? 'text-white' : 'text-fg'
+  const needsLightPlate = tone === 'dark'
+  const wordmarkClass = tone === 'light' ? 'text-white' : needsLightPlate ? 'vryx-logo-wordmark text-white dark:text-fg' : 'text-fg'
 
   const mark = (
     <img
@@ -46,10 +47,10 @@ export function VryxLogo({
     ) : null
 
   const content = (
-    <>
+    <span className={`inline-flex items-center gap-2.5 ${needsLightPlate ? 'vryx-logo-plate' : ''}`}>
       {mark}
       {wordmark}
-    </>
+    </span>
   )
 
   const ring =
