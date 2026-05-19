@@ -1,3 +1,6 @@
+import { summarizeInferenceRows } from './inference-metrics.js'
+import { scoreProductionReadiness } from './production-readiness.js'
+
 function toIsoDate(value) {
   if (!value) return null
   const date = value instanceof Date ? value : new Date(value)
@@ -17,6 +20,7 @@ function percentile(values, p) {
 }
 
 function parseJsonSafe(raw) {
+  if (raw && typeof raw === 'object') return raw
   if (typeof raw !== 'string') return null
   try {
     const parsed = JSON.parse(raw)
@@ -279,6 +283,123 @@ export function registerPublicStatusRoutes(app, options) {
     } catch (error) {
       console.error('public/network-status', error)
       return res.status(500).json({ ok: false, error: 'Impossible de charger le status réseau.' })
+    }
+  })
+
+  app.get('/api/public/golden-path-status', async (req, res) => {
+    try {
+      const hours = Math.max(1, Math.min(168, Number(req.query.hours) || 24))
+      const goldenModels = String(process.env.VRYX_GOLDEN_PATH_MODELS || 'gemma4:31b,qwen/qwen3.6-35b-a3b,qwen3.6-35b')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean)
+      const [workerRows, inferenceRows, benchmarkRows] = await Promise.all([
+        pool.query(
+          `SELECT peer_id AS peerId, model, desired_model AS desiredModel, runtime_backend AS runtimeBackend,
+                  weight_quantization AS weightQuantization, supports_q4_weights AS supportsQ4Weights,
+                  capabilities_json AS capabilitiesJson, machine_info AS machineInfo,
+                  public_ip AS publicIp, p2p_port AS p2pPort, last_heartbeat_at AS lastHeartbeatAt,
+                  TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
+           FROM workers
+           WHERE mode = 'worker'
+           ORDER BY last_heartbeat_at DESC
+           LIMIT 200`,
+        ),
+        pool.query(
+          `SELECT status, model, runtime, worker_id AS workerId, ttft_ms AS ttftMs,
+                  decode_tps AS decodeTps, latency_ms AS latencyMs, total_duration_ms AS totalDurationMs,
+                  prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
+                  total_tokens AS totalTokens, cost_eur AS costEur, error, created_at AS createdAt
+           FROM inference_request_logs
+           WHERE created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+           ORDER BY created_at DESC
+           LIMIT 5000`,
+          { hours },
+        ),
+        pool.query(
+          `SELECT model, mode, status, worker_count AS workerCount, latency_ms AS latencyMs,
+                  ttft_ms AS ttftMs, tps, prompt_tokens AS promptTokens,
+                  completion_tokens AS completionTokens, total_tokens AS totalTokens,
+                  error, created_at AS createdAt
+           FROM worker_benchmark_runs
+           WHERE created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+           ORDER BY created_at DESC
+           LIMIT 500`,
+          { hours },
+        ),
+      ])
+
+      const workers = (workerRows[0] || []).map((row) => {
+        const machineInfo = parseJsonSafe(row.machineInfo) || {}
+        const capabilitiesJson = parseJsonSafe(row.capabilitiesJson) || {}
+        const network = capabilitiesJson.network || machineInfo.network || machineInfo.connectivity || {}
+        return {
+          peerId: row.peerId,
+          model: row.model || null,
+          desiredModel: row.desiredModel || null,
+          runtimeBackend: row.runtimeBackend || null,
+          weightQuantization: row.weightQuantization || null,
+          supportsQ4Weights: Boolean(row.supportsQ4Weights),
+          secondsSinceHeartbeat: toNumber(row.secondsSinceHeartbeat, 999999),
+          lastHeartbeatAt: toIsoDate(row.lastHeartbeatAt),
+          routeMode: network.routeMode || (network.directReady ? 'direct_tcp' : 'unknown'),
+          directReady: Boolean(network.directReady || network.routeMode === 'direct_tcp'),
+          publicIp: row.publicIp || null,
+          p2pPort: row.p2pPort || null,
+          capabilitiesJson,
+          machineInfo,
+        }
+      })
+      const requests = inferenceRows[0] || []
+      const benchmarks = benchmarkRows[0] || []
+      const readiness = scoreProductionReadiness({
+        workers,
+        inferenceRows: requests,
+        inferenceSummary: summarizeInferenceRows(requests),
+        benchmarkRows: benchmarks,
+        goldenModels,
+      })
+      const benchmarkOk = benchmarks.filter((row) => row.status === 'ok' && Number(row.tps || 0) > 0)
+      const latestBenchmark = benchmarks[0] || null
+      return res.json({
+        ok: true,
+        sampledAt: new Date().toISOString(),
+        windowHours: hours,
+        readiness,
+        goldenPath: {
+          models: goldenModels,
+          stable99Proven: readiness.score >= 90 && readiness.metrics.successRate >= 99,
+          directWorkers: workers.filter((worker) => worker.directReady).length,
+          relayWorkers: workers.filter((worker) => worker.secondsSinceHeartbeat <= workerLiveSec && !worker.directReady).length,
+          benchmarkRuns: benchmarks.length,
+          benchmarkOk: benchmarkOk.length,
+          latestBenchmark: latestBenchmark
+            ? {
+                model: latestBenchmark.model,
+                status: latestBenchmark.status,
+                tps: Number(latestBenchmark.tps || 0),
+                ttftMs: Number(latestBenchmark.ttftMs || 0),
+                latencyMs: Number(latestBenchmark.latencyMs || 0),
+                workerCount: Number(latestBenchmark.workerCount || 0),
+                createdAt: toIsoDate(latestBenchmark.createdAt),
+                error: latestBenchmark.error || null,
+              }
+            : null,
+        },
+        workers: workers.map((worker) => ({
+          peerId: worker.peerId,
+          model: worker.model,
+          runtimeBackend: worker.runtimeBackend,
+          weightQuantization: worker.weightQuantization,
+          secondsSinceHeartbeat: worker.secondsSinceHeartbeat,
+          routeMode: worker.routeMode,
+          directReady: worker.directReady,
+          p2pPort: worker.p2pPort,
+        })),
+      })
+    } catch (error) {
+      console.error('public/golden-path-status', error)
+      return res.status(500).json({ ok: false, error: 'Impossible de charger le golden path status.' })
     }
   })
 }

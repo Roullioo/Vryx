@@ -1,0 +1,16 @@
+[Unit]
+Description=VRYX golden path benchmark recorder
+After=network-online.target mysql.service vryx-api.service vryx-initiator.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/var/www/vryx/server
+EnvironmentFile=/var/www/vryx/server/.env
+Environment=VRYX_ROOT_DIR=/var/www/vryx
+Environment=VRYX_GOLDEN_BENCH_MODEL=gemma4:31b
+Environment=VRYX_GOLDEN_BENCH_QUANT=q4
+Environment=VRYX_GOLDEN_BENCH_POOL=auto
+Environment=VRYX_GOLDEN_BENCH_TARGET_TPS=10
+Environment=VRYX_GOLDEN_BENCH_TOKENS=128,256
+ExecStart=/usr/bin/node scripts/golden-path-benchmark-cron.mjs

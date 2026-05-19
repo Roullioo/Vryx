@@ -10,7 +10,9 @@
     "test:production-readiness": "node scripts/production-readiness-test.mjs",
     "test:p2p-stream": "node scripts/p2p-stream-e2e.mjs",
     "test:worker-command": "node scripts/worker-command-e2e.mjs",
-    "gate:production-readiness": "node scripts/production-readiness-gate.mjs"
+    "gate:production-readiness": "node scripts/production-readiness-gate.mjs",
+    "gate:multiworker": "node scripts/multiworker-production-gate.mjs",
+    "bench:golden-path": "node scripts/golden-path-benchmark-cron.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
