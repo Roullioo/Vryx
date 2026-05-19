@@ -8,6 +8,16 @@ function hasGoldenModel(value, goldenModels) {
   return goldenModels.some((candidate) => model.includes(String(candidate).toLowerCase()))
 }
 
+function percentile(values, p) {
+  const clean = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b)
+  if (clean.length === 0) return 0
+  const rank = Math.ceil((p / 100) * clean.length) - 1
+  return clean[Math.max(0, Math.min(clean.length - 1, rank))]
+}
+
 export function scoreProductionReadiness({
   workers = [],
   inferenceSummary = null,
@@ -44,14 +54,19 @@ export function scoreProductionReadiness({
   }
 
   const summary = inferenceSummary || {}
-  const ok = num(summary.ok)
-  const count = num(summary.count)
-  const failed = num(summary.failed, Math.max(0, count - ok))
+  const validBenchmarks = benchmarkRows.filter((row) => String(row.status || '') === 'ok' && num(row.tps) >= minDecodeTps)
+  const okBenchmarks = benchmarkRows.filter((row) => String(row.status || '') === 'ok')
+  const benchmarkTps = validBenchmarks.map((row) => num(row.tps)).filter((value) => value > 0)
+  const benchmarkTtft = validBenchmarks.map((row) => num(row.ttftMs ?? row.ttft_ms)).filter((value) => value > 0)
+  const summaryCount = num(summary.count)
+  const ok = summaryCount > 0 ? num(summary.ok) : okBenchmarks.length
+  const count = summaryCount > 0 ? summaryCount : benchmarkRows.length
+  const failed = summaryCount > 0 ? num(summary.failed, Math.max(0, count - ok)) : Math.max(0, benchmarkRows.length - okBenchmarks.length)
   const successRate = count > 0 ? (ok / count) * 100 : 0
   const failureRate = count > 0 ? (failed / count) * 100 : 100
-  const tpsP50 = num(summary.decodeTps?.p50)
-  const tpsBest = num(summary.decodeTps?.best)
-  const ttftP95 = num(summary.ttftMs?.p95)
+  const tpsP50 = num(summary.decodeTps?.p50) || Number(percentile(benchmarkTps, 50).toFixed(3))
+  const tpsBest = num(summary.decodeTps?.best) || (benchmarkTps.length ? Number(Math.max(...benchmarkTps).toFixed(3)) : 0)
+  const ttftP95 = num(summary.ttftMs?.p95) || percentile(benchmarkTtft, 95)
   const latencyP95 = num(summary.latencyMs?.p95)
 
   if (count >= 3 && ok > 0) score += 15
@@ -83,13 +98,15 @@ export function scoreProductionReadiness({
   }
 
   const recentEmpty = inferenceRows.filter((row) => /empty_worker_response/i.test(String(row.error || ''))).length
-  if (recentEmpty === 0 && count > 0) score += 10
-  else {
+  if (recentEmpty === 0 && count > 0) {
+    score += 10
+  } else if (count === 0) {
+    warnings.push('Aucun sample récent pour prouver l’absence de réponse vide.')
+  } else {
     blockers.push(`${recentEmpty} réponse(s) vide(s) détectée(s) récemment.`)
     actions.push('Traiter les réponses vides comme incident P0 et inspecter worker/runtime.')
   }
 
-  const validBenchmarks = benchmarkRows.filter((row) => String(row.status || '') === 'ok' && num(row.tps) >= minDecodeTps)
   if (validBenchmarks.length > 0) score += 10
   else {
     warnings.push('Aucun benchmark golden path récent ne valide la cible TPS.')

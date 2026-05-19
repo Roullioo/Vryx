@@ -14,13 +14,14 @@ const prompt =
   'Écris une longue liste de mots français simples séparés par des virgules. Ne conclus pas. Continue jusqu’à atteindre la limite de génération.'
 
 function dbConfig() {
-  if (process.env.DATABASE_URL) return process.env.DATABASE_URL
+  if (process.env.DATABASE_URL) return { uri: process.env.DATABASE_URL, namedPlaceholders: true }
   return {
     host: process.env.DB_HOST || '127.0.0.1',
     port: Number(process.env.DB_PORT || 3306),
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
+    namedPlaceholders: true,
   }
 }
 
