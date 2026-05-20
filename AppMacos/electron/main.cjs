@@ -15,8 +15,9 @@ let nodeAndWorkerDir = bundledNodeAndWorkerDir;
 
 const DEFAULT_BOOTSTRAP = '/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz';
 const DEFAULT_API_URL = 'https://vryx.eu';
-const RUNTIME_COPY_REVISION = '2026-05-16-live-auth-stats-v33-qwen36-35b';
+const RUNTIME_COPY_REVISION = '2026-05-20-worker-start-preflight-v34';
 let updateCheckInterval = null;
+let workerUpdateDownloadPromise = null;
 
 const MODEL_CATALOG = [
   {
@@ -65,10 +66,9 @@ const MODEL_CATALOG = [
     diskGb: 70,
     totalModelGb: 70,
     effectiveModelGb: 19,
-    // The 4-bit weights are around 19 GB on disk, but mlx-lm needs a large
-    // unified-memory headroom for model buffers, tokenizer state, prefill and
-    // KV cache. Below this, macOS can kill the worker during warmup.
-    fullLoadMinGb: 44,
+    // The 4-bit weights are around 19 GB on disk. On M4 Max, mlx-lm runs
+    // reliably with ~38 GB allocated while keeping enough headroom for macOS.
+    fullLoadMinGb: 38,
     fullLoadInt8Gb: 38,
     fullLoadFp16Gb: 72,
     totalLayers: 40,
@@ -88,8 +88,8 @@ const MODEL_CATALOG = [
     speed: 'Rapide en Q4 MLX / vLLM, shard MoE sinon',
     useCase: 'MoE 35B total / 3B actifs: full Q4 si la mémoire suffit, sinon couches shardées par worker',
     quantizedVariants: [
-      { quantization: 'q4', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit', diskGb: 19, minMemoryGb: 44 },
-      { quantization: 'q4-dwq', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit-DWQ', diskGb: 19.3, minMemoryGb: 44 },
+      { quantization: 'q4', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit', diskGb: 19, minMemoryGb: 38 },
+      { quantization: 'q4-dwq', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit-DWQ', diskGb: 19.3, minMemoryGb: 38 },
       { quantization: 'int8', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-8bit', diskGb: 35.2, minMemoryGb: 38 },
       { quantization: 'fp8', backend: 'vllm', modelId: 'Qwen/Qwen3.6-35B-A3B-FP8', diskGb: 35, minMemoryGb: 40 },
     ],
@@ -279,6 +279,7 @@ function copyRuntimeIfNeeded() {
   }
   const target = runtimeDir();
   const marker = path.join(target, '.vryx-runtime-version');
+  const launcherName = process.platform === 'win32' ? 'start-worker.bat' : 'start-worker.sh';
   const version = `${app.getVersion()}-${process.platform}-${process.arch}-${RUNTIME_COPY_REVISION}`;
   let current = '';
   try {
@@ -286,7 +287,7 @@ function copyRuntimeIfNeeded() {
   } catch {
     current = '';
   }
-  if (current !== version || !fs.existsSync(path.join(target, 'start-worker.sh'))) {
+  if (current !== version || !fs.existsSync(path.join(target, launcherName))) {
     const preserved = path.join(app.getPath('userData'), 'runtime-preserved');
     fs.rmSync(preserved, { recursive: true, force: true });
     fs.mkdirSync(preserved, { recursive: true });
@@ -328,6 +329,51 @@ function copyRuntimeIfNeeded() {
   }
   nodeAndWorkerDir = target;
   return target;
+}
+
+async function applyMacRuntimeUpdate(zipPath) {
+  if (process.platform !== 'darwin' || !String(zipPath || '').toLowerCase().endsWith('.zip')) {
+    return { applied: false, reason: 'unsupported_platform' };
+  }
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vryx-worker-update-'));
+  try {
+    await new Promise((resolve, reject) => {
+      execFile('ditto', ['-x', '-k', zipPath, tmp], (error) => (error ? reject(error) : resolve()));
+    });
+    const runtimeSource = path.join(tmp, 'Vryx.app', 'Contents', 'Resources', 'nodeAndWorker');
+    if (!fs.existsSync(runtimeSource)) {
+      throw new Error('Runtime nodeAndWorker introuvable dans le paquet macOS.');
+    }
+    const target = runtimeDir();
+    const preserved = path.join(app.getPath('userData'), 'runtime-preserved-update');
+    fs.rmSync(preserved, { recursive: true, force: true });
+    fs.mkdirSync(preserved, { recursive: true });
+    const preservePairs = [
+      ['.vryx-keys', '.vryx-keys'],
+      ['python-inference/venv', 'python-venv'],
+    ];
+    for (const [rel, name] of preservePairs) {
+      const src = path.join(target, rel);
+      if (fs.existsSync(src)) fs.cpSync(src, path.join(preserved, name), { recursive: true });
+    }
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.cpSync(runtimeSource, target, { recursive: true });
+    for (const [rel, name] of preservePairs) {
+      const src = path.join(preserved, name);
+      if (fs.existsSync(src)) {
+        fs.mkdirSync(path.dirname(path.join(target, rel)), { recursive: true });
+        fs.cpSync(src, path.join(target, rel), { recursive: true });
+      }
+    }
+    fs.rmSync(preserved, { recursive: true, force: true });
+    fs.writeFileSync(path.join(target, '.vryx-runtime-version'), `remote-${Date.now()}`);
+    nodeAndWorkerDir = target;
+    appendWorkerLog('info', '[update] Runtime worker macOS appliqué dans Application Support/Vryx/runtime.');
+    return { applied: true };
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 function send(channel, payload) {
@@ -377,6 +423,42 @@ function safeDownloadName(url, fallback = 'Vryx-Worker-Update') {
   }
 }
 
+function workerUpdateFileName(release = {}, url = '') {
+  const sourceName = safeDownloadName(url, 'Vryx-Worker-Update.zip');
+  const ext = path.extname(sourceName) || (process.platform === 'win32' ? '.exe' : '.zip');
+  const version = String(release.version || 'latest').replace(/[^\w.\-]+/g, '-');
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  return `Vryx-Worker-${version}-${process.platform}-${arch}${ext}`;
+}
+
+function cleanupWorkerUpdateDir(updateDir, keepPath = '') {
+  fs.mkdirSync(updateDir, { recursive: true });
+  const keep = keepPath ? path.resolve(keepPath) : '';
+  const maxAgeMs = 7 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  for (const entry of fs.readdirSync(updateDir, { withFileTypes: true })) {
+    const full = path.join(updateDir, entry.name);
+    if (keep && path.resolve(full) === keep) continue;
+    const lower = entry.name.toLowerCase();
+    const isExtractedMacApp =
+      process.platform === 'darwin' &&
+      entry.isDirectory() &&
+      (/^vryx( \d+)?$/i.test(entry.name) || /^vryx.*\.app$/i.test(entry.name));
+    const isPartial = lower.endsWith('.download') || lower.endsWith('.part') || lower.endsWith('.tmp');
+    const isOldWorkerInstaller = /^vryx-worker-.*\.(zip|dmg|exe)$/i.test(entry.name);
+    let stale = false;
+    try {
+      const stat = fs.statSync(full);
+      stale = now - stat.mtimeMs > maxAgeMs;
+    } catch {
+      stale = true;
+    }
+    if (isExtractedMacApp || isPartial || (isOldWorkerInstaller && stale)) {
+      fs.rmSync(full, { recursive: true, force: true });
+    }
+  }
+}
+
 function downloadFile(url, destination, timeoutMs = 10 * 60 * 1000) {
   return new Promise((resolve, reject) => {
     const finalUrl = absoluteVryxUrl(url);
@@ -420,14 +502,28 @@ function sha256File(filePath) {
 }
 
 async function downloadWorkerUpdate(release, reason = 'manual') {
+  if (workerUpdateDownloadPromise) return workerUpdateDownloadPromise;
+  workerUpdateDownloadPromise = (async () => {
   const asset = releaseAssetForPlatform(release);
   const url = absoluteVryxUrl(asset.url);
   if (!url) throw new Error('Aucun paquet de mise à jour pour cette plateforme.');
   const updateDir = path.join(app.getPath('userData'), 'updates');
-  fs.mkdirSync(updateDir, { recursive: true });
-  const target = path.join(updateDir, safeDownloadName(url));
+  cleanupWorkerUpdateDir(updateDir);
+  const target = path.join(updateDir, workerUpdateFileName(release, url));
+  const partial = `${target}.download`;
+  if (fs.existsSync(target) && asset.sha256) {
+    const existing = await sha256File(target).catch(() => '');
+    if (existing && existing.toLowerCase() === String(asset.sha256).toLowerCase()) {
+      appendWorkerLog('info', `[update] Paquet déjà présent et vérifié : ${path.basename(target)}.`);
+      return target;
+    }
+  } else if (fs.existsSync(target) && !asset.sha256) {
+    appendWorkerLog('info', `[update] Paquet déjà présent : ${path.basename(target)}.`);
+    return target;
+  }
   appendWorkerLog('info', `[update] Téléchargement ${release.version || ''} (${reason})...`);
-  await downloadFile(url, target);
+  await downloadFile(url, partial);
+  fs.renameSync(partial, target);
   if (asset.sha256) {
     const actual = await sha256File(target);
     if (actual.toLowerCase() !== String(asset.sha256).toLowerCase()) {
@@ -438,7 +534,26 @@ async function downloadWorkerUpdate(release, reason = 'manual') {
   } else {
     appendWorkerLog('info', '[update] Aucun hash SHA-256 fourni par le manifeste.');
   }
+  cleanupWorkerUpdateDir(updateDir, target);
   return target;
+  })();
+  try {
+    return await workerUpdateDownloadPromise;
+  } finally {
+    workerUpdateDownloadPromise = null;
+  }
+}
+
+async function openWorkerUpdatePackage(installerPath) {
+  if (process.platform === 'darwin' && String(installerPath || '').toLowerCase().endsWith('.zip')) {
+    appendWorkerLog(
+      'info',
+      '[update] Paquet macOS téléchargé. Ouverture du dossier uniquement pour éviter les extractions Vryx, Vryx 2, Vryx 3 dans le cache.',
+    );
+    shell.showItemInFolder(installerPath);
+    return '';
+  }
+  return shell.openPath(installerPath);
 }
 
 async function checkWorkerSoftwareUpdate(reason = 'periodic') {
@@ -453,7 +568,7 @@ async function checkWorkerSoftwareUpdate(reason = 'periodic') {
     appendWorkerLog('info', `[update] Version worker disponible ${release.version} (actuelle ${current}).`);
     if (release.mandatory && !workerProcess) {
       const installerPath = await downloadWorkerUpdate(release, reason);
-      await shell.openPath(installerPath);
+      await openWorkerUpdatePackage(installerPath);
     }
   }
   return result;
@@ -483,8 +598,16 @@ async function handleRemoteWorkerCommand(commandEvent) {
       const status = await checkWorkerSoftwareUpdate('remote-command');
       if (!status.ok) throw new Error(status.error || 'Release indisponible.');
       const installerPath = await downloadWorkerUpdate({ ...status.release, ...release }, 'remote-command');
+      const applyResult = await applyMacRuntimeUpdate(installerPath);
       await acknowledgeRemoteCommand(config, command, 'acknowledged', null, peerId);
-      await shell.openPath(installerPath);
+      if (applyResult.applied) {
+        if (workerProcess) {
+          stopWorker();
+          setTimeout(async () => spawnWorker(readConfig(), await getHardwareStats()), 2000);
+        }
+      } else {
+        await openWorkerUpdatePackage(installerPath);
+      }
       return;
     }
     if (command.action === 'pause' || command.action === 'drain' || command.action === 'stop') {
@@ -545,6 +668,29 @@ function statusUrl(config) {
 
 function shardsUrl(config) {
   return `http://127.0.0.1:${Number(config.apiPort || DEFAULT_CONFIG.apiPort)}/api/shards`;
+}
+
+function isExpectedLocalApiOffline(error) {
+  const text = String(error || '').toLowerCase();
+  return (
+    text.includes('econnrefused') ||
+    text.includes('connection refused') ||
+    text.includes('connect refused') ||
+    text.includes('socket hang up') ||
+    text.includes('aborted') ||
+    text.includes('timeout')
+  );
+}
+
+function localApiLastError(local, remote, onlineGrace) {
+  if (local.ok || onlineGrace) return '';
+  if (isExpectedLocalApiOffline(local.error)) {
+    if (['starting', 'connecting'].includes(workerState.state)) {
+      return 'API locale du worker en cours de démarrage';
+    }
+    return '';
+  }
+  return String(local.error || remote.error || '');
 }
 
 function normalizeMetricNumber(...values) {
@@ -704,6 +850,7 @@ async function readWorkerMetrics() {
   const p2pReady = Boolean(p2pReadyNow || p2pGrace);
   const activeTps = computeActiveTps(tokensGenerated);
   const rewardPerToken = rewardPerTokenForModel(config.modelId);
+  const lastError = localApiLastError(local, remote, onlineGrace);
 
   lastWorkerMetrics = {
     online: Boolean(localOnline || remoteHeartbeatFresh || onlineGrace),
@@ -722,7 +869,7 @@ async function readWorkerMetrics() {
     uptimeSec,
     estimatedToday: tokensGenerated * rewardPerToken,
     lastHeartbeatAt: String(remoteWorker?.lastHeartbeatAt || ''),
-    lastError: local.ok || onlineGrace ? '' : String(local.error || remote.error || ''),
+    lastError,
     ...shardSummary,
   };
 
@@ -891,6 +1038,7 @@ function validateConfig(config, hardware) {
   const issues = [];
   const hardIssues = [];
   const fullLoad = canFullLoadModel(config, hardware, model);
+  const canShard = Boolean(model.distributedOnly || model.localDownloadMode === 'direct_or_shard');
   const requestedLoadMode = ['auto', 'full', 'shard'].includes(String(config.loadMode || ''))
     ? String(config.loadMode || 'auto')
     : 'auto';
@@ -898,7 +1046,11 @@ function validateConfig(config, hardware) {
     issues.push(`Memoire allouee trop basse pour un shard ${model.label}: ${memoryGb} Go < ${model.shardMinGb} Go.`);
   }
   if (requestedLoadMode === 'full' && !fullLoad) {
-    hardIssues.push(`Mode solo complet impossible pour ${model.label}: augmente la memoire allouee ou repasse en auto/multi-worker.`);
+    if (canShard) {
+      issues.push(`Mode solo complet impossible pour ${model.label}; bascule automatique en multi-worker shard.`);
+    } else {
+      hardIssues.push(`Mode solo complet impossible pour ${model.label}: augmente la memoire allouee ou repasse en auto/multi-worker.`);
+    }
   }
   if (memoryGb > Number(hardware.vramGb || hardware.totalMemoryGb || 0)) {
     issues.push('Memoire allouee superieure a la memoire detectee.');
@@ -907,11 +1059,13 @@ function validateConfig(config, hardware) {
   const workerMode =
     requestedLoadMode === 'shard'
       ? 'shard'
-      : requestedLoadMode === 'full' && fullLoad
-        ? 'full'
-        : fullLoad
-          ? 'full'
-          : (model.distributedOnly ? 'shard' : 'direct');
+    : requestedLoadMode === 'full' && fullLoad
+      ? 'full'
+    : fullLoad
+      ? 'full'
+      : canShard
+        ? 'shard'
+        : 'direct';
   if (workerMode === 'shard' && backend === 'mlx_lm') {
     backend = 'mlx';
   }
@@ -961,6 +1115,26 @@ function killPortUnixSync(port) {
   }
 }
 
+function cleanupLegacyWorkerLaunchAgentsSync() {
+  if (process.platform !== 'darwin') return;
+  const script = `
+    set +e
+    uid="$(id -u)"
+    for label in com.vryx.gemma.worker1.python com.vryx.gemma.worker1.rust com.vryx.gemma.worker2.python com.vryx.gemma.worker2.rust; do
+      launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || launchctl remove "$label" >/dev/null 2>&1 || true
+    done
+    for file in "$HOME"/Library/LaunchAgents/com.vryx.gemma.worker*.plist; do
+      [ -f "$file" ] || continue
+      mv "$file" "$file.disabled-legacy" >/dev/null 2>&1 || true
+    done
+  `;
+  try {
+    execFileSync('bash', ['-lc', script], { stdio: 'ignore' });
+  } catch {
+    /* ignore: cleanup is best-effort and the port cleanup below remains authoritative */
+  }
+}
+
 function stopWorker() {
   clearStartupWatchdog();
   if (workerProcess) {
@@ -982,6 +1156,49 @@ function stopWorker() {
 
 function appendWorkerLog(level, line) {
   send('worker-log', { level, line });
+}
+
+function ensureWorkerLauncherReady() {
+  const launcher = process.platform === 'win32'
+    ? path.join(nodeAndWorkerDir, 'start-worker.bat')
+    : path.join(nodeAndWorkerDir, 'start-worker.sh');
+  if (!fs.existsSync(launcher)) {
+    throw new Error(`Launcher worker introuvable: ${launcher}`);
+  }
+  const pythonDir = path.join(nodeAndWorkerDir, 'python-inference');
+  if (!fs.existsSync(pythonDir)) {
+    throw new Error(`Runtime Python introuvable: ${pythonDir}`);
+  }
+  if (process.platform === 'win32') {
+    const archDir = process.arch === 'arm64' ? 'win32-arm64' : 'win32-x64';
+    const bundledDaemon = path.join(nodeAndWorkerDir, 'bin', archDir, 'rust-daemon.exe');
+    const legacyDaemon = path.join(nodeAndWorkerDir, 'target', 'release', 'rust-daemon.exe');
+    if (!fs.existsSync(bundledDaemon) && !fs.existsSync(legacyDaemon)) {
+      throw new Error(
+        `Binaire rust-daemon.exe introuvable pour Windows (${archDir}). Reinstalle une build worker Windows complete.`,
+      );
+    }
+    return launcher;
+  }
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(launcher, 0o755);
+    } catch (error) {
+      appendWorkerLog('error', `[launcher] chmod start-worker.sh impossible: ${error.message}`);
+    }
+    const bundledDaemon = path.join(nodeAndWorkerDir, 'bin', process.platform === 'darwin' ? 'darwin-arm64' : 'linux-x64', 'rust-daemon');
+    const releaseDaemon = path.join(nodeAndWorkerDir, 'target', 'release', 'rust-daemon');
+    if (fs.existsSync(bundledDaemon)) {
+      try {
+        fs.chmodSync(bundledDaemon, 0o755);
+      } catch (error) {
+        appendWorkerLog('error', `[launcher] chmod rust-daemon impossible: ${error.message}`);
+      }
+    } else if (!fs.existsSync(releaseDaemon)) {
+      throw new Error(`Binaire rust-daemon introuvable: ${bundledDaemon}`);
+    }
+  }
+  return launcher;
 }
 
 function prepareModelResidency(config, validation) {
@@ -1019,6 +1236,15 @@ function prepareModelResidency(config, validation) {
 function spawnWorker(config, hardware) {
   if (workerProcess) return { ok: true, alreadyRunning: true };
   copyRuntimeIfNeeded();
+  let launcherPath;
+  try {
+    launcherPath = ensureWorkerLauncherReady();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendWorkerLog('error', `[launcher] ${message}`);
+    setWorkerState({ state: 'error', progress: 0, message });
+    return { ok: false, error: message };
+  }
   const validation = validateConfig(config, hardware);
   if (validation.hardIssues?.length) {
     return { ok: false, error: validation.hardIssues.join(' ') };
@@ -1027,6 +1253,7 @@ function spawnWorker(config, hardware) {
     return { ok: false, error: validation.issues.join(' ') };
   }
 
+  cleanupLegacyWorkerLaunchAgentsSync();
   killPortUnixSync(config.grpcPort);
   killPortUnixSync(config.apiPort);
   killPortUnixSync(config.p2pPort);
@@ -1091,9 +1318,12 @@ function spawnWorker(config, hardware) {
   });
   if (validation.workerMode === 'shard' && validation.backend === 'mlx') {
     env.VRYX_ENABLE_MLX_RUNTIME = '1';
+    env.VRYX_ENABLE_MLX_KERNELS = '1';
+    env.VRYX_MLX_STRICT = '1';
+    env.VRYX_ENABLE_GGUF_MLX_SHARD = '1';
     env.VRYX_ENABLE_LLAMA_MLX_SHARD = validation.model.family === 'Llama' ? '1' : (env.VRYX_ENABLE_LLAMA_MLX_SHARD || '0');
     env.VRYX_GGUF_MLX_CACHE_GB = String(Math.max(2, Math.min(8, Math.floor(Number(config.memoryGb || 8) * 0.25))));
-    env.VRYX_DISABLE_PYTORCH_FALLBACK = validation.model.family === 'Llama' ? '1' : (env.VRYX_DISABLE_PYTORCH_FALLBACK || '0');
+    env.VRYX_DISABLE_PYTORCH_FALLBACK = '1';
   }
   env.PATH = [
     '/opt/homebrew/bin',
@@ -1116,13 +1346,15 @@ function spawnWorker(config, hardware) {
   let args;
   if (process.platform === 'win32') {
     command = 'cmd.exe';
-    args = ['/c', path.join(nodeAndWorkerDir, 'start-worker.bat'), ...commonArgs];
+    args = ['/c', launcherPath, ...commonArgs];
   } else {
     command = 'bash';
-    args = [path.join(nodeAndWorkerDir, 'start-worker.sh'), ...commonArgs];
+    args = [launcherPath, ...commonArgs];
   }
 
   setWorkerState({ state: 'starting', progress: 15, message: 'Preparation du worker' });
+  appendWorkerLog('info', `[launcher] Démarrage: ${command} ${args.map((arg) => String(arg).includes(' ') ? `"${arg}"` : arg).join(' ')}`);
+  appendWorkerLog('info', `[launcher] Runtime: ${nodeAndWorkerDir}`);
   workerStartedAt = Date.now();
   startMetricsPoll();
   clearStartupWatchdog();
@@ -1187,22 +1419,30 @@ function spawnWorker(config, hardware) {
 
   workerProcess.on('close', (code) => {
     clearStartupWatchdog();
-  workerProcess = null;
-  workerStartedAt = 0;
-  activeTpsState = {
-    lastTokensGenerated: 0,
-    lastSampleMs: 0,
-    activeSamples: [],
-    lastActiveAtMs: 0,
-    sessionTokens: 0,
-    sessionStartedAtMs: 0,
-  };
-  workerHealthCache = {
-    onlineLastSeenMs: 0,
-    p2pLastSeenMs: 0,
-    remoteHeartbeatLastSeenMs: 0,
-  };
-  stopMetricsPoll();
+    const ranForMs = workerStartedAt ? Date.now() - workerStartedAt : 0;
+    const wasStarting = ['starting', 'connecting'].includes(workerState.state);
+    workerProcess = null;
+    workerStartedAt = 0;
+    activeTpsState = {
+      lastTokensGenerated: 0,
+      lastSampleMs: 0,
+      activeSamples: [],
+      lastActiveAtMs: 0,
+      sessionTokens: 0,
+      sessionStartedAtMs: 0,
+    };
+    workerHealthCache = {
+      onlineLastSeenMs: 0,
+      p2pLastSeenMs: 0,
+      remoteHeartbeatLastSeenMs: 0,
+    };
+    stopMetricsPoll();
+    if (wasStarting && code !== 0 && ranForMs < 30_000) {
+      const message = `Le worker a quitté pendant le démarrage (code ${code}). Ouvre les logs pour le détail.`;
+      appendWorkerLog('error', `[launcher] ${message}`);
+      setWorkerState({ state: 'error', progress: 0, message });
+      return;
+    }
     setWorkerState({
       state: 'stopped',
       progress: 0,

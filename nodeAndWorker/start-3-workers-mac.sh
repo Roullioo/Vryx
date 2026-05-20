@@ -26,7 +26,7 @@ if [[ ! -f "${DAEMON_BIN}" || "${SCRIPT_DIR}/rust-daemon/src/main.rs" -nt "${DAE
   cp /tmp/vryx-rust-target/release/rust-daemon "${DAEMON_BIN}"
 fi
 
-if [[ ! -d "${VENV_PATH}" ]]; then
+if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
   echo "[*] Création du venv Python…"
   python3 -m venv "${VENV_PATH}"
   # shellcheck source=/dev/null

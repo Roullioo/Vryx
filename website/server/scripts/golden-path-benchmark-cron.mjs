@@ -131,8 +131,14 @@ try {
   await conn.end()
 }
 
+const combinedOutput = `${bench.stdout}\n${bench.stderr}`
+const skippedNoWorkers =
+  /Aucun pair worker|discover_live_peers_empty|workers_offline|no live workers/i.test(combinedOutput)
+
 console.log(JSON.stringify({
   ok: bench.code === 0,
+  skipped: skippedNoWorkers,
+  skippedReason: skippedNoWorkers ? 'workers_offline' : null,
   code: bench.code,
   model,
   quant,
@@ -143,4 +149,4 @@ console.log(JSON.stringify({
   stderr: bench.stderr.trim(),
 }, null, 2))
 
-process.exit(bench.code === 0 ? 0 : 2)
+process.exit(bench.code === 0 || skippedNoWorkers ? 0 : 2)

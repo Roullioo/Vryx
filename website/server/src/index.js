@@ -73,7 +73,7 @@ function resolveInitiatorChatUrl(body) {
   return raw
 }
 /** Heartbeat récent pour la liste « workers live » (sidebar admin). */
-const WORKER_LIVE_SEC = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE_SEC) || 30))
+const WORKER_LIVE_SEC = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE_SEC) || 60))
 const WORKER_RESERVATION_TTL_SEC = Math.max(30, Math.min(900, Number(process.env.WORKER_RESERVATION_TTL_SEC) || 180))
 const WORKER_HEALTH_MIN_FOR_SCHEDULER = Math.max(0, Math.min(100, Number(process.env.WORKER_HEALTH_MIN_FOR_SCHEDULER) || 35))
 const VRYX_TOKEN_STREAM_BATCH_MS = Math.max(0, Math.min(250, Number(process.env.VRYX_TOKEN_STREAM_BATCH_MS) || 35))
@@ -236,7 +236,7 @@ function workerHealthScore(workerLike) {
     score -= runtimeState === 'failed' ? 40 : 28
     reasons.push(`runtime ${runtimeState}`)
   }
-  if (commandStatus === 'pending' || commandStatus === 'delivered' || commandStatus === 'pending_worker_offline') {
+  if (commandStatus === 'pending' || commandStatus === 'pending_worker_offline') {
     score -= 14
     reasons.push(`command ${commandStatus}`)
   }
@@ -280,10 +280,6 @@ function workerSchedulabilityIssue(workerLike) {
   if (desired !== 'active') return `desired_${desired}`
   const runtimeState = String(workerLike?.runtimeState || workerLike?.runtime_state || 'idle').toLowerCase()
   if (WORKER_UNSCHEDULABLE_RUNTIME_STATES.has(runtimeState)) return `runtime_${runtimeState}`
-  const commandStatus = String(workerLike?.lastCommandStatus || workerLike?.last_command_status || '')
-  if (commandStatus === 'pending' || commandStatus === 'delivered' || commandStatus === 'pending_worker_offline') {
-    return `command_${commandStatus}`
-  }
   const reservedUntil = workerLike?.reservedUntil || workerLike?.reserved_until || null
   if (reservedUntil && new Date(reservedUntil).getTime() > Date.now()) return 'reserved'
   return ''
@@ -866,7 +862,7 @@ const CURATED_MODEL_CATALOG = [
         label: 'Solo complet',
         description: 'Un worker charge le modèle quantifié complet si la mémoire allouée suffit.',
         requiredWorkers: 1,
-        minMemoryGb: 44,
+        minMemoryGb: 38,
         recommendedMemoryGb: 48,
       },
       {
@@ -879,8 +875,8 @@ const CURATED_MODEL_CATALOG = [
       },
     ],
     quantizedVariants: [
-      { quantization: 'q4', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit', diskGb: 19, minMemoryGb: 44 },
-      { quantization: 'q4-dwq', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit-DWQ', diskGb: 19.3, minMemoryGb: 44 },
+      { quantization: 'q4', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit', diskGb: 19, minMemoryGb: 38 },
+      { quantization: 'q4-dwq', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-4bit-DWQ', diskGb: 19.3, minMemoryGb: 38 },
       { quantization: 'int8', backend: 'mlx_lm', modelId: 'mlx-community/Qwen3.6-35B-A3B-8bit', diskGb: 35.2, minMemoryGb: 38 },
     ],
   },
@@ -1037,7 +1033,7 @@ async function loadSchedulerWorkers(modelId = null, options = {}) {
             w.machine_info AS machineInfo, w.desired_state AS desiredState,
             w.runtime_state AS runtimeState, w.reserved_until AS reservedUntil, w.current_job_id AS currentJobId,
             w.health_score AS storedHealthScore, w.p2p_peers AS p2pPeers,
-            w.last_command_status AS lastCommandStatus,
+            w.last_command_status AS lastCommandStatus, w.last_command_at AS lastCommandAt,
             TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) AS secondsSinceHeartbeat,
             (SELECT COALESCE(SUM(l.delta_tokens), 0) FROM worker_token_ledger l
               WHERE l.peer_id = w.peer_id AND l.created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)) AS tokensGenerated1h
@@ -1045,7 +1041,6 @@ async function loadSchedulerWorkers(modelId = null, options = {}) {
      WHERE w.mode = 'worker'
        AND w.desired_state = 'active'
        AND COALESCE(w.runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed')
-       AND COALESCE(w.last_command_status, '') NOT IN ('pending','delivered','pending_worker_offline')
        AND TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) <= :offline
      ORDER BY w.last_heartbeat_at DESC
      LIMIT 200`,
@@ -1070,8 +1065,9 @@ async function loadSchedulerWorkers(modelId = null, options = {}) {
 async function reserveWorkersForJob({ modelId, loadMode = 'auto', createdBy = null }) {
   await expireWorkerReservations()
   const jobId = `job_${crypto.randomUUID()}`
+  const normalizedLoadMode = ['auto', 'full', 'shard'].includes(loadMode) ? loadMode : 'auto'
   const workers = await loadSchedulerWorkers(modelId, { strictModel: true })
-  const plan = modelPlanFor(modelId, workers, loadMode)
+  const plan = modelPlanFor(modelId, workers, normalizedLoadMode)
   if (!plan.ready) return { ok: false, jobId, plan, reservations: [] }
   const reservations = []
   for (const assignment of plan.assignments) {
@@ -1084,7 +1080,6 @@ async function reserveWorkersForJob({ modelId, loadMode = 'auto', createdBy = nu
          AND desired_state = 'active'
          AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :liveSec
          AND COALESCE(runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed')
-         AND COALESCE(last_command_status, '') NOT IN ('pending','delivered','pending_worker_offline')
          AND (reserved_until IS NULL OR reserved_until < NOW() OR current_job_id = :jobId)`,
       { jobId, peerId: assignment.peerId, ttl: WORKER_RESERVATION_TTL_SEC, liveSec: WORKER_LIVE_SEC },
     )
@@ -3933,7 +3928,7 @@ async function currentWorkerRelease(channel = 'stable') {
   return {
     id: 'default',
     channel,
-    version: process.env.VRYX_WORKER_TARGET_VERSION || '1.0.2',
+    version: process.env.VRYX_WORKER_TARGET_VERSION || '1.0.4',
     macUrl: '/downloads/Vryx-Worker-latest-mac.zip',
     winX64Url: '/downloads/Vryx-Worker-Setup-latest-x64.exe',
     winArm64Url: '/downloads/Vryx-Worker-Setup-latest-arm64.exe',
@@ -4151,6 +4146,7 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
       : supports_vllm
         ? 'vllm'
         : 'pytorch'
+  const normalizedSupportsMlx = Boolean(supports_mlx) || normalizedRuntimeBackend === 'mlx' || normalizedRuntimeBackend === 'mlx_lm'
   const shouldUpdateRuntimeBackend = hasRuntimeBackend || supports_mlx || supports_vllm
   const hasMachineInfo = machine_info !== undefined && machine_info !== null && typeof machine_info === 'object'
   const public_ip =
@@ -4160,34 +4156,44 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
     null
   try {
     const reported = Math.max(0, Number(tokens_generated ?? 0))
-    const [prevRows] = await pool.query('SELECT tokens_generated AS tg FROM workers WHERE peer_id = :peer_id LIMIT 1', {
+    const [prevRows] = await pool.query(
+      'SELECT tokens_generated AS tg, runtime_backend AS rb, supports_mlx AS sm FROM workers WHERE peer_id = :peer_id LIMIT 1',
+      {
       peer_id,
-    })
+      },
+    )
     const prevT = prevRows[0]?.tg != null ? Number(prevRows[0].tg) : 0
+    const prevRuntimeBackend = String(prevRows[0]?.rb || '').trim().toLowerCase()
+    const prevSupportsMlx = Boolean(prevRows[0]?.sm)
     const counterReset = reported < prevT
     const newTokensTotal = counterReset ? reported : Math.max(prevT, reported)
     const inc = counterReset ? reported : Math.max(0, newTokensTotal - prevT)
 
   const normalizedAllocatedVram =
       allocated_vram_mb != null && gpu_vram_mb != null ? Math.min(allocated_vram_mb, gpu_vram_mb) : allocated_vram_mb
+    const normalizedRuntimeBackendResolved = normalizedRuntimeBackend || prevRuntimeBackend || 'pytorch'
     const normalizedModel = normalizeP2pModelId(model || '') || model || null
     const modelKey = normalizeP2pModelKey(normalizedModel || '')
-    const reportsLlamaCppQ4 = normalizedRuntimeBackend.includes('llama') && /(gemma|llama)/i.test(modelKey)
+    const reportsLlamaCppQ4 =
+      normalizedRuntimeBackendResolved.includes('llama') && /(gemma|llama)/i.test(modelKey)
     const normalizedWeightQuantization = reportsLlamaCppQ4
       ? 'q4'
       : hasWeightQuantization
         ? String(weight_quantization).trim().toLowerCase()
         : 'fp16'
-    const normalizedSupportsQ4 = Boolean(supports_q4_weights) || reportsLlamaCppQ4 || normalizedWeightQuantization.includes('q4')
+    const normalizedSupportsQ4 =
+      Boolean(supports_q4_weights) || reportsLlamaCppQ4 || normalizedWeightQuantization.includes('q4')
+    const normalizedSupportsMlxResolved =
+      normalizedSupportsMlx || prevSupportsMlx || normalizedRuntimeBackendResolved === 'mlx' || normalizedRuntimeBackendResolved === 'mlx_lm'
     const capabilitySnapshot = workerCapabilities({
       model: normalizedModel,
       gpuName: gpu_name,
       gpuVramMb: gpu_vram_mb,
       allocatedVramMb: normalizedAllocatedVram,
-      runtimeBackend: normalizedRuntimeBackend,
+      runtimeBackend: normalizedRuntimeBackendResolved,
       weightQuantization: normalizedWeightQuantization,
       supportsQ4Weights: normalizedSupportsQ4,
-      supportsMlx: supports_mlx,
+      supportsMlx: normalizedSupportsMlxResolved,
       supportsVllm: supports_vllm,
       machineInfo: machine_info ? JSON.stringify(machine_info) : null,
     })
@@ -4198,9 +4204,9 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
       p2pPeers: p2p_peers ?? 0,
       gpuVramMb: gpu_vram_mb,
       allocatedVramMb: normalizedAllocatedVram,
-      runtimeBackend: normalizedRuntimeBackend,
+      runtimeBackend: normalizedRuntimeBackendResolved,
       supportsQ4Weights: normalizedSupportsQ4,
-      supportsMlx: supports_mlx,
+      supportsMlx: normalizedSupportsMlxResolved,
       supportsVllm: supports_vllm,
     })
 
@@ -4264,10 +4270,10 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
         has_memory_limit_percent: hasMemoryLimitPercent ? 1 : 0,
         has_runtime_backend: shouldUpdateRuntimeBackend ? 1 : 0,
         has_weight_quantization: hasWeightQuantization || reportsLlamaCppQ4 ? 1 : 0,
-        runtime_backend: normalizedRuntimeBackend,
+        runtime_backend: normalizedRuntimeBackendResolved,
         weight_quantization: normalizedWeightQuantization,
         supports_q4_weights: normalizedSupportsQ4 ? 1 : 0,
-        supports_mlx: supports_mlx ? 1 : 0,
+        supports_mlx: normalizedSupportsMlxResolved ? 1 : 0,
         supports_vllm: supports_vllm ? 1 : 0,
         machine_info: hasMachineInfo ? JSON.stringify(machine_info) : null,
         has_machine_info: hasMachineInfo ? 1 : 0,
@@ -4333,7 +4339,17 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
          LIMIT 1`,
         { peer_id },
       )
-      if (!existingUpdate[0]) {
+      const [recentUpdate] = await pool.query(
+        `SELECT id
+         FROM worker_commands
+         WHERE peer_id = :peer_id
+           AND action = 'update_software'
+           AND created_at >= DATE_SUB(NOW(), INTERVAL 30 MINUTE)
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        { peer_id },
+      )
+      if (!existingUpdate[0] && !recentUpdate[0]) {
         await pool.query(
           `INSERT INTO worker_commands (peer_id, action, payload_json, requested_by, expires_at)
            VALUES (:peer_id, 'update_software', :payload, NULL, DATE_ADD(NOW(), INTERVAL 15 MINUTE))`,
@@ -5392,6 +5408,8 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
       body: JSON.stringify({
         prompt,
         model_id: model,
+        load_mode: req.body?.mode || 'auto',
+        force_distributed: req.body?.mode === 'shard',
         max_new_tokens: maxNewTokens,
         quantization: req.body?.quantization || 'q4',
         hidden_transport: req.body?.quantization || 'q4',
@@ -6083,6 +6101,8 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       quantization: requestedQuantization,
       hidden_transport: requestedQuantization,
       pool_preference: poolPreference,
+      load_mode: req.body?.load_mode || req.body?.loadMode || 'auto',
+      force_distributed: (req.body?.load_mode || req.body?.loadMode) === 'shard',
       temperature: 0,
       top_p: 0.65,
       top_k: 20,

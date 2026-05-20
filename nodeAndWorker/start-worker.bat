@@ -32,12 +32,18 @@ goto parse_args
 :done_args
 
 if "%VRYX_WORKER_SHARD_ONLY%"=="1" if "%VRYX_RUNTIME_BACKEND%"=="" set "VRYX_RUNTIME_BACKEND=cpu"
+set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
 
 echo [*] Modele : %MODEL_ID%
 echo [*] Ports  : gRPC %GRPC_PORT% / API %API_PORT% / P2P %P2P_PORT%
 echo [*] Backend: %VRYX_RUNTIME_BACKEND% / memoire worker %VRYX_WORKER_MEMORY_LIMIT_GB% Go (%VRYX_WORKER_MEMORY_LIMIT_PERCENT%%%)
 if "%VRYX_WORKER_SHARD_ONLY%"=="1" echo [*] Mode shard-only actif : aucun telechargement/chargement direct du modele complet.
 if not exist ".vryx-keys" mkdir ".vryx-keys"
+if not exist "python-inference" (
+    echo [!] Runtime Python introuvable: "%SCRIPT_DIR%python-inference"
+    exit /b 4058
+)
 
 :: Check Python
 python --version >nul 2>&1
@@ -48,25 +54,45 @@ if %errorlevel% neq 0 (
 )
 
 :: Check for virtualenv
-if not exist "venv" (
+if not exist "python-inference\\venv" (
     echo [*] Creation de l'environnement virtuel Python...
-    python -m venv venv
+    python -m venv python-inference\venv
 )
 
 echo [*] Activation de l'environnement virtuel...
-call venv\Scripts\activate
+call python-inference\venv\Scripts\activate.bat
 
 echo [*] Installation des dependances...
-pip install torch numpy grpcio grpcio-tools transformers >nul 2>&1
+pip install -r python-inference\requirements.txt >nul 2>&1
 
-:: Check for CUDA
-python -c "import torch; print('CUDA disponible' if torch.cuda.is_available() else 'CUDA non disponible')" | find "CUDA disponible" >nul
-if %errorlevel% equ 0 (
-    echo [^+] GPU NVIDIA détecté avec CUDA !
-    set "DEVICE=cuda"
-) else (
-    echo [!] CUDA non détecté. Utilisation du CPU (plus lent).
+:: Detect usable backend on Windows
+if /I "%VRYX_RUNTIME_BACKEND%"=="rocm" (
+    echo [!] ROCm Windows n'est pas supporte dans cette build worker. Fallback CPU.
     set "DEVICE=cpu"
+) else (
+    python -c "import torch; print('CUDA disponible' if torch.cuda.is_available() else 'CUDA non disponible')" | find "CUDA disponible" >nul
+    if %errorlevel% equ 0 (
+        echo [^+] GPU NVIDIA détecté avec CUDA !
+        set "DEVICE=cuda"
+    ) else (
+        echo [!] CUDA non détecté. Utilisation du CPU.
+        set "DEVICE=cpu"
+    )
+)
+
+set "DAEMON_BIN=bin\\win32-x64\\rust-daemon.exe"
+if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "DAEMON_BIN=bin\\win32-arm64\\rust-daemon.exe"
+if exist "%DAEMON_BIN%" (
+    echo [*] Daemon Rust packagé : %DAEMON_BIN%
+) else (
+    if exist "target\\release\\rust-daemon.exe" (
+        set "DAEMON_BIN=target\\release\\rust-daemon.exe"
+        echo [*] Daemon Rust local : %DAEMON_BIN%
+    ) else (
+        echo [!] Daemon Rust introuvable : "%SCRIPT_DIR%%DAEMON_BIN%"
+        echo [!] La build Windows livree est incomplete. Reinstalle le worker depuis un package corrige.
+        exit /b 4058
+    )
 )
 
 :: Lancement du serveur d'inférence en arrière-plan
@@ -75,11 +101,6 @@ start /B python python-inference/inference_server.py --port %GRPC_PORT% --stage 
 
 :: Lancement du daemon Rust
 echo [*] Lancement du daemon Rust P2P...
-if exist "target\release\rust-daemon.exe" (
-    target\release\rust-daemon.exe --mode worker --grpc-port %GRPC_PORT% --p2p-port %P2P_PORT% --api-port %API_PORT% --bootstrap-node %BOOTSTRAP_NODE% --api-url %API_URL% --model "%MODEL_ID%" --node-key-file ".vryx-keys\worker.node.key"
-) else (
-    echo [*] Compilation du daemon Rust (premiere fois)...
-    cd rust-daemon && cargo run --release -- --mode worker --grpc-port %GRPC_PORT% --p2p-port %P2P_PORT% --api-port %API_PORT% --bootstrap-node %BOOTSTRAP_NODE% --api-url %API_URL% --model "%MODEL_ID%" --node-key-file "..\.vryx-keys\worker.node.key"
-)
+"%DAEMON_BIN%" --mode worker --grpc-port %GRPC_PORT% --p2p-port %P2P_PORT% --api-port %API_PORT% --bootstrap-node %BOOTSTRAP_NODE% --api-url %API_URL% --model "%MODEL_ID%" --node-key-file ".vryx-keys\worker.node.key"
 
 pause

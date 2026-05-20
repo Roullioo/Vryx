@@ -243,8 +243,11 @@ class GGUFLazyMLXBackend(MLXBackend):
         if not _truthy_env("VRYX_ENABLE_MLX_RUNTIME"):
             self.unavailable_reason = "mlx_runtime_flag_disabled"
             return
-        if not _truthy_env("VRYX_ENABLE_LLAMA_MLX_SHARD"):
-            self.unavailable_reason = "llama_mlx_shard_flag_disabled"
+        if not (
+            _truthy_env("VRYX_ENABLE_GGUF_MLX_SHARD")
+            or _truthy_env("VRYX_ENABLE_LLAMA_MLX_SHARD")
+        ):
+            self.unavailable_reason = "gguf_mlx_shard_flag_disabled"
             return
         if gguf_quants is None:
             self.unavailable_reason = "gguf_package_missing"

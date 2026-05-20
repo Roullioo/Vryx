@@ -37,15 +37,23 @@ echo "  |            (macOS Edition)               |"
 echo "  +------------------------------------------+"
 echo ""
 echo "[*] Modèle : ${MODEL_ID}  |  gRPC : ${GRPC_PORT}  |  P2P TCP/QUIC : ${P2P_PORT}  |  API locale : ${API_PORT}"
+if command -v ulimit >/dev/null 2>&1; then
+    ulimit -n "${VRYX_WORKER_NOFILE_LIMIT:-65536}" >/dev/null 2>&1 || true
+fi
 if [ "${VRYX_WORKER_SHARD_ONLY:-0}" = "1" ] && [ -z "${VRYX_RUNTIME_BACKEND:-}" ]; then
     export VRYX_RUNTIME_BACKEND="mlx"
 fi
-if [ "${VRYX_WORKER_SHARD_ONLY:-0}" = "1" ] && [ "${VRYX_RUNTIME_BACKEND:-}" = "mlx" ]; then
+if [ "${VRYX_RUNTIME_BACKEND:-}" = "mlx" ] || [ "${VRYX_RUNTIME_BACKEND:-}" = "mlx_lm" ]; then
     export VRYX_ENABLE_MLX_RUNTIME="${VRYX_ENABLE_MLX_RUNTIME:-1}"
+    export VRYX_ENABLE_MLX_KERNELS="${VRYX_ENABLE_MLX_KERNELS:-1}"
+    export VRYX_ENABLE_GGUF_MLX_SHARD="${VRYX_ENABLE_GGUF_MLX_SHARD:-1}"
+    if [ "${VRYX_WORKER_SHARD_ONLY:-0}" = "1" ] || [ "${VRYX_EXPECT_MODEL_SHARDS_ONLY:-0}" = "1" ]; then
+        export VRYX_MLX_STRICT="${VRYX_MLX_STRICT:-1}"
+        export VRYX_DISABLE_PYTORCH_FALLBACK="${VRYX_DISABLE_PYTORCH_FALLBACK:-1}"
+    fi
     case "$(printf '%s' "$MODEL_ID" | tr '[:upper:]' '[:lower:]')" in
         *llama*70b*)
             export VRYX_ENABLE_LLAMA_MLX_SHARD="${VRYX_ENABLE_LLAMA_MLX_SHARD:-1}"
-            export VRYX_DISABLE_PYTORCH_FALLBACK="${VRYX_DISABLE_PYTORCH_FALLBACK:-1}"
             ;;
     esac
 fi
@@ -118,25 +126,34 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_DIR="${SCRIPT_DIR}/python-inference"
 VENV_PATH="${PYTHON_DIR}/venv"
+PYTHON_BIN="${VENV_PATH}/bin/python3"
+PIP_BIN="${VENV_PATH}/bin/pip"
 
-if [ ! -d "$VENV_PATH" ]; then
+if [ ! -x "$PYTHON_BIN" ]; then
+    if [ -d "$VENV_PATH" ]; then
+        echo "[*] Environnement virtuel Python incomplet, recréation..."
+        rm -rf "$VENV_PATH"
+    fi
     echo "[*] Création de l'environnement virtuel Python..."
     python3 -m venv "$VENV_PATH"
     source "$VENV_PATH/bin/activate"
-    python3 -m pip install --upgrade pip > /dev/null 2>&1
-    pip install -r "${PYTHON_DIR}/requirements.txt"
+    "$PYTHON_BIN" -m pip install --upgrade pip > /dev/null 2>&1
+    "$PIP_BIN" install -r "${PYTHON_DIR}/requirements.txt"
 else
     source "$VENV_PATH/bin/activate"
 fi
-python3 - <<'PY' >/dev/null 2>&1 || pip install -r "${PYTHON_DIR}/requirements.txt"
+"$PYTHON_BIN" - <<'PY' >/dev/null 2>&1 || "$PIP_BIN" install -r "${PYTHON_DIR}/requirements.txt"
+import platform
 import gguf, numpy
+if platform.system() == "Darwin" and platform.machine() == "arm64":
+    import mlx_lm
 PY
 
 echo "[+] Environnement Python prêt."
 
 # 2. Serveur gRPC worker : segments de pipeline P2P natifs (routing_path / Daisy Chain), sans Web2.
 echo "[*] Lancement du serveur gRPC d'inférence (stage 2, P2P natif)..."
-PYTHONUNBUFFERED=1 python3 "${PYTHON_DIR}/inference_server.py" \
+PYTHONUNBUFFERED=1 "$PYTHON_BIN" "${PYTHON_DIR}/inference_server.py" \
     --port "$GRPC_PORT" \
     --stage 2 \
     --model "$MODEL_ID" &

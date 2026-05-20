@@ -46,6 +46,13 @@ def _mx_weight_dtype(mx: Any) -> Any:
     return mx.float16
 
 
+def _bf16_uint16_to_float32(arr: np.ndarray) -> np.ndarray:
+    """Rebuild BF16 values transported as raw uint16 words into float32."""
+    raw = np.asarray(arr, dtype=np.uint16)
+    widened = raw.astype(np.uint32) << 16
+    return widened.view(np.float32)
+
+
 def _mlx_clear_cache(mx: Any) -> None:
     gc.collect()
     try:
@@ -210,6 +217,21 @@ def _mx_mlp(mx, x: Any, gate_w: Any, up_w: Any, down_w: Any) -> Any:
     return _mx_silu(mx, gate) * up @ down_w.T  # [B, L, D]
 
 
+def _infer_quant_bits(weight: Any, scales: Any, group_size: int = 64) -> int:
+    """Infer MLX packed quantization bits from packed uint32 columns + scales."""
+    try:
+        packed_cols = int(weight.shape[-1])
+        groups = int(scales.shape[-1])
+        input_dims = groups * int(group_size)
+        if packed_cols > 0 and input_dims > 0:
+            bits = int(round(32 * packed_cols / input_dims))
+            if bits in (2, 4, 8):
+                return bits
+    except Exception:
+        pass
+    return 4
+
+
 def _mx_l2norm(mx, x: Any, eps: float = 1e-6) -> Any:
     return x * mx.rsqrt(mx.sum(x * x, axis=-1, keepdims=True) + eps)
 
@@ -222,10 +244,30 @@ def _mx_sigmoid(mx, x: Any) -> Any:
     return mx.sigmoid(x)
 
 
+def _conv1d_weight_ck(weight: Any, channels: int) -> Any:
+    """Normalize Qwen linear_attn conv weight to [channels, kernel]."""
+    if getattr(weight, "ndim", 0) == 3:
+        shape = tuple(int(x) for x in weight.shape)
+        if shape[0] == channels and shape[-1] == 1:
+            return weight[:, :, 0]
+        if shape[0] == channels and shape[1] == 1:
+            return weight[:, 0, :]
+    return weight
+
+
+def _conv1d_kernel_size(weight: Any) -> int:
+    shape = tuple(int(x) for x in getattr(weight, "shape", ()))
+    if len(shape) == 3 and shape[-1] == 1:
+        return shape[1]
+    if shape:
+        return shape[-1]
+    return 1
+
+
 def _causal_conv1d_mlx(mx, x_bcl: Any, weight: Any, bias: Any | None = None) -> Any:
     """Depthwise causal Conv1d vectorielle — évite la boucle Python."""
     bsz, channels, seq_len = x_bcl.shape
-    weight_ck = weight.squeeze(1) if getattr(weight, "ndim", 0) == 3 else weight
+    weight_ck = _conv1d_weight_ck(weight, int(channels))
     kernel = int(weight_ck.shape[-1])
     # Padder causalement à gauche (kernel-1 zéros)
     pad = mx.zeros((bsz, channels, kernel - 1), dtype=x_bcl.dtype)
@@ -325,8 +367,20 @@ class MLXBackend:
                 "source_weight_bytes": source_bytes,
                 "rss_mb": round(_rss_mb(), 1),
             }
+        source_dtypes = getattr(self.shard, "weight_source_dtypes", {}) or {}
         for name, arr in self.shard.weight_arrays.items():
-            self.weights[name] = mx.array(np.asarray(arr), dtype=weight_dtype)
+            np_arr = np.asarray(arr)
+            source_dtype = str(source_dtypes.get(name) or "").upper()
+            # MLX-LM q4/q8 stores packed matrices as uint32 with adjacent BF16
+            # .scales/.biases tensors. Keep only the packed uint32 matrices as
+            # integers; BF16 buffers arrive as raw uint16 words and must become
+            # real floating arrays before mx.dequantize / mx.quantized_matmul.
+            if np_arr.dtype == np.uint32:
+                self.weights[name] = mx.array(np_arr)
+            elif source_dtype == "BF16" and np_arr.dtype == np.uint16:
+                self.weights[name] = mx.array(_bf16_uint16_to_float32(np_arr), dtype=weight_dtype)
+            else:
+                self.weights[name] = mx.array(np_arr, dtype=weight_dtype)
         # Forcer le chargement GPU Metal
         mx.eval(*self.weights.values())
 
@@ -427,7 +481,7 @@ class MLXBackend:
         # ── Obtenir hidden_states ────────────────────────────────────────────
         if self.shard.has_embedding and "token_ids" in payload:
             token_ids = payload["token_ids"]
-            emb_w = self.weights.get("embed_tokens.weight")
+            emb_w = self._dense_weight(mx, "embed_tokens")
             if emb_w is None:
                 return json.dumps({"ok": False, "error": "embed_tokens.weight manquant"}).encode()
             ids_mx = mx.array(token_ids, dtype=mx.int32)
@@ -493,7 +547,21 @@ class MLXBackend:
                 gate_w = self._w(f"{prefix}.mlp.gate_proj.weight")
                 up_w = self._w(f"{prefix}.mlp.up_proj.weight")
                 down_w = self._w(f"{prefix}.mlp.down_proj.weight")
-                if any(w is None for w in [norm1_w, norm2_w, gate_w, up_w, down_w]):
+                has_dense_mlp = not any(w is None for w in [gate_w, up_w, down_w])
+                has_qwen35_moe = self._has_qwen35_moe(prefix)
+                if norm1_w is None or norm2_w is None or (not has_dense_mlp and not has_qwen35_moe):
+                    print(
+                        f"[mlx] missing layer weights {prefix}: "
+                        f"norm1={norm1_w is not None} norm2={norm2_w is not None} "
+                        f"dense_mlp={has_dense_mlp} qwen35_moe={has_qwen35_moe} "
+                        f"sample_mlp={[k for k in self.weights if k.startswith(prefix + '.mlp.')][:16]}"
+                    )
+                    return None
+                if int(h.shape[-1]) != int(norm1_w.shape[0]):
+                    print(
+                        f"[mlx] hidden/norm mismatch {prefix}: hidden={tuple(h.shape)} "
+                        f"norm={tuple(norm1_w.shape)} embed={tuple(self._w('embed_tokens.weight').shape) if self._w('embed_tokens.weight') is not None else None}"
+                    )
                     return None
                 normed = _mx_rms_norm(mx, h, norm1_w, rms_eps)
                 if self._has_linear_attn(prefix):
@@ -504,10 +572,10 @@ class MLXBackend:
                         print(f"[mlx] linear_attn error layer {local_i}: {exc}\n{traceback.format_exc()}")
                         return None
                 else:
-                    q_w = self._w(f"{prefix}.self_attn.q_proj.weight")
-                    k_w = self._w(f"{prefix}.self_attn.k_proj.weight")
-                    v_w = self._w(f"{prefix}.self_attn.v_proj.weight")
-                    o_w = self._w(f"{prefix}.self_attn.o_proj.weight")
+                    q_w = self._dense_weight(mx, f"{prefix}.self_attn.q_proj")
+                    k_w = self._dense_weight(mx, f"{prefix}.self_attn.k_proj")
+                    v_w = self._dense_weight(mx, f"{prefix}.self_attn.v_proj")
+                    o_w = self._dense_weight(mx, f"{prefix}.self_attn.o_proj")
                     q_b = self.weights.get(f"{prefix}.self_attn.q_proj.bias")
                     k_b = self.weights.get(f"{prefix}.self_attn.k_proj.bias")
                     v_b = self.weights.get(f"{prefix}.self_attn.v_proj.bias")
@@ -546,7 +614,10 @@ class MLXBackend:
                         self.kv_cache[local_i] = (new_k, new_v)  # type: ignore[index]
                 h = h + attn_out
                 normed2 = _mx_rms_norm(mx, h, norm2_w, rms_eps)
-                h = h + _mx_mlp(mx, normed2, gate_w, up_w, down_w)
+                if has_qwen35_moe:
+                    h = h + self._qwen35_moe_forward(mx, prefix, normed2)
+                else:
+                    h = h + _mx_mlp(mx, normed2, gate_w, up_w, down_w)
                 if eval_every and ((local_i + 1) % eval_every == 0 or local_i + 1 == n_layers_here):
                     mx.eval(h)
                 if progress_every and ((local_i + 1) % progress_every == 0 or local_i + 1 == n_layers_here):
@@ -589,7 +660,7 @@ class MLXBackend:
             lm_head_t0 = time.perf_counter()
             last = hidden[0, -1, :]
             last_normed = _mx_rms_norm(mx, last, norm_w, rms_eps)
-            logits = (lm_w @ last_normed).astype(mx.float32)
+            logits = self._linear(mx, mx.expand_dims(last_normed, axis=0), "lm_head")[0].astype(mx.float32)
             mx.eval(logits)
             lm_head_ms = max(0, int((time.perf_counter() - lm_head_t0) * 1000))
 
@@ -764,6 +835,109 @@ class MLXBackend:
     def _has_linear_attn(self, prefix: str) -> bool:
         return f"{prefix}.linear_attn.in_proj_qkv.weight" in self.weights
 
+    def _linear(self, mx: Any, x: Any, base: str) -> Any:
+        weight = self._w(f"{base}.weight")
+        if weight is None:
+            raise ValueError(f"missing_weight:{base}.weight")
+        scales = self._w(f"{base}.scales")
+        biases = self._w(f"{base}.biases")
+        if scales is not None:
+            bits = _infer_quant_bits(weight, scales)
+            return mx.quantized_matmul(
+                x,
+                weight,
+                scales,
+                biases,
+                transpose=True,
+                group_size=64,
+                bits=bits,
+                mode="affine",
+            )
+        return x @ weight.T
+
+    def _dense_weight(self, mx: Any, base: str) -> Any | None:
+        weight = self._w(f"{base}.weight")
+        if weight is None:
+            return None
+        scales = self._w(f"{base}.scales")
+        biases = self._w(f"{base}.biases")
+        if scales is None:
+            return weight
+        bits = _infer_quant_bits(weight, scales)
+        return mx.dequantize(weight, scales, biases, group_size=64, bits=bits, mode="affine")
+
+    def _switch_linear(self, mx: Any, x: Any, indices: Any, base: str) -> Any:
+        weight = self._w(f"{base}.weight")
+        if weight is None:
+            raise ValueError(f"missing_weight:{base}.weight")
+        scales = self._w(f"{base}.scales")
+        biases = self._w(f"{base}.biases")
+        idx_shape = tuple(int(v) for v in indices.shape)
+        in_dim = int(x.shape[-1])
+        if tuple(int(v) for v in x.shape[:-1]) == idx_shape:
+            x_flat = x.reshape((-1, 1, in_dim))
+        else:
+            top_k = int(indices.shape[-1])
+            x_flat = mx.repeat(mx.expand_dims(x, axis=-2), top_k, axis=-2).reshape((-1, 1, in_dim))
+        rhs_flat = indices.reshape((-1,))
+        if scales is not None:
+            bits = _infer_quant_bits(weight, scales)
+            y = mx.gather_qmm(
+                x_flat,
+                weight,
+                scales,
+                biases,
+                rhs_indices=rhs_flat,
+                transpose=True,
+                group_size=64,
+                bits=bits,
+                mode="affine",
+                sorted_indices=False,
+            )
+            return y.squeeze(-2).reshape((*idx_shape, int(y.shape[-1])))
+        y = mx.gather_mm(
+            x_flat,
+            weight.swapaxes(-1, -2),
+            rhs_indices=rhs_flat,
+            sorted_indices=False,
+        )
+        return y.squeeze(-2).reshape((*idx_shape, int(y.shape[-1])))
+
+    def _has_qwen35_moe(self, prefix: str) -> bool:
+        return (
+            f"{prefix}.mlp.gate.weight" in self.weights
+            and f"{prefix}.mlp.switch_mlp.up_proj.weight" in self.weights
+            and f"{prefix}.mlp.switch_mlp.gate_proj.weight" in self.weights
+            and f"{prefix}.mlp.switch_mlp.down_proj.weight" in self.weights
+        )
+
+    def _qwen35_moe_forward(self, mx: Any, prefix: str, x: Any) -> Any:
+        cfg = self.shard.model_config
+        top_k = int(cfg.get("num_experts_per_tok") or cfg.get("text_config", {}).get("num_experts_per_tok") or 8)
+        router = self._linear(mx, x, f"{prefix}.mlp.gate")
+        gates = mx.softmax(router.astype(mx.float32), axis=-1, precise=True)
+        indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+        scores = mx.take_along_axis(gates, indices, axis=-1)
+        # Qwen3.5 A3B uses top-k routing; normalizing keeps activation scale
+        # stable across local shard splits and matches common MoE inference.
+        scores = scores / mx.maximum(mx.sum(scores, axis=-1, keepdims=True), 1e-9)
+
+        up = self._switch_linear(mx, x, indices, f"{prefix}.mlp.switch_mlp.up_proj")
+        gate = self._switch_linear(mx, x, indices, f"{prefix}.mlp.switch_mlp.gate_proj")
+        expert = self._switch_linear(
+            mx,
+            _mx_silu(mx, gate) * up,
+            indices,
+            f"{prefix}.mlp.switch_mlp.down_proj",
+        )
+        routed = (expert * scores[..., None]).sum(axis=-2)
+
+        shared_up = self._linear(mx, x, f"{prefix}.mlp.shared_expert.up_proj")
+        shared_gate = self._linear(mx, x, f"{prefix}.mlp.shared_expert.gate_proj")
+        shared = self._linear(mx, _mx_silu(mx, shared_gate) * shared_up, f"{prefix}.mlp.shared_expert.down_proj")
+        shared_scale = mx.sigmoid(self._linear(mx, x, f"{prefix}.mlp.shared_expert_gate"))
+        return routed + shared * shared_scale
+
     def _linear_attn_forward(self, mx: Any, prefix: str, local_i: int, hidden: Any, use_cache: bool, rms_eps: float) -> tuple[Any, dict[str, Any]]:
         w_qkv = self._w(f"{prefix}.linear_attn.in_proj_qkv.weight")
         w_z = self._w(f"{prefix}.linear_attn.in_proj_z.weight")
@@ -780,24 +954,26 @@ class MLXBackend:
         cfg = self.shard.model_config
         num_v_heads = int(cfg.get("linear_num_value_heads") or int(a_log.shape[0]))
         num_k_heads = int(cfg.get("linear_num_key_heads") or num_v_heads)
-        value_dim = int(w_z.shape[0])
+        head_v_dim_cfg = int(cfg.get("linear_value_head_dim") or 0)
+        head_k_dim_cfg = int(cfg.get("linear_key_head_dim") or 0)
+        value_dim = int(num_v_heads * head_v_dim_cfg) if head_v_dim_cfg > 0 else int(a_log.shape[0]) * 128
         head_v_dim = value_dim // num_v_heads
-        # conv_dim = key_dim*2 + value_dim, so key_dim = (w_qkv.shape[0] - value_dim) // 2
-        total_qkv = int(w_qkv.shape[0])
-        key_dim = (total_qkv - value_dim) // 2
+        # conv_dim = key_dim*2 + value_dim. Quantized packed weight shapes do not
+        # expose real output dims, so prefer config for Qwen3.5 A3B.
+        key_dim = int(num_k_heads * head_k_dim_cfg) if head_k_dim_cfg > 0 else value_dim // 2
         head_k_dim = key_dim // num_k_heads
         bsz, seq_len, _ = hidden.shape
 
-        mixed = hidden @ w_qkv.T                  # [B, L, key*2 + value]
-        z = (hidden @ w_z.T).reshape(bsz, seq_len, num_v_heads, head_v_dim)
-        b = hidden @ w_b.T                        # [B, L, num_v_heads]
-        a = hidden @ w_a.T                        # [B, L, num_v_heads]
+        mixed = self._linear(mx, hidden, f"{prefix}.linear_attn.in_proj_qkv")  # [B, L, key*2 + value]
+        z = self._linear(mx, hidden, f"{prefix}.linear_attn.in_proj_z").reshape(bsz, seq_len, num_v_heads, head_v_dim)
+        b = self._linear(mx, hidden, f"{prefix}.linear_attn.in_proj_b")        # [B, L, num_v_heads]
+        a = self._linear(mx, hidden, f"{prefix}.linear_attn.in_proj_a")        # [B, L, num_v_heads]
 
         state = self.linear_states[local_i] if self.linear_states is not None else {}
         conv_state = state.get("conv_state")
         rec_state = state.get("recurrent_state")
         mixed_bcl = mixed.transpose(0, 2, 1)
-        conv_kernel = int(w_conv.shape[-1])
+        conv_kernel = _conv1d_kernel_size(w_conv)
         if use_cache and conv_state is not None and seq_len == 1:
             combined = mx.concatenate([conv_state, mixed_bcl], axis=-1)
             mixed_conv = _causal_conv1d_mlx(mx, combined[:, :, -(conv_kernel):], w_conv)[:, :, -1:]
@@ -826,7 +1002,7 @@ class MLXBackend:
         z2 = z.reshape(-1, head_v_dim)
         out2 = _gated_rms_norm(mx, out2, z2, norm_w, rms_eps)
         out = out2.reshape(bsz, seq_len, value_dim)
-        out = out @ w_out.T
+        out = self._linear(mx, out, f"{prefix}.linear_attn.out_proj")
 
         if use_cache and self.linear_states is not None:
             self.linear_states[local_i] = {"conv_state": new_conv_state, "recurrent_state": new_rec_state}

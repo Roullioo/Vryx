@@ -2,7 +2,7 @@
   "name": "vryx-desktop",
   "productName": "Vryx",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.7",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {

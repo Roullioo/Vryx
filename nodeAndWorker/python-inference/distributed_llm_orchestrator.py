@@ -382,7 +382,7 @@ PIPELINE_STEP_TIMEOUT = _timeout_sec("VRYX_PIPELINE_STEP_TIMEOUT_SEC", max(TIMEO
 SHARD_INIT_TIMEOUT = _timeout_sec("VRYX_SHARD_INIT_TIMEOUT_SEC", 600.0)
 SHARD_LOAD_TIMEOUT = _timeout_sec("VRYX_SHARD_LOAD_TIMEOUT_SEC", 600.0)
 SHARD_BUILD_TIMEOUT = _timeout_sec("VRYX_SHARD_BUILD_TIMEOUT_SEC", 600.0)
-SHARD_READY_TIMEOUT = _timeout_sec("VRYX_SHARD_READY_TIMEOUT_SEC", min(180.0, SHARD_BUILD_TIMEOUT), floor=5.0)
+SHARD_READY_TIMEOUT = _timeout_sec("VRYX_SHARD_READY_TIMEOUT_SEC", SHARD_BUILD_TIMEOUT, floor=5.0)
 SHARD_STATUS_TIMEOUT = _timeout_sec("VRYX_SHARD_STATUS_TIMEOUT_SEC", 120.0, floor=20.0)
 MLX_DIRECT_RELAY_TIMEOUT = _timeout_sec("VRYX_MLX_DIRECT_RELAY_TIMEOUT_SEC", 30.0, floor=5.0)
 SHARD_TTL = int(os.environ.get("VRYX_DIST_SHARD_TTL", "1800"))
@@ -627,6 +627,16 @@ def _runtime_for_pool(pool_class: str, worker: dict[str, Any] | None = None) -> 
     return str((worker or {}).get("runtimeBackend") or (worker or {}).get("runtime_backend") or "pytorch").lower()
 
 
+def _shard_runtime_for_worker(pool_class: str, worker: dict[str, Any] | None = None) -> str:
+    runtime = _runtime_for_pool(pool_class, worker)
+    # mlx_lm est un runtime de modèle complet. Les shards doivent passer par
+    # le backend MLX Metal interne, sinon le worker retombe en PyTorch et
+    # tente de matérialiser des dizaines de Go de safetensors bruts.
+    if runtime in ("mlx_lm", "mlx-lm", "metal"):
+        return "mlx"
+    return runtime
+
+
 def _attention_for_pool(pool_class: str) -> str:
     if pool_class == "velocity_mlx":
         return "mlx_metal"
@@ -671,10 +681,10 @@ def _worker_matches_model(worker: dict[str, Any], model_id: Optional[str] = None
 
 
 def _requires_distributed_shards(model_id: Optional[str] = None) -> bool:
-    if LLAMA_CPP_DIRECT:
-        return False
     norm = _model_key(model_id or MODEL_ID)
     tail = _model_tail(norm)
+    if LLAMA_CPP_DIRECT:
+        return False
     # Les très gros modèles ne doivent jamais passer par le chemin direct
     # `mlx_lm.generate` : un worker tenterait de charger le modèle complet,
     # puis répondrait "shard-only", ce qui finit côté UI en "Réponse vide".
@@ -683,6 +693,21 @@ def _requires_distributed_shards(model_id: Optional[str] = None) -> bool:
         or "llama2-70b" in norm
         or tail in {"llama-2-70b-hf", "llama-2-70b-chat-hf"}
         or "70b" in tail
+    ):
+        return True
+    # Qwen 35B Q4 is production-routed through mlx-lm full-load on a large
+    # Apple worker first. The custom distributed safetensors path currently
+    # transfers BF16 weights, so forcing it would reject viable M4 Max runs and
+    # surface "empty response" failures. Keep the shard path explicit until a
+    # true Q4-sharded backend is enabled.
+    if (
+        os.environ.get("VRYX_FORCE_QWEN35_DISTRIBUTED", "0").strip().lower() in ("1", "true", "yes", "on")
+        and (
+            "qwen/qwen3.6-35b" in norm
+            or "qwen3.6-35b" in norm
+            or "qwen3-6-35b" in norm
+            or tail in {"qwen3.6-35b-a3b", "qwen3-6-35b-a3b"}
+        )
     ):
         return True
     return (
@@ -836,6 +861,16 @@ def _apply_preferred_worker_order(
     available = set(peers)
     ordered = [peer for peer in preferred_workers if peer in available]
     missing = [peer for peer in preferred_workers if peer not in available]
+    allow_offline_preferred = (
+        bool(_prepared_gguf_session_dir())
+        or os.environ.get("VRYX_ALLOW_PREFERRED_OFFLINE_WORKERS", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    if allow_offline_preferred and missing:
+        # Prepared GGUF manifests are peer-pinned. Some workers can be reachable through
+        # libp2p relay before their HTTP heartbeat is visible; keep the explicit operator
+        # placement and let shard.init produce the authoritative connectivity error.
+        ordered = preferred_workers[:]
+        missing = []
     return ordered, ordered, missing
 
 
@@ -983,12 +1018,13 @@ def _microbatch_cap_for_rtt(routing_path: list[str], latency_matrix: dict[str, A
     return max(2, min(DECODE_MICROBATCH_CAP, int(DECODE_MICROBATCH_CAP / ratio)))
 
 
-def _requires_mlx_lm_direct_guard() -> bool:
+def _requires_mlx_lm_direct_guard(force_distributed: bool = False, force_direct: bool = False) -> bool:
     normalized = MODEL_ID.lower().replace("_", "-")
     return (
         MLX_LM_DIRECT
         and ("qwen3.5" in normalized or "qwen3-5" in normalized or "qwen3.6" in normalized or "qwen3-6" in normalized)
-        and not _requires_distributed_shards(MODEL_ID)
+        and not force_distributed
+        and (force_direct or not _requires_distributed_shards(MODEL_ID))
     )
 
 
@@ -1437,13 +1473,19 @@ def _can_use_tokenizer_only_for_direct_mlx() -> bool:
     return bool(
         (
             (MLX_LM_DIRECT or LLAMA_CPP_DIRECT)
-            and not _requires_distributed_shards(MODEL_ID)
+            and (
+                not _requires_distributed_shards(MODEL_ID)
+                or _env_bool("VRYX_DIRECT_TOKENIZER_ONLY", "1")
+            )
         )
         or _prepared_gguf_session_dir()
     )
 
 
 _SAFETENSOR_NUMPY_DTYPES = {
+    # NumPy stable does not expose bfloat16, so workers memmap the raw 16-bit
+    # payload and convert it explicitly before building the compute slice.
+    "BF16": "uint16",
     "F16": "float16",
     "F32": "float32",
     "F64": "float64",
@@ -1485,6 +1527,7 @@ def _read_safetensor_offsets(path: str) -> dict[str, dict[str, Any]]:
         out[name] = {
             "shape": [int(x) for x in (meta.get("shape") or [])],
             "dtype": numpy_dtype,
+            "safetensors_dtype": dtype_code,
             "source_offset": data_base + start,
             "nbytes": end - start,
         }
@@ -1500,18 +1543,26 @@ def _stage_safetensor_source(shard_dir: str, snapshot_dir: str, rel_path: str) -
     snapshot_abs = os.path.abspath(snapshot_dir)
     if not src.startswith(snapshot_abs + os.sep):
         raise RuntimeError(f"chemin safetensors hors snapshot: {rel_path}")
+    real_src = os.path.realpath(src)
+    if not os.path.isfile(real_src):
+        raise RuntimeError(f"source safetensors introuvable: {rel_path}")
     dst = os.path.join(shard_dir, "sources", clean_rel)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.exists(dst):
+    if os.path.lexists(dst):
         return clean_rel
     try:
-        os.link(src, dst)
+        os.link(real_src, dst)
     except OSError:
-        os.symlink(src, dst)
+        if os.path.lexists(dst):
+            return clean_rel
+        try:
+            os.symlink(real_src, dst)
+        except FileExistsError:
+            return clean_rel
     return clean_rel
 
 
-def _ensure_model():
+def _ensure_model(require_weights: bool = False):
     global _model, _tokenizer, _model_config_cache
     with _model_lock:
         if _model is not None:
@@ -1547,7 +1598,7 @@ def _ensure_model():
                         "generation_config.json",
                     ],
                 )
-            elif local_snapshot and _can_use_tokenizer_only_for_direct_mlx():
+            elif local_snapshot and _can_use_tokenizer_only_for_direct_mlx() and not require_weights:
                 source_id = _direct_mlx_tokenizer_model_id()
                 print(
                     f"[VPS] Mode direct MLX: snapshot poids ignoré côté VPS; "
@@ -1572,7 +1623,7 @@ def _ensure_model():
                 )
             elif local_snapshot:
                 if not os.path.isdir(local_snapshot):
-                    if not _can_use_tokenizer_only_for_direct_mlx():
+                    if not _can_use_tokenizer_only_for_direct_mlx() or require_weights:
                         raise RuntimeError(
                             f"snapshot local introuvable: {local_snapshot}. "
                             "Place config/tokenizer/safetensors ici ou retire VRYX_MODEL_SNAPSHOT_DIR."
@@ -1613,12 +1664,7 @@ def _ensure_model():
                     )
                     snapshot_dir = local_snapshot
             else:
-                if MODEL_LOCAL_ONLY:
-                    if not _can_use_tokenizer_only_for_direct_mlx():
-                        raise RuntimeError(
-                            "VRYX_MODEL_LOCAL_ONLY=1 mais VRYX_MODEL_SNAPSHOT_DIR est vide. "
-                            "Aucun appel Hugging Face ne sera fait."
-                        )
+                if _can_use_tokenizer_only_for_direct_mlx() and not require_weights:
                     source_id = _direct_mlx_tokenizer_model_id()
                     print(
                         f"[VPS] Mode direct MLX tokenizer-only : chargement tokenizer/config léger depuis {source_id}."
@@ -1640,11 +1686,17 @@ def _ensure_model():
                             "generation_config.json",
                         ],
                     )
+                elif MODEL_LOCAL_ONLY:
+                    raise RuntimeError(
+                        "VRYX_MODEL_LOCAL_ONLY=1 mais VRYX_MODEL_SNAPSHOT_DIR est vide. "
+                        "Aucun appel Hugging Face ne sera fait."
+                    )
                 else:
-                    print(f"[VPS] Chargement {MODEL_ID} : authentification {token_hint} ({token_source}).")
-                    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, token=token)
-                    cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, token=token)
-                    snapshot_dir = snapshot_download(MODEL_ID, **_hf_snapshot_download_kwargs(token))
+                    source_id = _direct_mlx_tokenizer_model_id() if require_weights else MODEL_ID
+                    print(f"[VPS] Chargement {source_id} : authentification {token_hint} ({token_source}).")
+                    _tokenizer = AutoTokenizer.from_pretrained(source_id, trust_remote_code=True, token=token)
+                    cfg = AutoConfig.from_pretrained(source_id, trust_remote_code=True, token=token)
+                    snapshot_dir = snapshot_download(source_id, **_hf_snapshot_download_kwargs(token))
             weight_map = _load_safetensor_weight_map(snapshot_dir)
             if not weight_map:
                 if not _can_use_tokenizer_only_for_direct_mlx():
@@ -1820,7 +1872,45 @@ def _worker_memory_budget_mb(worker: dict[str, Any]) -> float:
 
 def _safe_weight_budget_mb(worker: dict[str, Any]) -> float:
     # Garde de la place pour activations, KV cache, process Python/MLX et fragmentation mémoire.
-    return max(0.0, _worker_memory_budget_mb(worker) * 0.72)
+    # Le facteur est configurable pour éviter un rejet excessif des workers Apple 16 Go en mode shard.
+    raw = os.environ.get("VRYX_SAFE_WEIGHT_BUDGET_RATIO", "0.92").strip()
+    try:
+        ratio = float(raw)
+    except Exception:
+        ratio = 0.92
+    ratio = max(0.55, min(0.98, ratio))
+    return max(0.0, _worker_memory_budget_mb(worker) * ratio)
+
+
+def _resident_weight_estimate_mb(raw_weight_mb: float, worker: dict[str, Any]) -> float:
+    quant = str(
+        worker.get("weightQuantization")
+        or worker.get("weight_quantization")
+        or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16")
+        or "fp16"
+    ).strip().lower()
+    runtime = str(worker.get("runtimeBackend") or worker.get("runtime_backend") or "").lower()
+    supports_q4 = bool(worker.get("supportsQ4Weights") or worker.get("supports_q4_weights"))
+    if "q4" in quant or "int4" in quant or supports_q4:
+        # Safetensors shards are exported from fp16/bf16 sources, but MLX/GGUF
+        # workers can keep a much smaller resident working set when Q4 is active.
+        # The disk/network payload is still tracked separately; this preflight is
+        # about RAM/VRAM residency, not download size.
+        return raw_weight_mb * 0.30
+    if "int8" in quant or "8" in quant:
+        return raw_weight_mb * 0.55
+    if "mlx" in runtime and supports_q4:
+        return raw_weight_mb * 0.30
+    return raw_weight_mb
+
+
+def _resident_required_weight_mb(raw_weight_mb: float, worker: dict[str, Any], prepared_quantized: bool) -> float:
+    if not prepared_quantized:
+        # Le chemin safetensors-ranges-v1 transfère les poids HF bruts. Tant
+        # qu'on n'a pas un manifeste GGUF/MLX quantifié, le worker ne possède
+        # pas réellement de poids Q4 résidents.
+        return raw_weight_mb
+    return _resident_weight_estimate_mb(raw_weight_mb, worker)
 
 
 def _weighted_counts(total_layers: int, workers: list[str], catalog: dict[str, dict]) -> list[int]:
@@ -2374,6 +2464,15 @@ def _selected_tensor_names(
     model_type = str(model_config.get("model_type") or "gpt2")
     selected: list[tuple[str, str]] = []
 
+    def add_tensor_with_quant(src: str, dst: str) -> None:
+        selected.append((src, dst))
+        base_src = src[:-7] if src.endswith(".weight") else src
+        base_dst = dst[:-7] if dst.endswith(".weight") else dst
+        for suffix in ("scales", "biases"):
+            q_src = f"{base_src}.{suffix}"
+            if q_src in weight_map:
+                selected.append((q_src, f"{base_dst}.{suffix}"))
+
     if model_type == "gpt2":
         if has_embedding:
             selected.extend([
@@ -2392,14 +2491,20 @@ def _selected_tensor_names(
                 ("lm_head.weight", "lm_head.weight"),
             ])
     else:
-        if "model.embed_tokens.weight" in weight_map:
+        if "language_model.model.embed_tokens.weight" in weight_map:
+            base_prefix = "language_model.model"
+            head_prefix = "language_model"
+        elif "model.embed_tokens.weight" in weight_map:
             base_prefix = "model"
+            head_prefix = ""
         elif "model.language_model.embed_tokens.weight" in weight_map:
             base_prefix = "model.language_model"
+            head_prefix = "model"
         else:
             base_prefix = "model"
+            head_prefix = ""
         if has_embedding:
-            selected.append((f"{base_prefix}.embed_tokens.weight", "embed_tokens.weight"))
+            add_tensor_with_quant(f"{base_prefix}.embed_tokens.weight", "embed_tokens.weight")
         for global_idx in range(layer_start, layer_end + 1):
             local_idx = global_idx - layer_start
             prefix = f"{base_prefix}.layers.{global_idx}."
@@ -2407,10 +2512,17 @@ def _selected_tensor_names(
                 selected.append((src, f"layers.{local_idx}.{src[len(prefix):]}"))
         if has_lm_head:
             selected.append((f"{base_prefix}.norm.weight", "norm.weight"))
-            if "lm_head.weight" in weight_map:
-                selected.append(("lm_head.weight", "lm_head.weight"))
+            lm_head_candidates = [
+                f"{head_prefix}.lm_head.weight" if head_prefix else "lm_head.weight",
+                "lm_head.weight",
+                "language_model.lm_head.weight",
+                "model.lm_head.weight",
+            ]
+            lm_head_name = next((name for name in lm_head_candidates if name in weight_map), "")
+            if lm_head_name:
+                add_tensor_with_quant(lm_head_name, "lm_head.weight")
             elif f"{base_prefix}.embed_tokens.weight" in weight_map:
-                selected.append((f"{base_prefix}.embed_tokens.weight", "lm_head.weight"))
+                add_tensor_with_quant(f"{base_prefix}.embed_tokens.weight", "lm_head.weight")
 
     missing = [src for src, _dst in selected if src not in weight_map]
     if missing:
@@ -2471,6 +2583,7 @@ def _save_shard_to_disk_from_safetensors(
                 "source_name": src_name,
                 "shape": tensor_meta["shape"],
                 "dtype": tensor_meta["dtype"],
+                "safetensors_dtype": tensor_meta.get("safetensors_dtype"),
                 "source_url": file_url,
                 "source_file": staged_rel,
                 "source_offset": int(tensor_meta["source_offset"]),
@@ -3338,9 +3451,26 @@ def _get_or_create_session(
             else:
                 ordered = ranked
             counts = _weighted_counts(total_layers, ordered, catalog)
-            if n >= 3 and model_config.get("model_type") != "gpt2":
-                # Le dernier worker porte aussi norm + lm_head : on évite de lui ajouter trop de couches.
-                max_last_layers = min(2, total_layers)
+            forced_counts_raw = os.environ.get("VRYX_FORCE_LAYER_COUNTS", "").strip()
+            forced_counts_applied = False
+            if forced_counts_raw:
+                try:
+                    forced_counts = [int(x.strip()) for x in forced_counts_raw.split(",") if x.strip()]
+                    if len(forced_counts) != n or sum(forced_counts) != total_layers or any(x <= 0 for x in forced_counts):
+                        raise ValueError(f"attendu {n} entiers positifs dont la somme vaut {total_layers}")
+                    counts = forced_counts
+                    forced_counts_applied = True
+                    print(f"[VPS] Placement forcé par VRYX_FORCE_LAYER_COUNTS={forced_counts_raw}")
+                except Exception as exc:
+                    print(f"[VPS] VRYX_FORCE_LAYER_COUNTS ignoré ({exc})")
+            if n >= 2 and not forced_counts_applied and model_config.get("model_type") != "gpt2":
+                # Le dernier worker porte aussi norm + lm_head. Sur Qwen 35B Q4,
+                # 27 couches + head dépasse le seuil MLX local et déclenche un
+                # fallback PyTorch invalide pour les poids linear_attn quantifiés.
+                max_last_layers = min(
+                    int(os.environ.get("VRYX_MAX_LM_HEAD_WORKER_LAYERS", "18") or "18"),
+                    total_layers,
+                )
                 if counts[-1] > max_last_layers:
                     overflow = counts[-1] - max_last_layers
                     counts[-1] = max_last_layers
@@ -3386,7 +3516,7 @@ def _get_or_create_session(
                     "vram_mb": (catalog.get(peer) or {}).get("gpuVramMb"),
                     "allocated_vram_mb": (catalog.get(peer) or {}).get("allocatedVramMb"),
                     "memory_limit_percent": (catalog.get(peer) or {}).get("memoryLimitPercent"),
-                    "runtime_backend": _runtime_for_pool(pool_class, catalog.get(peer) or {}),
+                    "runtime_backend": _shard_runtime_for_worker(pool_class, catalog.get(peer) or {}),
                     "weight_quantization": (catalog.get(peer) or {}).get("weightQuantization") or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16"),
                     "attention_backend": _attention_for_pool(pool_class),
                 }
@@ -3428,7 +3558,7 @@ def _get_or_create_session(
                 "async_load": True,
                 "hidden_transport": transport,
                 "weight_quantization": os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower(),
-                "runtime_backend": _runtime_for_pool(pool_class),
+                "runtime_backend": _shard_runtime_for_worker(pool_class, catalog.get(peer) or {}),
                 "supports_q4_weights": pool_class == "velocity_mlx" or os.environ.get("VRYX_SUPPORTS_Q4_WEIGHTS", "0").lower() in ("1", "true", "yes"),
                 "supports_mlx": pool_class == "velocity_mlx" or os.environ.get("VRYX_SUPPORTS_MLX", "0").lower() in ("1", "true", "yes"),
                 "supports_vllm": pool_class == "velocity_vllm" or os.environ.get("VRYX_SUPPORTS_VLLM", "0").lower() in ("1", "true", "yes"),
@@ -3495,9 +3625,26 @@ def _get_or_create_session(
                                 f"{weights_loaded} poids, build={shard_hit.get('build_ms')}ms"
                             )
                             return True
-                        last_reason = reason or (
-                            str(status.get("error")) if not status.get("ok", True) else last_reason
-                        )
+                        if shard_hit is not None:
+                            last_reason = "; ".join(
+                                str(x)
+                                for x in (
+                                    reason,
+                                    shard_hit.get("last_error"),
+                                    f"runtime={shard_hit.get('runtime_backend')}",
+                                    f"requested={shard_hit.get('requested_runtime_backend')}",
+                                    f"mode={shard_hit.get('weight_load_mode')}",
+                                    f"weights={shard_hit.get('weights_loaded')}",
+                                    f"bytes={shard_hit.get('weight_bytes')}",
+                                    f"loading={shard_hit.get('loading')}",
+                                    f"building={shard_hit.get('building')}",
+                                )
+                                if x not in (None, "", False)
+                            )[:700]
+                        else:
+                            last_reason = reason or (
+                                str(status.get("error")) if not status.get("ok", True) else last_reason
+                            )
                         poll_n += 1
                         time.sleep(_shard_ready_sleep_sec(poll_n))
                     print(
@@ -3553,14 +3700,17 @@ def _get_or_create_session(
                 manifest_bytes = 0
             worker_info = catalog.get(peer) or {}
             safe_mb = _safe_weight_budget_mb(worker_info)
-            required_mb = manifest_bytes / 1024 / 1024
-            if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb and not _prepared_gguf_session_dir():
+            raw_required_mb = manifest_bytes / 1024 / 1024
+            prepared_quantized = bool(_prepared_gguf_session_dir())
+            required_mb = _resident_required_weight_mb(raw_required_mb, worker_info, prepared_quantized)
+            if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb:
                 capacity_errors.append({
                     "worker_index": i,
                     "peer": peer[:48],
                     "gpu": worker_info.get("gpuName") or worker_info.get("gpu_name") or "unknown",
                     "layers": f"{ls}-{le}",
                     "required_weight_mb": round(required_mb, 1),
+                    "raw_weight_mb": round(raw_required_mb, 1),
                     "safe_weight_budget_mb": round(safe_mb, 1),
                     "allocated_vram_mb": _worker_memory_budget_mb(worker_info),
                     "weight_quantization": os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower(),
@@ -3579,8 +3729,8 @@ def _get_or_create_session(
                 "detail": detail,
                 "workers": capacity_errors,
                 "hint": (
-                    "Llama 2 70B fp16 ne tient pas sur cette chaîne. "
-                    "Utilise un backend de poids Q4/Q8 shardé ou ajoute des workers/VRAM avant de lancer le dispatch."
+                    f"{MODEL_ID} ne tient pas sur cette chaîne avec le budget mémoire sûr actuel. "
+                    "Réduis le contexte/KV, augmente l'allocation mémoire, ou ajoute des workers/VRAM."
                 ),
             })
             print(f"[VPS] Dispatch refusé: capacité worker insuffisante. {detail}")
@@ -3697,7 +3847,14 @@ def _run_mlx_lm_direct_chat(
             },
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
         }
-    ready_peers = _rotate_direct_ready_peers(ready_peers)
+    if any(marker in str(MODEL_ID).lower() for marker in ("32b", "34b", "35b", "65b", "70b", "72b")):
+        ready_peers = sorted(
+            ready_peers,
+            key=lambda p: _worker_memory_budget_mb(catalog.get(p) or {}),
+            reverse=True,
+        )
+    else:
+        ready_peers = _rotate_direct_ready_peers(ready_peers)
     peer = None
     acquire_reason = "none"
     for candidate in ready_peers:
@@ -3850,6 +4007,11 @@ def _run_mlx_lm_direct_chat(
         "ok": True,
         "routing_path": [peer],
         "peers": [peer],
+        "available_peers": list(peers),
+        "peers_online": len(peers),
+        "worker_count": 1,
+        "compute_worker_count": 1,
+        "visible_worker_count": len(peers),
         "model_id": MODEL_ID,
         "runtime_backend_per_worker": {peer: direct_backend},
         "pool_preference": pool_preference,
@@ -3879,7 +4041,9 @@ def _run_mlx_lm_direct_chat(
             "target_ms_per_token": 66,
             "actual_ms_per_token": int(decode_ms / completion_tokens) if completion_tokens else 0,
             "actual_tps": actual_tps,
-            "decode_mode": response.get("decode_mode") or ("llama_cpp_ollama_generate" if LLAMA_CPP_DIRECT else "mlx_lm_direct_stream_generate"),
+            "decode_mode": response.get("decode_mode") or (
+                "llama_cpp_ollama_generate" if direct_backend == "llama_cpp" else "mlx_lm_direct_stream_generate"
+            ),
             "routing_hops": 1,
             "relay_ms": relay_ms,
             "ttft_ms": response.get("ttft_ms"),
@@ -3887,7 +4051,7 @@ def _run_mlx_lm_direct_chat(
             "eval_ms": response.get("eval_ms"),
             "prompt_eval_ms": response.get("prompt_eval_ms"),
             "cache_hit": bool(response.get("cache_hit")),
-            "runtime_backend": "llama_cpp" if LLAMA_CPP_DIRECT else "mlx_lm",
+            "runtime_backend": direct_backend,
             "stop_reason": response.get("stop_reason"),
             "effective_max_tokens": response.get("effective_max_tokens"),
         },
@@ -3941,8 +4105,20 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         except (TypeError, ValueError):
             pass
 
-    requires_distributed_shards = _requires_distributed_shards(MODEL_ID)
-    min_workers_required = _required_min_workers_for_model(MODEL_ID)
+    requested_load_mode = str(options.get("load_mode") or options.get("loadMode") or "").strip().lower()
+    force_full_load = requested_load_mode in ("full", "solo", "single", "direct")
+    force_distributed = (
+        requested_load_mode == "shard"
+        or str(options.get("force_distributed") or "").strip().lower() in ("1", "true", "yes", "on")
+    )
+    requires_distributed_shards = (not force_full_load) and (
+        force_distributed or _requires_distributed_shards(MODEL_ID)
+    )
+    min_workers_required = (
+        max(2, DIST_MIN_SHARDED_WORKERS)
+        if requires_distributed_shards and not ALLOW_SINGLE_WORKER_LARGE_LLAMA
+        else _required_min_workers_for_model(MODEL_ID)
+    )
     wait_for_min = DIST_WAIT_FOR_MIN_WORKERS or requires_distributed_shards
     if requires_distributed_shards:
         disk_ok, disk_msg = _assert_shard_cache_disk()
@@ -3964,11 +4140,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
 
-    if LLAMA_CPP_DIRECT:
+    if LLAMA_CPP_DIRECT and not requires_distributed_shards:
         model_manifest, tokenizer = {"model_id": MODEL_ID, "source": "llama_cpp_direct"}, None
     else:
-        model_manifest, tokenizer = _ensure_model()
-    if model_manifest is None or (tokenizer is None and not LLAMA_CPP_DIRECT):
+        model_manifest, tokenizer = _ensure_model(require_weights=requires_distributed_shards)
+    if model_manifest is None or (tokenizer is None and not (LLAMA_CPP_DIRECT and not requires_distributed_shards)):
         return {
             "ok": False,
             "text": "",
@@ -4097,7 +4273,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
     # Tokenisation + mise en forme communes (cohérence directe + pipeline).
     model_config = _model_config_cache or {}
-    if LLAMA_CPP_DIRECT and tokenizer is None:
+    if LLAMA_CPP_DIRECT and tokenizer is None and not requires_distributed_shards:
         model_config = {
             "model_type": "llama_cpp_direct",
             "max_position_embeddings": int(os.environ.get("VRYX_LLAMA_CPP_NUM_CTX", "4096") or "4096"),
@@ -4169,12 +4345,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             trace["preferred_workers_applied"] = preferred_workers_applied
             trace["preferred_workers_missing"] = preferred_workers_missing
         return direct_result
-    if _requires_mlx_lm_direct_guard():
+    if _requires_mlx_lm_direct_guard(force_distributed=requires_distributed_shards, force_direct=force_full_load):
         return {
             "ok": False,
             "text": "",
             "error": (
-                "mlx_lm_direct_p2p obligatoire pour Qwen3.5-9B en production. "
+                "mlx_lm_direct_p2p obligatoire pour Qwen3.5/Qwen3.6 en production. "
                 "Le fallback vers le backend shard custom est bloqué pour préserver la qualité et le TPS."
             ),
             "trace": {
@@ -4229,7 +4405,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             detail_hint = f" Diagnostics orchestrateur : {chunk}."
         if capacity_diag:
             error_msg = (
-                "Dispatch Llama 70B impossible avec la mémoire worker actuelle. "
+                f"Dispatch {MODEL_ID} impossible avec la mémoire worker actuelle. "
                 f"{capacity_diag.get('detail')}. "
                 "Le pipeline a été arrêté avant téléchargement/build pour éviter une réponse vide ou un transport error. "
                 f"{capacity_diag.get('hint') or ''}"
@@ -4673,6 +4849,18 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 },
             )
     avg_ms = int(sum(step_latencies) / len(step_latencies)) if step_latencies else 0
+    prefill_ms = int(step_latencies[0]) if step_latencies else 0
+    decode_only_latencies = step_latencies[1:] if len(step_latencies) > 1 else []
+    decode_only_ms = int(sum(decode_only_latencies))
+    decode_only_tokens = max(0, len(generated_ids) - 1) if prefill_ms else len(generated_ids)
+    decode_only_avg_ms = int(decode_only_ms / decode_only_tokens) if decode_only_tokens > 0 and decode_only_ms > 0 else 0
+    e2e_tps = round((len(generated_ids) * 1000.0 / total_ms), 3) if total_ms > 0 and generated_ids else 0
+    decode_only_tps = (
+        round((decode_only_tokens * 1000.0 / decode_only_ms), 3)
+        if decode_only_tokens > 0 and decode_only_ms > 0
+        else e2e_tps
+    )
+    prefill_tps = round((1000.0 / prefill_ms), 3) if prefill_ms > 0 else 0
     relay_ms_total = sum(int(m.get("relay_ms") or 0) for m in relay_metrics)
     serialization_ms_total = sum(int(m.get("serialization_ms") or 0) for m in relay_metrics)
     hidden_bytes_total = sum(int(m.get("hidden_bytes") or 0) for m in relay_metrics)
@@ -4734,6 +4922,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "stream_fallback": "persistent_request_response" if PERSISTENT_RELAY else "request_response",
         "persistent_relay": PERSISTENT_RELAY,
         "connection_reuse": PERSISTENT_RELAY,
+        "worker_count": len(routing_path),
+        "compute_worker_count": len(routing_path),
+        "visible_worker_count": len(peers_sorted),
+        "available_peers": list(peers_sorted),
         "relay_timeout_sec": TIMEOUT,
         "pipeline_step_timeout_sec": PIPELINE_STEP_TIMEOUT,
         "relay_ms": relay_ms_total,
@@ -4843,14 +5035,30 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         },
         "tokens_generated": len(generated_ids),
         "avg_ms_per_token": avg_ms,
-        "hot_path_tps": round((len(generated_ids) * 1000.0 / total_ms), 3) if total_ms > 0 else 0,
+        "prefill_ms": prefill_ms,
+        "prefill_tps": prefill_tps,
+        "decode_only_ms": decode_only_ms,
+        "decode_only_tokens": decode_only_tokens,
+        "decode_only_avg_ms_per_token": decode_only_avg_ms,
+        "decode_only_tps": decode_only_tps,
+        "e2e_tps": e2e_tps,
+        "hot_path_tps": decode_only_tps,
         "setup_ms": setup_ms,
         "benchmark": {
             "target_tps": 15,
             "target_ms_per_token": 66,
             "intermediate_target_ms_per_token": 250,
             "actual_ms_per_token": avg_ms,
-            "actual_tps": round((len(generated_ids) * 1000.0 / total_ms), 3) if total_ms > 0 else 0,
+            "actual_tps": decode_only_tps,
+            "decode_only_tps": decode_only_tps,
+            "decode_only_ms": decode_only_ms,
+            "decode_only_tokens": decode_only_tokens,
+            "decode_only_avg_ms_per_token": decode_only_avg_ms,
+            "e2e_tps": e2e_tps,
+            "e2e_ms": total_ms,
+            "prefill_ms": prefill_ms,
+            "prefill_tps": prefill_tps,
+            "setup_ms": setup_ms,
             "decode_mode": effective_decode_mode,
             "routing_hops": len(routing_path),
             "stream_session_hot": bool(stream_open.get("ok")),

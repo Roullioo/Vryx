@@ -723,7 +723,7 @@ function WorkerVisual({
   const centerLabel = pending ? 'Démarrage' : active ? 'Live' : 'Démarrer'
   const centerHint = pending ? 'Préparation du worker' : active ? 'Calcul distribué' : 'Lancer le worker'
   return (
-    <div className={`compute-visual ${active ? 'is-working' : ''} ${pending ? 'is-pending' : ''}`}>
+    <div className={`compute-visual ${active ? 'is-working' : ''} ${pending ? 'is-pending' : ''} ${!canStart && !active ? 'has-start-warning' : ''}`}>
       <div className="compute-aura" />
       <div className="compute-stream stream-a" />
       <div className="compute-stream stream-b" />
@@ -742,7 +742,7 @@ function WorkerVisual({
         type="button"
         className="compute-core-button no-drag"
         onClick={onPrimaryClick}
-        disabled={pending || (!canStart && !active)}
+        disabled={pending}
         aria-label={active ? 'Arrêter le worker' : 'Démarrer le worker'}
       >
         <svg className="compute-progress" viewBox="0 0 240 240" aria-hidden="true">
@@ -1168,14 +1168,30 @@ function App() {
 
   const startWorker = async () => {
     if (workerState.state === 'starting' || workerState.state === 'connecting') return
+    setAuthError('')
     if (!config.authToken || !config.userId) {
       setAuthError('Connecte ton compte VRYX avant de lancer le worker.')
+      setWorkerState({ state: 'error', progress: 0, message: 'Connexion VRYX requise avant de démarrer' })
       return
     }
-    await saveConfig()
-    const out = await window.electron?.startWorker(config)
-    if (out && !out.ok) {
-      setIssues([out.error || 'Impossible de lancer le worker'])
+    if (!window.electron) {
+      setIssues(['Bridge Electron indisponible. Relance l’application Vryx.'])
+      setWorkerState({ state: 'error', progress: 0, message: 'Bridge Electron indisponible' })
+      return
+    }
+    setWorkerState({ state: 'starting', progress: 8, message: 'Demande de démarrage envoyée' })
+    try {
+      await saveConfig()
+      const out = await window.electron.startWorker(config)
+      if (!out?.ok) {
+        const error = out?.error || 'Impossible de lancer le worker'
+        setIssues([error])
+        setWorkerState({ state: 'error', progress: 0, message: error })
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setIssues([message])
+      setWorkerState({ state: 'error', progress: 0, message })
     }
   }
 

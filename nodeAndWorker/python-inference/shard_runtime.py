@@ -122,6 +122,7 @@ class PipelineShard:
     created_ns: int
     # Poids reçus (name → np.ndarray float16)
     weight_arrays: Dict[str, np.ndarray] = field(default_factory=dict)
+    weight_source_dtypes: Dict[str, str] = field(default_factory=dict)
     # Slice PyTorch construit après réception des poids
     model_slice: Optional[Any] = None
     # Runtime de calcul actif (PyTorch legacy, MLX Velocity, vLLM futur).
@@ -193,6 +194,7 @@ class PyTorchBackend:
         self.shard.model_slice = None
         self.shard.kv_cache = None
         self.shard.weight_arrays.clear()
+        self.shard.weight_source_dtypes.clear()
 
     def status(self) -> dict[str, Any]:
         ready = self.shard.model_slice is not None and bool(self.shard.weights_loaded or self.shard.weight_arrays)
@@ -227,6 +229,11 @@ def _select_backend(shard: PipelineShard, meta: dict[str, Any]) -> RuntimeBacken
     worker_env_backend = os.environ.get("VRYX_RUNTIME_BACKEND", "").strip().lower()
     meta_backend = str(meta.get("runtime_backend") or "").strip().lower()
     requested = worker_env_backend or meta_backend or "pytorch"
+    # mlx_lm est le runtime "modèle complet" côté worker. Pour un shard de
+    # couches, on utilise le backend MLX Metal interne, jamais le fallback
+    # PyTorch silencieux.
+    if requested in ("mlx_lm", "mlx-lm", "metal"):
+        requested = "mlx"
     print(f"[backend] select: worker_env={worker_env_backend!r} meta={meta_backend!r} → {requested!r}")
     if requested == "mlx":
         if str(getattr(shard, "weight_load_mode", "") or "").lower() == "gguf_ranges":
@@ -1643,6 +1650,22 @@ class _GPT2WorkerSlice(torch.nn.Module):
             self.lm_head = torch.nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
 
+def _torch_tensor_from_weight_array(arr: np.ndarray, source_dtype: Optional[str], target_dtype: torch.dtype) -> torch.Tensor:
+    """Convertit un tenseur transporté en ndarray vers le dtype de calcul."""
+    if str(source_dtype or "").upper() == "BF16":
+        raw = np.asarray(arr, dtype=np.uint16)
+        try:
+            t = torch.from_numpy(raw.view(np.int16))
+            if not t.is_contiguous():
+                t = t.contiguous()
+            return t.view(torch.bfloat16).to(dtype=target_dtype)
+        except Exception:
+            # Fallback portable : reconstruction IEEE bfloat16 -> float32 côté NumPy.
+            widened = raw.astype(np.uint32) << 16
+            return torch.from_numpy(widened.view(np.float32)).to(dtype=target_dtype)
+    return torch.from_numpy(arr).to(dtype=target_dtype)
+
+
 def _build_slice(shard: PipelineShard) -> object:
     """Construit le module PyTorch depuis les poids reçus."""
     cfg_d = shard.model_config
@@ -1650,8 +1673,10 @@ def _build_slice(shard: PipelineShard) -> object:
     is_gpt2_model = model_type == "gpt2"
     device = _worker_device()
     dtype = _worker_dtype(device, is_gpt2_model)
-    state_dict = {k: torch.from_numpy(v).to(dtype=dtype)
-                  for k, v in shard.weight_arrays.items()}
+    state_dict = {
+        k: _torch_tensor_from_weight_array(v, shard.weight_source_dtypes.get(k), dtype)
+        for k, v in shard.weight_arrays.items()
+    }
 
     if model_type == "gpt2" and HAS_GPT2:
         config = GPT2Config(
@@ -1748,6 +1773,7 @@ def _build_slice(shard: PipelineShard) -> object:
     if missing:
         print(f"[!] Shard {shard.session_id}: {len(missing)} poids manquants ({missing[:3]}…)")
     shard.weight_arrays.clear()
+    shard.weight_source_dtypes.clear()
 
     model.to(device=device, dtype=dtype)
     model.eval()
@@ -1780,6 +1806,67 @@ def _copy_http_range_to_file(url: str, start: int, nbytes: int, out_file: Any, s
             remaining -= len(chunk)
         if remaining != 0:
             raise RuntimeError(f"range_incomplet:{nbytes - remaining}/{nbytes}:{url}")
+
+
+def _candidate_local_source_dirs(model_id: str) -> list[str]:
+    """Répertoires de poids locaux possibles pour éviter de retélécharger un shard déjà résident."""
+    candidates: list[str] = []
+    explicit = os.environ.get("VRYX_WORKER_LOCAL_SOURCE_DIR", "").strip()
+    if explicit:
+        candidates.append(explicit)
+
+    home = os.path.expanduser("~")
+    hf_root = os.environ.get("HF_HOME") or os.path.join(home, ".cache", "huggingface")
+    hub_root = os.path.join(hf_root, "hub")
+    repo_ids = [
+        model_id,
+        "mlx-community/Qwen3.6-35B-A3B-4bit" if "qwen3.6-35b-a3b" in model_id.lower() else "",
+    ]
+    for repo_id in repo_ids:
+        if not repo_id or "/" not in repo_id:
+            continue
+        owner, name = repo_id.split("/", 1)
+        snapshots_dir = os.path.join(hub_root, f"models--{owner}--{name}", "snapshots")
+        if not os.path.isdir(snapshots_dir):
+            continue
+        try:
+            for snapshot in sorted(os.listdir(snapshots_dir), reverse=True):
+                path = os.path.join(snapshots_dir, snapshot)
+                if os.path.isdir(path):
+                    candidates.append(path)
+        except Exception:
+            pass
+    return candidates
+
+
+def _copy_local_or_http_range_to_file(
+    *,
+    model_id: str,
+    source_file: str,
+    source_url: str,
+    start: int,
+    nbytes: int,
+    out_file: Any,
+    ssl_context: Any,
+) -> str:
+    if source_file:
+        for base in _candidate_local_source_dirs(model_id):
+            local_path = os.path.join(base, source_file)
+            if os.path.exists(local_path) and os.path.getsize(local_path) >= start + nbytes:
+                with open(local_path, "rb") as src:
+                    src.seek(start)
+                    remaining = nbytes
+                    while remaining > 0:
+                        chunk = src.read(min(8 * 1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        remaining -= len(chunk)
+                    if remaining != 0:
+                        raise RuntimeError(f"local_range_incomplet:{nbytes - remaining}/{nbytes}:{local_path}")
+                return "local"
+    _copy_http_range_to_file(source_url, start, nbytes, out_file, ssl_context)
+    return "http"
 
 
 # ── API principale ─────────────────────────────────────────────────────────────
@@ -1829,7 +1916,9 @@ def pipeline_shard_init(meta_json: bytes) -> str:
     setattr(_shards[sid], "ring_attention", bool(meta.get("ring_attention", RING_ATTENTION)))
     _shards[sid].backend = _select_backend(_shards[sid], meta)
     setattr(_shards[sid], "loading", bool(str(meta.get("download_url") or "").strip()))
+    setattr(_shards[sid], "building", False)
     setattr(_shards[sid], "build_ready", False)
+    setattr(_shards[sid], "last_error", None)
     n_layers = _shards[sid].layer_end - _shards[sid].layer_start + 1
     print(f"[shard] init {sid[:16]}… layers {_shards[sid].layer_start}-{_shards[sid].layer_end}"
           f" embed={_shards[sid].has_embedding} lm_head={_shards[sid].has_lm_head}")
@@ -1843,6 +1932,15 @@ def pipeline_shard_init(meta_json: bytes) -> str:
 
             def _load_in_background() -> None:
                 result = pipeline_shard_init(json.dumps(async_meta).encode("utf-8"))
+                try:
+                    parsed = json.loads(result)
+                    if parsed.get("ok") is False:
+                        shard = _shards.get(sid)
+                        if shard is not None:
+                            setattr(shard, "last_error", str(parsed.get("error") or parsed)[:1000])
+                            setattr(shard, "loading", False)
+                except Exception:
+                    pass
                 print(f"[shard] async load terminé {sid[:16]}… {result[:240]}")
 
             threading.Thread(target=_load_in_background, daemon=True).start()
@@ -1898,6 +1996,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                         "name": str(entry.get("name") or ""),
                         "shape": entry.get("shape") or [],
                         "dtype": str(entry.get("dtype") or "float16"),
+                        "safetensors_dtype": entry.get("safetensors_dtype"),
                         "ggml_type": entry.get("ggml_type"),
                         "offset": offset,
                         "source_url": str(entry.get("source_url") or ""),
@@ -1911,20 +2010,55 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                 elif not (expected and os.path.exists(bin_local_path) and os.path.getsize(bin_local_path) >= expected):
                     print(f"[shard] Cache MISS ranges -> téléchargement vers {bin_local_path}")
                     part_path = f"{bin_local_path}.part"
+                    resume_idx = 0
+                    resume_bytes = 0
                     if os.path.exists(part_path):
-                        os.remove(part_path)
-                    with open(part_path, "wb") as out_bin:
-                        for idx, entry in enumerate(tensor_sources, start=1):
+                        part_size = os.path.getsize(part_path)
+                        if expected and part_size > expected:
+                            os.remove(part_path)
+                            part_size = 0
+                        if part_size > 0:
+                            complete_offset = 0
+                            for i, entry in enumerate(tensor_sources):
+                                next_offset = complete_offset + int(entry.get("nbytes") or 0)
+                                if next_offset <= part_size:
+                                    complete_offset = next_offset
+                                    resume_idx = i + 1
+                                else:
+                                    break
+                            if complete_offset > 0:
+                                with open(part_path, "r+b") as f:
+                                    f.truncate(complete_offset)
+                                resume_bytes = complete_offset
+                                print(
+                                    f"[shard] Cache PART resume ranges : "
+                                    f"{resume_idx}/{len(tensor_sources)} tensors, {resume_bytes / 1e6:.1f} MB"
+                                )
+                            else:
+                                os.remove(part_path)
+                                part_size = 0
+                    mode = "ab" if resume_bytes > 0 else "wb"
+                    with open(part_path, mode) as out_bin:
+                        for idx, entry in enumerate(tensor_sources[resume_idx:], start=resume_idx + 1):
                             source_url = str(entry.get("source_url") or "")
+                            source_file = str(entry.get("source_file") or "")
                             source_offset = int(entry.get("source_offset") or 0)
                             nbytes = int(entry.get("nbytes") or 0)
                             if not source_url or nbytes <= 0:
                                 raise RuntimeError(f"tensor_source invalide: {entry}")
                             for attempt in range(5):
                                 try:
-                                    _copy_http_range_to_file(source_url, source_offset, nbytes, out_bin, _ctx)
+                                    source_kind = _copy_local_or_http_range_to_file(
+                                        model_id=shard.model_id,
+                                        source_file=source_file,
+                                        source_url=source_url,
+                                        start=source_offset,
+                                        nbytes=nbytes,
+                                        out_file=out_bin,
+                                        ssl_context=_ctx,
+                                    )
                                     if idx == 1 or idx == len(tensor_sources) or idx % 32 == 0:
-                                        print(f"[shard] Range {idx}/{len(tensor_sources)} OK")
+                                        print(f"[shard] Range {idx}/{len(tensor_sources)} OK ({source_kind})")
                                     break
                                 except Exception as ex:
                                     if attempt == 4:
@@ -1954,6 +2088,8 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                         off = int(entry["offset"])
                         arr = np.memmap(bin_local_path, dtype=dtype, mode="r", offset=off, shape=shape)
                         shard.weight_arrays[name] = arr
+                        if entry.get("safetensors_dtype"):
+                            shard.weight_source_dtypes[name] = str(entry.get("safetensors_dtype") or "")
                         n_weights += 1
                     setattr(shard, "weight_file_path", bin_local_path)
                 setattr(shard, "weight_load_mode", "gguf_ranges" if is_gguf_ranges else "safetensors_ranges")
@@ -2009,14 +2145,27 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                 if expected and os.path.getsize(bin_local_path) < expected:
                     raise RuntimeError(f"Download incomplet : {os.path.getsize(bin_local_path)}/{expected}")
 
+                keep_memmap = os.environ.get("VRYX_KEEP_WEIGHT_MEMMAP", "0").strip().lower() in ("1", "true", "yes")
                 for entry in weights_index:
                     name = entry["name"]
                     shape = tuple(int(x) for x in entry["shape"])
                     dtype = np.dtype(entry["dtype"])
                     off = int(entry["offset"])
                     nbytes = int(entry["nbytes"])
-                    arr = np.memmap(bin_local_path, dtype=dtype, mode="r", offset=off, shape=shape)
+                    arr_mm = np.memmap(bin_local_path, dtype=dtype, mode="r", offset=off, shape=shape)
+                    # Par défaut on détache en ndarray pour éviter de garder un FD ouvert par tenseur
+                    # (sinon ERREUR 24 "Too many open files" sur les gros shards 35B).
+                    if keep_memmap:
+                        arr = arr_mm
+                    else:
+                        arr = np.asarray(arr_mm).copy()
+                        try:
+                            del arr_mm
+                        except Exception:
+                            pass
                     shard.weight_arrays[name] = arr
+                    if entry.get("safetensors_dtype"):
+                        shard.weight_source_dtypes[name] = str(entry.get("safetensors_dtype") or "")
                     n_weights += 1
                 setattr(shard, "weight_file_path", bin_local_path)
                 setattr(shard, "weight_load_mode", "memmap")
@@ -2030,6 +2179,8 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                         dtype = np.dtype(w["dtype"])
                         arr = np.frombuffer(arr_bytes, dtype=dtype).reshape(shape).copy()
                         shard.weight_arrays[param_name] = arr
+                        if w.get("safetensors_dtype"):
+                            shard.weight_source_dtypes[param_name] = str(w.get("safetensors_dtype") or "")
                         n_weights += 1
                     except Exception as e:
                         print(f"[shard] Erreur param {param_name} : {e}")
@@ -2076,11 +2227,15 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                                    "weights_loaded": n_weights, "download_ms": elapsed})
             else:
                 setattr(shard, "loading", False)
-                return json.dumps({"ok": False, "session_id": sid,
-                                   "error": f"Build échoué : {build_res.get('error')}"})
+                error = f"Build échoué : {build_res.get('error')}"
+                setattr(shard, "last_error", error)
+                return json.dumps({"ok": False, "session_id": sid, "error": error})
         except Exception as e:
             try:
-                setattr(_shards.get(sid), "loading", False)
+                shard = _shards.get(sid)
+                if shard is not None:
+                    setattr(shard, "loading", False)
+                    setattr(shard, "last_error", f"Téléchargement échoué : {e}")
             except Exception:
                 pass
             print(f"[shard] Échec téléchargement {download_url} : {e}")
@@ -2104,6 +2259,8 @@ def pipeline_shard_load(load_json: bytes) -> str:
     dtype = np.dtype(dtype_str)
     arr = np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
     shard.weight_arrays[param_name] = arr
+    if meta.get("safetensors_dtype"):
+        shard.weight_source_dtypes[param_name] = str(meta.get("safetensors_dtype") or "")
     shard.weights_loaded = len(shard.weight_arrays)
     shard.weight_bytes = sum(a.nbytes for a in shard.weight_arrays.values())
     return json.dumps({"ok": True, "param": param_name, "shape": list(shape)})
@@ -2117,6 +2274,7 @@ def pipeline_shard_build(sid: str) -> str:
     if getattr(shard, "building", False):
         return json.dumps({"ok": False, "error": "build déjà en cours"})
     setattr(shard, "building", True)
+    setattr(shard, "last_error", None)
     if shard.backend is None:
         shard.backend = _select_backend(shard, {"runtime_backend": getattr(shard, "runtime_backend", "pytorch")})
     try:
@@ -2130,6 +2288,7 @@ def pipeline_shard_build(sid: str) -> str:
                 print(f"[backend] fallback PyTorch interdit : {reason}")
                 result["runtime_fallback_disabled"] = True
                 result["runtime_fallback_reason"] = reason
+                setattr(shard, "last_error", reason)
                 return json.dumps(result)
             print(f"[backend] fallback {getattr(shard.backend, 'name', 'unknown')} → pytorch : {reason}")
             shard.backend = PyTorchBackend(shard, requested_backend=getattr(shard, "runtime_backend", "mlx"), fallback_reason=reason)
@@ -2137,6 +2296,9 @@ def pipeline_shard_build(sid: str) -> str:
             result["runtime_fallback_reason"] = reason
         if result.get("ok"):
             setattr(shard, "build_ready", True)
+            setattr(shard, "last_error", None)
+        else:
+            setattr(shard, "last_error", str(result.get("error") or result)[:1000])
         return json.dumps(result)
     finally:
         setattr(shard, "building", False)
@@ -2636,6 +2798,10 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "fallback_disabled": os.environ.get("VRYX_DISABLE_PYTORCH_FALLBACK", "0").lower() in ("1", "true", "yes"),
             "built": ready,
             "ready": ready,
+            "loading": bool(getattr(shard, "loading", False)),
+            "building": bool(getattr(shard, "building", False)),
+            "build_ready": bool(getattr(shard, "build_ready", False)),
+            "last_error": getattr(shard, "last_error", None),
             "resident_vram": ready,
             "weight_load_mode": getattr(shard, "weight_load_mode", "memory"),
             "download_ms": shard.download_ms,

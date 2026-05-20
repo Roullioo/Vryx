@@ -12,6 +12,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{
@@ -864,6 +865,112 @@ async fn send_heartbeat(
     }
 }
 
+fn is_public_routable_ip(host: &str) -> bool {
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4 == Ipv4Addr::BROADCAST
+                || v4.octets()[0] >= 224)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast())
+        }
+    }
+}
+
+fn worker_direct_addrs_from_status(worker: &serde_json::Value, peer_id: PeerId) -> Vec<Multiaddr> {
+    let Some(public_ip) = worker
+        .get("publicIp")
+        .or_else(|| worker.get("public_ip"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && is_public_routable_ip(s))
+    else {
+        return Vec::new();
+    };
+    let Some(p2p_port) = worker
+        .get("p2pPort")
+        .or_else(|| worker.get("p2p_port"))
+        .and_then(|v| v.as_u64())
+        .filter(|p| *p > 0 && *p <= u16::MAX as u64)
+    else {
+        return Vec::new();
+    };
+
+    [
+        format!("/ip4/{}/udp/{}/quic-v1/p2p/{}", public_ip, p2p_port, peer_id),
+        format!("/ip4/{}/tcp/{}/p2p/{}", public_ip, p2p_port, peer_id),
+    ]
+    .into_iter()
+    .filter_map(|addr| addr.parse::<Multiaddr>().ok())
+    .collect()
+}
+
+fn register_worker_addresses(
+    swarm: &mut Swarm<VryxBehaviour>,
+    peer_id: PeerId,
+    addrs: &[Multiaddr],
+    known_worker_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
+) {
+    if addrs.is_empty() {
+        return;
+    }
+    let cached = known_worker_addrs.entry(peer_id).or_default();
+    for addr in addrs {
+        swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+        swarm.add_peer_address(peer_id, addr.clone());
+        if !cached.iter().any(|existing| existing == addr) {
+            cached.push(addr.clone());
+        }
+    }
+}
+
+fn dial_worker_best_effort(
+    swarm: &mut Swarm<VryxBehaviour>,
+    peer_id: PeerId,
+    known_worker_addrs: &HashMap<PeerId, Vec<Multiaddr>>,
+    bootstrap_node: Option<&String>,
+    context: &str,
+) -> bool {
+    let mut attempted = false;
+    if let Some(addrs) = known_worker_addrs.get(&peer_id) {
+        for addr in addrs {
+            attempted = true;
+            match swarm.dial(addr.clone()) {
+                Ok(()) => println!("[P2P] Dial direct {} vers {} : {}", context, peer_id, addr),
+                Err(e) => eprintln!("[!] Dial direct {} vers {} échoué {} : {:?}", context, peer_id, addr, e),
+            }
+        }
+    }
+
+    if let Some(bs) = bootstrap_node
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), peer_id);
+        if let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() {
+            attempted = true;
+            swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
+            swarm.add_peer_address(peer_id, relay_addr.clone());
+            match swarm.dial(relay_addr.clone()) {
+                Ok(()) => println!("[P2P] Dial relay fallback {} vers {} : {}", context, peer_id, relay_addr),
+                Err(e) => eprintln!("[!] Dial relay fallback {} vers {} échoué : {:?}", context, peer_id, e),
+            }
+        }
+    }
+    attempted
+}
+
 /// Initiateur : lit `/api/workers/status`, enregistre les workers et relance un dial relay.
 /// Évite la course avec le ticker heartbeat (~30 s) quand `/api/chat` arrive juste après le démarrage.
 async fn initiator_pull_workers_from_api_now(
@@ -877,6 +984,7 @@ async fn initiator_pull_workers_from_api_now(
     active_peers: &Arc<Mutex<HashSet<PeerId>>>,
     registry_worker_count: Option<&Arc<AtomicUsize>>,
     registry_worker_peers: Option<&Arc<Mutex<HashSet<PeerId>>>>,
+    known_worker_addrs: &mut HashMap<PeerId, Vec<Multiaddr>>,
     log_origin: &'static str,
 ) {
     let Some(boot_addr_str) = bootstrap_node.map(|s| s.as_str()) else {
@@ -935,12 +1043,13 @@ async fn initiator_pull_workers_from_api_now(
         }
         registry_count += 1;
         registry_peers.insert(peer_id);
+        let direct_addrs = worker_direct_addrs_from_status(worker, peer_id);
+        register_worker_addresses(swarm, peer_id, &direct_addrs, known_worker_addrs);
         let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", boot_addr_str, peer_id);
-        let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() else {
-            continue;
-        };
-        swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
-        swarm.add_peer_address(peer_id, relay_addr.clone());
+        if let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() {
+            swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
+            swarm.add_peer_address(peer_id, relay_addr.clone());
+        }
         let newly_discovered = discovered_peers.insert(peer_id);
         if newly_discovered {
             match log_origin {
@@ -949,17 +1058,21 @@ async fn initiator_pull_workers_from_api_now(
             }
         }
         if !active_peers.lock().unwrap().contains(&peer_id) {
-            if let Err(e) = swarm.dial(relay_addr) {
-                eprintln!(
-                    "[!] Dial worker {} échoué ({:?})",
-                    peer_id, e
+            if !direct_addrs.is_empty() {
+                println!(
+                    "[P2P] {} : {} adresse(s) directe(s) candidate(s) pour {}",
+                    log_origin,
+                    direct_addrs.len(),
+                    peer_id
                 );
-            } else {
-                match log_origin {
-                    "heartbeat" => println!("[P2P] Dial worker heartbeat : {}", peer_id),
-                    _ => println!("[P2P] Pré-chat : dial relay vers {}", peer_id),
-                }
             }
+            let _ = dial_worker_best_effort(
+                swarm,
+                peer_id,
+                known_worker_addrs,
+                bootstrap_node,
+                log_origin,
+            );
         }
     }
     if let Some(atom) = registry_worker_count {
@@ -1146,6 +1259,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Instant,
         )>,
     > = HashMap::new();
+    let mut known_worker_addrs: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
 
     type ChatApiTx = tokio::sync::oneshot::Sender<serde_json::Value>;
 
@@ -1428,6 +1542,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     {
                         request_obj["scheduler_job_id"] = serde_json::json!(scheduler_job_id);
                     }
+                    if let Some(load_mode) = payload
+                        .get("load_mode")
+                        .or_else(|| payload.get("loadMode"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| matches!(*s, "auto" | "full" | "shard"))
+                    {
+                        request_obj["load_mode"] = serde_json::json!(load_mode);
+                    }
+                    if payload
+                        .get("force_distributed")
+                        .or_else(|| payload.get("forceDistributed"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                    {
+                        request_obj["force_distributed"] = serde_json::json!(true);
+                    }
                     for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                         if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                             request_obj[key] = serde_json::json!(value);
@@ -1528,6 +1659,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .filter(|s| !s.is_empty() && s.len() <= 100)
                 {
                     request_obj["scheduler_job_id"] = serde_json::json!(scheduler_job_id);
+                }
+                if let Some(load_mode) = payload
+                    .get("load_mode")
+                    .or_else(|| payload.get("loadMode"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| matches!(*s, "auto" | "full" | "shard"))
+                {
+                    request_obj["load_mode"] = serde_json::json!(load_mode);
+                }
+                if payload
+                    .get("force_distributed")
+                    .or_else(|| payload.get("forceDistributed"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                {
+                    request_obj["force_distributed"] = serde_json::json!(true);
                 }
                 for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                     if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
@@ -1713,7 +1861,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut bootstrap_interval = time::interval(Duration::from_secs(30));
     bootstrap_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-    let mut heartbeat_interval = time::interval(Duration::from_secs(30));
+    let heartbeat_secs = env_u64_clamped("VRYX_HEARTBEAT_INTERVAL_S", 10, 5, 60);
+    let mut heartbeat_interval = time::interval(Duration::from_secs(heartbeat_secs));
     heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let model_name = args.model.clone();
@@ -1923,22 +2072,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         peer,
                         hidden_bytes as f64 / 1024.0
                     );
-                    if let Some(bs) = args
-                        .bootstrap_node
-                        .as_ref()
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                    {
-                        let relay_addr_str =
-                            format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), peer);
-                        if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
-                            swarm.behaviour_mut().kad.add_address(&peer, ma.clone());
-                            swarm.add_peer_address(peer, ma.clone());
-                            if let Err(e) = swarm.dial(ma) {
-                                eprintln!("[!] Relais dial circuit vers worker : {:?}", e);
-                            }
-                        }
-                    }
+                    let _ = dial_worker_best_effort(
+                        &mut swarm,
+                        peer,
+                        &known_worker_addrs,
+                        args.bootstrap_node.as_ref(),
+                        "relay-http",
+                    );
                     let req_id = swarm
                         .behaviour_mut()
                         .request_response
@@ -1968,10 +2108,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(600)
                     .clamp(600, 3600);
-                if let ChatState::Generating { request_started, .. } = &chat_state {
-                    let no_workers_for_cancel = !chat_cancel_keepalive_signal();
-                    let elapsed = request_started.elapsed().as_secs();
-                    if elapsed > inference_timeout_secs {
+	                if let ChatState::Generating { request_started, .. } = &chat_state {
+	                    let no_workers_for_cancel = !chat_cancel_keepalive_signal();
+	                    let elapsed = request_started.elapsed().as_secs();
+	                    let no_worker_cancel_grace_secs: u64 = std::env::var("VRYX_NO_WORKER_CANCEL_GRACE_S")
+	                        .ok()
+	                        .and_then(|s| s.parse().ok())
+	                        .unwrap_or(600)
+	                        .clamp(120, 3600);
+	                    if elapsed > inference_timeout_secs {
                         eprintln!(
                             "[!] ChatState::Generating expiré ({}s > {}s), reset à Idle.",
                             elapsed, inference_timeout_secs
@@ -1987,10 +2132,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     ),
                                 }));
                             }
-                        }
-                        chat_state = ChatState::Idle;
-                        drain_chat_pending_after_idle!();
-                    } else if no_workers_for_cancel && elapsed > 45 {
+	                        }
+	                        chat_state = ChatState::Idle;
+	                        drain_chat_pending_after_idle!();
+	                    } else if no_workers_for_cancel && elapsed > no_worker_cancel_grace_secs {
                         eprintln!(
                             "[!] Génération en cours mais aucun signal worker ({}s sans P2P ni registre API). Reset à Idle.",
                             elapsed
@@ -2046,6 +2191,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             &active_peers,
                             Some(&initiator_registry_workers),
                             Some(&initiator_registry_worker_peers),
+                            &mut known_worker_addrs,
                             "chat",
                         )
                         .await;
@@ -2312,7 +2458,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let no_workers_for_cancel = !chat_cancel_keepalive_signal();
                         let elapsed = request_started.elapsed().as_secs();
                         let expired = elapsed > inference_timeout_secs;
-                        let stuck_no_worker = no_workers_for_cancel && elapsed > 120;
+                        let no_worker_cancel_grace_secs: u64 = std::env::var("VRYX_NO_WORKER_CANCEL_GRACE_S")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(600)
+                            .clamp(120, 3600);
+                        let stuck_no_worker = no_workers_for_cancel && elapsed > no_worker_cancel_grace_secs;
                         if expired || stuck_no_worker {
                             eprintln!(
                                 "[!] Heartbeat : ChatState::Generating bloqué {}s (expired={}, no_workers={}), reset à Idle.",
@@ -2362,13 +2513,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if active_peers.lock().unwrap().contains(&pt) {
                             continue 'redial_lp;
                         }
-                        if let Some(bs) = args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                            let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), pt);
-                            if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
-                                swarm.behaviour_mut().kad.add_address(&pt, ma.clone());
-                                let _ = swarm.dial(ma);
-                            }
-                        }
+                        let _ = dial_worker_best_effort(
+                            &mut swarm,
+                            pt,
+                            &known_worker_addrs,
+                            args.bootstrap_node.as_ref(),
+                            "relay-waiting",
+                        );
                     }
                 }
 
@@ -2465,6 +2616,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             &active_peers,
                             Some(&initiator_registry_workers),
                             Some(&initiator_registry_worker_peers),
+                            &mut known_worker_addrs,
                             "heartbeat",
                         )
                         .await;
@@ -2870,16 +3022,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     );
                                     active_peers.lock().unwrap().remove(&peer);
                                     peer_connection_count.lock().unwrap().remove(&peer);
-                                    if let Some(bs) =
-                                        args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
-                                    {
-                                        let relay_addr_str =
-                                            format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), peer);
-                                        if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
-                                            swarm.behaviour_mut().kad.add_address(&peer, ma.clone());
-                                            let _ = swarm.dial(ma);
-                                        }
-                                    }
+                                    let _ = dial_worker_best_effort(
+                                        &mut swarm,
+                                        peer,
+                                        &known_worker_addrs,
+                                        args.bootstrap_node.as_ref(),
+                                        "outbound-failure",
+                                    );
                                     pending_relay_until_connected.entry(peer).or_default().push_back((
                                         req_retry,
                                         reply_tx,

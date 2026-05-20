@@ -58,9 +58,15 @@ case "${CMD}" in
     ;;
 esac
 
-if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
-  echo "Venv manquant : ${VENV_PATH}. Crée-le puis pip install -r python-inference/requirements.txt" >&2
-  exit 1
+if [[ -x "${VENV_PATH}/bin/python" ]]; then
+  PY="${VENV_PATH}/bin/python"
+else
+  PY="${VRYX_PYTHON_BIN:-$(command -v python3 || true)}"
+  if [[ -z "${PY}" || ! -x "${PY}" ]]; then
+    echo "Python introuvable. Crée ${VENV_PATH} ou exporte VRYX_PYTHON_BIN=/chemin/python3" >&2
+    exit 1
+  fi
+  echo "[!] Venv incomplet (${VENV_PATH}) : utilisation de ${PY}"
 fi
 if [[ ! -f "${DAEMON}" ]]; then
   echo "Binaire Rust manquant : ${DAEMON}. Lance : (cd '${SCRIPT_DIR}/rust-daemon' && cargo build --release)" >&2
@@ -70,8 +76,6 @@ fi
 quick_stop
 mkdir -p "${LOG_DIR}"
 rm -f "${PIDS_FILE}"
-
-PY="${VENV_PATH}/bin/python"
 
 # Shards HTTP local : sans cela les workers tentent https://vryx.eu → 404 et /api/chat reste bloqué.
 export VRYX_SHARD_BASE_DIR="${LOG_DIR}/shards"

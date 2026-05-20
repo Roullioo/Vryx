@@ -27,14 +27,18 @@ if [ ! -f "${DAEMON}" ]; then
     cd "${SCRIPT_DIR}" && cargo build --release -p rust-daemon
 fi
 
-if [ ! -d "${VENV_PATH}/bin" ]; then
-    echo -e "${YELLOW}[!] Venv Python manquant. Créez-le avec:${NC}"
-    echo "    python3 -m venv ${VENV_PATH}"
-    echo "    source ${VENV_PATH}/bin/activate && pip install -r ${PYTHON_DIR}/requirements.txt"
-    exit 1
+if [ -x "${VENV_PATH}/bin/python" ]; then
+    # shellcheck source=/dev/null
+    source "${VENV_PATH}/bin/activate"
+    PYTHON_BIN="${VENV_PATH}/bin/python"
+else
+    PYTHON_BIN="${VRYX_PYTHON_BIN:-$(command -v python3 || true)}"
+    if [ -z "${PYTHON_BIN}" ] || [ ! -x "${PYTHON_BIN}" ]; then
+        echo -e "${YELLOW}[!] Python introuvable. Créez le venv ou exportez VRYX_PYTHON_BIN.${NC}"
+        exit 1
+    fi
+    echo -e "${YELLOW}[!] Venv incomplet, utilisation de ${PYTHON_BIN}.${NC}"
 fi
-
-source "${VENV_PATH}/bin/activate"
 
 # ── Nettoyage des anciens processus ───────────────────────────
 echo "[*] Nettoyage des anciens processus..."
@@ -44,12 +48,12 @@ sleep 1
 
 # ── Démarrage des serveurs gRPC ────────────────────────────────
 echo -e "${GREEN}[1/4] Démarrage inference stage 1 (port 50051)...${NC}"
-python3 "${PYTHON_DIR}/inference_server.py" --port 50051 --stage 1 \
+"${PYTHON_BIN}" "${PYTHON_DIR}/inference_server.py" --port 50051 --stage 1 \
     > /tmp/vryx_stage1.log 2>&1 &
 STAGE1_PID=$!
 
 echo -e "${GREEN}[2/4] Démarrage inference stage 2 (port 50052)...${NC}"
-python3 "${PYTHON_DIR}/inference_server.py" --port 50052 --stage 2 \
+"${PYTHON_BIN}" "${PYTHON_DIR}/inference_server.py" --port 50052 --stage 2 \
     > /tmp/vryx_stage2.log 2>&1 &
 STAGE2_PID=$!
 
@@ -57,7 +61,7 @@ STAGE2_PID=$!
 wait_port() {
     local port=$1 label=$2
     for i in $(seq 1 60); do
-        python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); r=s.connect_ex(('127.0.0.1',${port})); s.close(); sys.exit(0 if r==0 else 1)" 2>/dev/null \
+        "${PYTHON_BIN}" -c "import socket,sys; s=socket.socket(); s.settimeout(1); r=s.connect_ex(('127.0.0.1',${port})); s.close(); sys.exit(0 if r==0 else 1)" 2>/dev/null \
             && echo -e "${GREEN}[OK] ${label} prêt sur :${port} (${i}x2s)${NC}" && return 0
         echo -n "."
         sleep 2

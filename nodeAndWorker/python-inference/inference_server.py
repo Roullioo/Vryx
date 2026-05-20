@@ -404,8 +404,49 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             except Exception:
                 sid = session_id or ""
 
-            out_bytes = shard_runtime.pipeline_shard_forward(raw, sid)
+            print(
+                f"[worker-grpc] pipeline-forward start sid={sid[:16]} "
+                f"bytes={len(raw)} routing={len(routing_path)}",
+                flush=True,
+            )
+            timeout_sec = max(30.0, float(os.environ.get("VRYX_WORKER_FORWARD_TIMEOUT_SEC", "300")))
+            try:
+                out_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(shard_runtime.pipeline_shard_forward, raw, sid),
+                    timeout=timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                out_bytes = json.dumps({
+                    "ok": False,
+                    "error": f"worker_forward_timeout_after_{int(timeout_sec)}s",
+                    "session_id": sid,
+                    "runtime_backend": "unknown",
+                }, ensure_ascii=False).encode()
+                print(
+                    f"[worker-grpc] pipeline-forward timeout sid={sid[:16]} "
+                    f"after={compute_ms}ms",
+                    flush=True,
+                )
+            except Exception as exc:
+                compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                out_bytes = json.dumps({
+                    "ok": False,
+                    "error": f"worker_forward_exception:{type(exc).__name__}:{exc}",
+                    "session_id": sid,
+                    "runtime_backend": "unknown",
+                }, ensure_ascii=False).encode()
+                print(
+                    f"[worker-grpc] pipeline-forward exception sid={sid[:16]} "
+                    f"{type(exc).__name__}:{exc}",
+                    flush=True,
+                )
             compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            print(
+                f"[worker-grpc] pipeline-forward done sid={sid[:16]} "
+                f"bytes={len(out_bytes)} compute_ms={compute_ms}",
+                flush=True,
+            )
 
             # Trace minimale pour l'UI
             trace = json.dumps({
@@ -468,6 +509,14 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                         ]
                     if maybe_payload.get("scheduler_job_id") or maybe_payload.get("schedulerJobId"):
                         request_options["scheduler_job_id"] = maybe_payload.get("scheduler_job_id") or maybe_payload.get("schedulerJobId")
+                    if maybe_payload.get("load_mode") or maybe_payload.get("loadMode"):
+                        request_options["load_mode"] = maybe_payload.get("load_mode") or maybe_payload.get("loadMode")
+                    if maybe_payload.get("force_distributed") is not None or maybe_payload.get("forceDistributed") is not None:
+                        request_options["force_distributed"] = bool(
+                            maybe_payload.get("force_distributed")
+                            if maybe_payload.get("force_distributed") is not None
+                            else maybe_payload.get("forceDistributed")
+                        )
                     if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
                         request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
             except Exception:
