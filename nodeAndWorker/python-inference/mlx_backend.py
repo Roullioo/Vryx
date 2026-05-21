@@ -125,6 +125,8 @@ def _mx_gqa_forward(
     past_k: Any | None, past_v: Any | None,
     causal_mask: Any | None,
     use_cache: bool,
+    linear_fn: Any | None = None,
+    linear_prefixes: tuple[str, str, str, str] | None = None,
 ) -> tuple[Any, Any | None, Any | None]:
     B, L, _ = hidden.shape
     # Qwen3.5 full_attention: q_proj sort 2×num_heads×head_dim (gated queries: [q, gate]).
@@ -151,15 +153,20 @@ def _mx_gqa_forward(
             head_dim = k_out // num_kv_heads if num_kv_heads > 0 else head_dim
             num_heads = q_out // head_dim if head_dim > 0 else num_heads
 
-    q_proj = hidden @ q_w.T
-    k_proj = hidden @ k_w.T
-    v_proj = hidden @ v_w.T
-    if q_b is not None:
-        q_proj = q_proj + q_b
-    if k_b is not None:
-        k_proj = k_proj + k_b
-    if v_b is not None:
-        v_proj = v_proj + v_b
+    if linear_fn is not None and linear_prefixes is not None:
+        q_proj = linear_fn(hidden, linear_prefixes[0])
+        k_proj = linear_fn(hidden, linear_prefixes[1])
+        v_proj = linear_fn(hidden, linear_prefixes[2])
+    else:
+        q_proj = hidden @ q_w.T
+        k_proj = hidden @ k_w.T
+        v_proj = hidden @ v_w.T
+        if q_b is not None:
+            q_proj = q_proj + q_b
+        if k_b is not None:
+            k_proj = k_proj + k_b
+        if v_b is not None:
+            v_proj = v_proj + v_b
 
     q = q_proj.reshape(B, L, -1, head_dim * (2 if is_gated_q else 1)).transpose(0, 2, 1, 3)
     if is_gated_q:
@@ -197,9 +204,12 @@ def _mx_gqa_forward(
     if is_gated_q and gate_q is not None:
         gate = gate_q.transpose(0, 2, 1, 3).reshape(B, L, num_heads * head_dim)
         out = out * mx.sigmoid(gate)
-    out = out @ o_w.T
-    if o_b is not None:
-        out = out + o_b
+    if linear_fn is not None and linear_prefixes is not None:
+        out = linear_fn(out, linear_prefixes[3])
+    else:
+        out = out @ o_w.T
+        if o_b is not None:
+            out = out + o_b
     return out, new_k, new_v
 
 
@@ -285,10 +295,21 @@ class MLXBackend:
         self.scan_backend_requested = _normalize_scan_backend(os.environ.get(_SCAN_BACKEND_ENV))
         self.scan_backend_effective = self.scan_backend_requested
 
-        if os.environ.get("VRYX_ENABLE_MLX_RUNTIME", "0").lower() not in ("1", "true", "yes"):
+        runtime_requested = str(os.environ.get("VRYX_RUNTIME_BACKEND") or "").strip().lower() == "mlx"
+        mlx_supported = os.environ.get("VRYX_SUPPORTS_MLX", "0").lower() in ("1", "true", "yes")
+        mlx_runtime_enabled = (
+            os.environ.get("VRYX_ENABLE_MLX_RUNTIME", "0").lower() in ("1", "true", "yes")
+            or runtime_requested
+            or mlx_supported
+        )
+        mlx_kernels_enabled = (
+            os.environ.get("VRYX_ENABLE_MLX_KERNELS", "0").lower() in ("1", "true", "yes")
+            or mlx_runtime_enabled
+        )
+        if not mlx_runtime_enabled:
             self.unavailable_reason = "mlx_runtime_flag_disabled"
             return
-        if os.environ.get("VRYX_ENABLE_MLX_KERNELS", "0").lower() not in ("1", "true", "yes"):
+        if not mlx_kernels_enabled:
             self.unavailable_reason = "mlx_qwen_kernels_pending"
             return
         try:
@@ -316,7 +337,7 @@ class MLXBackend:
         self.weights = {}
         weight_dtype = _mx_weight_dtype(mx)
         source_bytes = int(sum(int(getattr(arr, "nbytes", 0)) for arr in self.shard.weight_arrays.values()))
-        max_shard_gb = float(os.environ.get("VRYX_MLX_MAX_SHARD_GB", "12"))
+        max_shard_gb = float(os.environ.get("VRYX_MLX_MAX_SHARD_GB", "32"))
         if source_bytes > max_shard_gb * 1024**3:
             return {
                 "ok": False,
@@ -326,7 +347,11 @@ class MLXBackend:
                 "rss_mb": round(_rss_mb(), 1),
             }
         for name, arr in self.shard.weight_arrays.items():
-            self.weights[name] = mx.array(np.asarray(arr), dtype=weight_dtype)
+            arr_np = np.asarray(arr)
+            if arr_np.dtype.kind in ("u", "i", "b"):
+                self.weights[name] = mx.array(arr_np)
+            else:
+                self.weights[name] = mx.array(arr_np, dtype=weight_dtype)
         # Forcer le chargement GPU Metal
         mx.eval(*self.weights.values())
 
@@ -372,6 +397,146 @@ class MLXBackend:
             "weight_dtype": str(weight_dtype),
             "rss_mb": round(_rss_mb(), 1),
         }
+
+    def _quant_cfg(self, prefix: str) -> dict[str, Any]:
+        q = self.shard.model_config.get("quantization")
+        if not isinstance(q, dict):
+            return {"group_size": 64, "bits": 4, "mode": "affine"}
+        cfg = {
+            "group_size": int(q.get("group_size") or 64),
+            "bits": int(q.get("bits") or 4),
+            "mode": str(q.get("mode") or "affine"),
+        }
+        candidates = [prefix]
+        if prefix.startswith("layers."):
+            parts = prefix.split(".", 2)
+            if len(parts) == 3 and parts[1].isdigit():
+                global_i = self.shard.layer_start + int(parts[1])
+                candidates.append(f"language_model.model.layers.{global_i}.{parts[2]}")
+                candidates.append(f"model.layers.{global_i}.{parts[2]}")
+        elif prefix in ("embed_tokens", "lm_head"):
+            candidates.extend([
+                f"language_model.model.{prefix}",
+                f"language_model.{prefix}",
+                f"model.{prefix}",
+            ])
+        for key in candidates:
+            item = q.get(key)
+            if isinstance(item, dict):
+                cfg["group_size"] = int(item.get("group_size") or cfg["group_size"])
+                cfg["bits"] = int(item.get("bits") or cfg["bits"])
+                cfg["mode"] = str(item.get("mode") or cfg["mode"])
+                break
+        return cfg
+
+    def _linear_out_features(self, prefix: str) -> int:
+        w = self._w(f"{prefix}.weight")
+        if w is None:
+            return 0
+        return int(w.shape[-2] if getattr(w, "ndim", 0) >= 3 else w.shape[0])
+
+    def _linear_in_features(self, prefix: str) -> int:
+        w = self._w(f"{prefix}.weight")
+        if w is None:
+            return 0
+        scales = self.weights.get(f"{prefix}.scales")
+        if scales is not None:
+            cfg = self._quant_cfg(prefix)
+            return int(w.shape[-1]) * 32 // max(1, int(cfg.get("bits") or 4))
+        return int(w.shape[-1])
+
+    def _linear(self, x: Any, prefix: str, expert_idx: int | None = None) -> Any:
+        mx = self.mx
+        w = self._w(f"{prefix}.weight")
+        if w is None:
+            raise ValueError(f"linear_weight_missing:{prefix}.weight")
+        scales = self.weights.get(f"{prefix}.scales")
+        biases = self.weights.get(f"{prefix}.biases")
+        dense_bias = self.weights.get(f"{prefix}.bias")
+        if expert_idx is not None and getattr(w, "ndim", 0) >= 3:
+            w = w[expert_idx]
+            if scales is not None and getattr(scales, "ndim", 0) >= 3:
+                scales = scales[expert_idx]
+            if biases is not None and getattr(biases, "ndim", 0) >= 3:
+                biases = biases[expert_idx]
+            if dense_bias is not None and getattr(dense_bias, "ndim", 0) >= 2:
+                dense_bias = dense_bias[expert_idx]
+        if scales is not None:
+            cfg = self._quant_cfg(prefix)
+            y = mx.quantized_matmul(
+                x,
+                w,
+                scales=scales,
+                biases=biases,
+                transpose=True,
+                group_size=int(cfg.get("group_size") or 64),
+                bits=int(cfg.get("bits") or 4),
+                mode=str(cfg.get("mode") or "affine"),
+            )
+        else:
+            y = x @ w.T
+        if dense_bias is not None:
+            y = y + dense_bias
+        return y
+
+    def _embedding_lookup(self, mx: Any, token_ids: Any) -> Any:
+        emb = self.weights.get("embed_tokens.weight")
+        if emb is None:
+            raise ValueError("embed_tokens.weight manquant")
+        scales = self.weights.get("embed_tokens.scales")
+        if scales is not None:
+            cfg = self._quant_cfg("embed_tokens")
+            emb = mx.dequantize(
+                emb,
+                scales=scales,
+                biases=self.weights.get("embed_tokens.biases"),
+                group_size=int(cfg.get("group_size") or 64),
+                bits=int(cfg.get("bits") or 4),
+                mode=str(cfg.get("mode") or "affine"),
+                dtype=mx.float16,
+            )
+            mx.eval(emb)
+            self.weights["embed_tokens.weight"] = emb
+            self.weights.pop("embed_tokens.scales", None)
+            self.weights.pop("embed_tokens.biases", None)
+        return emb[token_ids]
+
+    def _moe_mlp(self, mx: Any, prefix: str, x: Any) -> Any:
+        gate_prefix = f"{prefix}.mlp.gate"
+        switch_prefix = f"{prefix}.mlp.switch_mlp"
+        shared_prefix = f"{prefix}.mlp.shared_expert"
+        flat = x.reshape(-1, int(x.shape[-1]))
+        logits = self._linear(flat, gate_prefix).astype(mx.float32)
+        top_k = max(1, min(int(self.shard.model_config.get("num_experts_per_tok") or 8), int(logits.shape[-1])))
+        probs = mx.softmax(logits, axis=-1)
+        idxs = mx.argsort(probs, axis=-1)[:, -top_k:]
+        vals = mx.take_along_axis(probs, idxs, axis=-1)
+        vals = vals / mx.sum(vals, axis=-1, keepdims=True)
+        mx.eval(vals, idxs)
+        idx_np = np.asarray(idxs, dtype=np.int64)
+        vals_np = np.asarray(vals, dtype=np.float32)
+        rows = []
+        for token_i in range(idx_np.shape[0]):
+            token = flat[token_i:token_i + 1]
+            acc = None
+            for pos in range(idx_np.shape[1]):
+                expert_idx = int(idx_np[token_i, pos])
+                gate_up = self._linear(token, f"{switch_prefix}.gate_proj", expert_idx=expert_idx)
+                up = self._linear(token, f"{switch_prefix}.up_proj", expert_idx=expert_idx)
+                down = self._linear(_mx_silu(mx, gate_up) * up, f"{switch_prefix}.down_proj", expert_idx=expert_idx)
+                contrib = down * float(vals_np[token_i, pos])
+                acc = contrib if acc is None else acc + contrib
+            if f"{shared_prefix}.gate_proj.weight" in self.weights:
+                shared = self._linear(_mx_silu(mx, self._linear(token, f"{shared_prefix}.gate_proj")) * self._linear(token, f"{shared_prefix}.up_proj"), f"{shared_prefix}.down_proj")
+                shared_gate = mx.sigmoid(self._linear(token, f"{prefix}.mlp.shared_expert_gate"))
+                acc = (acc if acc is not None else mx.zeros_like(shared)) + shared_gate * shared
+            rows.append(acc[0])
+        return mx.stack(rows, axis=0).reshape(x.shape)
+
+    def _dense_mlp(self, mx: Any, prefix: str, x: Any) -> Any:
+        gate = self._linear(x, f"{prefix}.mlp.gate_proj")
+        up = self._linear(x, f"{prefix}.mlp.up_proj")
+        return self._linear(_mx_silu(mx, gate) * up, f"{prefix}.mlp.down_proj")
 
     # ── forward ───────────────────────────────────────────────────────────────
 
@@ -427,11 +592,11 @@ class MLXBackend:
         # ── Obtenir hidden_states ────────────────────────────────────────────
         if self.shard.has_embedding and "token_ids" in payload:
             token_ids = payload["token_ids"]
-            emb_w = self.weights.get("embed_tokens.weight")
-            if emb_w is None:
-                return json.dumps({"ok": False, "error": "embed_tokens.weight manquant"}).encode()
             ids_mx = mx.array(token_ids, dtype=mx.int32)
-            hidden = emb_w[ids_mx]           # [L, D]
+            try:
+                hidden = self._embedding_lookup(mx, ids_mx)  # [L, D]
+            except Exception as exc:
+                return json.dumps({"ok": False, "error": str(exc)}).encode()
             hidden = mx.expand_dims(hidden, axis=0)  # [1, L, D]
             seq_len = len(token_ids)
         else:
@@ -493,7 +658,9 @@ class MLXBackend:
                 gate_w = self._w(f"{prefix}.mlp.gate_proj.weight")
                 up_w = self._w(f"{prefix}.mlp.up_proj.weight")
                 down_w = self._w(f"{prefix}.mlp.down_proj.weight")
-                if any(w is None for w in [norm1_w, norm2_w, gate_w, up_w, down_w]):
+                has_dense_mlp = all(w is not None for w in [gate_w, up_w, down_w])
+                has_moe_mlp = f"{prefix}.mlp.gate.weight" in self.weights and f"{prefix}.mlp.switch_mlp.gate_proj.weight" in self.weights
+                if norm1_w is None or norm2_w is None or (not has_dense_mlp and not has_moe_mlp):
                     return None
                 normed = _mx_rms_norm(mx, h, norm1_w, rms_eps)
                 if self._has_linear_attn(prefix):
@@ -532,7 +699,7 @@ class MLXBackend:
                                     break
                     past_kv = self.kv_cache[local_i] if use_kv and self.kv_cache else None  # type: ignore[index]
                     past_k, past_v = (past_kv if past_kv is not None else (None, None))
-                    o_in_l = int(o_w.shape[1])
+                    o_in_l = self._linear_in_features(f"{prefix}.self_attn.o_proj")
                     layer_num_heads = n_heads_here
                     layer_head_dim = o_in_l // layer_num_heads if o_in_l % layer_num_heads == 0 else head_dim_here
                     layer_num_kv = int(k_w.shape[0]) // layer_head_dim
@@ -541,12 +708,22 @@ class MLXBackend:
                         mx, normed, q_w, k_w, v_w, o_w, q_b, k_b, v_b, o_b, q_norm_w, k_norm_w, rms_eps,
                         layer_num_heads, layer_num_kv, layer_head_dim, pos_ids_here,
                         layer_cos, layer_sin, past_k, past_v, causal_here, use_kv,
+                        self._linear,
+                        (
+                            f"{prefix}.self_attn.q_proj",
+                            f"{prefix}.self_attn.k_proj",
+                            f"{prefix}.self_attn.v_proj",
+                            f"{prefix}.self_attn.o_proj",
+                        ),
                     )
                     if use_kv and new_k is not None:
                         self.kv_cache[local_i] = (new_k, new_v)  # type: ignore[index]
                 h = h + attn_out
                 normed2 = _mx_rms_norm(mx, h, norm2_w, rms_eps)
-                h = h + _mx_mlp(mx, normed2, gate_w, up_w, down_w)
+                if has_moe_mlp:
+                    h = h + self._moe_mlp(mx, prefix, normed2)
+                else:
+                    h = h + self._dense_mlp(mx, prefix, normed2)
                 if eval_every and ((local_i + 1) % eval_every == 0 or local_i + 1 == n_layers_here):
                     mx.eval(h)
                 if progress_every and ((local_i + 1) % progress_every == 0 or local_i + 1 == n_layers_here):
@@ -589,7 +766,7 @@ class MLXBackend:
             lm_head_t0 = time.perf_counter()
             last = hidden[0, -1, :]
             last_normed = _mx_rms_norm(mx, last, norm_w, rms_eps)
-            logits = (lm_w @ last_normed).astype(mx.float32)
+            logits = self._linear(last_normed, "lm_head").astype(mx.float32)
             mx.eval(logits)
             lm_head_ms = max(0, int((time.perf_counter() - lm_head_t0) * 1000))
 
@@ -641,7 +818,7 @@ class MLXBackend:
                     if int(cur_tid) in stop_ids_int:
                         break
                     ids_mx_mic = mx.array([int(cur_tid)], dtype=mx.int32)
-                    h_mic = mx.expand_dims(emb_w_mic[ids_mx_mic], axis=0).astype(mx.float32)
+                    h_mic = mx.expand_dims(self._embedding_lookup(mx, ids_mx_mic), axis=0).astype(mx.float32)
                     sp_mic = int(self.shard.seq_position)
                     hz_mic = mlx_run_transformer(h_mic, sp_mic, 1, None)
                     if hz_mic is None:
@@ -650,7 +827,7 @@ class MLXBackend:
                     lh_t = time.perf_counter()
                     last_m = hz_mic[0, -1, :]
                     ln_m = _mx_rms_norm(mx, last_m, norm_w, rms_eps)
-                    logits_m = (lm_w @ ln_m).astype(mx.float32)
+                    logits_m = self._linear(ln_m, "lm_head").astype(mx.float32)
                     mx.eval(logits_m)
                     lm_head_ms += max(0, int((time.perf_counter() - lh_t) * 1000))
                     mic_payload = dict(payload)
@@ -788,10 +965,10 @@ class MLXBackend:
         head_k_dim = key_dim // num_k_heads
         bsz, seq_len, _ = hidden.shape
 
-        mixed = hidden @ w_qkv.T                  # [B, L, key*2 + value]
-        z = (hidden @ w_z.T).reshape(bsz, seq_len, num_v_heads, head_v_dim)
-        b = hidden @ w_b.T                        # [B, L, num_v_heads]
-        a = hidden @ w_a.T                        # [B, L, num_v_heads]
+        mixed = self._linear(hidden, f"{prefix}.linear_attn.in_proj_qkv")  # [B, L, key*2 + value]
+        z = self._linear(hidden, f"{prefix}.linear_attn.in_proj_z").reshape(bsz, seq_len, num_v_heads, head_v_dim)
+        b = self._linear(hidden, f"{prefix}.linear_attn.in_proj_b")        # [B, L, num_v_heads]
+        a = self._linear(hidden, f"{prefix}.linear_attn.in_proj_a")        # [B, L, num_v_heads]
 
         state = self.linear_states[local_i] if self.linear_states is not None else {}
         conv_state = state.get("conv_state")
@@ -826,7 +1003,7 @@ class MLXBackend:
         z2 = z.reshape(-1, head_v_dim)
         out2 = _gated_rms_norm(mx, out2, z2, norm_w, rms_eps)
         out = out2.reshape(bsz, seq_len, value_dim)
-        out = out @ w_out.T
+        out = self._linear(out, f"{prefix}.linear_attn.out_proj")
 
         if use_cache and self.linear_states is not None:
             self.linear_states[local_i] = {"conv_state": new_conv_state, "recurrent_state": new_rec_state}

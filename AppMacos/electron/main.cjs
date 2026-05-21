@@ -15,7 +15,7 @@ let nodeAndWorkerDir = bundledNodeAndWorkerDir;
 
 const DEFAULT_BOOTSTRAP = '/ip4/51.222.26.225/tcp/4001/p2p/12D3KooWLMT5gnTuCNkVewEhX8wcQ3spGFauT6XtcaBCs5N8n9Zz';
 const DEFAULT_API_URL = 'https://vryx.eu';
-const RUNTIME_COPY_REVISION = '2026-05-16-live-auth-stats-v33-qwen36-35b';
+const RUNTIME_COPY_REVISION = '2026-05-21-p2p-shard-runtime-v34';
 let updateCheckInterval = null;
 
 const MODEL_CATALOG = [
@@ -159,6 +159,8 @@ const DEFAULT_CONFIG = {
   language: 'auto',
   authToken: '',
   userEmail: '',
+  runtimeVersion: '',
+  workerSecret: '',
   electricityPriceKwh: 0.22,
 };
 
@@ -168,6 +170,7 @@ let workerState = { state: 'stopped', progress: 0, message: 'Worker arrete' };
 let workerStartedAt = 0;
 let metricsInterval = null;
 let startupWatchdog = null;
+let lastShardRuntimeRestartAt = 0;
 let activeTpsState = {
   lastTokensGenerated: 0,
   lastSampleMs: 0,
@@ -272,6 +275,67 @@ function runtimeDir() {
   return path.join(app.getPath('userData'), 'runtime', 'nodeAndWorker');
 }
 
+function runtimeMarkerVersion(version = app.getVersion()) {
+  return `${version}-${process.platform}-${process.arch}-${RUNTIME_COPY_REVISION}`;
+}
+
+function currentWorkerVersion(config = readConfig()) {
+  const runtimeVersion = String(config?.runtimeVersion || '').trim();
+  return runtimeVersion || app.getVersion();
+}
+
+function runtimePreservePairs() {
+  return [
+    ['.vryx-keys', '.vryx-keys'],
+    ['python-inference/venv', 'python-venv'],
+  ];
+}
+
+function copyRuntimeTree(source, target) {
+  fs.cpSync(source, target, {
+    recursive: true,
+    filter(src) {
+      const rel = path.relative(source, src);
+      if (!rel) return true;
+      if (rel.includes(`${path.sep}.vryx-keys`)) return false;
+      if (rel.includes(`${path.sep}.vryx-keys-mac`)) return false;
+      if (rel.includes(`${path.sep}logs`)) return false;
+      if (rel.includes(`${path.sep}__pycache__`)) return false;
+      if (rel.includes(`${path.sep}.pytest_cache`)) return false;
+      if (rel.endsWith('.log')) return false;
+      return true;
+    },
+  });
+}
+
+function installRuntimeFromDirectory(source, markerVersion = runtimeMarkerVersion()) {
+  const target = runtimeDir();
+  const marker = path.join(target, '.vryx-runtime-version');
+  const preserved = path.join(app.getPath('userData'), 'runtime-preserved');
+  fs.rmSync(preserved, { recursive: true, force: true });
+  fs.mkdirSync(preserved, { recursive: true });
+  for (const [rel, name] of runtimePreservePairs()) {
+    const src = path.join(target, rel);
+    if (fs.existsSync(src)) {
+      fs.cpSync(src, path.join(preserved, name), { recursive: true });
+    }
+  }
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  copyRuntimeTree(source, target);
+  for (const [rel, name] of runtimePreservePairs()) {
+    const src = path.join(preserved, name);
+    if (fs.existsSync(src)) {
+      fs.mkdirSync(path.dirname(path.join(target, rel)), { recursive: true });
+      fs.cpSync(src, path.join(target, rel), { recursive: true });
+    }
+  }
+  fs.rmSync(preserved, { recursive: true, force: true });
+  fs.writeFileSync(marker, markerVersion);
+  nodeAndWorkerDir = target;
+  return target;
+}
+
 function copyRuntimeIfNeeded() {
   if (!isPackaged) {
     nodeAndWorkerDir = bundledNodeAndWorkerDir;
@@ -279,7 +343,7 @@ function copyRuntimeIfNeeded() {
   }
   const target = runtimeDir();
   const marker = path.join(target, '.vryx-runtime-version');
-  const version = `${app.getVersion()}-${process.platform}-${process.arch}-${RUNTIME_COPY_REVISION}`;
+  const version = runtimeMarkerVersion();
   let current = '';
   try {
     current = fs.readFileSync(marker, 'utf8').trim();
@@ -287,44 +351,7 @@ function copyRuntimeIfNeeded() {
     current = '';
   }
   if (current !== version || !fs.existsSync(path.join(target, 'start-worker.sh'))) {
-    const preserved = path.join(app.getPath('userData'), 'runtime-preserved');
-    fs.rmSync(preserved, { recursive: true, force: true });
-    fs.mkdirSync(preserved, { recursive: true });
-    const preservePairs = [
-      ['.vryx-keys', '.vryx-keys'],
-      ['python-inference/venv', 'python-venv'],
-    ];
-    for (const [rel, name] of preservePairs) {
-      const src = path.join(target, rel);
-      if (fs.existsSync(src)) {
-        fs.cpSync(src, path.join(preserved, name), { recursive: true });
-      }
-    }
-    fs.rmSync(target, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.cpSync(bundledNodeAndWorkerDir, target, {
-      recursive: true,
-      filter(src) {
-        const rel = path.relative(bundledNodeAndWorkerDir, src);
-        if (!rel) return true;
-        if (rel.includes(`${path.sep}.vryx-keys`)) return false;
-        if (rel.includes(`${path.sep}.vryx-keys-mac`)) return false;
-        if (rel.includes(`${path.sep}logs`)) return false;
-        if (rel.includes(`${path.sep}__pycache__`)) return false;
-        if (rel.includes(`${path.sep}.pytest_cache`)) return false;
-        if (rel.endsWith('.log')) return false;
-        return true;
-      },
-    });
-    for (const [rel, name] of preservePairs) {
-      const src = path.join(preserved, name);
-      if (fs.existsSync(src)) {
-        fs.mkdirSync(path.dirname(path.join(target, rel)), { recursive: true });
-        fs.cpSync(src, path.join(target, rel), { recursive: true });
-      }
-    }
-    fs.rmSync(preserved, { recursive: true, force: true });
-    fs.writeFileSync(marker, version);
+    installRuntimeFromDirectory(bundledNodeAndWorkerDir, version);
   }
   nodeAndWorkerDir = target;
   return target;
@@ -409,6 +436,77 @@ function downloadFile(url, destination, timeoutMs = 10 * 60 * 1000) {
   });
 }
 
+function execFilePromise(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, options, (error, stdout = '', stderr = '') => {
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function extractZipArchive(archivePath, destination) {
+  fs.rmSync(destination, { recursive: true, force: true });
+  fs.mkdirSync(destination, { recursive: true });
+  if (process.platform === 'darwin') {
+    await execFilePromise('ditto', ['-x', '-k', archivePath, destination], { timeout: 10 * 60 * 1000 });
+    return;
+  }
+  await execFilePromise('unzip', ['-q', archivePath, '-d', destination], { timeout: 10 * 60 * 1000 });
+}
+
+function findBundledRuntimeRoot(root, depth = 8) {
+  if (!root || depth < 0) return '';
+  const startScript = process.platform === 'win32' ? 'start-worker.bat' : 'start-worker.sh';
+  if (
+    fs.existsSync(path.join(root, startScript)) &&
+    fs.existsSync(path.join(root, 'python-inference')) &&
+    fs.existsSync(path.join(root, 'rust-daemon'))
+  ) {
+    return root;
+  }
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return '';
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const found = findBundledRuntimeRoot(path.join(root, entry.name), depth - 1);
+    if (found) return found;
+  }
+  return '';
+}
+
+async function applyDownloadedWorkerUpdate(installerPath, release = {}) {
+  if (!installerPath || !/\.zip$/i.test(installerPath)) {
+    return { applied: false, reason: 'archive_zip_requise' };
+  }
+  const extractRoot = path.join(app.getPath('userData'), 'updates', `extract-${Date.now()}`);
+  try {
+    await extractZipArchive(installerPath, extractRoot);
+    const runtimeSource = findBundledRuntimeRoot(extractRoot);
+    if (!runtimeSource) {
+      return { applied: false, reason: 'runtime_nodeAndWorker_introuvable' };
+    }
+    const targetVersion = String(release.version || '').trim() || app.getVersion();
+    stopWorker();
+    installRuntimeFromDirectory(runtimeSource, runtimeMarkerVersion());
+    const nextConfig = writeConfig({ ...readConfig(), runtimeVersion: targetVersion });
+    appendWorkerLog('info', `[update] Runtime ${targetVersion} appliqué depuis ${path.basename(installerPath)}.`);
+    setTimeout(async () => spawnWorker(readConfig(), await getHardwareStats()), 2000);
+    return { applied: true, version: currentWorkerVersion(nextConfig), runtimeSource };
+  } finally {
+    fs.rmSync(extractRoot, { recursive: true, force: true });
+  }
+}
+
 function sha256File(filePath) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
@@ -423,6 +521,9 @@ async function downloadWorkerUpdate(release, reason = 'manual') {
   const asset = releaseAssetForPlatform(release);
   const url = absoluteVryxUrl(asset.url);
   if (!url) throw new Error('Aucun paquet de mise à jour pour cette plateforme.');
+  if (reason === 'remote-command' && !asset.sha256) {
+    throw new Error('Hash SHA-256 requis pour une mise à jour distante.');
+  }
   const updateDir = path.join(app.getPath('userData'), 'updates');
   fs.mkdirSync(updateDir, { recursive: true });
   const target = path.join(updateDir, safeDownloadName(url));
@@ -445,7 +546,7 @@ async function checkWorkerSoftwareUpdate(reason = 'periodic') {
   const out = await fetchJson(`${DEFAULT_API_URL}/api/worker/releases/current`, {}, 6000);
   if (!out.ok || !out.data?.release?.version) return { ok: false, error: out.error || 'Release indisponible.' };
   const release = out.data.release;
-  const current = app.getVersion();
+  const current = currentWorkerVersion();
   const available = compareVersionLike(current, release.version) < 0;
   const result = { ok: true, currentVersion: current, available, release, reason };
   send('worker-update-status', result);
@@ -453,7 +554,11 @@ async function checkWorkerSoftwareUpdate(reason = 'periodic') {
     appendWorkerLog('info', `[update] Version worker disponible ${release.version} (actuelle ${current}).`);
     if (release.mandatory && !workerProcess) {
       const installerPath = await downloadWorkerUpdate(release, reason);
-      await shell.openPath(installerPath);
+      const applied = await applyDownloadedWorkerUpdate(installerPath, release);
+      if (!applied.applied) {
+        appendWorkerLog('error', `[update] Application automatique impossible: ${applied.reason}`);
+        await shell.openPath(installerPath);
+      }
     }
   }
   return result;
@@ -464,11 +569,16 @@ async function acknowledgeRemoteCommand(config, command, status = 'acknowledged'
   await fetchJsonPost(`${DEFAULT_API_URL}/api/workers/heartbeat`, {
     peer_id: peerId || lastWorkerMetrics.peerId || 'desktop-app',
     mode: 'worker',
-    version: app.getVersion(),
+    version: currentWorkerVersion(config),
     model: config.modelId,
     user_id: Number(config.userId || 0),
     command_ack: { id: command.id, status, error },
-  }, {}, 6000);
+  }, workerAuthHeaders(config), 6000);
+}
+
+function workerAuthHeaders(config = readConfig()) {
+  const secret = String(config?.workerSecret || '').trim();
+  return secret ? { Authorization: `Bearer ${secret}` } : {};
 }
 
 async function handleRemoteWorkerCommand(commandEvent) {
@@ -482,9 +592,30 @@ async function handleRemoteWorkerCommand(commandEvent) {
       const release = command.payload?.release || command.payload || {};
       const status = await checkWorkerSoftwareUpdate('remote-command');
       if (!status.ok) throw new Error(status.error || 'Release indisponible.');
-      const installerPath = await downloadWorkerUpdate({ ...status.release, ...release }, 'remote-command');
-      await acknowledgeRemoteCommand(config, command, 'acknowledged', null, peerId);
-      await shell.openPath(installerPath);
+      const mergedRelease = { ...status.release, ...release };
+      const installerPath = await downloadWorkerUpdate(mergedRelease, 'remote-command');
+      const applied = await applyDownloadedWorkerUpdate(installerPath, mergedRelease);
+      if (!applied.applied) {
+        await shell.openPath(installerPath);
+        throw new Error(`Mise à jour téléchargée mais application automatique impossible: ${applied.reason}`);
+      }
+      appendWorkerLog('info', `[remote] Update appliquée localement; ACK différé jusqu'au heartbeat version ${mergedRelease.version || mergedRelease.targetVersion || 'cible'}.`);
+      await fetchJsonPost(`${DEFAULT_API_URL}/api/workers/heartbeat`, {
+        peer_id: peerId,
+        mode: 'worker',
+        version: currentWorkerVersion(readConfig()),
+        model: readConfig().modelId,
+        user_id: Number(readConfig().userId || 0),
+      }, workerAuthHeaders(readConfig()), 6000).catch(() => {});
+      return;
+    }
+    if (command.action === 'rotate_secret') {
+      const nextSecret = String(command.payload?.workerSecret || command.payload?.secret || '').trim();
+      if (nextSecret.length < 32) throw new Error('Nouveau secret worker invalide.');
+      writeConfig({ ...config, workerSecret: nextSecret });
+      await acknowledgeRemoteCommand(readConfig(), command, 'acknowledged', null, peerId);
+      stopWorker();
+      setTimeout(async () => spawnWorker(readConfig(), await getHardwareStats()), 2000);
       return;
     }
     if (command.action === 'pause' || command.action === 'drain' || command.action === 'stop') {
@@ -568,6 +699,9 @@ function summarizeShardStatus(payload) {
       shardSessionId: '',
       shardWeightLoadMode: '',
       shardReady: false,
+      shardLoading: false,
+      shardLoadError: '',
+      shardMaxAgeSec: 0,
     };
   }
   const layers = shards.reduce((sum, shard) => {
@@ -593,6 +727,9 @@ function summarizeShardStatus(payload) {
     shardSessionId: String(primary.session_id || ''),
     shardWeightLoadMode: String(primary.weight_load_mode || ''),
     shardReady: shards.some((shard) => Boolean(shard.ready || shard.resident_vram || shard.build_ready)),
+    shardLoading: shards.some((shard) => Boolean(shard.loading)),
+    shardLoadError: String(shards.find((shard) => shard.load_error)?.load_error || ''),
+    shardMaxAgeSec: Math.max(0, ...shards.map((shard) => normalizeMetricNumber(shard.age_sec))),
   };
 }
 
@@ -730,6 +867,11 @@ async function readWorkerMetrics() {
     setWorkerState({ state: 'working', progress: 100, message: 'Worker P2P pret et visible sur VRYX' });
   } else if (localOnline && ['starting', 'stopped'].includes(workerState.state)) {
     setWorkerState({ state: 'connecting', progress: 75, message: 'Worker local demarre, connexion P2P en cours' });
+  }
+  if (lastWorkerMetrics.shardLoadError) {
+    restartWorkerForStuckShard(`shard load error: ${lastWorkerMetrics.shardLoadError}`);
+  } else if (lastWorkerMetrics.shardLoading && Number(lastWorkerMetrics.shardMaxAgeSec || 0) > 20 * 60) {
+    restartWorkerForStuckShard(`shard loading bloqué depuis ${lastWorkerMetrics.shardMaxAgeSec}s`);
   }
 
   return lastWorkerMetrics;
@@ -980,6 +1122,15 @@ function stopWorker() {
   setWorkerState({ state: 'stopped', progress: 0, message: 'Worker arrete' });
 }
 
+function restartWorkerForStuckShard(reason) {
+  const now = Date.now();
+  if (!workerProcess || now - lastShardRuntimeRestartAt < 10 * 60 * 1000) return;
+  lastShardRuntimeRestartAt = now;
+  appendWorkerLog('error', `[watchdog] Redémarrage runtime worker: ${reason}`);
+  stopWorker();
+  setTimeout(async () => spawnWorker(readConfig(), await getHardwareStats()), 2500);
+}
+
 function appendWorkerLog(level, line) {
   send('worker-log', { level, line });
 }
@@ -1032,7 +1183,8 @@ function spawnWorker(config, hardware) {
   killPortUnixSync(config.p2pPort);
   const env = { ...process.env };
   env.VELOCITY_ROLE = 'worker';
-  env.VRYX_WORKER_VERSION = app.getVersion();
+  env.VRYX_WORKER_VERSION = currentWorkerVersion(config);
+  if (config.workerSecret) env.VRYX_WORKER_SECRET = String(config.workerSecret);
   env.VRYX_RUNTIME_BACKEND = validation.backend;
   env.VRYX_WORKER_MODEL = config.modelId;
   env.VRYX_WORKER_MODEL_TOTAL_GB = String(validation.model.totalModelGb || validation.model.diskGb || '');
@@ -1089,8 +1241,11 @@ function spawnWorker(config, hardware) {
     vramGb: hardware.vramGb,
     backendCandidates: hardware.backendCandidates,
   });
-  if (validation.workerMode === 'shard' && validation.backend === 'mlx') {
+  if (validation.backend.includes('mlx')) {
     env.VRYX_ENABLE_MLX_RUNTIME = '1';
+    env.VRYX_ENABLE_MLX_KERNELS = '1';
+  }
+  if (validation.workerMode === 'shard' && validation.backend === 'mlx') {
     env.VRYX_ENABLE_LLAMA_MLX_SHARD = validation.model.family === 'Llama' ? '1' : (env.VRYX_ENABLE_LLAMA_MLX_SHARD || '0');
     env.VRYX_GGUF_MLX_CACHE_GB = String(Math.max(2, Math.min(8, Math.floor(Number(config.memoryGb || 8) * 0.25))));
     env.VRYX_DISABLE_PYTORCH_FALLBACK = validation.model.family === 'Llama' ? '1' : (env.VRYX_DISABLE_PYTORCH_FALLBACK || '0');

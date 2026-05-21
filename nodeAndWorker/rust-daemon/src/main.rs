@@ -884,7 +884,11 @@ async fn send_heartbeat(
                                     "mode": payload.mode,
                                     "command_ack": { "id": cmd_id, "status": "acknowledged" }
                                 });
-                                let _ = client.post(&ack_url).json(&ack_payload).send().await;
+                                let mut ack_req = client.post(&ack_url).json(&ack_payload);
+                                if !token.is_empty() {
+                                    ack_req = ack_req.header("Authorization", format!("Bearer {}", token));
+                                }
+                                let _ = ack_req.send().await;
                                 std::process::exit(0);
                             }
                             "hot_reload_python" => {
@@ -915,6 +919,8 @@ async fn send_heartbeat(
                                     "[VRYX_REMOTE_COMMAND] Action=hot_reload_python (cmd={}) → POST {}",
                                     cmd_id, reload_url
                                 );
+                                let mut ack_status = "failed";
+                                let mut ack_error: Option<String> = None;
                                 match client.post(&reload_url).json(&reload_body).timeout(
                                     std::time::Duration::from_secs(15)
                                 ).send().await {
@@ -922,11 +928,32 @@ async fn send_heartbeat(
                                         let status = resp.status();
                                         let body_text = resp.text().await.unwrap_or_default();
                                         println!("[VRYX_REMOTE_COMMAND] hot_reload_python → HTTP {} : {}", status, body_text);
+                                        if status.is_success() {
+                                            ack_status = "acknowledged";
+                                        } else {
+                                            ack_error = Some(format!("hot_reload_python HTTP {}: {}", status, body_text));
+                                        }
                                     }
                                     Err(e) => {
                                         eprintln!("[VRYX_REMOTE_COMMAND] hot_reload_python POST échec : {}", e);
+                                        ack_error = Some(format!("hot_reload_python POST échec : {}", e));
                                     }
                                 }
+                                let ack_url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
+                                let ack_payload = serde_json::json!({
+                                    "peer_id": payload.peer_id,
+                                    "mode": payload.mode,
+                                    "command_ack": {
+                                        "id": cmd_id,
+                                        "status": ack_status,
+                                        "error": ack_error,
+                                    }
+                                });
+                                let mut ack_req = client.post(&ack_url).json(&ack_payload);
+                                if !token.is_empty() {
+                                    ack_req = ack_req.header("Authorization", format!("Bearer {}", token));
+                                }
+                                let _ = ack_req.send().await;
                             }
                             _ => {
                                 if !action.is_empty() {
@@ -1513,6 +1540,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     {
                         request_obj["scheduler_job_id"] = serde_json::json!(scheduler_job_id);
                     }
+                    if let Some(load_mode) = payload
+                        .get("load_mode")
+                        .or_else(|| payload.get("loadMode"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| matches!(*s, "auto" | "full" | "shard"))
+                    {
+                        request_obj["load_mode"] = serde_json::json!(load_mode);
+                    }
+                    if payload
+                        .get("force_distributed")
+                        .or_else(|| payload.get("forceDistributed"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                    {
+                        request_obj["force_distributed"] = serde_json::json!(true);
+                    }
                     for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                         if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                             request_obj[key] = serde_json::json!(value);
@@ -1613,6 +1657,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .filter(|s| !s.is_empty() && s.len() <= 100)
                 {
                     request_obj["scheduler_job_id"] = serde_json::json!(scheduler_job_id);
+                }
+                if let Some(load_mode) = payload
+                    .get("load_mode")
+                    .or_else(|| payload.get("loadMode"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| matches!(*s, "auto" | "full" | "shard"))
+                {
+                    request_obj["load_mode"] = serde_json::json!(load_mode);
+                }
+                if payload
+                    .get("force_distributed")
+                    .or_else(|| payload.get("forceDistributed"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                {
+                    request_obj["force_distributed"] = serde_json::json!(true);
                 }
                 for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                     if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {

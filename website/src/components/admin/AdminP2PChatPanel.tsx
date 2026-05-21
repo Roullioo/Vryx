@@ -318,6 +318,8 @@ export function AdminP2PChatPanel({
           prompt: userMsg,
           quantization,
           pool_preference: poolPreference,
+          load_mode: 'shard',
+          force_distributed: true,
           maxNewTokens,
           model_id: chatModelId,
         }),

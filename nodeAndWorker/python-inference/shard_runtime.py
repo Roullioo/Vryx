@@ -21,6 +21,7 @@ Variables worker (sélection backend) :
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import os
 import copy
@@ -227,6 +228,8 @@ def _select_backend(shard: PipelineShard, meta: dict[str, Any]) -> RuntimeBacken
     worker_env_backend = os.environ.get("VRYX_RUNTIME_BACKEND", "").strip().lower()
     meta_backend = str(meta.get("runtime_backend") or "").strip().lower()
     requested = worker_env_backend or meta_backend or "pytorch"
+    if worker_env_backend == "mlx_lm" and meta_backend == "mlx":
+        requested = "mlx"
     print(f"[backend] select: worker_env={worker_env_backend!r} meta={meta_backend!r} → {requested!r}")
     if requested == "mlx":
         if str(getattr(shard, "weight_load_mode", "") or "").lower() == "gguf_ranges":
@@ -1786,6 +1789,49 @@ def _copy_http_range_to_file(url: str, start: int, nbytes: int, out_file: Any, s
             raise RuntimeError(f"range_incomplet:{nbytes - remaining}/{nbytes}:{url}")
 
 
+def _copy_http_range_to_path_at(url: str, source_start: int, nbytes: int, path: str, dest_offset: int, ssl_context: Any) -> None:
+    """Copie une plage HTTP à un offset précis du cache local, sans sérialiser tous les tenseurs."""
+    if nbytes <= 0:
+        return
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Range", f"bytes={source_start}-{source_start + nbytes - 1}")
+    with urllib.request.urlopen(req, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=ssl_context) as resp:
+        status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+        if status != 206:
+            raise RuntimeError(f"range_non_supporte:{status}:{url}")
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            remaining = nbytes
+            write_at = dest_offset
+            while remaining > 0:
+                chunk = resp.read(min(8 * 1024 * 1024, remaining))
+                if not chunk:
+                    break
+                os.pwrite(fd, chunk, write_at)
+                write_at += len(chunk)
+                remaining -= len(chunk)
+            if remaining != 0:
+                raise RuntimeError(f"range_incomplet:{nbytes - remaining}/{nbytes}:{url}")
+        finally:
+            os.close(fd)
+
+
+def _array_from_raw_file(path: str, dtype_name: str, offset: int, shape: tuple[int, ...]) -> np.ndarray:
+    """Retourne un ndarray/memmap pour un tenseur shardé.
+
+    NumPy standard ne comprend pas le bfloat16 brut des safetensors. Les tenseurs
+    BF16 restants dans les shards MLX quantifiés sont petits (normes, biais, conv),
+    donc on les convertit en fp16 au chargement worker.
+    """
+    dtype_norm = str(dtype_name or "float16").lower()
+    if dtype_norm in ("bfloat16", "bf16"):
+        raw = np.memmap(path, dtype=np.uint16, mode="r", offset=offset, shape=shape)
+        fp32 = (np.asarray(raw, dtype=np.uint32) << np.uint32(16)).view(np.float32)
+        return fp32.astype(np.float16, copy=False)
+    mm = np.memmap(path, dtype=np.dtype(dtype_norm), mode="r", offset=offset, shape=shape)
+    return np.array(mm, copy=True)
+
+
 # ── API principale ─────────────────────────────────────────────────────────────
 
 def pipeline_shard_init(meta_json: bytes) -> str:
@@ -1833,6 +1879,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
     setattr(_shards[sid], "ring_attention", bool(meta.get("ring_attention", RING_ATTENTION)))
     _shards[sid].backend = _select_backend(_shards[sid], meta)
     setattr(_shards[sid], "loading", bool(str(meta.get("download_url") or "").strip()))
+    setattr(_shards[sid], "load_error", "")
     setattr(_shards[sid], "build_ready", False)
     n_layers = _shards[sid].layer_end - _shards[sid].layer_start + 1
     print(f"[shard] init {sid[:16]}… layers {_shards[sid].layer_start}-{_shards[sid].layer_end}"
@@ -1917,19 +1964,23 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                     part_path = f"{bin_local_path}.part"
                     if os.path.exists(part_path):
                         os.remove(part_path)
-                    with open(part_path, "wb") as out_bin:
-                        for idx, entry in enumerate(tensor_sources, start=1):
+                    parallel_ranges = max(1, int(os.environ.get("VRYX_RANGE_DOWNLOAD_PARALLELISM", "8") or "8"))
+                    if parallel_ranges > 1 and len(tensor_sources) > 1:
+                        with open(part_path, "wb") as out_bin:
+                            out_bin.truncate(expected)
+
+                        def _download_one_range(idx_entry: tuple[int, dict[str, Any]]) -> int:
+                            idx, entry = idx_entry
                             source_url = str(entry.get("source_url") or "")
                             source_offset = int(entry.get("source_offset") or 0)
                             nbytes = int(entry.get("nbytes") or 0)
                             if not source_url or nbytes <= 0:
                                 raise RuntimeError(f"tensor_source invalide: {entry}")
+                            dest_offset = int(local_index[idx - 1]["offset"])
                             for attempt in range(5):
                                 try:
-                                    _copy_http_range_to_file(source_url, source_offset, nbytes, out_bin, _ctx)
-                                    if idx == 1 or idx == len(tensor_sources) or idx % 32 == 0:
-                                        print(f"[shard] Range {idx}/{len(tensor_sources)} OK")
-                                    break
+                                    _copy_http_range_to_path_at(source_url, source_offset, nbytes, part_path, dest_offset, _ctx)
+                                    return idx
                                 except Exception as ex:
                                     if attempt == 4:
                                         raise
@@ -1938,6 +1989,44 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                                         f"tentative {attempt + 1}: {ex}"
                                     )
                                     time.sleep(2.0)
+                            return idx
+
+                        done_ranges = 0
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_ranges) as executor:
+                            futures = [
+                                executor.submit(_download_one_range, (idx, entry))
+                                for idx, entry in enumerate(tensor_sources, start=1)
+                            ]
+                            for future in concurrent.futures.as_completed(futures):
+                                idx = future.result()
+                                done_ranges += 1
+                                if done_ranges == 1 or done_ranges == len(tensor_sources) or done_ranges % 32 == 0:
+                                    print(
+                                        f"[shard] Range {done_ranges}/{len(tensor_sources)} OK "
+                                        f"(dernier={idx}, parallel={parallel_ranges})"
+                                    )
+                    else:
+                        with open(part_path, "wb") as out_bin:
+                            for idx, entry in enumerate(tensor_sources, start=1):
+                                source_url = str(entry.get("source_url") or "")
+                                source_offset = int(entry.get("source_offset") or 0)
+                                nbytes = int(entry.get("nbytes") or 0)
+                                if not source_url or nbytes <= 0:
+                                    raise RuntimeError(f"tensor_source invalide: {entry}")
+                                for attempt in range(5):
+                                    try:
+                                        _copy_http_range_to_file(source_url, source_offset, nbytes, out_bin, _ctx)
+                                        if idx == 1 or idx == len(tensor_sources) or idx % 32 == 0:
+                                            print(f"[shard] Range {idx}/{len(tensor_sources)} OK")
+                                        break
+                                    except Exception as ex:
+                                        if attempt == 4:
+                                            raise
+                                        print(
+                                            f"[shard] Range retry {idx}/{len(tensor_sources)} "
+                                            f"tentative {attempt + 1}: {ex}"
+                                        )
+                                        time.sleep(2.0)
                     os.replace(part_path, bin_local_path)
                 elif not is_gguf_ranges:
                     print(f"[shard] Cache HIT ranges : {bin_local_path}")
@@ -1954,9 +2043,8 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                     for entry in local_index:
                         name = entry["name"]
                         shape = tuple(int(x) for x in entry["shape"])
-                        dtype = np.dtype(entry["dtype"])
                         off = int(entry["offset"])
-                        arr = np.memmap(bin_local_path, dtype=dtype, mode="r", offset=off, shape=shape)
+                        arr = _array_from_raw_file(bin_local_path, str(entry["dtype"]), off, shape)
                         shard.weight_arrays[name] = arr
                         n_weights += 1
                     setattr(shard, "weight_file_path", bin_local_path)
@@ -2016,10 +2104,9 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                 for entry in weights_index:
                     name = entry["name"]
                     shape = tuple(int(x) for x in entry["shape"])
-                    dtype = np.dtype(entry["dtype"])
                     off = int(entry["offset"])
                     nbytes = int(entry["nbytes"])
-                    arr = np.memmap(bin_local_path, dtype=dtype, mode="r", offset=off, shape=shape)
+                    arr = _array_from_raw_file(bin_local_path, str(entry["dtype"]), off, shape)
                     shard.weight_arrays[name] = arr
                     n_weights += 1
                 setattr(shard, "weight_file_path", bin_local_path)
@@ -2084,7 +2171,9 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                                    "error": f"Build échoué : {build_res.get('error')}"})
         except Exception as e:
             try:
-                setattr(_shards.get(sid), "loading", False)
+                shard_ref = _shards.get(sid)
+                setattr(shard_ref, "loading", False)
+                setattr(shard_ref, "load_error", str(e)[:500])
             except Exception:
                 pass
             print(f"[shard] Échec téléchargement {download_url} : {e}")
@@ -2641,6 +2730,8 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "built": ready,
             "ready": ready,
             "resident_vram": ready,
+            "loading": bool(getattr(shard, "loading", False)),
+            "load_error": str(getattr(shard, "load_error", "") or ""),
             "weight_load_mode": getattr(shard, "weight_load_mode", "memory"),
             "download_ms": shard.download_ms,
             "build_ms": shard.build_ms,

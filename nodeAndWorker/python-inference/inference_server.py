@@ -37,6 +37,7 @@ import vryx_pb2
 import vryx_pb2_grpc
 
 import distributed_llm_orchestrator
+import mlx_backend
 import shard_runtime
 
 # tensor_parallel_orchestrator (optionnel, importé si disponible)
@@ -468,6 +469,14 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                         ]
                     if maybe_payload.get("scheduler_job_id") or maybe_payload.get("schedulerJobId"):
                         request_options["scheduler_job_id"] = maybe_payload.get("scheduler_job_id") or maybe_payload.get("schedulerJobId")
+                    if maybe_payload.get("load_mode") or maybe_payload.get("loadMode"):
+                        request_options["load_mode"] = maybe_payload.get("load_mode") or maybe_payload.get("loadMode")
+                    if maybe_payload.get("force_distributed") is not None or maybe_payload.get("forceDistributed") is not None:
+                        request_options["force_distributed"] = bool(
+                            maybe_payload.get("force_distributed")
+                            if maybe_payload.get("force_distributed") is not None
+                            else maybe_payload.get("forceDistributed")
+                        )
                     if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
                         request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
             except Exception:
@@ -761,6 +770,7 @@ class _HotReloadHandler(http.server.BaseHTTPRequestHandler):
 
             # Modules à rechargement prioritaire
             modules_map = {
+                "mlx_backend": mlx_backend,
                 "shard_runtime": shard_runtime,
                 "distributed_llm_orchestrator": distributed_llm_orchestrator,
             }
@@ -849,4 +859,3 @@ if __name__ == "__main__":
     if args.model:
         os.environ["VRYX_WORKER_MODEL"] = args.model
     asyncio.run(serve(args.port, args.stage))
-

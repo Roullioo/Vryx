@@ -620,8 +620,9 @@ def _worker_pool_class(worker: dict[str, Any]) -> str:
 
 def _runtime_for_pool(pool_class: str, worker: dict[str, Any] | None = None) -> str:
     if pool_class == "velocity_mlx":
-        runtime = str((worker or {}).get("runtimeBackend") or (worker or {}).get("runtime_backend") or "").lower()
-        return runtime if runtime in ("mlx", "mlx_lm") else "mlx"
+        # Les shards pipeline utilisent le backend slice MLX. `mlx_lm` désigne le
+        # chemin full-load/direct et ne doit pas être envoyé à shard_runtime.
+        return "mlx"
     if pool_class == "velocity_vllm":
         return "vllm"
     return str((worker or {}).get("runtimeBackend") or (worker or {}).get("runtime_backend") or "pytorch").lower()
@@ -1057,6 +1058,7 @@ _model_lock = threading.RLock()
 _model_runtime_lock = threading.RLock()
 _model_config_cache: Optional[dict] = None
 _model_cache_by_id: dict[str, tuple[Any, Any, Optional[dict]]] = {}
+_model_source_id: Optional[str] = None
 
 
 def _normalize_runtime_model_id(value: Any) -> Optional[str]:
@@ -1084,21 +1086,23 @@ def _canonical_runtime_model_id(model_id: Optional[str]) -> Optional[str]:
 
 
 def _activate_model_id(model_id: Any) -> str:
-    global MODEL_ID, _model, _tokenizer, _model_config_cache
+    global MODEL_ID, _model, _tokenizer, _model_config_cache, _model_source_id
     requested = _canonical_runtime_model_id(_normalize_runtime_model_id(model_id))
     if not requested or _model_key(requested) == _model_key(MODEL_ID):
         return MODEL_ID
     with _model_lock:
         if _model is not None or _tokenizer is not None or _model_config_cache is not None:
-            _model_cache_by_id[MODEL_ID] = (_model, _tokenizer, _model_config_cache)
+            _model_cache_by_id[_model_source_id or MODEL_ID] = (_model, _tokenizer, _model_config_cache)
         MODEL_ID = requested
         cached = _model_cache_by_id.get(MODEL_ID)
         if cached:
             _model, _tokenizer, _model_config_cache = cached
+            _model_source_id = MODEL_ID
         else:
             _model = None
             _tokenizer = None
             _model_config_cache = None
+            _model_source_id = None
         print(f"[VPS] Modèle actif demandé par la session : {MODEL_ID}", flush=True)
     return MODEL_ID
 
@@ -1372,6 +1376,7 @@ def _build_model_config(cfg: Any) -> dict:
         "num_experts_per_tok": getattr(text_cfg, "num_experts_per_tok", None),
         "output_router_logits": bool(getattr(text_cfg, "output_router_logits", False)),
         "router_aux_loss_coef": getattr(text_cfg, "router_aux_loss_coef", 0.001),
+        "quantization": _jsonable(getattr(text_cfg, "quantization", None) or getattr(cfg, "quantization", None)),
     }
 
 
@@ -1431,6 +1436,30 @@ def _direct_mlx_worker_load_model_id() -> str:
     if "llama-2-70b" in normalized or "llama2-70b" in normalized or "70b" in normalized:
         return "mlx-community/llama2-70b-qnt4bit"
     return os.environ.get("VRYX_MLX_LM_MODEL_ID", "").strip()
+
+
+def _distributed_weight_model_id(requested_quantization: str, requires_distributed_shards: bool) -> str:
+    """Repo de poids à utiliser pour le chemin shard distribué.
+
+    MODEL_ID reste l'identité logique du modèle côté workers/scheduler. Pour q4/q8 MLX,
+    le VPS doit cependant préparer les shards depuis un snapshot déjà quantifié, sinon le
+    manifeste ranges pointe vers les poids fp16/bf16 d'origine.
+    """
+    explicit = os.environ.get("VRYX_DISTRIBUTED_WEIGHT_MODEL_ID", "").strip()
+    if explicit:
+        return explicit
+    if not requires_distributed_shards:
+        return MODEL_ID
+    q = str(requested_quantization or "").strip().lower()
+    normalized = MODEL_ID.lower().replace("_", "-")
+    if "qwen3.6-35b-a3b" in normalized or "qwen3-6-35b-a3b" in normalized:
+        if q in ("q4-dwq", "4bit-dwq"):
+            return os.environ.get("VRYX_MLX_Q4_DWQ_MODEL_ID", "").strip() or "mlx-community/Qwen3.6-35B-A3B-4bit-DWQ"
+        if q in ("q4", "int4", "4bit"):
+            return os.environ.get("VRYX_MLX_Q4_MODEL_ID", "").strip() or "mlx-community/Qwen3.6-35B-A3B-4bit"
+        if q in ("q8", "int8", "8bit"):
+            return os.environ.get("VRYX_MLX_Q8_MODEL_ID", "").strip() or "mlx-community/Qwen3.6-35B-A3B-8bit"
+    return MODEL_ID
 
 
 def _can_use_tokenizer_only_for_direct_mlx() -> bool:
@@ -1513,11 +1542,22 @@ def _stage_safetensor_source(shard_dir: str, snapshot_dir: str, rel_path: str) -
     return clean_rel
 
 
-def _ensure_model():
-    global _model, _tokenizer, _model_config_cache
+def _ensure_model(source_model_id: Optional[str] = None):
+    global _model, _tokenizer, _model_config_cache, _model_source_id
     with _model_lock:
-        if _model is not None:
+        requested_source_id = _canonical_runtime_model_id(_normalize_runtime_model_id(source_model_id)) or MODEL_ID
+        if _model is not None and _model_source_id and _model_key(_model_source_id) == _model_key(requested_source_id):
             return _model, _tokenizer
+        if _model is not None or _tokenizer is not None or _model_config_cache is not None:
+            _model_cache_by_id[_model_source_id or MODEL_ID] = (_model, _tokenizer, _model_config_cache)
+        cached = _model_cache_by_id.get(requested_source_id)
+        if cached:
+            _model, _tokenizer, _model_config_cache = cached
+            _model_source_id = requested_source_id
+            return _model, _tokenizer
+        _model = None
+        _tokenizer = None
+        _model_config_cache = None
         try:
             _prepare_hf_cache_env()
             token, token_source = _resolve_hf_token()
@@ -1643,22 +1683,29 @@ def _ensure_model():
                         ],
                     )
                 else:
-                    print(f"[VPS] Chargement {MODEL_ID} : authentification {token_hint} ({token_source}).")
-                    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, token=token)
-                    cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True, token=token)
-                    snapshot_dir = snapshot_download(MODEL_ID, **_hf_snapshot_download_kwargs(token))
+                    print(
+                        f"[VPS] Chargement poids {requested_source_id} pour modèle logique {MODEL_ID} : "
+                        f"authentification {token_hint} ({token_source})."
+                    )
+                    _tokenizer = AutoTokenizer.from_pretrained(requested_source_id, trust_remote_code=True, token=token)
+                    cfg = AutoConfig.from_pretrained(requested_source_id, trust_remote_code=True, token=token)
+                    snapshot_dir = snapshot_download(requested_source_id, **_hf_snapshot_download_kwargs(token))
             weight_map = _load_safetensor_weight_map(snapshot_dir)
             if not weight_map:
                 if not _can_use_tokenizer_only_for_direct_mlx():
                     raise RuntimeError("aucun poids safetensors trouvé dans le snapshot modèle")
                 print("[VPS] Mode direct MLX: aucun poids requis côté VPS, tokenizer/config seulement.")
             _model_config_cache = _build_model_config(cfg)
+            _model_config_cache["_model_id"] = MODEL_ID
+            _model_config_cache["_weight_model_id"] = requested_source_id
             _model = {
                 "snapshot_dir": snapshot_dir,
                 "weight_map": weight_map,
                 "config": _model_config_cache,
                 "tokenizer_only": not bool(weight_map),
+                "source_model_id": requested_source_id,
             }
+            _model_source_id = requested_source_id
             elapsed = int((time.perf_counter() - t0) * 1000)
             if weight_map:
                 print(f"[VPS] Manifeste modèle prêt : {len(weight_map)} tenseurs sur disque, {elapsed}ms")
@@ -1666,11 +1713,12 @@ def _ensure_model():
                 print(f"[VPS] Tokenizer/config prêts pour direct MLX worker, {elapsed}ms")
         except Exception as e:
             hint = _hf_download_error_hint(e)
-            print(f"[VPS] Impossible de charger {MODEL_ID} : {e}")
+            print(f"[VPS] Impossible de charger {requested_source_id} pour {MODEL_ID} : {e}")
             if hint != str(e):
                 print(f"[VPS] Détails : {hint}")
             _model = None
             _tokenizer = None
+            _model_source_id = None
     return _model, _tokenizer
 
 
@@ -1841,6 +1889,46 @@ def _weighted_counts(total_layers: int, workers: list[str], catalog: dict[str, d
         idx = max(range(len(raw)), key=lambda i: weights[i])
         raw[idx] += 1
     return raw
+
+
+def _rebalance_pipeline_first_shard(
+    counts: list[int],
+    workers: list[str],
+    catalog: dict[str, dict],
+    model_config: dict[str, Any],
+    pool_class: str,
+) -> list[int]:
+    """
+    Pipeline mode needs the first worker to own the embedding and the first
+    transformer blocks, but a weak first worker should not receive a large
+    proportional slice just because it has enough memory on paper.
+    """
+    if len(workers) != 2 or len(counts) != 2:
+        return counts
+    if pool_class != "velocity_mlx":
+        return counts
+    total_layers = int(model_config.get("num_hidden_layers_total") or sum(counts) or 0)
+    if total_layers < 4:
+        return counts
+    try:
+        explicit_cap = int(os.environ.get("VRYX_FIRST_WORKER_MAX_LAYERS") or "0")
+    except (TypeError, ValueError):
+        explicit_cap = 0
+    if explicit_cap <= 0:
+        first_budget = _safe_weight_budget_mb(catalog.get(workers[0]) or {})
+        last_budget = _safe_weight_budget_mb(catalog.get(workers[-1]) or {})
+        first_compute = _gpu_compute_hint(catalog.get(workers[0]) or {})
+        last_compute = _gpu_compute_hint(catalog.get(workers[-1]) or {})
+        first_is_small = first_budget > 0 and last_budget > 0 and first_budget < (last_budget * 0.55)
+        first_is_slow = first_compute < max(1.0, last_compute * 0.75)
+        is_large_model = total_layers >= 24
+        if not (is_large_model and (first_is_small or first_is_slow)):
+            return counts
+        explicit_cap = 2
+    first_cap = max(1, min(explicit_cap, total_layers - 1))
+    if counts[0] <= first_cap:
+        return counts
+    return [first_cap, total_layers - first_cap]
 
 
 # ── Extraction des poids par tranche ──────────────────────────────────────────
@@ -2377,44 +2465,71 @@ def _selected_tensor_names(
 ) -> list[tuple[str, str]]:
     model_type = str(model_config.get("model_type") or "gpt2")
     selected: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_tensor(src: str, dst: str) -> None:
+        if src in weight_map and (src, dst) not in seen:
+            selected.append((src, dst))
+            seen.add((src, dst))
+
+    def add_quant_companions(src_weight: str, dst_weight: str) -> None:
+        if not src_weight.endswith(".weight") or not dst_weight.endswith(".weight"):
+            return
+        src_base = src_weight[:-len(".weight")]
+        dst_base = dst_weight[:-len(".weight")]
+        for suffix in ("scales", "biases"):
+            add_tensor(f"{src_base}.{suffix}", f"{dst_base}.{suffix}")
 
     if model_type == "gpt2":
         if has_embedding:
-            selected.extend([
-                ("transformer.wte.weight", "wte.weight"),
-                ("transformer.wpe.weight", "wpe.weight"),
-            ])
+            add_tensor("transformer.wte.weight", "wte.weight")
+            add_tensor("transformer.wpe.weight", "wpe.weight")
         for global_idx in range(layer_start, layer_end + 1):
             local_idx = global_idx - layer_start
             prefix = f"transformer.h.{global_idx}."
             for src in sorted(k for k in weight_map if k.startswith(prefix)):
-                selected.append((src, f"h.{local_idx}.{src[len(prefix):]}"))
+                add_tensor(src, f"h.{local_idx}.{src[len(prefix):]}")
         if has_lm_head:
-            selected.extend([
-                ("transformer.ln_f.weight", "ln_f.weight"),
-                ("transformer.ln_f.bias", "ln_f.bias"),
-                ("lm_head.weight", "lm_head.weight"),
-            ])
+            add_tensor("transformer.ln_f.weight", "ln_f.weight")
+            add_tensor("transformer.ln_f.bias", "ln_f.bias")
+            add_tensor("lm_head.weight", "lm_head.weight")
     else:
-        if "model.embed_tokens.weight" in weight_map:
-            base_prefix = "model"
-        elif "model.language_model.embed_tokens.weight" in weight_map:
-            base_prefix = "model.language_model"
-        else:
-            base_prefix = "model"
+        base_prefix = "model"
+        for candidate in (
+            "model",
+            "language_model.model",
+            "model.language_model",
+            "transformer",
+        ):
+            if f"{candidate}.embed_tokens.weight" in weight_map or any(
+                k.startswith(f"{candidate}.layers.") for k in weight_map
+            ):
+                base_prefix = candidate
+                break
         if has_embedding:
-            selected.append((f"{base_prefix}.embed_tokens.weight", "embed_tokens.weight"))
+            src = f"{base_prefix}.embed_tokens.weight"
+            add_tensor(src, "embed_tokens.weight")
+            add_quant_companions(src, "embed_tokens.weight")
         for global_idx in range(layer_start, layer_end + 1):
             local_idx = global_idx - layer_start
             prefix = f"{base_prefix}.layers.{global_idx}."
             for src in sorted(k for k in weight_map if k.startswith(prefix)):
-                selected.append((src, f"layers.{local_idx}.{src[len(prefix):]}"))
+                add_tensor(src, f"layers.{local_idx}.{src[len(prefix):]}")
         if has_lm_head:
-            selected.append((f"{base_prefix}.norm.weight", "norm.weight"))
-            if "lm_head.weight" in weight_map:
-                selected.append(("lm_head.weight", "lm_head.weight"))
+            add_tensor(f"{base_prefix}.norm.weight", "norm.weight")
+            lm_candidates = [
+                "lm_head.weight",
+                "language_model.lm_head.weight",
+                f"{base_prefix}.lm_head.weight",
+            ]
+            lm_src = next((src for src in lm_candidates if src in weight_map), "")
+            if lm_src:
+                add_tensor(lm_src, "lm_head.weight")
+                add_quant_companions(lm_src, "lm_head.weight")
             elif f"{base_prefix}.embed_tokens.weight" in weight_map:
-                selected.append((f"{base_prefix}.embed_tokens.weight", "lm_head.weight"))
+                emb_src = f"{base_prefix}.embed_tokens.weight"
+                add_tensor(emb_src, "lm_head.weight")
+                add_quant_companions(emb_src, "lm_head.weight")
 
     missing = [src for src, _dst in selected if src not in weight_map]
     if missing:
@@ -2795,7 +2910,7 @@ _SESSION_CACHE_KEY_VERSION = "v4-gguf-lazy-pool-registry"
 
 def _model_fingerprint(model_config: dict) -> str:
     return (
-        f"{MODEL_ID}|{model_config.get('model_type')}|"
+        f"{MODEL_ID}|{model_config.get('_weight_model_id') or MODEL_ID}|{model_config.get('model_type')}|"
         f"{model_config.get('num_hidden_layers_total')}|"
         f"{model_config.get('hidden_size')}|{model_config.get('vocab_size')}"
     )
@@ -2873,6 +2988,37 @@ def _write_prefix_cache_manifest(model_key: str, meta: dict[str, Any]) -> None:
         path = _prefix_cache_manifest_path(model_key, str(meta["prefix_hash"]))
         with open(path, "w") as f:
             json.dump(meta, f, ensure_ascii=False)
+
+
+def _manifest_has_native_quantized_weights(manifest: dict[str, Any], quant: str) -> bool:
+    """Retourne True uniquement si le manifeste pointe vers des poids déjà quantifiés."""
+    fmt = str(manifest.get("format") or "").lower()
+    tensor_sources = manifest.get("tensor_sources") if isinstance(manifest.get("tensor_sources"), list) else []
+    if fmt == "gguf-ranges-v1" or any(isinstance(e, dict) and e.get("ggml_type") for e in tensor_sources):
+        return True
+    q = str(quant or "").lower()
+    if "q4" in q or "4bit" in q or "int4" in q:
+        names = {
+            str(e.get("name") or "")
+            for e in tensor_sources
+            if isinstance(e, dict)
+        }
+        dtypes = {
+            str(e.get("dtype") or "").lower()
+            for e in tensor_sources
+            if isinstance(e, dict) and str(e.get("name") or "").endswith(".weight")
+        }
+        has_packed_weights = bool(dtypes) and dtypes.issubset({"uint32", "uint8"})
+        has_quant_companions = any(n.endswith(".scales") for n in names) and any(n.endswith(".biases") for n in names)
+        return has_packed_weights and has_quant_companions
+    if "q8" in q or "8bit" in q or "int8" in q:
+        dtypes = {
+            str(e.get("dtype") or "").lower()
+            for e in tensor_sources
+            if isinstance(e, dict) and str(e.get("name") or "").endswith(".weight")
+        }
+        return bool(dtypes) and dtypes.issubset({"int8", "uint8"})
+    return False
 
 
 def _cache_control(
@@ -3092,6 +3238,11 @@ def _session_ready_from_status(
         weights_loaded = int(shard.get("weights_loaded") or 0)
         if ready and weights_loaded > 0:
             return True, None, shard
+        load_error = str(shard.get("load_error") or shard.get("error") or "").strip()
+        if load_error:
+            return False, f"shard_load_error:{load_error[:180]}", shard
+        if bool(shard.get("loading")):
+            return False, "shard_loading", shard
         return False, "shard_not_ready", shard
     return False, "session_unknown_on_worker", None
 
@@ -3270,17 +3421,19 @@ def _get_or_create_session(
     model_manifest: dict,
     hidden_transport: str | None = None,
     pool_class: str = "legacy_pytorch",
+    requested_weight_quantization: str | None = None,
 ) -> tuple[Optional[str], str, list[dict[str, Any]]]:
     """
     Retourne (session_id, statut, diag préparation) avec statut parmi 'reused', 'created', 'failed'.
     diag : entrées structurées uniquement si création de session a échoué (sinon liste vide).
     """
     transport = _normalize_hidden_transport(hidden_transport)
+    weight_quantization = str(requested_weight_quantization or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16")).lower()
     # Toujours la même clé et le même ordre de tranches que routing_path (pairs triés).
     model_key = _model_fingerprint(model_config)
     catalog = _fetch_worker_catalog()
     latency_matrix = _refresh_latency_matrix(peers)
-    key = _SESSION_CACHE_KEY_VERSION + "|" + pool_class + "|" + model_key + "|" + "|".join(peers)
+    key = _SESSION_CACHE_KEY_VERSION + "|" + pool_class + "|" + weight_quantization + "|" + model_key + "|" + "|".join(peers)
     pool_id = "pool-" + str(abs(hash(key)))[:12]
     with _worker_session_lock:
         if key in _worker_sessions:
@@ -3347,6 +3500,13 @@ def _get_or_create_session(
             else:
                 ordered = ranked
             counts = _weighted_counts(total_layers, ordered, catalog)
+            rebalanced_counts = _rebalance_pipeline_first_shard(counts, ordered, catalog, model_config, pool_class)
+            if rebalanced_counts != counts:
+                print(
+                    "[VPS] Placement pipeline asymétrique actif : "
+                    f"{[_short(p) for p in ordered]} couches {counts} -> {rebalanced_counts}"
+                )
+                counts = rebalanced_counts
             if n >= 3 and model_config.get("model_type") != "gpt2":
                 # Le dernier worker porte aussi norm + lm_head : on évite de lui ajouter trop de couches.
                 max_last_layers = min(2, total_layers)
@@ -3396,7 +3556,7 @@ def _get_or_create_session(
                     "allocated_vram_mb": (catalog.get(peer) or {}).get("allocatedVramMb"),
                     "memory_limit_percent": (catalog.get(peer) or {}).get("memoryLimitPercent"),
                     "runtime_backend": _runtime_for_pool(pool_class, catalog.get(peer) or {}),
-                    "weight_quantization": (catalog.get(peer) or {}).get("weightQuantization") or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16"),
+                    "weight_quantization": (catalog.get(peer) or {}).get("weightQuantization") or weight_quantization,
                     "attention_backend": _attention_for_pool(pool_class),
                 }
                 for i, (peer, ls, le, has_emb, has_head) in enumerate(assignments)
@@ -3423,6 +3583,25 @@ def _get_or_create_session(
             download_url: str,
             diag: list[dict[str, Any]],
         ) -> bool:
+            worker_info = catalog.get(peer) or {}
+            worker_supports_q4 = bool(
+                worker_info.get("supportsQ4Weights")
+                or worker_info.get("supports_q4_weights")
+                or pool_class == "velocity_mlx"
+                or os.environ.get("VRYX_SUPPORTS_Q4_WEIGHTS", "0").lower() in ("1", "true", "yes")
+            )
+            worker_supports_mlx = bool(
+                worker_info.get("supportsMlx")
+                or worker_info.get("supports_mlx")
+                or pool_class == "velocity_mlx"
+                or os.environ.get("VRYX_SUPPORTS_MLX", "0").lower() in ("1", "true", "yes")
+            )
+            worker_supports_vllm = bool(
+                worker_info.get("supportsVllm")
+                or worker_info.get("supports_vllm")
+                or pool_class == "velocity_vllm"
+                or os.environ.get("VRYX_SUPPORTS_VLLM", "0").lower() in ("1", "true", "yes")
+            )
             init_payload = json.dumps({
                 "session_id": session_id,
                 "pool_id": pool_id,
@@ -3436,11 +3615,11 @@ def _get_or_create_session(
                 "download_url": download_url,
                 "async_load": True,
                 "hidden_transport": transport,
-                "weight_quantization": os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower(),
-                "runtime_backend": _runtime_for_pool(pool_class),
-                "supports_q4_weights": pool_class == "velocity_mlx" or os.environ.get("VRYX_SUPPORTS_Q4_WEIGHTS", "0").lower() in ("1", "true", "yes"),
-                "supports_mlx": pool_class == "velocity_mlx" or os.environ.get("VRYX_SUPPORTS_MLX", "0").lower() in ("1", "true", "yes"),
-                "supports_vllm": pool_class == "velocity_vllm" or os.environ.get("VRYX_SUPPORTS_VLLM", "0").lower() in ("1", "true", "yes"),
+                "weight_quantization": weight_quantization,
+                "runtime_backend": _runtime_for_pool(pool_class, worker_info),
+                "supports_q4_weights": worker_supports_q4,
+                "supports_mlx": worker_supports_mlx,
+                "supports_vllm": worker_supports_vllm,
                 "pipeline_stream_mode": PIPELINE_STREAM_MODE,
                 "worker_kv_cache": WORKER_KV_CACHE,
                 "hidden_quic": HIDDEN_QUIC,
@@ -3509,18 +3688,19 @@ def _get_or_create_session(
                         )
                         poll_n += 1
                         time.sleep(_shard_ready_sleep_sec(poll_n))
+                    detail = (
+                        f"worker_not_ready_after_{int(SHARD_READY_TIMEOUT)}s: "
+                        f"{last_reason or 'session_not_ready'}"
+                    )[:500]
                     print(
                         f"[VPS] Worker {i} ({peer[:16]}) timeout readiness après init "
-                        f"({int(SHARD_READY_TIMEOUT)}s)"
+                        f"({int(SHARD_READY_TIMEOUT)}s) : {detail}"
                     )
                     diag.append({
                         "worker_index": i,
                         "peer": peer[:48],
                         "phase": "ready_poll_timeout",
-                        "detail": (
-                            f"worker_not_ready_after_{int(SHARD_READY_TIMEOUT)}s: "
-                            f"{last_reason or 'session_not_ready'}"
-                        )[:500],
+                        "detail": detail,
                         "manifest_url_preview": download_url[:120],
                     })
                     return False
@@ -3557,17 +3737,16 @@ def _get_or_create_session(
             try:
                 manifest_path = os.path.join(SHARD_BASE_DIR, session_id, f"worker-{i}.json")
                 with open(manifest_path, "r", encoding="utf-8") as fp:
-                    manifest_bytes = int((json.load(fp) or {}).get("binary_total_bytes") or 0)
+                    manifest = json.load(fp) or {}
+                    manifest_bytes = int(manifest.get("binary_total_bytes") or 0)
             except Exception:
+                manifest = {}
                 manifest_bytes = 0
             worker_info = catalog.get(peer) or {}
             safe_mb = _safe_weight_budget_mb(worker_info)
             required_mb = manifest_bytes / 1024 / 1024
-            quant = os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower()
-            if "q4" in quant or "4bit" in quant:
-                required_mb *= 0.28
-            elif "q8" in quant or "8bit" in quant:
-                required_mb *= 0.55
+            quant = weight_quantization
+            native_quantized_weights = _manifest_has_native_quantized_weights(manifest, quant)
             if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb and not _prepared_gguf_session_dir():
                 capacity_errors.append({
                     "worker_index": i,
@@ -3578,6 +3757,8 @@ def _get_or_create_session(
                     "safe_weight_budget_mb": round(safe_mb, 1),
                     "allocated_vram_mb": _worker_memory_budget_mb(worker_info),
                     "weight_quantization": quant,
+                    "manifest_format": str(manifest.get("format") or "unknown"),
+                    "native_quantized_weights": native_quantized_weights,
                 })
             init_jobs.append((i, peer, ls, le, has_emb, has_head, download_url))
 
@@ -3585,6 +3766,11 @@ def _get_or_create_session(
             detail = "; ".join(
                 f"w{e['worker_index']} {e['gpu']} layers {e['layers']}: "
                 f"{e['required_weight_mb']}MB requis > {e['safe_weight_budget_mb']}MB sûrs"
+                + (
+                    f" ({e['weight_quantization']} demandé, manifeste {e['manifest_format']} non quantifié)"
+                    if e.get("weight_quantization") in ("q4", "int4", "4bit", "q4-dwq") and not e.get("native_quantized_weights")
+                    else ""
+                )
                 for e in capacity_errors[:4]
             )
             prep_diag.append({
@@ -3593,8 +3779,8 @@ def _get_or_create_session(
                 "detail": detail,
                 "workers": capacity_errors,
                 "hint": (
-                    "Llama 2 70B fp16 ne tient pas sur cette chaîne. "
-                    "Utilise un backend de poids Q4/Q8 shardé ou ajoute des workers/VRAM avant de lancer le dispatch."
+                    "Le shard distribué courant pointe vers des poids safetensors source, pas vers un runtime Q4 natif. "
+                    "Prépare des manifests GGUF/MLX quantifiés ou ajoute assez de mémoire worker avant de lancer le dispatch."
                 ),
             })
             print(f"[VPS] Dispatch refusé: capacité worker insuffisante. {detail}")
@@ -3618,7 +3804,12 @@ def _get_or_create_session(
 
         # Création séquentielle des shards sur disque VPS ; relay + poll ready ci-dessus (séquentiel ou parallèle selon env).
         if not all(results):
-            print("[VPS] Certains workers n'ont pas reçu leurs poids.")
+            details = "; ".join(
+                f"w{d.get('worker_index')}:{d.get('phase')}:{str(d.get('detail') or '')[:160]}"
+                for d in prep_diag[-len(init_jobs):]
+                if isinstance(d, dict)
+            )
+            print(f"[VPS] Certains workers n'ont pas reçu leurs poids. {details}")
             _register_pool(pool_id, {"status": "failed", "session_status": "failed", "shard_prep_diag": prep_diag})
             return None, "failed", prep_diag
 
@@ -3979,8 +4170,20 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         except (TypeError, ValueError):
             pass
 
-    requires_distributed_shards = _requires_distributed_shards(MODEL_ID)
-    min_workers_required = _required_min_workers_for_model(MODEL_ID)
+    requested_load_mode = str(options.get("load_mode") or options.get("loadMode") or "").strip().lower()
+    force_full_load = requested_load_mode in ("full", "solo", "single", "direct")
+    force_distributed = (
+        requested_load_mode == "shard"
+        or str(options.get("force_distributed") or "").strip().lower() in ("1", "true", "yes", "on")
+    )
+    requires_distributed_shards = (not force_full_load) and (
+        force_distributed or _requires_distributed_shards(MODEL_ID)
+    )
+    min_workers_required = (
+        max(2, DIST_MIN_SHARDED_WORKERS)
+        if requires_distributed_shards and not ALLOW_SINGLE_WORKER_LARGE_LLAMA
+        else _required_min_workers_for_model(MODEL_ID)
+    )
     wait_for_min = DIST_WAIT_FOR_MIN_WORKERS or requires_distributed_shards
     if requires_distributed_shards:
         disk_ok, disk_msg = _assert_shard_cache_disk()
@@ -4002,11 +4205,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
 
-    if LLAMA_CPP_DIRECT:
+    weight_model_id = _distributed_weight_model_id(requested_quantization, requires_distributed_shards)
+    if LLAMA_CPP_DIRECT and not requires_distributed_shards:
         model_manifest, tokenizer = {"model_id": MODEL_ID, "source": "llama_cpp_direct"}, None
     else:
-        model_manifest, tokenizer = _ensure_model()
-    if model_manifest is None or (tokenizer is None and not LLAMA_CPP_DIRECT):
+        model_manifest, tokenizer = _ensure_model(weight_model_id)
+    if model_manifest is None or (tokenizer is None and not (LLAMA_CPP_DIRECT and not requires_distributed_shards)):
         return {
             "ok": False,
             "text": "",
@@ -4135,7 +4339,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
     # Tokenisation + mise en forme communes (cohérence directe + pipeline).
     model_config = _model_config_cache or {}
-    if LLAMA_CPP_DIRECT and tokenizer is None:
+    if LLAMA_CPP_DIRECT and tokenizer is None and not requires_distributed_shards:
         model_config = {
             "model_type": "llama_cpp_direct",
             "max_position_embeddings": int(os.environ.get("VRYX_LLAMA_CPP_NUM_CTX", "4096") or "4096"),
@@ -4207,7 +4411,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             trace["preferred_workers_applied"] = preferred_workers_applied
             trace["preferred_workers_missing"] = preferred_workers_missing
         return direct_result
-    if _requires_mlx_lm_direct_guard():
+    if not requires_distributed_shards and _requires_mlx_lm_direct_guard():
         return {
             "ok": False,
             "text": "",
@@ -4250,7 +4454,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     # Obtenir / créer la session de poids
     t_setup = time.perf_counter()
     session_id, sess_status, shard_prep_diag = _get_or_create_session(
-        peers, model_config, model_manifest, hidden_transport, pool_class
+        peers, model_config, model_manifest, hidden_transport, pool_class, requested_quantization
     )
     setup_ms = int((time.perf_counter() - t_setup) * 1000)
     if sess_status == "failed" or session_id is None:
@@ -4267,7 +4471,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             detail_hint = f" Diagnostics orchestrateur : {chunk}."
         if capacity_diag:
             error_msg = (
-                "Dispatch Llama 70B impossible avec la mémoire worker actuelle. "
+                f"Dispatch shard impossible pour {MODEL_ID} avec la mémoire worker actuelle. "
                 f"{capacity_diag.get('detail')}. "
                 "Le pipeline a été arrêté avant téléchargement/build pour éviter une réponse vide ou un transport error. "
                 f"{capacity_diag.get('hint') or ''}"

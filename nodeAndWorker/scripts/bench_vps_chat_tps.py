@@ -13,6 +13,9 @@ Variables utiles :
   VRYX_BENCH_POOL=auto
   VRYX_BENCH_QUANT=fp16
   VRYX_BENCH_MODEL=Qwen/Qwen3.5-9B
+  VRYX_BENCH_LOAD_MODE=full
+  VRYX_BENCH_FORCE_DISTRIBUTED=0
+  VRYX_BENCH_MIN_COMPUTE_WORKERS=0
 """
 from __future__ import annotations
 
@@ -53,6 +56,18 @@ def _chat(url: str, max_new_tokens: int, prompt: str, timeout_sec: float) -> dic
     model = os.environ.get("VRYX_BENCH_MODEL", "").strip()
     if model:
         payload["model_id"] = model
+    load_mode = os.environ.get("VRYX_BENCH_LOAD_MODE", "").strip()
+    if load_mode:
+        payload["load_mode"] = load_mode
+    if os.environ.get("VRYX_BENCH_FORCE_DISTRIBUTED", "").strip().lower() in ("1", "true", "yes", "on"):
+        payload["force_distributed"] = True
+    preferred = os.environ.get("VRYX_BENCH_PREFERRED_WORKERS", "").strip()
+    if preferred:
+        payload["preferred_worker_peer_ids"] = [
+            peer.strip()
+            for peer in preferred.replace(";", ",").split(",")
+            if peer.strip()
+        ]
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     started = time.perf_counter()
@@ -88,9 +103,16 @@ def _metric(data: dict[str, Any], tokens_requested: int) -> dict[str, Any]:
         "server_latency_ms": latency_ms,
         "tps_wall": tps_wall,
         "tps_latency": tps_latency,
-        "decode_tps": bench.get("actual_tps"),
+        "decode_tps": bench.get("decode_only_tps") or bench.get("actual_tps"),
+        "decode_only_tps": bench.get("decode_only_tps") or bench.get("actual_tps"),
+        "e2e_tps": bench.get("e2e_tps") or tps_wall,
         "trace_actual_tps": bench.get("actual_tps"),
         "trace_ms_per_token": bench.get("actual_ms_per_token"),
+        "decode_only_ms": bench.get("decode_only_ms"),
+        "decode_only_tokens": bench.get("decode_only_tokens"),
+        "decode_only_avg_ms_per_token": bench.get("decode_only_avg_ms_per_token"),
+        "prefill_ms": bench.get("prefill_ms"),
+        "setup_ms": bench.get("setup_ms"),
         "ttft_ms": bench.get("ttft_ms"),
         "relay_ms": bench.get("relay_ms"),
         "eval_ms": bench.get("eval_ms"),
@@ -101,6 +123,9 @@ def _metric(data: dict[str, Any], tokens_requested: int) -> dict[str, Any]:
         "runtime_backend": runtime_backend,
         "model_id": trace.get("model_id") or data.get("model_id"),
         "worker_count": trace.get("worker_count") or trace.get("peers_online"),
+        "compute_worker_count": trace.get("compute_worker_count") or trace.get("worker_count"),
+        "visible_worker_count": trace.get("visible_worker_count") or trace.get("peers_online"),
+        "available_peers": trace.get("available_peers"),
     }
 
 
@@ -110,6 +135,7 @@ def main() -> int:
         url = url.rstrip("/") + "/api/chat"
     timeout_sec = float(os.environ.get("VRYX_BENCH_HTTP_TIMEOUT", "360"))
     target_tps = float(os.environ.get("VRYX_BENCH_TARGET_TPS", "50"))
+    min_compute_workers = int(os.environ.get("VRYX_BENCH_MIN_COMPUTE_WORKERS", "0") or "0")
     token_counts = _env_list("VRYX_BENCH_TOKENS", "64,128,256")
     prompt = os.environ.get(
         "VRYX_BENCH_PROMPT",
@@ -131,7 +157,7 @@ def main() -> int:
         results.append(metric)
         print(json.dumps(metric, ensure_ascii=False, sort_keys=True), flush=True)
 
-    decode_values = [float(r["decode_tps"] or r["trace_actual_tps"] or 0.0) for r in results if r.get("ok")]
+    decode_values = [float(r["decode_only_tps"] or r["decode_tps"] or r["trace_actual_tps"] or 0.0) for r in results if r.get("ok")]
     e2e_values = [float(r["tps_wall"] or 0.0) for r in results if r.get("ok")]
     sustained = decode_values or e2e_values
     best = max(sustained) if sustained else 0.0
@@ -139,6 +165,7 @@ def main() -> int:
     summary = {
         "ok": bool(results) and all(r.get("ok") for r in results),
         "target_tps": target_tps,
+        "min_compute_workers": min_compute_workers,
         "best_decode_tps": round(max(decode_values), 3) if decode_values else 0.0,
         "median_decode_tps": round(float(statistics.median(decode_values)), 3) if decode_values else 0.0,
         "best_e2e_tps": round(max(e2e_values), 3) if e2e_values else 0.0,
@@ -149,8 +176,14 @@ def main() -> int:
         "empty_responses": sum(1 for r in results if r.get("empty_response")),
         "runs": len(results),
     }
+    if min_compute_workers > 0:
+        worker_counts = [int(r.get("compute_worker_count") or 0) for r in results if r.get("ok")]
+        summary["min_compute_workers_reached"] = bool(worker_counts) and min(worker_counts) >= min_compute_workers
+        summary["ok"] = bool(summary["ok"]) and bool(summary["min_compute_workers_reached"])
+    else:
+        summary["min_compute_workers_reached"] = None
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
-    return 0 if summary["target_reached"] else 2
+    return 0 if summary["target_reached"] and summary["ok"] else 2
 
 
 if __name__ == "__main__":

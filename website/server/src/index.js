@@ -132,10 +132,7 @@ function isUserPipelineChatActive(userId) {
 
 const WORKER_SECRET = process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET;
 
-function requireWorkerSecret(req, res, next) {
-  if (!WORKER_SECRET) {
-    return next()
-  }
+async function requireWorkerSecret(req, res, next) {
   const authHeader = req.headers['authorization'] || ''
   let token = ''
   if (authHeader.startsWith('Bearer ')) {
@@ -143,10 +140,34 @@ function requireWorkerSecret(req, res, next) {
   } else {
     token = req.query.token || req.headers['x-worker-token'] || ''
   }
-  if (token !== WORKER_SECRET && process.env.ALLOW_UNSECURE_WORKERS !== '1') {
-    return res.status(401).json({ error: 'Unauthorized: Invalid worker secret token.' })
+  if (process.env.ALLOW_UNSECURE_WORKERS === '1') return next()
+  if (WORKER_SECRET && token === WORKER_SECRET) return next()
+  const peerId = String(req.body?.peer_id || req.query.peer_id || '').trim()
+  if (peerId && token) {
+    try {
+      const [rows] = await pool.query(
+        `SELECT worker_secret_hash AS workerSecretHash,
+                worker_secret_expires_at AS workerSecretExpiresAt,
+                worker_next_secret_hash AS workerNextSecretHash,
+                worker_next_secret_expires_at AS workerNextSecretExpiresAt
+         FROM workers
+         WHERE peer_id = :peerId
+         LIMIT 1`,
+        { peerId },
+      )
+      const tokenHash = sha256Hex(token)
+      const row = rows[0] || {}
+      const currentValid = row.workerSecretHash && (!row.workerSecretExpiresAt || new Date(row.workerSecretExpiresAt).getTime() > Date.now())
+      const nextValid = row.workerNextSecretHash && (!row.workerNextSecretExpiresAt || new Date(row.workerNextSecretExpiresAt).getTime() > Date.now())
+      if ((currentValid && row.workerSecretHash === tokenHash) || (nextValid && row.workerNextSecretHash === tokenHash)) return next()
+    } catch (e) {
+      console.warn('worker secret lookup failed', e?.code || e?.message || e)
+    }
   }
-  next()
+  if (!WORKER_SECRET && !peerId) {
+    return next()
+  }
+  return res.status(401).json({ error: 'Unauthorized: Invalid worker secret token.' })
 }
 
 function csrfProtection(req, res, next) {
@@ -298,7 +319,7 @@ function workerHealthScore(workerLike) {
     score -= runtimeState === 'failed' ? 40 : 28
     reasons.push(`runtime ${runtimeState}`)
   }
-  if (commandStatus === 'pending' || commandStatus === 'delivered' || commandStatus === 'pending_worker_offline') {
+  if (commandStatus === 'pending' || commandStatus === 'pending_worker_offline') {
     score -= 14
     reasons.push(`command ${commandStatus}`)
   }
@@ -343,7 +364,7 @@ function workerSchedulabilityIssue(workerLike) {
   const runtimeState = String(workerLike?.runtimeState || workerLike?.runtime_state || 'idle').toLowerCase()
   if (WORKER_UNSCHEDULABLE_RUNTIME_STATES.has(runtimeState)) return `runtime_${runtimeState}`
   const commandStatus = String(workerLike?.lastCommandStatus || workerLike?.last_command_status || '')
-  if (commandStatus === 'pending' || commandStatus === 'delivered' || commandStatus === 'pending_worker_offline') {
+  if (commandStatus === 'pending' || commandStatus === 'pending_worker_offline') {
     return `command_${commandStatus}`
   }
   const reservedUntil = workerLike?.reservedUntil || workerLike?.reserved_until || null
@@ -612,6 +633,10 @@ function newApiKeyPrefix() {
 
 function apiKeyHash(raw) {
   return crypto.createHash('sha256').update(raw).digest('hex')
+}
+
+function sha256Hex(raw) {
+  return crypto.createHash('sha256').update(String(raw || '')).digest('hex')
 }
 
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
@@ -1108,7 +1133,7 @@ async function loadSchedulerWorkers(modelId = null, options = {}) {
      WHERE w.mode = 'worker'
        AND w.desired_state = 'active'
        AND COALESCE(w.runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed','cooldown')
-       AND COALESCE(w.last_command_status, '') NOT IN ('pending','delivered','pending_worker_offline')
+       AND COALESCE(w.last_command_status, '') NOT IN ('pending','pending_worker_offline')
        AND TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) <= :offline
      ORDER BY w.last_heartbeat_at DESC
      LIMIT 200`,
@@ -1147,7 +1172,7 @@ async function reserveWorkersForJob({ modelId, loadMode = 'auto', createdBy = nu
          AND desired_state = 'active'
          AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :liveSec
          AND COALESCE(runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed','cooldown')
-         AND COALESCE(last_command_status, '') NOT IN ('pending','delivered','pending_worker_offline')
+         AND COALESCE(last_command_status, '') NOT IN ('pending','pending_worker_offline')
          AND (reserved_until IS NULL OR reserved_until < NOW() OR current_job_id = :jobId)`,
       { jobId, peerId: assignment.peerId, ttl: WORKER_RESERVATION_TTL_SEC, liveSec: WORKER_LIVE_SEC },
     )
@@ -1237,7 +1262,7 @@ function workerCommandSatisfiedByHeartbeat(command, heartbeat) {
     return (requestedMb > 0 && actualMb > 0 && Math.abs(actualMb - requestedMb) <= 256)
       || (requestedPct > 0 && actualPct > 0 && Math.abs(actualPct - requestedPct) <= 1)
   }
-  if (['pause', 'resume', 'drain', 'stop'].includes(action)) {
+  if (['pause', 'resume', 'drain', 'stop', 'rotate_secret'].includes(action)) {
     return true
   }
   if (action === 'update_software') {
@@ -1256,7 +1281,7 @@ async function acknowledgeSatisfiedDeliveredCommands(peerId, heartbeat) {
      FROM worker_commands
      WHERE peer_id = :peerId
        AND status = 'delivered'
-       AND action IN ('pause','resume','drain','stop','set_model','set_memory')
+      AND action IN ('pause','resume','drain','stop','set_model','set_memory','update_software','rotate_secret')
      ORDER BY created_at ASC
      LIMIT 10`,
     { peerId },
@@ -1278,7 +1303,8 @@ async function acknowledgeSatisfiedDeliveredCommands(peerId, heartbeat) {
   await pool.query(
     `UPDATE workers
      SET last_command_status = 'acknowledged',
-         last_command_error = NULL
+         last_command_error = NULL,
+         runtime_state = 'ready'
      WHERE peer_id = :peerId`,
     { peerId },
   )
@@ -1461,10 +1487,21 @@ async function ensureWorkersTable() {
   if (!present.has('last_command_status')) await pool.query(`ALTER TABLE workers ADD COLUMN last_command_status VARCHAR(40) NULL`)
   if (!present.has('last_command_error')) await pool.query(`ALTER TABLE workers ADD COLUMN last_command_error VARCHAR(255) NULL`)
   if (!present.has('health_score')) await pool.query(`ALTER TABLE workers ADD COLUMN health_score TINYINT UNSIGNED NOT NULL DEFAULT 0`)
-  if (!present.has('runtime_state')) await pool.query(`ALTER TABLE workers ADD COLUMN runtime_state ENUM('idle','reserved','running','cooldown','failed') NOT NULL DEFAULT 'idle'`)
+  if (!present.has('runtime_state')) await pool.query(`ALTER TABLE workers ADD COLUMN runtime_state ENUM('idle','updating','restarting','loading_shard','ready','reserved','running','cooldown','failed') NOT NULL DEFAULT 'idle'`)
+  else {
+    try {
+      await pool.query(`ALTER TABLE workers MODIFY runtime_state ENUM('idle','updating','restarting','loading_shard','ready','reserved','running','cooldown','failed') NOT NULL DEFAULT 'idle'`)
+    } catch {
+      /* compatible enough on older MySQL variants */
+    }
+  }
   if (!present.has('reserved_until')) await pool.query(`ALTER TABLE workers ADD COLUMN reserved_until TIMESTAMP NULL DEFAULT NULL`)
   if (!present.has('current_job_id')) await pool.query(`ALTER TABLE workers ADD COLUMN current_job_id VARCHAR(80) NULL`)
   if (!present.has('capabilities_json')) await pool.query(`ALTER TABLE workers ADD COLUMN capabilities_json JSON NULL`)
+  if (!present.has('worker_secret_hash')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_secret_hash VARCHAR(64) NULL`)
+  if (!present.has('worker_secret_expires_at')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_secret_expires_at TIMESTAMP NULL DEFAULT NULL`)
+  if (!present.has('worker_next_secret_hash')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_next_secret_hash VARCHAR(64) NULL`)
+  if (!present.has('worker_next_secret_expires_at')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_next_secret_expires_at TIMESTAMP NULL DEFAULT NULL`)
 }
 
 async function ensureWorkerReservationsTable() {
@@ -1513,7 +1550,7 @@ async function ensureWorkerCommandsTable() {
     CREATE TABLE IF NOT EXISTS worker_commands (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       peer_id VARCHAR(100) NOT NULL,
-      action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software','hot_reload_python') NOT NULL,
+      action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software','hot_reload_python','rotate_secret') NOT NULL,
       payload_json JSON NULL,
       status ENUM('pending','delivered','acknowledged','failed','cancelled') NOT NULL DEFAULT 'pending',
       requested_by BIGINT UNSIGNED NULL,
@@ -1551,7 +1588,7 @@ async function ensureWorkerCommandsTable() {
   try {
     await pool.query(`
       ALTER TABLE worker_commands
-      MODIFY action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software','hot_reload_python') NOT NULL
+      MODIFY action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software','hot_reload_python','rotate_secret') NOT NULL
     `)
   } catch {
     /* older MySQL variants may already be compatible */
@@ -4215,6 +4252,7 @@ const heartbeatBodySchema = z.object({
   supports_mlx: z.boolean().optional().default(false),
   supports_vllm: z.boolean().optional().default(false),
   machine_info: z.record(z.string(), z.unknown()).nullable().optional(),
+  runtime_state: z.enum(['idle', 'updating', 'restarting', 'loading_shard', 'ready', 'reserved', 'running', 'cooldown', 'failed']).optional(),
   command_ack: z
     .object({
       id: z.union([z.number().int().min(1), z.string().min(1)]),
@@ -4268,6 +4306,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     supports_mlx,
     supports_vllm,
     machine_info,
+    runtime_state,
     command_ack,
   } = parsed.data
   const hasGpuName = gpu_name !== undefined
@@ -4312,6 +4351,9 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
         ? String(weight_quantization).trim().toLowerCase()
         : 'fp16'
     const normalizedSupportsQ4 = Boolean(supports_q4_weights) || reportsLlamaCppQ4 || normalizedWeightQuantization.includes('q4')
+    const heartbeatRuntimeState = runtime_state || (
+      mode === 'worker' && normalizedModel ? 'ready' : 'idle'
+    )
     const capabilitySnapshot = workerCapabilities({
       model: normalizedModel,
       gpuName: gpu_name,
@@ -4342,12 +4384,12 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
                             tokens_in, tokens_out, model, user_id, gpu_name, gpu_vram_mb,
                             allocated_vram_mb, memory_limit_percent,
                             runtime_backend, weight_quantization, supports_q4_weights, supports_mlx, supports_vllm, machine_info,
-                            health_score, runtime_state, capabilities_json)
+	                            health_score, runtime_state, capabilities_json)
        VALUES (:peer_id, :mode, :grpc_port, :p2p_port, :public_ip, :version, :p2p_peers, :tokens_gen,
                :tokens_in, :tokens_out, :model, :user_id, :gpu_name_ins, :gpu_vram_ins,
                :allocated_vram_ins, :memory_limit_percent_ins,
                :runtime_backend, :weight_quantization, :supports_q4_weights, :supports_mlx, :supports_vllm, :machine_info,
-               :health_score, 'idle', :capabilities_json)
+	               :health_score, :runtime_state, :capabilities_json)
        ON DUPLICATE KEY UPDATE
          mode = VALUES(mode),
          grpc_port = VALUES(grpc_port),
@@ -4371,7 +4413,11 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
          supports_vllm = VALUES(supports_vllm),
          machine_info = IF(:has_machine_info, VALUES(machine_info), machine_info),
          health_score = VALUES(health_score),
-         runtime_state = IF(reserved_until IS NOT NULL AND reserved_until > NOW(), runtime_state, 'idle'),
+	         runtime_state = CASE
+	           WHEN reserved_until IS NOT NULL AND reserved_until > NOW() THEN runtime_state
+	           WHEN last_command_status IN ('pending','delivered') AND runtime_state IN ('updating','restarting','loading_shard') THEN runtime_state
+	           ELSE VALUES(runtime_state)
+	         END,
          capabilities_json = VALUES(capabilities_json),
          last_heartbeat_at = CURRENT_TIMESTAMP`,
       {
@@ -4405,6 +4451,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
         machine_info: hasMachineInfo ? JSON.stringify(machine_info) : null,
         has_machine_info: hasMachineInfo ? 1 : 0,
         health_score: healthSnapshot.score,
+        runtime_state: heartbeatRuntimeState,
         capabilities_json: JSON.stringify(capabilitySnapshot),
       },
     )
@@ -4420,7 +4467,46 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     }
     if (command_ack?.id) {
       const ackFailed = command_ack.status === 'failed'
+      const [ackRows] = await pool.query(
+        `SELECT id, action, payload_json AS payloadJson
+         FROM worker_commands
+         WHERE id = :id AND peer_id = :peer_id
+         LIMIT 1`,
+        { id: String(command_ack.id), peer_id },
+      )
+      const ackCommand = ackRows[0]
+      const ackPayload = parseMaybeJsonObject(ackCommand?.payloadJson) || {}
+      const targetVersion = String(ackPayload.targetVersion || ackPayload.release?.version || ackPayload.version || '').trim()
+      const ackPrematureUpdate =
+        !ackFailed &&
+        ackCommand?.action === 'update_software' &&
+        targetVersion &&
+        (!version || compareVersionLike(version, targetVersion) < 0)
       if (ackFailed) await rollbackDesiredStateFromCommand(peer_id, command_ack.id).catch(() => {})
+      if (ackPrematureUpdate) {
+        await pool.query(
+          `UPDATE worker_commands
+           SET status = 'delivered',
+               error = :error
+           WHERE id = :id AND peer_id = :peer_id AND status IN ('pending','delivered')`,
+          {
+            id: String(command_ack.id),
+            peer_id,
+            error: `ACK ignoré: version heartbeat ${version || 'unknown'} < cible ${targetVersion}`,
+          },
+        )
+        await pool.query(
+          `UPDATE workers
+           SET last_command_status = 'delivered',
+               last_command_error = :error,
+               runtime_state = 'updating'
+           WHERE peer_id = :peer_id`,
+          {
+            peer_id,
+            error: `Update appliquée non vérifiée: ${version || 'unknown'} < ${targetVersion}`,
+          },
+        )
+      } else {
       await pool.query(
         `UPDATE worker_commands
          SET status = :status, error = :error, acknowledged_at = CURRENT_TIMESTAMP
@@ -4432,16 +4518,41 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
           error: command_ack.error ?? null,
         },
       )
+      const nextRuntimeState = ackFailed
+        ? 'failed'
+        : ackCommand?.action === 'restart'
+          ? 'restarting'
+          : ackCommand?.action === 'update_software'
+            ? 'ready'
+            : ackCommand?.action === 'set_model'
+              ? 'loading_shard'
+              : 'ready'
+      if (!ackFailed && ackCommand?.action === 'rotate_secret') {
+        await pool.query(
+          `UPDATE workers
+           SET worker_secret_hash = worker_next_secret_hash,
+               worker_secret_expires_at = worker_next_secret_expires_at,
+               worker_next_secret_hash = NULL,
+               worker_next_secret_expires_at = NULL
+           WHERE peer_id = :peer_id
+             AND worker_next_secret_hash IS NOT NULL`,
+          { peer_id },
+        )
+      }
       await pool.query(
         `UPDATE workers
-         SET last_command_status = :status, last_command_error = :error
+         SET last_command_status = :status,
+             last_command_error = :error,
+             runtime_state = :runtime_state
          WHERE peer_id = :peer_id`,
         {
           peer_id,
           status: ackFailed ? 'failed' : 'acknowledged',
           error: command_ack.error ?? null,
+          runtime_state: nextRuntimeState,
         },
       )
+      }
     }
     await acknowledgeSatisfiedDeliveredCommands(peer_id, {
       model: normalizedModel,
@@ -4455,6 +4566,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     if (
       mode === 'worker' &&
       release?.version &&
+      (release.macSha256 || release.winX64Sha256 || release.winArm64Sha256 || release.runtimeSha256) &&
       version &&
       process.env.ALLOW_UNSECURE_WORKERS !== '1' &&
       compareVersionLike(version, release.version) < 0
@@ -4492,10 +4604,11 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
         )
         await pool.query(
           `UPDATE workers
-           SET last_command_at = CURRENT_TIMESTAMP,
-               last_command_status = 'pending',
-               last_command_error = NULL
-           WHERE peer_id = :peer_id`,
+	           SET last_command_at = CURRENT_TIMESTAMP,
+	               last_command_status = 'pending',
+	               last_command_error = NULL,
+	               runtime_state = 'updating'
+	           WHERE peer_id = :peer_id`,
           { peer_id },
         )
       }
@@ -4512,6 +4625,12 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     )
     const command = commandRows[0]
     if (command) {
+      const deliveredRuntimeState =
+        command.action === 'update_software' ? 'updating'
+        : command.action === 'restart' ? 'restarting'
+        : command.action === 'set_model' ? 'loading_shard'
+        : command.action === 'rotate_secret' ? 'updating'
+        : null
       await pool.query(
         `UPDATE worker_commands
          SET status = 'delivered', delivered_at = CURRENT_TIMESTAMP
@@ -4520,9 +4639,11 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
       )
       await pool.query(
         `UPDATE workers
-         SET last_command_status = 'delivered', last_command_error = NULL
+         SET last_command_status = 'delivered',
+             last_command_error = NULL,
+             runtime_state = COALESCE(:runtimeState, runtime_state)
          WHERE peer_id = :peer_id`,
-        { peer_id },
+        { peer_id, runtimeState: deliveredRuntimeState },
       )
     }
 
@@ -5163,8 +5284,90 @@ adminRouter.get('/workers/registered', async (req, res) => {
   }
 })
 
+async function fetchJsonWithTimeout(url, timeoutMs = 2500) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const started = Date.now()
+  try {
+    const response = await fetch(url, { signal: controller.signal })
+    const text = await response.text()
+    let body = null
+    try { body = JSON.parse(text) } catch { body = { raw: text.slice(0, 1000) } }
+    return { ok: response.ok, status: response.status, elapsedMs: Date.now() - started, body }
+  } catch (e) {
+    return { ok: false, status: 0, elapsedMs: Date.now() - started, error: e?.name === 'AbortError' ? 'timeout' : String(e?.message || e) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+adminRouter.get('/workers/:peerId/health', async (req, res) => {
+  const peerId = decodeURIComponent(String(req.params.peerId || ''))
+  if (!peerId) return res.status(400).json({ ok: false, error: 'peerId requis.' })
+  try {
+    const [rows] = await pool.query(
+      `SELECT peer_id AS peerId, public_ip AS publicIp, grpc_port AS grpcPort, p2p_port AS p2pPort,
+              version, model, runtime_backend AS runtimeBackend, weight_quantization AS weightQuantization,
+              runtime_state AS runtimeState, health_score AS healthScore,
+              last_command_status AS lastCommandStatus, last_command_error AS lastCommandError,
+              worker_secret_hash IS NOT NULL AS hasWorkerSecret,
+              worker_secret_expires_at AS workerSecretExpiresAt,
+              TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
+       FROM workers WHERE peer_id = :peerId LIMIT 1`,
+      { peerId },
+    )
+    const worker = rows[0]
+    if (!worker) return res.status(404).json({ ok: false, error: 'Worker introuvable.' })
+    const publicIp = String(worker.publicIp || '').replace(/^::ffff:/, '')
+    const probes = {}
+    if (publicIp) {
+      probes.status = await fetchJsonWithTimeout(`http://${publicIp}:3031/api/status`, 2200)
+      probes.shards = await fetchJsonWithTimeout(`http://${publicIp}:3031/api/shards`, 2500)
+      const grpcPort = Number(worker.grpcPort || 50052)
+      if (Number.isFinite(grpcPort) && grpcPort > 0) {
+        probes.pythonAdmin = await fetchJsonWithTimeout(`http://${publicIp}:${grpcPort + 1}/health`, 1800)
+      }
+    }
+    const shardBody = probes.shards?.body || {}
+    const shards = Array.isArray(shardBody.shards) ? shardBody.shards : []
+    const shardSummary = {
+      ok: Boolean(probes.shards?.ok && shardBody.ok !== false),
+      count: shards.length,
+      ready: shards.filter((s) => s?.ready || s?.resident_vram || s?.built).length,
+      loading: shards.filter((s) => s?.loading).length,
+      errors: shards.map((s) => s?.load_error || s?.error).filter(Boolean).slice(0, 5),
+      sessions: shards.slice(0, 8).map((s) => ({
+        sessionId: s.session_id,
+        modelId: s.model_id,
+        layers: `${s.layer_start}-${s.layer_end}`,
+        ready: Boolean(s.ready || s.resident_vram || s.built),
+        loading: Boolean(s.loading),
+        weightsLoaded: Number(s.weights_loaded || 0),
+        weightQuantization: s.weight_quantization || null,
+        runtimeBackend: s.runtime_backend || null,
+        attentionBackend: s.attention_backend || null,
+        loadError: s.load_error || null,
+      })),
+    }
+    return res.json({
+      ok: true,
+      worker: {
+        ...worker,
+        secondsSinceHeartbeat: Number(worker.secondsSinceHeartbeat),
+        healthScore: Number(worker.healthScore || 0),
+        hasWorkerSecret: Boolean(worker.hasWorkerSecret),
+      },
+      probes,
+      shardSummary,
+    })
+  } catch (e) {
+    console.error('admin/workers/health', e)
+    return res.status(500).json({ ok: false, error: 'Erreur healthcheck worker.' })
+  }
+})
+
 const workerActionBodySchema = z.object({
-  action: z.enum(['pause', 'resume', 'drain', 'stop', 'restart', 'set_model', 'set_memory', 'update_software', 'hot_reload_python']),
+  action: z.enum(['pause', 'resume', 'drain', 'stop', 'restart', 'set_model', 'set_memory', 'update_software', 'hot_reload_python', 'rotate_secret']),
   model: z.string().min(1).max(140).optional(),
   loadMode: z.enum(['auto', 'full', 'shard']).optional(),
   quantization: z.string().min(1).max(20).optional(),
@@ -5221,6 +5424,10 @@ adminRouter.post('/workers/:peerId/actions', async (req, res) => {
       Object.assign(payload, { release: await currentWorkerRelease('stable') })
       const targetVersion = String(payload.release?.version || '').trim()
       const currentVersion = String(currentWorker.version || '').trim()
+      const hasReleaseHash = Boolean(payload.release?.macSha256 || payload.release?.winX64Sha256 || payload.release?.winArm64Sha256 || payload.release?.runtimeSha256)
+      if (!hasReleaseHash) {
+        return res.status(409).json({ ok: false, error: 'Release worker sans hash SHA-256: update distante refusée.' })
+      }
       if (targetVersion && currentVersion && compareVersionLike(currentVersion, targetVersion) >= 0) {
         return res.json({
           ok: true,
@@ -5232,6 +5439,20 @@ adminRouter.post('/workers/:peerId/actions', async (req, res) => {
         })
       }
     }
+    let rotatedWorkerSecret = ''
+    if (action === 'rotate_secret') {
+      rotatedWorkerSecret = crypto.randomBytes(32).toString('hex')
+      Object.assign(payload, {
+        workerSecret: rotatedWorkerSecret,
+        secretExpiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString(),
+      })
+    }
+    const runtimeState =
+      action === 'update_software' ? 'updating'
+      : action === 'restart' ? 'restarting'
+      : action === 'set_model' ? 'loading_shard'
+      : action === 'rotate_secret' ? 'updating'
+      : null
     const [result] = await pool.query(
       `INSERT INTO worker_commands (peer_id, action, payload_json, requested_by, expires_at)
        VALUES (:peerId, :action, :payload, :requestedBy, DATE_ADD(NOW(), INTERVAL :ttlMinute MINUTE))`,
@@ -5245,29 +5466,35 @@ adminRouter.post('/workers/:peerId/actions', async (req, res) => {
     )
     await pool.query(
       `UPDATE workers
-       SET desired_state = COALESCE(:desiredState, desired_state),
+	       SET desired_state = COALESCE(:desiredState, desired_state),
            desired_model = COALESCE(:model, desired_model),
            desired_allocated_vram_mb = COALESCE(:allocatedVramMb, desired_allocated_vram_mb),
            desired_memory_limit_percent = COALESCE(:memoryPercent, desired_memory_limit_percent),
-           last_command_at = CURRENT_TIMESTAMP,
-           last_command_status = 'pending',
-           last_command_error = NULL
-       WHERE peer_id = :peerId`,
+	           last_command_at = CURRENT_TIMESTAMP,
+	           last_command_status = 'pending',
+	           last_command_error = NULL,
+	           runtime_state = COALESCE(:runtimeState, runtime_state),
+	           worker_next_secret_hash = COALESCE(:workerSecretHash, worker_next_secret_hash),
+	           worker_next_secret_expires_at = COALESCE(:workerSecretExpiresAt, worker_next_secret_expires_at)
+	       WHERE peer_id = :peerId`,
       {
         peerId,
         desiredState,
         model: action === 'set_model' ? model : null,
         allocatedVramMb: action === 'set_memory' ? allocatedVramMb ?? null : null,
-        memoryPercent: action === 'set_memory' ? memoryPercent ?? null : null,
-      },
-    )
+	        memoryPercent: action === 'set_memory' ? memoryPercent ?? null : null,
+	        runtimeState,
+	        workerSecretHash: rotatedWorkerSecret ? sha256Hex(rotatedWorkerSecret) : null,
+	        workerSecretExpiresAt: rotatedWorkerSecret ? payload.secretExpiresAt.slice(0, 19).replace('T', ' ') : null,
+	      },
+	    )
     return res.json({
       ok: true,
       command: {
         id: String(result.insertId),
         peerId,
         action,
-        payload,
+        payload: action === 'rotate_secret' ? { ...payload, workerSecret: '[redacted]' } : payload,
         status: 'pending',
       },
     })
@@ -6059,6 +6286,9 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     maxNewTokens = Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(parsedCap))
   }
   const chatModelId = await resolveP2pChatModelId(req.body?.model_id ?? req.body?.modelId)
+  const requestedLoadMode = ['auto', 'full', 'shard'].includes(req.body?.load_mode || req.body?.loadMode)
+    ? (req.body?.load_mode || req.body?.loadMode)
+    : 'shard'
   const requestId = req.requestId || crypto.randomUUID()
   const startedAt = Date.now()
   let firstTokenAt = null
@@ -6092,7 +6322,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     return res.end()
   }
   const reservation = chatModelId
-    ? await reserveWorkersForJob({ modelId: chatModelId, loadMode: req.body?.load_mode || req.body?.loadMode || 'auto', createdBy: req.user.id })
+    ? await reserveWorkersForJob({ modelId: chatModelId, loadMode: requestedLoadMode, createdBy: req.user.id })
     : { ok: true, jobId: null, plan: null, reservations: [] }
   if (!reservation.ok) {
     await recordInferenceRequestLog(buildInferenceLog({
@@ -6219,6 +6449,8 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       quantization: requestedQuantization,
       hidden_transport: requestedQuantization,
       pool_preference: poolPreference,
+      load_mode: requestedLoadMode,
+      force_distributed: requestedLoadMode === 'shard' || reservation.reservations.length > 1,
       temperature: 0,
       top_p: 0.65,
       top_k: 20,

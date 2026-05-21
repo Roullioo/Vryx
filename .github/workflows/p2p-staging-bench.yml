@@ -1,0 +1,41 @@
+name: P2P Staging Bench
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  qwen36-dual-worker-bench:
+    name: Qwen 3.6 35B dual-worker shard bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VRYX_BENCH_URL: ${{ secrets.VRYX_BENCH_URL }}
+      VRYX_BENCH_MODEL: Qwen/Qwen3.6-35B-A3B
+      VRYX_BENCH_LOAD_MODE: shard
+      VRYX_BENCH_FORCE_DISTRIBUTED: '1'
+      VRYX_BENCH_MIN_COMPUTE_WORKERS: '2'
+      VRYX_BENCH_QUANT: q4
+      VRYX_BENCH_POOL: velocity_mlx
+      VRYX_BENCH_TOKENS: '64'
+      VRYX_BENCH_TARGET_TPS: '0'
+      VRYX_BENCH_HTTP_TIMEOUT: '2400'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Require staging bench endpoint
+        run: |
+          if [ -z "$VRYX_BENCH_URL" ]; then
+            echo "VRYX_BENCH_URL secret is required for release/staging bench." >&2
+            exit 1
+          fi
+
+      - name: Run forced P2P shard bench
+        run: python3 nodeAndWorker/scripts/bench_vps_chat_tps.py

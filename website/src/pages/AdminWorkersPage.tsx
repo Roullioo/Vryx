@@ -46,7 +46,7 @@ type RegisteredWorker = {
   healthScore?: number
   healthState?: string
   healthReasons?: string[]
-  runtimeState?: 'idle' | 'reserved' | 'running' | 'cooldown' | 'failed'
+  runtimeState?: 'idle' | 'updating' | 'restarting' | 'loading_shard' | 'ready' | 'reserved' | 'running' | 'cooldown' | 'failed'
   reservedUntil?: string | null
   currentJobId?: string | null
   capabilities?: Record<string, unknown> | null
@@ -95,6 +95,31 @@ type WorkerRelease = {
   runtimeUrl?: string | null
   mandatory?: boolean
   notes?: string | null
+}
+
+type WorkerDetailedHealth = {
+  ok: boolean
+  worker?: RegisteredWorker & { hasWorkerSecret?: boolean; workerSecretExpiresAt?: string | null }
+  probes?: Record<string, { ok?: boolean; status?: number; elapsedMs?: number; error?: string; body?: unknown }>
+  shardSummary?: {
+    ok: boolean
+    count: number
+    ready: number
+    loading: number
+    errors: string[]
+    sessions: Array<{
+      sessionId?: string
+      modelId?: string
+      layers?: string
+      ready?: boolean
+      loading?: boolean
+      weightsLoaded?: number
+      weightQuantization?: string | null
+      runtimeBackend?: string | null
+      attentionBackend?: string | null
+      loadError?: string | null
+    }>
+  }
 }
 
 type AvailableModel = {
@@ -703,6 +728,8 @@ export function AdminWorkerDetailPage() {
   const [memoryPreset, setMemoryPreset] = useState('')
   const [availableModels, setAvailableModels] = useState<AvailableModel[]>([])
   const [modelPlan, setModelPlan] = useState<ModelPlan | null>(null)
+  const [detailedHealth, setDetailedHealth] = useState<WorkerDetailedHealth | null>(null)
+  const [healthBusy, setHealthBusy] = useState(false)
 
   const refreshWorker = useCallback(async () => {
     if (!peerId) return
@@ -809,6 +836,16 @@ export function AdminWorkerDetailPage() {
     if (Number.isFinite(gb) && gb > 0) payload.allocatedVramMb = Math.round(gb * 1024)
     if (Number.isFinite(pct) && pct > 0) payload.memoryPercent = Math.round(pct)
     void sendWorkerAction('set_memory', payload)
+  }
+
+  async function runDetailedHealthcheck() {
+    if (!peerId) return
+    const id = decodeURIComponent(peerId)
+    setHealthBusy(true)
+    const r = await apiJson<WorkerDetailedHealth>(`/api/admin/workers/${encodeURIComponent(id)}/health`)
+    setHealthBusy(false)
+    if (r.ok) setDetailedHealth(r.data)
+    else setCommandMsg(r.error)
   }
 
   function selectMemoryPreset(value: string) {
@@ -988,11 +1025,21 @@ export function AdminWorkerDetailPage() {
               <p className="text-sm font-semibold text-fg">Santé scheduler</p>
               <p className="mt-1 text-[12px] text-muted">Score utilisé pour éviter les workers instables, réservés ou trop vieux.</p>
             </div>
-            <span className={`rounded-full px-3 py-1 text-[11px] font-bold uppercase ${
-              (worker.healthScore ?? 0) >= 70 ? 'bg-success/10 text-success' : (worker.healthScore ?? 0) >= 45 ? 'bg-warning/10 text-warning' : 'bg-alert/10 text-alert'
-            }`}>
-              {worker.healthScore ?? 0}/100 · {worker.healthState || 'unknown'}
-            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void runDetailedHealthcheck()}
+                disabled={healthBusy}
+                className="rounded-xl border border-accent/30 px-3 py-1.5 text-[11px] font-bold text-accent hover:bg-accent/10 disabled:opacity-50"
+              >
+                {healthBusy ? 'Check…' : 'Health shard'}
+              </button>
+              <span className={`rounded-full px-3 py-1 text-[11px] font-bold uppercase ${
+                (worker.healthScore ?? 0) >= 70 ? 'bg-success/10 text-success' : (worker.healthScore ?? 0) >= 45 ? 'bg-warning/10 text-warning' : 'bg-alert/10 text-alert'
+              }`}>
+                {worker.healthScore ?? 0}/100 · {worker.healthState || 'unknown'}
+              </span>
+            </div>
           </div>
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
             <div className="rounded-2xl border border-border/70 bg-surface/70 p-3">
@@ -1008,6 +1055,31 @@ export function AdminWorkerDetailPage() {
               <p className="mt-1 text-xs font-semibold text-fg">{worker.healthReasons?.length ? worker.healthReasons.join(', ') : 'Aucun signal négatif'}</p>
             </div>
           </div>
+          {detailedHealth?.shardSummary && (
+            <div className="mt-4 rounded-2xl border border-border/70 bg-surface/70 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Health shard local</p>
+                <span className={detailedHealth.shardSummary.ok ? 'text-xs font-bold text-success' : 'text-xs font-bold text-warning'}>
+                  {detailedHealth.shardSummary.ready}/{detailedHealth.shardSummary.count} ready · {detailedHealth.shardSummary.loading} loading
+                </span>
+              </div>
+              {detailedHealth.shardSummary.errors.length > 0 && (
+                <p className="mt-2 text-xs font-semibold text-alert">{detailedHealth.shardSummary.errors.join(' · ')}</p>
+              )}
+              {detailedHealth.shardSummary.sessions.length > 0 && (
+                <div className="mt-3 grid gap-2 lg:grid-cols-2">
+                  {detailedHealth.shardSummary.sessions.map((s, idx) => (
+                    <div key={`${s.sessionId || idx}`} className="rounded-xl border border-border bg-card px-3 py-2">
+                      <p className="truncate text-[11px] font-mono text-fg">{s.sessionId || 'session inconnue'}</p>
+                      <p className="mt-1 text-[11px] text-muted">
+                        layers {s.layers || '—'} · {s.weightsLoaded ?? 0} poids · {s.weightQuantization || '—'} · {s.ready ? 'ready' : s.loading ? 'loading' : 'not ready'}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="rounded-3xl border border-white/10 bg-card/80 p-5 shadow-[0_24px_80px_-52px_rgba(34,211,238,.85)] backdrop-blur-xl">
@@ -1078,9 +1150,10 @@ export function AdminWorkerDetailPage() {
                   ['pause', 'Pause'],
                   ['resume', 'Activer'],
                   ['drain', 'Drain'],
-                  ['restart', 'Restart'],
-                  ['update_software', 'Update'],
-                  ['stop', 'Stop'],
+	                  ['restart', 'Restart'],
+	                  ['update_software', 'Update'],
+	                  ['rotate_secret', 'Secret'],
+	                  ['stop', 'Stop'],
                 ].map(([action, label]) => (
                   <button
                     key={action}
