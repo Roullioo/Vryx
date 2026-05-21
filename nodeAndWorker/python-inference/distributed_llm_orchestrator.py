@@ -1444,6 +1444,7 @@ def _can_use_tokenizer_only_for_direct_mlx() -> bool:
 
 
 _SAFETENSOR_NUMPY_DTYPES = {
+    "BF16": "bfloat16",
     "F16": "float16",
     "F32": "float32",
     "F64": "float64",
@@ -1502,12 +1503,13 @@ def _stage_safetensor_source(shard_dir: str, snapshot_dir: str, rel_path: str) -
         raise RuntimeError(f"chemin safetensors hors snapshot: {rel_path}")
     dst = os.path.join(shard_dir, "sources", clean_rel)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.exists(dst):
+    if os.path.lexists(dst):
         return clean_rel
+    real_src = os.path.realpath(src)
     try:
-        os.link(src, dst)
+        os.link(real_src, dst)
     except OSError:
-        os.symlink(src, dst)
+        os.symlink(real_src, dst)
     return clean_rel
 
 
@@ -2341,7 +2343,9 @@ def _save_shard_to_disk(
 
     # Manifeste JSON pour le worker (URL joignables depuis les workers distants ; pas forcément localhost)
     api_base = _worker_shard_download_base_url()
-    bin_url = f"{api_base}/api/internal/shard-serve/{session_id}/{bin_filename}"
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    token_suffix = f"?token={secret_token}" if secret_token else ""
+    bin_url = f"{api_base}/api/internal/shard-serve/{session_id}/{bin_filename}{token_suffix}"
     manifest = {
         "session_id": session_id,
         "layer_start": layer_start,
@@ -2360,7 +2364,7 @@ def _save_shard_to_disk(
     bin_mb = os.path.getsize(bin_filepath) / 1e6
     json_kb = os.path.getsize(json_filepath) / 1e3
     print(f"[VPS] Shard worker-{peer_idx} : {bin_mb:.1f} MB binaire + {json_kb:.1f} KB manifeste ({len(index)} params)")
-    return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}"
+    return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}{token_suffix}"
 
 
 def _selected_tensor_names(
@@ -2447,6 +2451,9 @@ def _save_shard_to_disk_from_safetensors(
     weight_map = dict(model_manifest["weight_map"])
     selected = _selected_tensor_names(model_config, weight_map, layer_start, layer_end, has_embedding, has_lm_head)
 
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    token_suffix = f"?token={secret_token}" if secret_token else ""
+
     if SHARD_TRANSFER_MODE not in ("packed", "bin", "binary"):
         api_base = _worker_shard_download_base_url()
         header_cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -2465,7 +2472,7 @@ def _save_shard_to_disk_from_safetensors(
             staged_files.add(staged_rel)
             nbytes = int(tensor_meta["nbytes"])
             total_bytes += nbytes
-            file_url = f"{api_base}/api/internal/shard-serve/{session_id}/sources/{quote(staged_rel, safe='/')}"
+            file_url = f"{api_base}/api/internal/shard-serve/{session_id}/sources/{quote(staged_rel, safe='/')}{token_suffix}"
             tensor_sources.append({
                 "name": dst_name,
                 "source_name": src_name,
@@ -2498,7 +2505,7 @@ def _save_shard_to_disk_from_safetensors(
             f"[VPS] Shard worker-{peer_idx} ranges : {total_bytes / 1e6:.1f} MB référencés "
             f"+ {json_kb:.1f} KB manifeste ({len(tensor_sources)} params, {len(staged_files)} fichiers source)"
         )
-        return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}"
+        return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}{token_suffix}"
 
     index = []
     offset = 0
@@ -2525,7 +2532,7 @@ def _save_shard_to_disk_from_safetensors(
             del tensor, arr, data
 
     api_base = _worker_shard_download_base_url()
-    bin_url = f"{api_base}/api/internal/shard-serve/{session_id}/{bin_filename}"
+    bin_url = f"{api_base}/api/internal/shard-serve/{session_id}/{bin_filename}{token_suffix}"
     manifest = {
         "session_id": session_id,
         "layer_start": layer_start,
@@ -2547,7 +2554,7 @@ def _save_shard_to_disk_from_safetensors(
         f"[VPS] Shard worker-{peer_idx} disque : {bin_mb:.1f} MB binaire + "
         f"{json_kb:.1f} KB manifeste ({len(index)} params)"
     )
-    return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}"
+    return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}{token_suffix}"
 
 
 def _prepared_gguf_session_dir() -> str:
@@ -2628,12 +2635,14 @@ def _save_shard_to_disk_from_prepared_gguf(
     with open(out_path, "w", encoding="utf-8") as fp:
         json.dump(out, fp, ensure_ascii=False)
     api_base = _worker_shard_download_base_url()
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    token_suffix = f"?token={secret_token}" if secret_token else ""
     print(
         f"[VPS] Shard GGUF préparé worker-{peer_idx}: peer={peer_id[:16]} "
         f"layers {layer_start}-{layer_end}, {int(out.get('binary_total_bytes') or 0) / 1e9:.2f}GB"
     )
     return (
-        f"{api_base}/api/internal/shard-serve/{session_id}/worker-{peer_idx}.json",
+        f"{api_base}/api/internal/shard-serve/{session_id}/worker-{peer_idx}.json{token_suffix}",
         layer_start,
         layer_end,
         has_embedding,
@@ -3554,6 +3563,11 @@ def _get_or_create_session(
             worker_info = catalog.get(peer) or {}
             safe_mb = _safe_weight_budget_mb(worker_info)
             required_mb = manifest_bytes / 1024 / 1024
+            quant = os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower()
+            if "q4" in quant or "4bit" in quant:
+                required_mb *= 0.28
+            elif "q8" in quant or "8bit" in quant:
+                required_mb *= 0.55
             if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb and not _prepared_gguf_session_dir():
                 capacity_errors.append({
                     "worker_index": i,
@@ -3563,7 +3577,7 @@ def _get_or_create_session(
                     "required_weight_mb": round(required_mb, 1),
                     "safe_weight_budget_mb": round(safe_mb, 1),
                     "allocated_vram_mb": _worker_memory_budget_mb(worker_info),
-                    "weight_quantization": os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16").lower(),
+                    "weight_quantization": quant,
                 })
             init_jobs.append((i, peer, ls, le, has_emb, has_head, download_url))
 
@@ -3814,7 +3828,31 @@ def _run_mlx_lm_direct_chat(
             },
             "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
         }
+    error_text2 = str(response.get("error") or "")
+    if error_text2.startswith("mlx_lm_direct_disabled") or error_text2.startswith("mlx_lm_no_mlx"):
+        # Worker has old firmware (shard-only mode) — skip and reroute to next peer
+        _mark_mlx_direct_peer_busy(peer, busy_sec=10.0)
+        remaining_peers = [p for p in peers if p != peer]
+        if remaining_peers:
+            rerouted = _run_mlx_lm_direct_chat(
+                prompt,
+                tokenizer,
+                prompt_token_count,
+                remaining_peers,
+                decode_cap,
+                requested_quantization,
+                pool_preference,
+                formatted_prompt=formatted_prompt,
+                options=options,
+                latency_matrix=latency_matrix,
+            )
+            if rerouted:
+                rerouted_trace = rerouted.setdefault("trace", {})
+                rerouted_trace["rerouted_after_disabled_peer"] = peer
+                rerouted_trace["disabled_peer_error"] = error_text2[:120]
+                return rerouted
     if response.get("ok") is False:
+
         return {
             "ok": False,
             "text": "",

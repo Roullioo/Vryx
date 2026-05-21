@@ -547,6 +547,8 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _requires_distributed_shards(model_id: str) -> bool:
+    if "Qwen3.6-35B" in model_id or model_id == "Qwen/Qwen3.6-35B-A3B":
+        return False
     if _env_truthy("VRYX_LLAMA_CPP_DIRECT"):
         return False
     return (
@@ -560,6 +562,8 @@ def _resolve_mlx_load_model_id(model_id: str, payload: dict[str, Any]) -> str:
     explicit = str(payload.get("load_model_id") or "").strip()
     if explicit:
         return explicit
+    if model_id == "Qwen/Qwen3.6-35B-A3B" or "Qwen3.6-35B" in model_id:
+        return "mlx-community/Qwen3.6-35B-A3B-4bit"
     env_model = os.environ.get("VRYX_MLX_LM_MODEL_ID", "").strip()
     if env_model and (env_model != model_id or ("70b" in model_id.lower())):
         return env_model

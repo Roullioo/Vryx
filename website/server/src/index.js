@@ -77,11 +77,10 @@ const WORKER_LIVE_SEC = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE
 const WORKER_RESERVATION_TTL_SEC = Math.max(30, Math.min(900, Number(process.env.WORKER_RESERVATION_TTL_SEC) || 180))
 const WORKER_HEALTH_MIN_FOR_SCHEDULER = Math.max(0, Math.min(100, Number(process.env.WORKER_HEALTH_MIN_FOR_SCHEDULER) || 35))
 const VRYX_TOKEN_STREAM_BATCH_MS = Math.max(0, Math.min(250, Number(process.env.VRYX_TOKEN_STREAM_BATCH_MS) || 35))
-const WORKER_UNSCHEDULABLE_RUNTIME_STATES = new Set(['loading', 'downloading', 'reserved', 'running', 'busy', 'failed'])
+const WORKER_UNSCHEDULABLE_RUNTIME_STATES = new Set(['loading', 'downloading', 'reserved', 'running', 'busy', 'failed', 'cooldown'])
 /** Adresses e-mail promues admin automatiquement à chaque démarrage. */
 const FORCED_ADMIN_EMAILS = (
-  process.env.ADMIN_EMAILS ||
-  'julientruffier.dev@gmail.com,baptiste.peru@gmail.com'
+  process.env.ADMIN_EMAILS || ''
 )
   .split(',')
   .map((s) => s.trim().toLowerCase())
@@ -110,14 +109,77 @@ const VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET = (() => {
 
 /** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
 let pipelineChatSessions = 0
-function pipelineChatBegin() {
+const activeUserChatSessions = new Set()
+
+function pipelineChatBegin(userId = null) {
   pipelineChatSessions += 1
+  if (userId) {
+    activeUserChatSessions.add(String(userId))
+  }
 }
-function pipelineChatEnd() {
+function pipelineChatEnd(userId = null) {
   pipelineChatSessions = Math.max(0, pipelineChatSessions - 1)
+  if (userId) {
+    activeUserChatSessions.delete(String(userId))
+  }
 }
 function isPipelineChatActive() {
   return pipelineChatSessions > 0
+}
+function isUserPipelineChatActive(userId) {
+  return userId ? activeUserChatSessions.has(String(userId)) : false
+}
+
+const WORKER_SECRET = process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET;
+
+function requireWorkerSecret(req, res, next) {
+  if (!WORKER_SECRET) {
+    return next()
+  }
+  const authHeader = req.headers['authorization'] || ''
+  let token = ''
+  if (authHeader.startsWith('Bearer ')) {
+    token = authHeader.substring(7)
+  } else {
+    token = req.query.token || req.headers['x-worker-token'] || ''
+  }
+  if (token !== WORKER_SECRET && process.env.ALLOW_UNSECURE_WORKERS !== '1') {
+    return res.status(401).json({ error: 'Unauthorized: Invalid worker secret token.' })
+  }
+  next()
+}
+
+function csrfProtection(req, res, next) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return next()
+  }
+  const origin = req.headers['origin']
+  const referer = req.headers['referer']
+  const host = req.get('host') || ''
+  const protocol = req.protocol || 'http'
+  const localUrl = `${protocol}://${host}`
+  const allowedOrigins = [
+    localUrl.toLowerCase(),
+    CORS_ORIGIN.toLowerCase(),
+    'https://vryx.eu',
+    'https://www.vryx.eu'
+  ].filter(Boolean)
+
+  if (origin) {
+    if (!allowedOrigins.some(allowed => origin.toLowerCase().startsWith(allowed))) {
+      return res.status(403).json({ error: 'CSRF Protection: Invalid request origin.' })
+    }
+  } else if (referer) {
+    if (!allowedOrigins.some(allowed => referer.toLowerCase().startsWith(allowed))) {
+      return res.status(403).json({ error: 'CSRF Protection: Invalid request referer.' })
+    }
+  } else {
+    const hasAuthCookie = req.cookies && req.cookies[COOKIE_NAME]
+    if (hasAuthCookie) {
+      return res.status(403).json({ error: 'CSRF Protection: Missing request origin or referer.' })
+    }
+  }
+  next()
 }
 
 const p2pTokenStreams = new Map()
@@ -781,7 +843,8 @@ async function discoverAvailableModels() {
             SUM(CASE WHEN TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :liveSec THEN 1 ELSE 0 END) AS workersOnline,
             MAX(last_heartbeat_at) AS lastSeenAt
      FROM workers
-     WHERE model IS NOT NULL AND model <> ''
+     WHERE mode = 'worker'
+       AND model IS NOT NULL AND model <> ''
      GROUP BY model
      ORDER BY workersOnline DESC, lastSeenAt DESC`,
     { liveSec: WORKER_LIVE_SEC },
@@ -1044,7 +1107,7 @@ async function loadSchedulerWorkers(modelId = null, options = {}) {
      FROM workers w
      WHERE w.mode = 'worker'
        AND w.desired_state = 'active'
-       AND COALESCE(w.runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed')
+       AND COALESCE(w.runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed','cooldown')
        AND COALESCE(w.last_command_status, '') NOT IN ('pending','delivered','pending_worker_offline')
        AND TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) <= :offline
      ORDER BY w.last_heartbeat_at DESC
@@ -1083,7 +1146,7 @@ async function reserveWorkersForJob({ modelId, loadMode = 'auto', createdBy = nu
        WHERE peer_id = :peerId
          AND desired_state = 'active'
          AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :liveSec
-         AND COALESCE(runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed')
+         AND COALESCE(runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed','cooldown')
          AND COALESCE(last_command_status, '') NOT IN ('pending','delivered','pending_worker_offline')
          AND (reserved_until IS NULL OR reserved_until < NOW() OR current_job_id = :jobId)`,
       { jobId, peerId: assignment.peerId, ttl: WORKER_RESERVATION_TTL_SEC, liveSec: WORKER_LIVE_SEC },
@@ -1450,7 +1513,7 @@ async function ensureWorkerCommandsTable() {
     CREATE TABLE IF NOT EXISTS worker_commands (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       peer_id VARCHAR(100) NOT NULL,
-      action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software') NOT NULL,
+      action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software','hot_reload_python') NOT NULL,
       payload_json JSON NULL,
       status ENUM('pending','delivered','acknowledged','failed','cancelled') NOT NULL DEFAULT 'pending',
       requested_by BIGINT UNSIGNED NULL,
@@ -1488,7 +1551,7 @@ async function ensureWorkerCommandsTable() {
   try {
     await pool.query(`
       ALTER TABLE worker_commands
-      MODIFY action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software') NOT NULL
+      MODIFY action ENUM('pause','resume','drain','stop','restart','set_model','set_memory','update_software','hot_reload_python') NOT NULL
     `)
   } catch {
     /* older MySQL variants may already be compatible */
@@ -1865,6 +1928,7 @@ app.use(
 )
 app.use(express.json({ limit: '8mb' }))
 app.use(cookieParser())
+app.use(csrfProtection)
 app.use(authMiddleware)
 registerObservabilityMiddleware(app, observability)
 
@@ -2670,6 +2734,8 @@ openAiRouter.post('/chat/completions', async (req, res) => {
       res.setHeader('X-Accel-Buffering', 'no')
       res.flushHeaders?.()
       let streamedText = ''
+      let streamedTokenCount = 0
+      let finalData = null
       const upstream = await fetch(`${VRYX_INITIATOR_CHAT_URL}/api/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
@@ -2698,33 +2764,74 @@ openAiRouter.post('/chat/completions', async (req, res) => {
           }
           if (evt.event === 'token' && typeof evt.token === 'string' && evt.token) {
             streamedText += evt.token
+            streamedTokenCount += 1
+            sendOpenAiSse(res, {
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model,
+              choices: [{ index: 0, delta: { content: evt.token }, finish_reason: null }],
+            })
+          } else if (evt.event === 'done' || evt.done) {
+            let doneData = {}
+            if (evt && typeof evt.json === 'string' && evt.json.trim()) {
+              try {
+                doneData = JSON.parse(evt.json)
+              } catch {
+                doneData = {}
+              }
+            } else if (evt && evt.json && typeof evt.json === 'object') {
+              doneData = evt.json
+            }
+            finalData = doneData
           } else if (evt.event === 'error' || evt.error) {
             sendOpenAiSse(res, { error: { message: String(evt.error || 'Erreur Vryx'), type: 'server_error' } })
           }
         }
       }
+      if (buffer.trim()) {
+        try {
+          const evt = JSON.parse(buffer.trim())
+          if (evt.event === 'done' || evt.done) {
+            let doneData = {}
+            if (evt && typeof evt.json === 'string' && evt.json.trim()) {
+              try {
+                doneData = JSON.parse(evt.json)
+              } catch {
+                doneData = {}
+              }
+            } else if (evt && evt.json && typeof evt.json === 'object') {
+              doneData = evt.json
+            }
+            finalData = doneData
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      const promptEstTokens = Math.max(1, Math.round(prompt.length / 4))
+      const promptTokens = Number(finalData?.prompt_tokens || promptEstTokens)
+      const completionTokens = Number(finalData?.completion_tokens || streamedTokenCount)
+      const totalTokens = Number(finalData?.total_tokens || (promptTokens + completionTokens))
+      await recordApiKeyUsage(req, {
+        model,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        latencyMs: Date.now() - created * 1000,
+      }).catch(err => console.error('Error recording API key usage for stream:', err))
       const toolCall = synthesizeToolCallFromText(streamedText, tools)
       if (toolCall) {
         for (const chunk of openAiToolCallChunk({ id, created, model, toolCall })) sendOpenAiSse(res, chunk)
-        res.write('data: [DONE]\n\n')
-        return res.end()
-      }
-      if (streamedText) {
+      } else {
         sendOpenAiSse(res, {
           id,
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: { content: streamedText }, finish_reason: null }],
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
         })
       }
-      sendOpenAiSse(res, {
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      })
       res.write('data: [DONE]\n\n')
       return res.end()
     }
@@ -2919,21 +3026,31 @@ app.post('/api/auth/desktop-callback', authLimiter, async (req, res) => {
   }
 })
 
+function sanitizeNextPath(next) {
+  if (typeof next !== 'string') return '/'
+  const cleaned = next.trim()
+  if (cleaned.startsWith('/') && !cleaned.startsWith('//') && !cleaned.includes('://')) {
+    return cleaned
+  }
+  return '/'
+}
+
 app.get('/api/auth/google/start', (req, res) => {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
     return res.status(501).send('Connexion Google non configurée sur le serveur.')
   }
-  const state = Buffer.from(JSON.stringify({
+  const nextParam = sanitizeNextPath(req.query.next)
+  const stateToken = jwt.sign({
     desktop: req.query.desktop === '1',
-    next: typeof req.query.next === 'string' ? req.query.next : '/',
-  })).toString('base64url')
+    next: nextParam,
+  }, JWT_SECRET, { expiresIn: '15m' })
   const redirectUri = getGoogleRedirectUri(req)
   const url = new URL('https://accounts.google.com/o/oauth2/v2/auth')
   url.searchParams.set('client_id', GOOGLE_CLIENT_ID)
   url.searchParams.set('redirect_uri', redirectUri)
   url.searchParams.set('response_type', 'code')
   url.searchParams.set('scope', 'openid email profile')
-  url.searchParams.set('state', state)
+  url.searchParams.set('state', stateToken)
   url.searchParams.set('prompt', 'select_account')
   res.redirect(url.toString())
 })
@@ -2941,9 +3058,25 @@ app.get('/api/auth/google/start', (req, res) => {
 function parseGoogleState(rawState) {
   let state = { desktop: false, next: '/' }
   try {
-    state = JSON.parse(Buffer.from(String(rawState || ''), 'base64url').toString('utf8'))
+    const decoded = jwt.verify(rawState, JWT_SECRET)
+    if (decoded && typeof decoded === 'object') {
+      state = {
+        desktop: Boolean(decoded.desktop),
+        next: sanitizeNextPath(decoded.next),
+      }
+    }
   } catch {
-    /* ignore */
+    try {
+      const parsed = JSON.parse(Buffer.from(String(rawState || ''), 'base64url').toString('utf8'))
+      if (parsed && typeof parsed === 'object') {
+        state = {
+          desktop: parsed.desktop === '1' || parsed.desktop === true,
+          next: sanitizeNextPath(parsed.next),
+        }
+      }
+    } catch {
+      /* ignore */
+    }
   }
   return state && typeof state === 'object' ? state : { desktop: false, next: '/' }
 }
@@ -3518,7 +3651,7 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
     if (typeof res.flush === 'function') res.flush()
   }
 
-  if (isPipelineChatActive()) {
+  if (isUserPipelineChatActive(req.user.id)) {
     send({ error: 'Une génération P2P est déjà en cours. Attendez la fin du stream actuel.', retryable: true })
     return res.end()
   }
@@ -3603,7 +3736,7 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
     return evt && typeof evt === 'object' ? evt : {}
   }
 
-  pipelineChatBegin()
+  pipelineChatBegin(req.user.id)
   try {
     send({ stage: 'queued', status: 'Connexion au pipeline P2P...' })
     const tokenStreamCallbackUrl =
@@ -3709,7 +3842,7 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
     clearTimeout(timer)
     clearInterval(keepAlive)
     p2pTokenStreams.delete(streamId)
-    pipelineChatEnd()
+    pipelineChatEnd(req.user.id)
     res.end()
   }
 })
@@ -4107,7 +4240,7 @@ const adminWorkerPingLimiter = rateLimit({
   message: { error: 'Trop de mesures de latence. Réessayez dans une minute.' },
 })
 
-app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
+app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (req, res) => {
   const parsed = heartbeatBodySchema.safeParse(req.body)
   if (!parsed.success) {
     const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
@@ -4323,6 +4456,7 @@ app.post('/api/workers/heartbeat', workerLimiter, async (req, res) => {
       mode === 'worker' &&
       release?.version &&
       version &&
+      process.env.ALLOW_UNSECURE_WORKERS !== '1' &&
       compareVersionLike(version, release.version) < 0
     ) {
       const [existingUpdate] = await pool.query(
@@ -5030,12 +5164,13 @@ adminRouter.get('/workers/registered', async (req, res) => {
 })
 
 const workerActionBodySchema = z.object({
-  action: z.enum(['pause', 'resume', 'drain', 'stop', 'restart', 'set_model', 'set_memory', 'update_software']),
+  action: z.enum(['pause', 'resume', 'drain', 'stop', 'restart', 'set_model', 'set_memory', 'update_software', 'hot_reload_python']),
   model: z.string().min(1).max(140).optional(),
   loadMode: z.enum(['auto', 'full', 'shard']).optional(),
   quantization: z.string().min(1).max(20).optional(),
   allocatedVramMb: z.number().int().min(256).max(262144).optional(),
   memoryPercent: z.number().int().min(1).max(100).optional(),
+  files: z.array(z.string().min(1).max(80)).max(10).optional(),
 })
 
 adminRouter.post('/workers/:peerId/actions', async (req, res) => {
@@ -5043,7 +5178,7 @@ adminRouter.post('/workers/:peerId/actions', async (req, res) => {
   const parsed = workerActionBodySchema.safeParse(req.body || {})
   if (!peerId) return res.status(400).json({ ok: false, error: 'peerId requis.' })
   if (!parsed.success) return res.status(400).json({ ok: false, error: 'Action worker invalide.' })
-  const { action, model, loadMode, quantization, allocatedVramMb, memoryPercent } = parsed.data
+  const { action, model, loadMode, quantization, allocatedVramMb, memoryPercent, files } = parsed.data
   if (action === 'set_model' && !model) {
     return res.status(400).json({ ok: false, error: 'Modèle requis.' })
   }
@@ -5074,6 +5209,7 @@ adminRouter.post('/workers/:peerId/actions', async (req, res) => {
       quantization: action === 'set_model' ? quantization || 'q4' : null,
       allocatedVramMb: allocatedVramMb ?? null,
       memoryPercent: memoryPercent ?? null,
+      files: action === 'hot_reload_python' ? (files ?? ['shard_runtime', 'distributed_llm_orchestrator']) : null,
       requestedBy: req.user.id,
       previous: {
         desiredModel: currentWorker.desiredModel ?? null,
@@ -5936,7 +6072,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`)
     if (typeof res.flush === 'function') res.flush()
   }
-  if (isPipelineChatActive()) {
+  if (isUserPipelineChatActive(req.user.id)) {
     await recordInferenceRequestLog(buildInferenceLog({
       requestId,
       userId: req.user.id,
@@ -6022,7 +6158,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     clearInterval(keepAliveInterval)
     ctrl.abort()
   })
-  pipelineChatBegin()
+  pipelineChatBegin(req.user.id)
   const readNativeDonePayload = (evt) => {
     let doneData = {}
     if (evt && typeof evt.json === 'string' && evt.json.trim()) {
@@ -6656,7 +6792,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     clearInterval(keepAliveInterval)
     p2pTokenStreams.delete(streamId)
     if (reservation.jobId) await releaseWorkerReservation(reservation.jobId, chatSucceeded ? 'released' : 'failed').catch(() => {})
-    pipelineChatEnd()
+    pipelineChatEnd(req.user.id)
   }
   res.end()
 })
@@ -6766,7 +6902,7 @@ app.use('/api/admin', adminRouter)
  * Les workers téléchargent leurs couches directement depuis le VPS via HTTPS, sans passer par le relay P2P.
  * Accessible uniquement depuis localhost (Python VPS).
  */
-app.use('/api/internal/shard-serve', express.static(process.env.VRYX_SHARD_BASE_DIR || '/var/lib/vryx-shards', {
+app.use('/api/internal/shard-serve', requireWorkerSecret, express.static(process.env.VRYX_SHARD_BASE_DIR || '/var/lib/vryx-shards', {
   dotfiles: 'deny',
   maxAge: 0,
   setHeaders(res, filePath) {

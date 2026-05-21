@@ -839,7 +839,16 @@ async fn send_heartbeat(
     payload: &HeartbeatPayload,
 ) {
     let url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
-    match client.post(&url).json(payload).send().await {
+    let token = std::env::var("VRYX_WORKER_SECRET")
+        .or_else(|_| std::env::var("WORKER_INFERENCE_DELEGATE_SECRET"))
+        .unwrap_or_default();
+    
+    let mut req = client.post(&url).json(payload);
+    if !token.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+
+    match req.send().await {
         Ok(r) if r.status().is_success() => {
             match r.json::<serde_json::Value>().await {
                 Ok(body) => {
@@ -850,6 +859,81 @@ async fn send_heartbeat(
                             "command": command,
                         });
                         println!("[VRYX_REMOTE_COMMAND] {}", event);
+
+                        let action = command
+                            .get("action")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let cmd_id = command
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        match action.as_str() {
+                            "restart" => {
+                                println!(
+                                    "[VRYX_REMOTE_COMMAND] Action=restart (cmd={}) → exit(0) pour redémarrage superviseur.",
+                                    cmd_id
+                                );
+                                // Envoyer un ACK avant de quitter pour que la BDD enregistre la livraison
+                                let ack_url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
+                                let ack_payload = serde_json::json!({
+                                    "peer_id": payload.peer_id,
+                                    "mode": payload.mode,
+                                    "command_ack": { "id": cmd_id, "status": "acknowledged" }
+                                });
+                                let _ = client.post(&ack_url).json(&ack_payload).send().await;
+                                std::process::exit(0);
+                            }
+                            "hot_reload_python" => {
+                                // Le payload peut contenir { files: ["shard_runtime", "distributed_llm_orchestrator"] }
+                                let files: Vec<String> = command
+                                    .get("payload")
+                                    .and_then(|p| p.get("files"))
+                                    .and_then(|f| f.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+
+                                // Chercher le grpc_port à partir de VRYX_GRPC_PORT ou variable d'environnement
+                                let grpc_port_env = std::env::var("VRYX_GRPC_PORT")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u16>().ok())
+                                    .unwrap_or(50052);
+                                let admin_port = grpc_port_env + 1;
+                                let reload_url = format!("http://127.0.0.1:{}/internal/hot-reload-python", admin_port);
+                                let reload_body = serde_json::json!({
+                                    "files": files,
+                                    "command_id": cmd_id,
+                                });
+                                println!(
+                                    "[VRYX_REMOTE_COMMAND] Action=hot_reload_python (cmd={}) → POST {}",
+                                    cmd_id, reload_url
+                                );
+                                match client.post(&reload_url).json(&reload_body).timeout(
+                                    std::time::Duration::from_secs(15)
+                                ).send().await {
+                                    Ok(resp) => {
+                                        let status = resp.status();
+                                        let body_text = resp.text().await.unwrap_or_default();
+                                        println!("[VRYX_REMOTE_COMMAND] hot_reload_python → HTTP {} : {}", status, body_text);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[VRYX_REMOTE_COMMAND] hot_reload_python POST échec : {}", e);
+                                    }
+                                }
+                            }
+                            _ => {
+                                if !action.is_empty() {
+                                    println!("[VRYX_REMOTE_COMMAND] Action={} (cmd={}) non gérée côté daemon.", action, cmd_id);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(_) => println!("[*] Heartbeat OK → {}", url),
@@ -863,6 +947,7 @@ async fn send_heartbeat(
         }
     }
 }
+
 
 /// Initiateur : lit `/api/workers/status`, enregistre les workers et relance un dial relay.
 /// Évite la course avec le ticker heartbeat (~30 s) quand `/api/chat` arrive juste après le démarrage.

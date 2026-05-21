@@ -730,6 +730,89 @@ def _handle_legacy_shard(dtype: str, raw: bytes, session_id: str):
 
 # ── Serve ──────────────────────────────────────────────────────────────────────
 
+import importlib
+import http.server
+import socketserver
+
+
+class _HotReloadHandler(http.server.BaseHTTPRequestHandler):
+    """Gestionnaire HTTP minimaliste pour les endpoints admin internes du worker."""
+
+    log_message = lambda self, fmt, *args: None  # silence les logs HTTP
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200, {"ok": True, "server": "vryx-worker-admin"})
+        else:
+            self._respond(404, {"ok": False, "error": "endpoint inconnu"})
+
+    def do_POST(self):
+        if self.path == "/internal/hot-reload-python":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+            except Exception:
+                payload = {}
+
+            files_requested = payload.get("files") or []
+            reloaded = []
+            errors = []
+
+            # Modules à rechargement prioritaire
+            modules_map = {
+                "shard_runtime": shard_runtime,
+                "distributed_llm_orchestrator": distributed_llm_orchestrator,
+            }
+            targets = (
+                [m for m in files_requested if m in modules_map]
+                if files_requested
+                else list(modules_map.keys())
+            )
+
+            for name in targets:
+                mod = modules_map.get(name)
+                if mod is None:
+                    errors.append(f"{name}: module non trouvé")
+                    continue
+                try:
+                    importlib.reload(mod)
+                    reloaded.append(name)
+                    print(f"[HOT_RELOAD] Module rechargé : {name}")
+                except Exception as exc:
+                    errors.append(f"{name}: {exc}")
+                    print(f"[HOT_RELOAD] Erreur rechargement {name} : {exc}")
+
+            result = {
+                "ok": len(errors) == 0,
+                "reloaded": reloaded,
+                "errors": errors,
+                "command_id": payload.get("command_id"),
+            }
+            self._respond(200 if result["ok"] else 500, result)
+        else:
+            self._respond(404, {"ok": False, "error": "endpoint inconnu"})
+
+    def _respond(self, code: int, data: dict) -> None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _start_admin_http_server(admin_port: int) -> None:
+    """Lance le serveur HTTP admin dans un thread daemon (non bloquant)."""
+    def _run():
+        with socketserver.TCPServer(("127.0.0.1", admin_port), _HotReloadHandler) as httpd:
+            httpd.allow_reuse_address = True
+            print(f"[*] Admin HTTP worker sur http://127.0.0.1:{admin_port} (hot-reload, health)")
+            httpd.serve_forever()
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 async def serve(port: int, stage: int):
     # Limite 1 GB pour les transferts de poids de modèle (Pipeline Parallelism).
     _1GB = 1 * 1024 * 1024 * 1024
@@ -743,6 +826,12 @@ async def serve(port: int, stage: int):
         server,
     )
     server.add_insecure_port(f"[::]:{port}")
+
+    # Pour les workers (stage 2), démarrer le serveur HTTP admin pour le hot-reload.
+    if stage == 2:
+        admin_port = port + 1
+        _start_admin_http_server(admin_port)
+
     await server.start()
     await server.wait_for_termination()
 
@@ -760,3 +849,4 @@ if __name__ == "__main__":
     if args.model:
         os.environ["VRYX_WORKER_MODEL"] = args.model
     asyncio.run(serve(args.port, args.stage))
+
