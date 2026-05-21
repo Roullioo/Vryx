@@ -1072,16 +1072,6 @@ function validateConfig(config, hardware) {
   };
 }
 
-function killPortUnix(port) {
-  if (process.platform === 'win32') return;
-  try {
-    const p = spawn('bash', ['-lc', `lsof -ti:${Number(port)} | xargs kill -9 2>/dev/null || true`]);
-    p.unref();
-  } catch {
-    /* ignore */
-  }
-}
-
 function killPortUnixSync(port) {
   if (process.platform === 'win32') return;
   const safePort = Number(port);

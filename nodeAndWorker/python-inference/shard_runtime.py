@@ -2557,7 +2557,7 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
             accepted_token_count = 1
             speculative_available = False
             print(f"[shard] lm_head {sid[:12]}… step={step} → token={next_token_id} ({compute_ms}ms)")
-            return json.dumps({
+            response = {
                 "ok": True,
                 "next_token_id": next_token_id,
                 "candidate_token_ids": candidate_token_ids,
@@ -2574,8 +2574,11 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
                 "attention_backend": getattr(model, "vryx_attention_backend", "unknown"),
                 "hidden_quic": bool(payload.get("hidden_quic", getattr(shard, "hidden_quic", HIDDEN_QUIC))),
                 "quic_used": False,
-                "debug_top_logits": _debug_top_logits_torch(logits),
-            }).encode()
+            }
+            debug_top_logits = _debug_top_logits_torch(logits)
+            if debug_top_logits:
+                response["debug_top_logits"] = debug_top_logits
+            return json.dumps(response).encode()
         else:
             # Worker intermédiaire : q4/int8 par requête, avec int8 comme chemin stable.
             transport = str(payload.get("hidden_transport") or getattr(shard, "hidden_transport", HIDDEN_TRANSPORT)).lower()

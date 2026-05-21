@@ -274,6 +274,13 @@ fn env_f64_positive(name: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+fn tensor_yamux_config() -> yamux::Config {
+    let mut config = yamux::Config::default();
+    #[allow(deprecated)]
+    config.set_receive_window_size(10 * 1024 * 1024);
+    config
+}
+
 fn heartbeat_allocated_vram_mb(gpu_vram_mb: Option<u64>) -> (Option<u64>, Option<u8>) {
     let limit_from_gb = env_f64_positive("VRYX_WORKER_MEMORY_LIMIT_GB")
         .map(|gb| (gb * 1024.0).round() as u64)
@@ -1117,28 +1124,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_tcp(
             tcp::Config::default(),
             noise::Config::new,
-            || {
-                let mut config = yamux::Config::default();
-                config.set_receive_window_size(10 * 1024 * 1024);
-                config
-            }
+            tensor_yamux_config,
         )?
         .with_quic()
         .with_dns()?
         .with_relay_client(
             noise::Config::new,
-            || {
-                let mut config = yamux::Config::default();
-                config.set_receive_window_size(10 * 1024 * 1024);
-                config
-            }
+            tensor_yamux_config,
         )?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = key.public().to_peer_id();
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
-            let mut rr_config = request_response::Config::default();
             let p2p_request_timeout_s = env_u64_clamped("VRYX_P2P_REQUEST_TIMEOUT_S", 3600, 30, 7200);
-            rr_config.set_request_timeout(Duration::from_secs(p2p_request_timeout_s));
+            let rr_config = request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(p2p_request_timeout_s));
             // Codec personnalisé 512 MB pour le transfert de tranches de poids LLM.
             let request_response = request_response::Behaviour::with_codec(
                 vryx_codec::Codec::<TensorRequest, TensorResponse>::default(),
@@ -1162,7 +1161,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 config.max_circuits = 1000;
                 config.max_circuit_duration = Duration::from_secs(3600);
                 config.max_circuit_bytes = 1024 * 1024 * 1024; // 1 GB
-                // Désactivation des rate limiters pour debug
                 config.reservation_rate_limiters = vec![];
                 config.circuit_src_rate_limiters = vec![];
                 Some(libp2p::relay::Behaviour::new(peer_id, config))

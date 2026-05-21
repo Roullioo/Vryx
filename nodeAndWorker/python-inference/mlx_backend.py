@@ -857,7 +857,7 @@ class MLXBackend:
                 f"[mlx] lm_head {sid[:12]}… step={step} greedy_micro={want_micro_extra} "
                 f"tokens_batch={n_acc} total_ms≈{compute_ms} first_tok={next_token_id}",
             )
-            return json.dumps({
+            response = {
                 "ok": True,
                 "next_token_id": candidate_tokens[-1],
                 "candidate_token_ids": candidate_tokens,
@@ -877,8 +877,11 @@ class MLXBackend:
                 "attention_backend": "mlx_metal",
                 "linear_scan_backend": self.scan_backend_effective,
                 "runtime_backend": "mlx",
-                "debug_top_logits": _debug_top_logits_mx(mx, logits),
-            }).encode()
+            }
+            debug_top_logits = _debug_top_logits_mx(mx, logits)
+            if debug_top_logits:
+                response["debug_top_logits"] = debug_top_logits
+            return json.dumps(response).encode()
         else:
             if request_id != "default":
                 self._request_states[request_id] = {
