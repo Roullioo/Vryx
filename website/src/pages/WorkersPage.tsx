@@ -860,7 +860,7 @@ export function WorkersPage() {
               { step: '01', title: 'Déclaration', body: 'Le worker enregistre son hardware, son backend, sa VRAM et son heartbeat.' },
               { step: '02', title: 'Sélection', body: 'Le scheduler réserve des workers compatibles avec le modèle et le mode demandé.' },
               { step: '03', title: 'Run', body: 'Le pipeline exécute les fragments utiles et renvoie les métriques de latence et TPS.' },
-              { step: '04', title: 'Ledger', body: 'Les tokens générés alimentent les preuves réseau et le futur payout worker.' },
+              { step: '04', title: 'Ledger', body: 'Les tokens et le prix réel de la requête alimentent le payout worker.' },
             ].map((row) => (
               <li
                 key={row.step}

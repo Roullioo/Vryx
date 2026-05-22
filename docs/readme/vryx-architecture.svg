@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+  <title id="title">Vryx architecture map</title>
+  <desc id="desc">A layered technical architecture diagram for Vryx: users, web app, API, database, Rust daemon, Python inference runtime, workers and observability.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#edf6f9"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#dbeafe"/>
+      <stop offset="1" stop-color="#e0f2fe"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ccfbf1"/>
+      <stop offset="1" stop-color="#ecfccb"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fef3c7"/>
+      <stop offset="1" stop-color="#ffedd5"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+    <style>
+      .title { font-family: Inter, Arial, sans-serif; font-weight: 800; font-size: 42px; fill: #0f172a; letter-spacing: 0; }
+      .subtitle { font-family: Inter, Arial, sans-serif; font-weight: 500; font-size: 18px; fill: #475569; }
+      .lane { fill: #ffffff; stroke: #d8e2ea; stroke-width: 1.3; }
+      .box { stroke: #cbd5e1; stroke-width: 1.4; }
+      .h { font-family: Inter, Arial, sans-serif; font-weight: 800; font-size: 18px; fill: #0f172a; }
+      .p { font-family: Inter, Arial, sans-serif; font-weight: 500; font-size: 14px; fill: #475569; }
+      .tag { font-family: Inter, Arial, sans-serif; font-weight: 700; font-size: 12px; fill: #0f766e; letter-spacing: 0.05em; }
+      .arrow { fill: none; stroke: #64748b; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowhead); }
+      .arrowHot { fill: none; stroke: url(#ink); stroke-width: 3.2; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowheadHot); }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowheadHot" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="760" rx="24" fill="#f8fafc"/>
+  <text class="title" x="72" y="76">Architecture Vryx</text>
+  <text class="subtitle" x="72" y="108">Un control plane web, un réseau libp2p, des workers GPU et une boucle de preuve en production.</text>
+
+  <rect class="lane" x="56" y="148" width="1168" height="132" rx="20"/>
+  <text class="tag" x="82" y="181">EXPERIENCE</text>
+  <rect class="box" x="92" y="202" width="224" height="52" rx="14" fill="#dbeafe"/>
+  <text class="h" x="116" y="231">Developers</text>
+  <text class="p" x="116" y="249">API compatible OpenAI</text>
+  <rect class="box" x="386" y="202" width="224" height="52" rx="14" fill="#dbeafe"/>
+  <text class="h" x="410" y="231">Dashboard Admin</text>
+  <text class="p" x="410" y="249">readiness, workers, pricing</text>
+  <rect class="box" x="680" y="202" width="224" height="52" rx="14" fill="#dbeafe"/>
+  <text class="h" x="704" y="231">App Worker</text>
+  <text class="p" x="704" y="249">Electron + runtime local</text>
+  <rect class="box" x="974" y="202" width="204" height="52" rx="14" fill="#dbeafe"/>
+  <text class="h" x="998" y="231">Enterprise</text>
+  <text class="p" x="998" y="249">quotes, pilots, LOI</text>
+
+  <rect class="lane" x="56" y="312" width="1168" height="170" rx="20"/>
+  <text class="tag" x="82" y="345">CONTROL PLANE</text>
+  <rect class="box" x="92" y="368" width="246" height="78" rx="16" fill="#ffffff"/>
+  <text class="h" x="118" y="397">React + Vite</text>
+  <text class="p" x="118" y="419">site, pages publiques, panel</text>
+  <rect class="box" x="406" y="368" width="258" height="78" rx="16" fill="#ffffff"/>
+  <text class="h" x="432" y="397">API Express</text>
+  <text class="p" x="432" y="419">auth, billing, admin, proxy</text>
+  <rect class="box" x="732" y="368" width="208" height="78" rx="16" fill="#ffffff"/>
+  <text class="h" x="758" y="397">MariaDB</text>
+  <text class="p" x="758" y="419">users, workers, usage</text>
+  <rect class="box" x="1002" y="368" width="176" height="78" rx="16" fill="#ffffff"/>
+  <text class="h" x="1028" y="397">PM2 + Nginx</text>
+  <text class="p" x="1028" y="419">VPS production</text>
+
+  <rect class="lane" x="56" y="514" width="1168" height="170" rx="20"/>
+  <text class="tag" x="82" y="547">COMPUTE PLANE</text>
+  <rect class="box" x="92" y="570" width="260" height="78" rx="16" fill="#ccfbf1"/>
+  <text class="h" x="118" y="599">Daemon Rust</text>
+  <text class="p" x="118" y="621">libp2p TCP/QUIC + Axum</text>
+  <rect class="box" x="420" y="570" width="260" height="78" rx="16" fill="#ccfbf1"/>
+  <text class="h" x="446" y="599">Python gRPC</text>
+  <text class="p" x="446" y="621">orchestrateur + shard runtime</text>
+  <rect class="box" x="748" y="570" width="196" height="78" rx="16" fill="#fef3c7"/>
+  <text class="h" x="774" y="599">Worker GPU</text>
+  <text class="p" x="774" y="621">MLX / llama / vLLM</text>
+  <rect class="box" x="1002" y="570" width="176" height="78" rx="16" fill="#fef3c7"/>
+  <text class="h" x="1028" y="599">Bench CI</text>
+  <text class="p" x="1028" y="621">proof + score 24h</text>
+
+  <path class="arrowHot" d="M316 228 C342 228 360 228 386 228"/>
+  <path class="arrow" d="M610 228 C636 228 654 228 680 228"/>
+  <path class="arrow" d="M904 228 C930 228 948 228 974 228"/>
+  <path class="arrowHot" d="M338 407 C362 407 382 407 406 407"/>
+  <path class="arrow" d="M664 407 C688 407 708 407 732 407"/>
+  <path class="arrow" d="M940 407 C964 407 980 407 1002 407"/>
+  <path class="arrowHot" d="M535 446 C502 494 414 522 352 592"/>
+  <path class="arrowHot" d="M352 609 C376 609 396 609 420 609"/>
+  <path class="arrowHot" d="M680 609 C704 609 724 609 748 609"/>
+  <path class="arrow" d="M944 609 C968 609 986 609 1002 609"/>
+  <path class="arrow" d="M836 570 C828 516 828 488 836 446"/>
+
+  <g transform="translate(84 700)">
+    <circle cx="10" cy="10" r="7" fill="#0f766e"/>
+      <text class="p" x="28" y="15">Chemin chaud : requête API vers orchestration et workers.</text>
+    <circle cx="440" cy="10" r="7" fill="#64748b"/>
+    <text class="p" x="458" y="15">Boucles de contrôle : admin, logs, readiness, facturation.</text>
+  </g>
+</svg>

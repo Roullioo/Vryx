@@ -21,6 +21,8 @@ Angle investisseur : le coeur technique existe ; la levee finance l'industrialis
 - Service `vryx-golden-path-proof-100.service` pour preuve 100 requetes.
 - Workflow CI `Investor CI`.
 - Workflow release worker `Worker Release Build`.
+- All credentials used during investor-readiness testing were rotated after validation.
+- Redis/Valkey is used as a speed, coordination and job layer while MariaDB remains the source of truth for users, credits, pricing, usage, payouts and audits.
 
 ## Metrics a exposer en pitch
 

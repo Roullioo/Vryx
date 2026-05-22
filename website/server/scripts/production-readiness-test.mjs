@@ -40,4 +40,36 @@ assert.ok(weak.score < 50)
 assert.ok(weak.blockers.some((item) => item.includes('Aucun worker live')))
 assert.ok(weak.blockers.some((item) => item.includes('réponse')))
 
+const benchmarkBacked = scoreProductionReadiness({
+  workers: [
+    {
+      secondsSinceHeartbeat: 3,
+      model: 'Qwen/Qwen3.6-35B-A3B',
+      runtimeBackend: 'mlx_lm',
+      weightQuantization: 'q4',
+      supportsQ4Weights: true,
+      capabilitiesJson: { network: { routeMode: 'direct_tcp' } },
+    },
+  ],
+  inferenceRows: [
+    { status: 'failed', error: 'no_stable_worker_reservation', latencyMs: 6, ttftMs: 0, decodeTps: 0, totalTokens: 0 },
+    { status: 'failed', error: 'no_stable_worker_reservation', latencyMs: 5, ttftMs: 0, decodeTps: 0, totalTokens: 0 },
+  ],
+  inferenceSummary: summarizeInferenceRows([
+    { status: 'failed', error: 'no_stable_worker_reservation', latencyMs: 6, ttftMs: 0, decodeTps: 0, totalTokens: 0 },
+    { status: 'failed', error: 'no_stable_worker_reservation', latencyMs: 5, ttftMs: 0, decodeTps: 0, totalTokens: 0 },
+  ]),
+  benchmarkRows: [
+    { status: 'ok', tps: 66, ttftMs: 650, latencyMs: 7000 },
+    { status: 'ok', tps: 70, ttftMs: 700, latencyMs: 6500 },
+    { status: 'ok', tps: 69, ttftMs: 900, latencyMs: 6200 },
+    { status: 'failed', tps: 0, ttftMs: 0, latencyMs: 900 },
+  ],
+})
+
+assert.equal(benchmarkBacked.score, 100)
+assert.equal(benchmarkBacked.metrics.requestCount, 4)
+assert.equal(benchmarkBacked.metrics.validBenchmarks, 3)
+assert.deepEqual(benchmarkBacked.blockers, [])
+
 console.log('production-readiness-test: ok')

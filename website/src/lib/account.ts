@@ -69,7 +69,29 @@ export type BillingLedgerEntry = {
   description: string
   referenceType: string | null
   referenceId: string | null
+  pricing?: {
+    billingMode?: string
+    rates?: {
+      inputEurPerMillion?: number
+      outputEurPerMillion?: number
+      blendedEurPerMillion?: number
+    }
+    inputCostEur?: number
+    outputCostEur?: number
+    volumeDiscountPercent?: number
+  } | null
   createdAt: string | null
+}
+
+export type BillingInvoice = {
+  provider: string
+  providerSessionId: string | null
+  amountEur: number
+  currency: string
+  status: string
+  checkoutUrl: string | null
+  createdAt: string | null
+  updatedAt: string | null
 }
 
 export type AccountBilling = {
@@ -83,8 +105,18 @@ export type AccountBilling = {
     requestCount: number
     totalTokens: number
     costEur: number
+    averageEurPerMillion: number | null
   }
   ledger: BillingLedgerEntry[]
+  invoices?: BillingInvoice[]
+  pricing?: {
+    published: boolean
+    minInputEurPerMillion: number | null
+    minOutputEurPerMillion: number | null
+    eurPerMillionTokens: number | null
+    workerRewardSharePercent: number
+    volumeDiscounts: { minMonthlyMillions: number; discountPercent: number }[]
+  }
 }
 
 export type AccountSessionSummary = {

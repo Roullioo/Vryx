@@ -20,6 +20,8 @@ type RegisteredWorker = {
   tokensGenerated: number
   tokensGenerated1h?: number
   tokensGenerated24h?: number
+  payoutPendingEur?: number
+  payout24hEur?: number
   tokensIn: number
   tokensOut: number
   model: string | null
@@ -1338,6 +1340,7 @@ export function AdminWorkerDetailPage() {
             { label: 'Tokens générés', value: fmt(worker.tokensGenerated) },
             { label: 'Tokens in', value: fmt(worker.tokensIn) },
             { label: 'Tokens out', value: fmt(worker.tokensOut) },
+            { label: 'Payout pending', value: `${Number(worker.payoutPendingEur || 0).toFixed(4)} €` },
           ].map((s) => (
             <div key={s.label} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
               <p className="text-xs text-muted">{s.label}</p>

@@ -1,0 +1,24 @@
+services:
+  valkey:
+    image: valkey/valkey:9.1.0-alpine
+    container_name: vryx-valkey
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - valkey-data:/data
+
+volumes:
+  valkey-data:

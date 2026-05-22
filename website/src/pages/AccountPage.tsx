@@ -1486,7 +1486,11 @@ export function AccountPage() {
               <div className="grid gap-5 lg:grid-cols-3">
                 <Kpi title="Solde crédits" value={`${money(billing?.balanceEur ?? overview?.balanceCredits ?? 0)} €`} detail={billing?.enforceCredits ? 'Blocage actif si solde insuffisant' : 'Débit actif, blocage désactivé'} tone="emerald" />
                 <Kpi title="Usage API mois" value={`${money(billing?.monthUsage.costEur ?? 0, 6)} €`} detail={`${compact(billing?.monthUsage.totalTokens ?? 0)} tokens API`} tone="violet" />
-                <Kpi title="Coût moyen" value={`${money(eurPerMillion, 4)} €`} detail="Par million de tokens" />
+                <Kpi
+                  title="Coût moyen"
+                  value={`${money(billing?.monthUsage.averageEurPerMillion ?? billing?.pricing?.eurPerMillionTokens ?? eurPerMillion, 4)} €`}
+                  detail={billing?.pricing?.published === false ? 'Tarif privé / sur devis' : 'Par million de tokens'}
+                />
               </div>
               <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,26rem)]">
                 <Panel className="p-5">
@@ -1516,7 +1520,14 @@ export function AccountPage() {
                   </div>
                   <div className="mt-5 grid gap-3 sm:grid-cols-3">
                     <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Projection</p><p className="mt-1 font-mono font-semibold">{money(estimatedMonthly)} € / mois</p></div>
-                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Rewards workers</p><p className="mt-1 font-mono font-semibold">{money(investor?.estimatedWorkerRewardsEur ?? 0, 6)} €</p></div>
+                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6">
+                      <p className="text-xs text-muted">Prix actuel</p>
+                      <p className="mt-1 font-mono font-semibold">
+                        {billing?.pricing?.minInputEurPerMillion != null && billing?.pricing?.minOutputEurPerMillion != null
+                          ? `${money(billing.pricing.minInputEurPerMillion, 4)} / ${money(billing.pricing.minOutputEurPerMillion, 4)} €/M`
+                          : 'Sur devis'}
+                      </p>
+                    </div>
                     <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Marge estimée</p><p className="mt-1 font-mono font-semibold">{money(investor?.estimatedGrossMarginPercent ?? 0, 0)}%</p></div>
                   </div>
                 </Panel>
@@ -1535,7 +1546,12 @@ export function AccountPage() {
                               {entry.amountEur >= 0 ? '+' : ''}{money(entry.amountEur, 6)} €
                             </span>
                           </div>
-                          <p className="mt-1 text-xs text-muted">{dateTime(entry.createdAt)} · {entry.type}</p>
+                          <p className="mt-1 text-xs text-muted">
+                            {dateTime(entry.createdAt)} · {entry.type}
+                            {entry.pricing?.rates?.inputEurPerMillion != null && entry.pricing?.rates?.outputEurPerMillion != null
+                              ? ` · ${money(entry.pricing.rates.inputEurPerMillion, 4)}/${money(entry.pricing.rates.outputEurPerMillion, 4)} €/M`
+                              : ''}
+                          </p>
                         </div>
                       ))
                     ) : (
@@ -1544,6 +1560,25 @@ export function AccountPage() {
                   </div>
                 </Panel>
               </div>
+              {billing?.invoices?.length ? (
+                <Panel className="mt-5 p-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-semibold text-fg">Paiements et factures Stripe</p>
+                    <span className="rounded-full bg-surface px-2.5 py-1 text-xs font-semibold text-muted">{billing.invoices.length}</span>
+                  </div>
+                  <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                    {billing.invoices.slice(0, 6).map((invoice) => (
+                      <div key={`${invoice.provider}:${invoice.providerSessionId}`} className="rounded-2xl bg-black/5 p-4 dark:bg-white/6">
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="font-mono text-xs text-muted">{invoice.providerSessionId || invoice.provider}</p>
+                          <p className="font-mono text-sm font-semibold text-fg">{money(invoice.amountEur, 2)} €</p>
+                        </div>
+                        <p className="mt-1 text-xs text-muted">{dateTime(invoice.createdAt)} · {invoice.status}</p>
+                      </div>
+                    ))}
+                  </div>
+                </Panel>
+              ) : null}
             </section>
           ) : null}
 

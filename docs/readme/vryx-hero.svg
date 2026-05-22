@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" role="img" aria-labelledby="title desc">
+  <title id="title">Vryx distributed inference network</title>
+  <desc id="desc">A stylized map of the Vryx network with developers, API, orchestrator, workers, observability and billing.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="0.52" stop-color="#0b1d2a"/>
+      <stop offset="1" stop-color="#12131f"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#122739"/>
+      <stop offset="1" stop-color="#152033"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="0.5" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+    <style>
+      .small { font-family: Inter, Arial, sans-serif; font-weight: 500; font-size: 17px; fill: #b8c7d9; }
+      .label { font-family: Inter, Arial, sans-serif; font-weight: 700; font-size: 18px; fill: #f8fafc; }
+      .tiny { font-family: Inter, Arial, sans-serif; font-weight: 600; font-size: 13px; fill: #8ea3b8; letter-spacing: 0.04em; }
+      .hero { font-family: Inter, Arial, sans-serif; font-weight: 800; font-size: 70px; fill: #f8fafc; letter-spacing: 0; }
+      .sub { font-family: Inter, Arial, sans-serif; font-weight: 500; font-size: 24px; fill: #cbd5e1; }
+      .line { stroke: #2dd4bf; stroke-width: 2.2; stroke-linecap: round; opacity: 0.45; }
+      .line2 { stroke: #60a5fa; stroke-width: 2.2; stroke-linecap: round; opacity: 0.5; }
+      .node { fill: #0f2233; stroke: #35536a; stroke-width: 1.5; }
+      .core { fill: url(#panel); stroke: #6ee7d8; stroke-width: 2; }
+      .chip { fill: #0f1b2d; stroke: #2f475d; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="520" rx="28" fill="url(#bg)"/>
+  <path d="M0 382 C170 280 260 436 430 334 C600 232 702 310 856 220 C1016 126 1104 180 1280 78 L1280 520 L0 520 Z" fill="#0d2530" opacity="0.58"/>
+  <path d="M0 432 C190 330 294 474 466 370 C620 276 780 388 934 274 C1078 166 1144 214 1280 138" fill="none" stroke="url(#accent)" stroke-width="2" opacity="0.42"/>
+
+  <g transform="translate(72 72)">
+    <text class="tiny" x="0" y="0">VRYX NETWORK</text>
+    <text class="hero" x="0" y="82">Inference</text>
+    <text class="hero" x="0" y="158">distribuée.</text>
+    <text class="sub" x="2" y="214">API OpenAI-compatible, workers desktop,</text>
+    <text class="sub" x="2" y="250">orchestration P2P et preuves live.</text>
+  </g>
+
+  <g transform="translate(522 64)" filter="url(#soft)">
+    <rect class="core" x="152" y="134" width="220" height="130" rx="18"/>
+    <text class="tiny" x="184" y="175">CONTROL PLANE</text>
+    <text class="label" x="184" y="208">API + Orchestrateur</text>
+    <text class="small" x="184" y="236">Express, Rust, Python/gRPC</text>
+
+    <g>
+      <line class="line" x1="262" y1="134" x2="150" y2="70"/>
+      <line class="line" x1="152" y1="198" x2="38" y2="198"/>
+      <line class="line" x1="260" y1="264" x2="136" y2="356"/>
+      <line class="line2" x1="372" y1="172" x2="520" y2="102"/>
+      <line class="line2" x1="372" y1="224" x2="520" y2="274"/>
+      <line class="line2" x1="372" y1="246" x2="494" y2="378"/>
+    </g>
+
+    <g transform="translate(0 36)">
+      <rect class="node" x="0" y="0" width="150" height="74" rx="15"/>
+      <circle cx="34" cy="37" r="17" fill="#2dd4bf"/>
+      <path d="M28 37 h12 M34 31 v12" stroke="#06221f" stroke-width="4" stroke-linecap="round"/>
+      <text class="label" x="64" y="32">Developers</text>
+      <text class="small" x="64" y="55">API requests</text>
+    </g>
+
+    <g transform="translate(0 161)">
+      <rect class="node" x="0" y="0" width="150" height="74" rx="15"/>
+      <circle cx="34" cy="37" r="17" fill="#60a5fa"/>
+      <path d="M25 37 h18 M34 28 v18" stroke="#071827" stroke-width="4" stroke-linecap="round"/>
+      <text class="label" x="64" y="32">Admin</text>
+      <text class="small" x="64" y="55">readiness live</text>
+    </g>
+
+    <g transform="translate(0 324)">
+      <rect class="node" x="0" y="0" width="170" height="74" rx="15"/>
+      <circle cx="34" cy="37" r="17" fill="#f59e0b"/>
+      <path d="M26 39 c10 -16 18 -16 26 0" fill="none" stroke="#261805" stroke-width="4" stroke-linecap="round"/>
+      <text class="label" x="64" y="32">Billing</text>
+      <text class="small" x="64" y="55">crédits + payout</text>
+    </g>
+
+    <g transform="translate(520 60)">
+      <rect class="node" x="0" y="0" width="176" height="76" rx="16"/>
+      <rect x="24" y="20" width="29" height="36" rx="6" fill="#2dd4bf"/>
+      <rect x="61" y="12" width="29" height="44" rx="6" fill="#60a5fa"/>
+      <text class="label" x="108" y="32">Worker A</text>
+      <text class="small" x="108" y="56">M4 Max Q4</text>
+    </g>
+
+    <g transform="translate(520 235)">
+      <rect class="node" x="0" y="0" width="176" height="76" rx="16"/>
+      <rect x="24" y="20" width="29" height="36" rx="6" fill="#2dd4bf"/>
+      <rect x="61" y="12" width="29" height="44" rx="6" fill="#60a5fa"/>
+      <text class="label" x="108" y="32">Worker B</text>
+      <text class="small" x="108" y="56">GPU / MLX</text>
+    </g>
+
+    <g transform="translate(494 356)">
+      <rect class="node" x="0" y="0" width="202" height="76" rx="16"/>
+      <circle cx="38" cy="38" r="20" fill="#f59e0b"/>
+      <path d="M27 39 h22" stroke="#221404" stroke-width="4" stroke-linecap="round"/>
+      <text class="label" x="74" y="32">Proof loop</text>
+      <text class="small" x="74" y="56">bench CI + logs</text>
+    </g>
+  </g>
+
+  <g transform="translate(74 464)">
+    <rect class="chip" x="0" y="0" width="172" height="42" rx="21"/>
+    <text class="small" x="24" y="27">libp2p network</text>
+    <rect class="chip" x="190" y="0" width="186" height="42" rx="21"/>
+    <text class="small" x="214" y="27">OpenAI API shape</text>
+    <rect class="chip" x="394" y="0" width="160" height="42" rx="21"/>
+    <text class="small" x="418" y="27">Stripe ready</text>
+  </g>
+</svg>

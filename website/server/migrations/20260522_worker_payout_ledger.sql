@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS worker_payout_ledger (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  peer_id VARCHAR(100) NOT NULL,
+  api_key_usage_id BIGINT UNSIGNED NULL,
+  user_id BIGINT UNSIGNED NULL,
+  model VARCHAR(120) NULL,
+  prompt_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  completion_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  total_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  customer_cost_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+  worker_share_percent DECIMAL(6,3) NOT NULL DEFAULT 0,
+  payout_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+  currency CHAR(3) NOT NULL DEFAULT 'EUR',
+  pricing_snapshot_json LONGTEXT NULL,
+  status ENUM('pending','payable','paid','void') NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_worker_payout_peer_time (peer_id, created_at),
+  KEY idx_worker_payout_usage (api_key_usage_id),
+  KEY idx_worker_payout_status (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

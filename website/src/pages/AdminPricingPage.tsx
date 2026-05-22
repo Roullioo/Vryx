@@ -56,6 +56,16 @@ function formatDate(value: string | null | undefined) {
   return new Date(value).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' })
 }
 
+function availabilityLabel(value: string | null | undefined) {
+  switch (value) {
+    case 'available': return 'Disponible'
+    case 'limited': return 'Limité'
+    case 'reservation': return 'Sur réservation'
+    case 'unavailable': return 'Indisponible'
+    default: return 'Non défini'
+  }
+}
+
 export function AdminPricingPage() {
   const { t } = useTranslation('admin')
   const [tab, setTab] = useState<TabId>('general')
@@ -303,7 +313,7 @@ export function AdminPricingPage() {
                       <div className="flex flex-wrap gap-1.5">
                         <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${model.isPublic ? 'bg-accent/10 text-accent' : 'bg-border text-muted'}`}>{model.isPublic ? 'Public' : 'Privé'}</span>
                         <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${model.isActive ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>{model.isActive ? 'Actif' : 'Inactif'}</span>
-                        <span className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase text-muted">{model.availabilityStatus || 'available'}</span>
+                        <span className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase text-muted">{availabilityLabel(model.availabilityStatus)}</span>
                       </div>
                     </td>
                     <td className="px-4 py-3 text-xs text-muted">
