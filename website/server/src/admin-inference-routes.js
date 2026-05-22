@@ -1,5 +1,6 @@
 import { summarizeInferenceRows } from './inference-metrics.js'
 import { scoreProductionReadiness } from './production-readiness.js'
+import { getJsonCache, setJsonCache } from './cache.js'
 
 function parseMaybeJsonObject(value) {
   if (!value) return null
@@ -79,6 +80,9 @@ export function registerAdminInferenceRoutes(adminRouter, { pool }) {
         .filter(Boolean)
       const minDecodeTps = Math.max(1, Math.min(200, Number(req.query.min_tps || process.env.VRYX_GOLDEN_MIN_TPS) || 10))
       const maxTtftP95Ms = Math.max(500, Math.min(120_000, Number(req.query.max_ttft_p95_ms || process.env.VRYX_GOLDEN_MAX_TTFT_P95_MS) || 10_000))
+      const cacheKey = `admin:production-readiness:v1:${hours}:${goldenModels.join(',')}:${minDecodeTps}:${maxTtftP95Ms}`
+      const cached = await getJsonCache(cacheKey)
+      if (cached) return res.json(cached)
       const [workerRows, inferenceRows, benchmarkRows] = await Promise.all([
         pool.query(
           `SELECT peer_id AS peerId, model, desired_model AS desiredModel, runtime_backend AS runtimeBackend,
@@ -126,12 +130,14 @@ export function registerAdminInferenceRoutes(adminRouter, { pool }) {
         minDecodeTps,
         maxTtftP95Ms,
       })
-      res.json({
+      const payload = {
         ok: true,
         sampledAt: new Date().toISOString(),
         windowHours: hours,
         readiness,
-      })
+      }
+      await setJsonCache(cacheKey, payload, 10)
+      res.json(payload)
     } catch (e) {
       console.error('admin/production-readiness', e)
       res.status(500).json({ ok: false, error: 'Erreur score production readiness.' })

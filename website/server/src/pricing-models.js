@@ -6,6 +6,7 @@ import {
   splitLegacyBlendedPrice,
   validatePricingFloor,
 } from './pricing-engine.js'
+import { getJsonCache, setJsonCache, delCache } from './cache.js'
 
 const DEFAULT_VOLUME_DISCOUNTS = [
   { minMonthlyMillions: 100, discountPercent: 5 },
@@ -558,14 +559,24 @@ export function invalidatePricingCache() {
   pricingCacheUntil = 0
   tiersCache = null
   tiersCacheUntil = 0
+  delCache('pricing:*').catch((e) => console.warn('[redis] pricing cache invalidation skipped', e?.message || e))
 }
 
 export async function getPricingTiers(pool, { force = false } = {}) {
   const now = Date.now()
   if (!force && tiersCache && tiersCacheUntil > now) return tiersCache
+  if (!force) {
+    const cached = await getJsonCache('pricing:tiers:v1')
+    if (cached) {
+      tiersCache = cached
+      tiersCacheUntil = now + 30_000
+      return tiersCache
+    }
+  }
   const [rows] = await pool.query('SELECT * FROM pricing_tiers ORDER BY sort_order ASC')
   tiersCache = rows.map(tierRowToDto)
   tiersCacheUntil = now + 30_000
+  await setJsonCache('pricing:tiers:v1', tiersCache, 60)
   return tiersCache
 }
 
@@ -607,6 +618,14 @@ export async function getAllFineTuningPlans(pool) {
 export async function getPricingConfig(pool, fallbackEnv, { force = false } = {}) {
   const now = Date.now()
   if (!force && pricingCache && pricingCacheUntil > now) return pricingCache
+  if (!force) {
+    const cached = await getJsonCache('pricing:config:v1')
+    if (cached) {
+      pricingCache = cached
+      pricingCacheUntil = now + 30_000
+      return pricingCache
+    }
+  }
   const [rows] = await pool.query(`
     SELECT c.*, u.email AS updated_by_email
     FROM pricing_config c
@@ -616,6 +635,7 @@ export async function getPricingConfig(pool, fallbackEnv, { force = false } = {}
   `)
   pricingCache = pricingRowToDto(rows[0], fallbackEnv)
   pricingCacheUntil = now + 30_000
+  await setJsonCache('pricing:config:v1', pricingCache, 60)
   return pricingCache
 }
 

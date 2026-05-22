@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { summarizeInferenceRows } from './inference-metrics.js'
 import { scoreProductionReadiness } from './production-readiness.js'
+import { getJsonCache, setJsonCache } from './cache.js'
 
 function toIsoDate(value) {
   if (!value) return null
@@ -128,6 +129,10 @@ export function registerPublicStatusRoutes(app, options) {
   app.get('/api/public/network-status', async (req, res) => {
     try {
       const requestedModel = typeof req.query.model === 'string' ? req.query.model.trim().toLowerCase() : ''
+      const exposeWorkerDetails = process.env.VRYX_PUBLIC_EXPOSE_WORKER_DETAILS === '1'
+      const cacheKey = `public:network-status:v1:${requestedModel || 'all'}:${exposeWorkerDetails ? 'details' : 'redacted'}`
+      const cached = await getJsonCache(cacheKey)
+      if (cached) return res.json(cached)
       const [workerRows, ledgerRows, sessionRows, apiRows, models] = await Promise.all([
         pool.query(
           `SELECT peer_id AS peerId, mode, model, gpu_name AS gpuName,
@@ -181,7 +186,6 @@ export function registerPublicStatusRoutes(app, options) {
         : Number(eurPerMillion)
       const effectiveWorkerRewardShare = Number(pricingConfig?.workerRewardSharePercent ?? workerRewardSharePercent)
 
-      const exposeWorkerDetails = process.env.VRYX_PUBLIC_EXPOSE_WORKER_DETAILS === '1'
       const workers = (workerRows[0] || []).map((row, index) => {
         const secondsSinceHeartbeat = toNumber(row.secondsSinceHeartbeat, 999999)
         const online = secondsSinceHeartbeat <= workerOfflineSec
@@ -280,7 +284,7 @@ export function registerPublicStatusRoutes(app, options) {
         }
       })
 
-      return res.json({
+      const payload = {
         ok: true,
         sampledAt: new Date().toISOString(),
         publicExposure: exposeWorkerDetails ? 'worker_details_enabled' : 'redacted',
@@ -350,7 +354,9 @@ export function registerPublicStatusRoutes(app, options) {
           }
           return out
         }),
-      })
+      }
+      await setJsonCache(cacheKey, payload, 5)
+      return res.json(payload)
     } catch (error) {
       console.error('public/network-status', error)
       return res.status(500).json({ ok: false, error: 'Impossible de charger le status réseau.' })
@@ -360,6 +366,9 @@ export function registerPublicStatusRoutes(app, options) {
   app.get('/api/public/golden-path-status', async (req, res) => {
     try {
       const hours = Math.max(1, Math.min(168, Number(req.query.hours) || 24))
+      const cacheKey = `public:golden-path-status:v1:${hours}`
+      const cached = await getJsonCache(cacheKey)
+      if (cached) return res.json(cached)
       const goldenModels = String(process.env.VRYX_GOLDEN_PATH_MODELS || 'gemma4:31b,qwen/qwen3.6-35b-a3b,qwen3.6-35b')
         .split(',')
         .map((value) => value.trim())
@@ -459,7 +468,7 @@ export function registerPublicStatusRoutes(app, options) {
         }
       })
       const proof100 = benchmarkEvidence.find((item) => item.ok) || null
-      return res.json({
+      const payload = {
         ok: true,
         sampledAt: new Date().toISOString(),
         windowHours: hours,
@@ -495,7 +504,9 @@ export function registerPublicStatusRoutes(app, options) {
           routeMode: worker.routeMode,
           directReady: worker.directReady,
         })),
-      })
+      }
+      await setJsonCache(cacheKey, payload, 10)
+      return res.json(payload)
     } catch (error) {
       console.error('public/golden-path-status', error)
       return res.status(500).json({ ok: false, error: 'Impossible de charger le golden path status.' })

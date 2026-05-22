@@ -19,6 +19,9 @@ import { createObservability, registerObservabilityMiddleware, registerObservabi
 import { registerPublicStatusRoutes } from './public-status.js'
 import { buildInferenceLog } from './inference-metrics.js'
 import { registerAdminInferenceRoutes } from './admin-inference-routes.js'
+import { initRedis, isRedisReady, isRedisRequiredInProd } from './redis-client.js'
+import { setJsonCache } from './cache.js'
+import { claimIdempotencyKey, clearIdempotencyKey } from './idempotency.js'
 import { computeRequestCost, computeBlendedPrice, resolveWorkerPayout } from './pricing-engine.js'
 import {
   ensurePricingAndModelCatalogTables,
@@ -4965,8 +4968,14 @@ function verifyStripeWebhookSignature(req) {
 app.post('/api/billing/stripe/webhook', async (req, res) => {
   if (!STRIPE_SECRET_KEY) return res.status(501).json({ ok: false, error: 'Stripe non configuré.' })
   if (!verifyStripeWebhookSignature(req)) return res.status(400).json({ ok: false, error: 'Signature Stripe invalide.' })
+  let stripeIdempotencyKey = ''
   try {
     const eventId = typeof req.body?.id === 'string' ? req.body.id : ''
+    if (eventId) {
+      stripeIdempotencyKey = `stripe:${eventId}`
+      const replay = await claimIdempotencyKey(stripeIdempotencyKey, 7 * 24 * 60 * 60)
+      if (!replay.claimed) return res.json({ ok: true, replay: true, eventId })
+    }
     let event = req.body
     if (eventId) {
       const stripeRes = await fetch(`https://api.stripe.com/v1/events/${encodeURIComponent(eventId)}`, {
@@ -5038,6 +5047,9 @@ app.post('/api/billing/stripe/webhook', async (req, res) => {
       conn.release()
     }
   } catch (e) {
+    if (stripeIdempotencyKey) {
+      await clearIdempotencyKey(stripeIdempotencyKey).catch(() => {})
+    }
     console.error('billing/stripe/webhook', e)
     res.status(500).json({ ok: false, error: 'Webhook billing impossible.' })
   }
@@ -5606,6 +5618,20 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
       supportsMlx: supports_mlx,
       supportsVllm: supports_vllm,
     })
+    setJsonCache(`worker:live:${peer_id}`, {
+      peerId: peer_id,
+      mode,
+      model: normalizedModel,
+      runtimeBackend: normalizedRuntimeBackend,
+      weightQuantization: normalizedWeightQuantization,
+      supportsQ4Weights: normalizedSupportsQ4,
+      p2pPeers: p2p_peers ?? 0,
+      directReady: Boolean(machine_info?.network?.directReady || machine_info?.connectivity?.directReady),
+      routeMode: machine_info?.network?.routeMode || machine_info?.connectivity?.routeMode || 'unknown',
+      healthScore: healthSnapshot.score,
+      runtimeState: heartbeatRuntimeState,
+      lastHeartbeatAt: new Date().toISOString(),
+    }, 90).catch((e) => console.warn('[redis] worker live cache skipped', e?.message || e))
 
     await pool.query(
       `INSERT INTO workers (peer_id, mode, grpc_port, p2p_port, public_ip, version, p2p_peers, tokens_generated,
@@ -9001,6 +9027,10 @@ app.get('/api/internal/live-peers', async (req, res) => {
 async function start() {
   console.log('Attente de la base de données…')
   await waitForDatabase()
+  await initRedis()
+  if (IS_PRODUCTION && isRedisRequiredInProd() && !isRedisReady()) {
+    throw new Error('Redis required in production but not ready.')
+  }
   await ensureTable()
   await ensureWorkersTable()
   await ensureWorkerReservationsTable()
