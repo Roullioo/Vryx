@@ -156,22 +156,16 @@ export function ModelsPanelPage() {
   return (
     <div className="bg-bg min-h-[calc(100svh-4.25rem)] pb-8 sm:pb-10 lg:pb-12">
       <section
-        className="relative isolate -mt-[4.25rem] flex min-h-[min(86vh,38rem)] flex-col overflow-hidden border-b border-border pt-[4.25rem] sm:min-h-[min(88vh,42rem)]"
+        className="page-hero"
         aria-labelledby="models-hero-heading"
       >
-        <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-          aria-hidden
-        >
+        <div className="page-hero-media-shell" aria-hidden>
           <div
-            className="absolute inset-0 scale-105 bg-cover bg-center bg-no-repeat blur-[3px]"
-            style={{ backgroundImage: "url('/brain.png')" }}
+            className="page-hero-media blur-[3px]"
+            style={{ backgroundImage: "url('/heroes/home-hero.webp')" }}
           />
         </div>
-        <div
-          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
-          aria-hidden
-        />
+        <div className="page-hero-overlay" aria-hidden />
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-8 text-center sm:pb-16 sm:pt-10">
           <motion.div
             initial={{ opacity: 0, y: 14 }}

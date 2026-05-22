@@ -1,14 +1,37 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { CLIENT_PYTHON_SNIPPET } from '../../data/clientsContent'
 
 /** Fond terminal sombre : les couleurs d’accent syntaxe restent lisibles (thème type Dracula). */
-export function ClientPythonSnippet({ className = '' }: { className?: string }) {
+export function ClientPythonSnippet({
+  className = '',
+  apiBaseUrl,
+  model,
+}: {
+  className?: string
+  apiBaseUrl: string
+  model: string
+}) {
   const [copied, setCopied] = useState(false)
+  const pythonSnippet = useMemo(() => {
+    return `from openai import OpenAI
+
+client = OpenAI(
+    base_url="${apiBaseUrl}",
+    api_key="vel_...",
+)
+
+response = client.chat.completions.create(
+    model="${model}",
+    messages=[...]
+)
+
+# C'est tout.
+print(response.choices[0].message.content)`
+  }, [apiBaseUrl, model])
 
   async function handleCopy() {
     try {
-      await navigator.clipboard.writeText(CLIENT_PYTHON_SNIPPET)
+      await navigator.clipboard.writeText(pythonSnippet)
       setCopied(true)
       window.setTimeout(() => setCopied(false), 2200)
     } catch {
@@ -60,7 +83,7 @@ export function ClientPythonSnippet({ className = '' }: { className?: string }) 
           {'\n'}
           {'    '}
           <span className="text-[#8be9fd]">base_url</span>=
-          <span className="text-[#f1fa8c]">&quot;https://api.vryx-ai.eu/v1&quot;</span>,{'\n'}
+          <span className="text-[#f1fa8c]">&quot;{apiBaseUrl}&quot;</span>,{'\n'}
           {'    '}
           <span className="text-[#8be9fd]">api_key</span>=<span className="text-[#f1fa8c]">&quot;vel_...&quot;</span>,{'\n'}
           ){'\n\n'}
@@ -69,7 +92,7 @@ export function ClientPythonSnippet({ className = '' }: { className?: string }) 
           <span className="text-[#50fa7b]">create</span>(
           {'\n'}
           {'    '}
-          <span className="text-[#8be9fd]">model</span>=<span className="text-[#f1fa8c]">&quot;vryx-llama-70b&quot;</span>,{'\n'}
+          <span className="text-[#8be9fd]">model</span>=<span className="text-[#f1fa8c]">&quot;{model}&quot;</span>,{'\n'}
           {'    '}
           <span className="text-[#8be9fd]">messages</span>=[...]{'\n'}
           ){'\n\n'}

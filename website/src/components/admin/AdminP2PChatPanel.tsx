@@ -534,7 +534,7 @@ export function AdminP2PChatPanel({
                       worker: label,
                       latencyMs: data.latencyMs ?? 0,
                       pingMs: data.pingMs ?? 0,
-                      mode: data.mode || 'Pipeline P2P natif',
+                      mode: data.mode || 'Pipeline distribué',
                       tokensIn: data.tokensIn ?? data.worker?.tokensIn,
                       tokensOut: data.tokensOut ?? data.worker?.tokensOut,
                       promptTokens: data.promptTokens,
@@ -678,9 +678,9 @@ export function AdminP2PChatPanel({
         <div className="grid grid-cols-2 gap-1 sm:grid-cols-4">
           {[
             { id: 'auto' as const, short: 'Auto', title: 'Auto', desc: 'Vryx si saine, sinon legacy.' },
-            { id: 'velocity_mlx' as const, short: 'MLX', title: 'Vryx MLX', desc: 'Pool Mac optimisée.' },
-            { id: 'velocity_vllm' as const, short: 'vLLM', title: 'Vryx vLLM', desc: 'Pool Nvidia PagedAttention.' },
-            { id: 'legacy_pytorch' as const, short: 'PyTorch', title: 'Legacy PyTorch', desc: 'Chemin stable actuel.' },
+            { id: 'velocity_mlx' as const, short: 'Mac', title: 'Pool Mac', desc: 'Machines Apple optimisées.' },
+            { id: 'velocity_vllm' as const, short: 'Nvidia', title: 'Pool GPU', desc: 'Machines Nvidia optimisées.' },
+            { id: 'legacy_pytorch' as const, short: 'Stable', title: 'Pool stable', desc: 'Chemin de compatibilité actuel.' },
           ].map((item) => {
             const selected = poolPreference === item.id
             return (
@@ -792,7 +792,7 @@ export function AdminP2PChatPanel({
               Zone de dialogue
             </h3>
             <p className="mt-1 text-[11px] leading-snug text-muted sm:text-xs">
-              Initiateur Rust · SSE · chaîne <span className="font-mono text-fg/85">initiator_sequential</span>
+              Initiateur Rust · SSE · chaîne <span className="font-medium text-fg/85">séquentielle</span>
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
@@ -894,7 +894,7 @@ export function AdminP2PChatPanel({
                 Premier message
               </p>
               <p className="text-sm leading-relaxed text-zinc-600 dark:text-zinc-300">
-                Le texte traverse le réseau P2P natif (gRPC). Réglez le budget de tokens ci-dessus si besoin, puis
+                Le texte traverse le réseau distribué. Réglez le budget de tokens ci-dessus si besoin, puis
                 écrivez votre consigne.
               </p>
             </div>
@@ -1082,7 +1082,7 @@ export function AdminP2PChatPanel({
                     {(m.trace.routingPath?.length ?? 0) > 0 && (
                       <div className="flex justify-between">
                         <span className="text-muted">Chaîne de relais</span>
-                        <span className="text-fg">{m.trace.routingPath?.length} nœud(s) · Daisy Chain</span>
+                        <span className="text-fg">{m.trace.routingPath?.length} nœud(s) · relais séquentiel</span>
                       </div>
                     )}
                     {(m.trace.schedulerWorkersUsed ?? 0) > 0 && (
@@ -1159,7 +1159,7 @@ export function AdminP2PChatPanel({
                         <div className="flex justify-between">
                           <span className="text-muted">Ports</span>
                           <span className="text-fg">
-                            gRPC {m.trace.workerInfo.grpcPort || '—'} / P2P {m.trace.workerInfo.p2pPort || '—'}
+                            interne {m.trace.workerInfo.grpcPort || '—'} / direct {m.trace.workerInfo.p2pPort || '—'}
                           </span>
                         </div>
                         <div className="flex justify-between">

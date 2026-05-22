@@ -153,6 +153,7 @@ function pricingRowToDto(row, fallbackEnv) {
     eurPerMillionTokens: published ? blendedLegacy : null,
     updatedAt: row?.updated_at ?? null,
     updatedByUserId: row?.updated_by_user_id ?? null,
+    updatedByEmail: row?.updated_by_email ?? null,
   }
 }
 
@@ -188,6 +189,9 @@ function privatePoolPlanToDto(row) {
     tokenDiscountPercent: clampPercent(row.token_discount_percent, 30),
     isPublic: Boolean(row.is_public),
     sortOrder: Number(row.sort_order || 0),
+    updatedAt: row.updated_at ?? null,
+    updatedByUserId: row.updated_by_user_id ?? null,
+    updatedByEmail: row.updated_by_email ?? null,
   }
 }
 
@@ -270,7 +274,22 @@ function normalizeModelRow(row, globalConfig, tierMap) {
     requiredWorkers: Number(row.required_workers || 1),
     sortOrder: Number(row.sort_order || 0),
     updatedAt: row.updated_at ?? null,
+    updatedByUserId: row.updated_by_user_id ?? null,
+    updatedByEmail: row.updated_by_email ?? null,
   }
+}
+
+async function writePricingAudit(pool, entityType, entityId, beforeValue, afterValue, userId = null) {
+  await pool.query(`
+    INSERT INTO pricing_config_audit (entity_type, entity_id, before_json, after_json, updated_by_user_id)
+    VALUES (:entityType, :entityId, :beforeJson, :afterJson, :userId)
+  `, {
+    entityType,
+    entityId,
+    beforeJson: beforeValue == null ? null : JSON.stringify(beforeValue),
+    afterJson: afterValue == null ? null : JSON.stringify(afterValue),
+    userId,
+  })
 }
 
 export async function ensurePricingAndModelCatalogTables(pool, fallbackEnv) {
@@ -383,6 +402,8 @@ export async function ensurePricingAndModelCatalogTables(pool, fallbackEnv) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
 
+  await ensureColumn(pool, 'private_pool_plans', 'updated_by_user_id', 'BIGINT UNSIGNED NULL')
+
   for (const [slug, name, monthlyEur, workerMin, workerMax, discount, sortOrder] of PRIVATE_POOL_PLAN_SEED) {
     await pool.query(`
       INSERT INTO private_pool_plans (slug, name, monthly_eur, worker_count_min, worker_count_max, token_discount_percent, is_public, sort_order)
@@ -472,6 +493,7 @@ export async function ensurePricingAndModelCatalogTables(pool, fallbackEnv) {
     ['min_vryx_margin_percent', 'DECIMAL(6,3) NULL'],
     ['availability_status', "VARCHAR(24) NOT NULL DEFAULT 'available'"],
     ['api_alias', 'VARCHAR(120) NULL'],
+    ['updated_by_user_id', 'BIGINT UNSIGNED NULL'],
   ]
   for (const [col, def] of modelColumns) {
     await ensureColumn(pool, 'model_catalog', col, def)
@@ -568,7 +590,12 @@ export async function getAllSubscriptionPlans(pool) {
 }
 
 export async function getAllPrivatePoolPlans(pool) {
-  const [rows] = await pool.query('SELECT * FROM private_pool_plans ORDER BY sort_order ASC')
+  const [rows] = await pool.query(`
+    SELECT p.*, u.email AS updated_by_email
+    FROM private_pool_plans p
+    LEFT JOIN users u ON u.id = p.updated_by_user_id
+    ORDER BY p.sort_order ASC
+  `)
   return rows.map(privatePoolPlanToDto)
 }
 
@@ -580,7 +607,13 @@ export async function getAllFineTuningPlans(pool) {
 export async function getPricingConfig(pool, fallbackEnv, { force = false } = {}) {
   const now = Date.now()
   if (!force && pricingCache && pricingCacheUntil > now) return pricingCache
-  const [rows] = await pool.query('SELECT * FROM pricing_config WHERE id = 1 LIMIT 1')
+  const [rows] = await pool.query(`
+    SELECT c.*, u.email AS updated_by_email
+    FROM pricing_config c
+    LEFT JOIN users u ON u.id = c.updated_by_user_id
+    WHERE c.id = 1
+    LIMIT 1
+  `)
   pricingCache = pricingRowToDto(rows[0], fallbackEnv)
   pricingCacheUntil = now + 30_000
   return pricingCache
@@ -599,6 +632,27 @@ export async function getPublicPricingBundle(pool, fallbackEnv) {
     getFineTuningPlans(pool),
   ])
   return { pricing, tiers, subscriptionPlans, privatePoolPlans, fineTuningPlans }
+}
+
+export async function getPricingAudit(pool, { limit = 80 } = {}) {
+  const safeLimit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 80)))
+  const [rows] = await pool.query(`
+    SELECT a.*, u.email AS updated_by_email
+    FROM pricing_config_audit a
+    LEFT JOIN users u ON u.id = a.updated_by_user_id
+    ORDER BY a.created_at DESC
+    LIMIT ${safeLimit}
+  `)
+  return rows.map((row) => ({
+    id: Number(row.id),
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    before: row.before_json ? JSON.parse(row.before_json) : null,
+    after: row.after_json ? JSON.parse(row.after_json) : null,
+    updatedByUserId: row.updated_by_user_id ?? null,
+    updatedByEmail: row.updated_by_email ?? null,
+    createdAt: row.created_at,
+  }))
 }
 
 async function buildTierMap(pool) {
@@ -621,14 +675,17 @@ export async function resolveModelPricingByKey(pool, fallbackEnv, modelKey, bill
   return { ...normalized, billingMode }
 }
 
-export async function getPublicModels(pool, fallbackEnv, { includeInactive = false, includePrivate = false } = {}) {
+export async function getPublicModels(pool, fallbackEnv, { includeInactive = false, includePrivate = false, includeModifierDetails = false } = {}) {
   const globalConfig = await getPricingConfig(pool, fallbackEnv)
   const tierMap = await buildTierMap(pool)
   const clauses = []
-  if (!includeInactive) clauses.push('is_active = 1')
-  if (!includePrivate) clauses.push('is_public = 1')
+  if (!includeInactive) clauses.push('m.is_active = 1')
+  if (!includePrivate) clauses.push('m.is_public = 1')
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
-  const [rows] = await pool.query(`SELECT * FROM model_catalog ${where} ORDER BY sort_order ASC, name ASC`)
+  const select = includeModifierDetails
+    ? 'SELECT m.*, u.email AS updated_by_email FROM model_catalog m LEFT JOIN users u ON u.id = m.updated_by_user_id'
+    : 'SELECT m.* FROM model_catalog m'
+  const [rows] = await pool.query(`${select} ${where} ORDER BY m.sort_order ASC, m.name ASC`)
   return rows.map((row) => normalizeModelRow(row, globalConfig, tierMap))
 }
 
@@ -693,7 +750,9 @@ export async function updatePricingConfig(pool, input, fallbackEnv, userId = nul
     userId,
   })
   invalidatePricingCache()
-  return getPricingConfig(pool, fallbackEnv, { force: true })
+  const updated = await getPricingConfig(pool, fallbackEnv, { force: true })
+  await writePricingAudit(pool, 'pricing_config', 'global', current, updated, userId)
+  return updated
 }
 
 export async function upsertPricingTier(pool, input) {
@@ -732,20 +791,25 @@ export async function upsertSubscriptionPlan(pool, input) {
   return slug
 }
 
-export async function upsertPrivatePoolPlan(pool, input) {
+export async function upsertPrivatePoolPlan(pool, input, userId = null) {
   const slug = slugifyModel(input.slug)
+  const [beforeRows] = await pool.query('SELECT * FROM private_pool_plans WHERE slug = :slug LIMIT 1', { slug })
   await pool.query(`
-    INSERT INTO private_pool_plans (slug, name, monthly_eur, worker_count_min, worker_count_max, token_discount_percent, is_public, sort_order)
-    VALUES (:slug, :name, :monthlyEur, :workerMin, :workerMax, :discount, :isPublic, :sortOrder)
+    INSERT INTO private_pool_plans (slug, name, monthly_eur, worker_count_min, worker_count_max, token_discount_percent, is_public, sort_order, updated_by_user_id)
+    VALUES (:slug, :name, :monthlyEur, :workerMin, :workerMax, :discount, :isPublic, :sortOrder, :userId)
     ON DUPLICATE KEY UPDATE name = VALUES(name), monthly_eur = VALUES(monthly_eur), worker_count_min = VALUES(worker_count_min),
-      worker_count_max = VALUES(worker_count_max), token_discount_percent = VALUES(token_discount_percent), is_public = VALUES(is_public)
+      worker_count_max = VALUES(worker_count_max), token_discount_percent = VALUES(token_discount_percent), is_public = VALUES(is_public),
+      sort_order = VALUES(sort_order), updated_by_user_id = :userId
   `, {
     slug, name: input.name, monthlyEur: Number(input.monthlyEur || 0),
     workerMin: Math.max(0, Math.floor(Number(input.workerCountMin || 0))),
     workerMax: Math.max(0, Math.floor(Number(input.workerCountMax || 0))),
     discount: clampPercent(input.tokenDiscountPercent, 30),
     isPublic: input.isPublic === false ? 0 : 1, sortOrder: Math.floor(Number(input.sortOrder || 0)),
+    userId,
   })
+  const [afterRows] = await pool.query('SELECT * FROM private_pool_plans WHERE slug = :slug LIMIT 1', { slug })
+  await writePricingAudit(pool, 'private_pool_plan', slug, beforeRows[0] ?? null, afterRows[0] ?? null, userId)
   return slug
 }
 
@@ -764,8 +828,9 @@ export async function upsertFineTuningPlan(pool, input) {
   return slug
 }
 
-export async function upsertModelCatalogEntry(pool, input, fallbackEnv) {
+export async function upsertModelCatalogEntry(pool, input, fallbackEnv, userId = null) {
   const slug = input.slug ? slugifyModel(input.slug) : slugifyModel(input.hfId || input.name)
+  const [beforeRows] = await pool.query('SELECT * FROM model_catalog WHERE slug = :slug LIMIT 1', { slug })
   const modalities = Array.isArray(input.modalities) ? input.modalities.map(String).filter(Boolean) : []
   const globalConfig = await getPricingConfig(pool, fallbackEnv)
   const tierMap = await buildTierMap(pool)
@@ -791,13 +856,13 @@ export async function upsertModelCatalogEntry(pool, input, fallbackEnv) {
        eur_per_million_cached_input, eur_per_million_batch_input, eur_per_million_batch_output,
        private_pool_input_eur_per_million, private_pool_output_eur_per_million,
        worker_share_percent, estimated_worker_cost_input, estimated_worker_cost_output,
-       min_vryx_margin_percent, availability_status, api_alias,
+       min_vryx_margin_percent, availability_status, api_alias, updated_by_user_id,
        is_active, is_public, min_vram_mb, required_workers, sort_order)
     VALUES
       (:slug, :hfId, :name, :provider, :family, :paramsNote, :contextTokens, :modalitiesJson,
        :openWeights, :weightGb, :eurPerMillion, :pricingTier, :inputEur, :outputEur,
        :cachedInput, :batchInput, :batchOutput, :poolInput, :poolOutput,
-       :workerShare, :workerCostIn, :workerCostOut, :minMargin, :availability, :apiAlias,
+       :workerShare, :workerCostIn, :workerCostOut, :minMargin, :availability, :apiAlias, :userId,
        :isActive, :isPublic, :minVramMb, :requiredWorkers, :sortOrder)
     ON DUPLICATE KEY UPDATE
       hf_id = VALUES(hf_id), name = VALUES(name), provider = VALUES(provider), family = VALUES(family),
@@ -815,6 +880,7 @@ export async function upsertModelCatalogEntry(pool, input, fallbackEnv) {
       estimated_worker_cost_output = VALUES(estimated_worker_cost_output),
       min_vryx_margin_percent = VALUES(min_vryx_margin_percent),
       availability_status = VALUES(availability_status), api_alias = VALUES(api_alias),
+      updated_by_user_id = VALUES(updated_by_user_id),
       is_active = VALUES(is_active), is_public = VALUES(is_public),
       min_vram_mb = VALUES(min_vram_mb), required_workers = VALUES(required_workers), sort_order = VALUES(sort_order)
   `, {
@@ -848,7 +914,10 @@ export async function upsertModelCatalogEntry(pool, input, fallbackEnv) {
     minVramMb: input.minVramMb == null || input.minVramMb === '' ? null : Math.max(0, Math.floor(Number(input.minVramMb))),
     requiredWorkers: Math.max(1, Math.floor(Number(input.requiredWorkers || 1))),
     sortOrder: Math.floor(Number(input.sortOrder || 0)),
+    userId,
   })
+  const [afterRows] = await pool.query('SELECT * FROM model_catalog WHERE slug = :slug LIMIT 1', { slug })
+  await writePricingAudit(pool, 'model_catalog', slug, beforeRows[0] ?? null, afterRows[0] ?? null, userId)
   return { slug, warnings: floor.warnings }
 }
 

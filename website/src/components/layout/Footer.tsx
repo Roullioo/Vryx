@@ -13,7 +13,7 @@ export function Footer() {
           <div className="max-w-sm">
             <Link to="/" className="inline-flex w-fit items-center gap-3 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 focus-visible:ring-offset-2 focus-visible:ring-offset-bg">
               <img
-                src="/logo.png"
+                src="/logo.webp"
                 alt="Vryx"
                 width={40}
                 height={40}

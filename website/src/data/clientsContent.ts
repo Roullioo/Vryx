@@ -1,19 +1,3 @@
-/** Exemple copiable pour la doc client (SDK OpenAI). */
-export const CLIENT_PYTHON_SNIPPET = `from openai import OpenAI
-
-client = OpenAI(
-    base_url="https://api.vryx-ai.eu/v1",
-    api_key="vel_...",
-)
-
-response = client.chat.completions.create(
-    model="vryx-llama-70b",
-    messages=[...]
-)
-
-# C'est tout.
-print(response.choices[0].message.content)`
-
 export const CLIENT_FAQ = [
   {
     q: 'Puis-je utiliser le SDK officiel OpenAI ?',
@@ -30,7 +14,8 @@ export const CLIENT_FAQ = [
 ] as const
 
 export const CLIENT_ENDPOINTS = [
-  { method: 'POST', path: '/v1/chat/completions', desc: 'Chat complétions (principal)' },
-  { method: 'POST', path: '/v1/embeddings', desc: 'Embeddings (selon offre)' },
-  { method: 'GET', path: '/v1/models', desc: 'Liste des modèles disponibles' },
+  { method: 'POST', path: '/v1/chat/completions', desc: 'Chat Completions (API principale)' },
+  { method: 'GET', path: '/v1/models', desc: 'Liste dynamique des modèles (auth requis)' },
+  { method: 'GET', path: '/api/public/models', desc: 'Liste publique des modèles et statut (aucune auth)' },
+  { method: 'GET', path: '/api/public/pricing', desc: 'Tarifs publics et paramètres de facturation (lecture seule)' },
 ] as const

@@ -20,10 +20,12 @@ export function MainLayout() {
   const topDarkHero =
     pathname === '/' ||
     pathname === '/clients' ||
+    pathname === '/enterprise' ||
     pathname === '/race-pool' ||
     pathname === '/simulateur' ||
     pathname === '/comparatif' ||
     pathname === '/workers' ||
+    pathname === '/status' ||
     pathname === '/network' ||
     pathname === '/panel/modeles'
 

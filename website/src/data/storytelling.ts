@@ -19,50 +19,50 @@ export const STORYTELLING = {
   },
   clientsSection: {
     eyebrow: 'Pour les développeurs',
-    title: 'API compatible OpenAI, -80% moins chère.',
+    title: 'API compatible OpenAI, credits et couts mesures.',
     intro:
-      'Vous changez juste l\'URL et la clé API. Tout le reste est identique. Vous réglez en euros par carte bancaire.',
+      'Vous changez l\'URL, générez une clé API et suivez vos tokens, crédits et coûts en euros. La priorité produit est la preuve de fonctionnement, pas une promesse de remise uniforme.',
   },
   workersSection: {
     eyebrow: 'Pour les gamers',
     title: 'Louez votre GPU quand vous ne jouez pas.',
     bodyLead:
-      'Reversements en euros par virement SEPA. La mise en service repose sur une application cliente légère : elle rattache votre GPU au réseau sans vous imposer de stocker un modèle volumineux sur votre disque. Vous exécutez des charges de calcul transitoires, et votre solde worker est mis à jour au fil des tâches.',
+      'Reversements en euros par virement SEPA. La mise en service rattache votre machine au reseau, declare son hardware, son runtime, son modele et son etat de sante. Selon le profil, le worker execute un runtime local et participe aux generations mesurees.',
     bodyRange:
       'Fourchette indicative : un GPU milieu ou haut de gamme, régulièrement en ligne, peut générer entre 15 et 45 € par mois, selon le réseau et votre disponibilité.',
-    linkCompare: 'Voir le fonctionnement (Course et Relais)',
+    linkCompare: 'Voir le fonctionnement du pool',
     linkPage: 'Installation et FAQ, page worker',
   },
   racePoolSection: {
     eyebrow: 'L\'architecture réseau',
-    title: 'Comment on élimine la latence d\'Internet.',
+    title: 'Comment Vryx orchestre un pool IA distribué.',
     titleAccent: '',
     intro:
-      'Les connexions des particuliers peuvent être instables. Nous avons conçu la "Competitive Redundancy" (La Course) et le "Pipeline Parallelism" (Le Relais) pour garantir une vitesse optimale en permanence.',
+      'Vryx orchestre un réseau de workers déclarés, réservés et mesurés. La course reste une optimisation possible, mais le chemin stable est un pipeline distribué, réservé et auditable.',
     highlights: [
       {
-        title: 'La Course',
+        title: 'Réservation et sélection',
         body:
-          'Après découpage mémoire, un bloc peut être envoyé à plusieurs GPU en parallèle : le premier résultat valide pour ce bloc débloque la suite ; les autres tentatives sur ce bloc sont interrompues.',
+          'Le serveur choisit les workers selon le modèle, la mémoire disponible, le heartbeat et la disponibilité. Les routes publiques ne publient que des données redacted.',
       },
       {
-        title: 'Le Relais',
+        title: 'Pipeline et preuves',
         body:
-          'Les très grands modèles sont découpés en chaîne : un groupe de machines enchaîne avec le suivant pour ne saturer aucun poste.',
+          'Les runs produisent des traces : affectations, tokens, latence, débit, coûts estimés, readiness et artefacts de benchmark.',
       },
     ],
   },
   racePoolPage: {
     eyebrow: 'L\'architecture Vryx',
-    title: 'La Course et le Relais : vitesse garantie.',
+    title: 'Race Pool : orchestration, pipeline et preuves.',
     titleAccent: '',
     intro:
-      'Pour concurrencer les datacenters sans posséder de serveurs, Vryx contourne l\'instabilité d\'Internet via deux innovations majeures : la Course (pour la redondance) et le Relais (pour la répartition de charge).',
+      'Race Pool décrit maintenant le fonctionnement réel : réservation de workers, construction du chemin d’exécution, pipeline distribué et mesures exploitables en readiness.',
   },
   comparePage: {
-    title: 'La Course (Competitive Redundancy)',
+    title: 'Pool workers et repartition de calcul',
     intro:
-      'Solo ou Pool : même réseau, seul le gain change.\nChoisissez entre jackpot immédiat ou revenus réguliers.',
+      'Solo ou pool: le revenu depend de la disponibilite, du modele supporte, de la latence et de la qualite des runs.',
   },
   clientsPage: {
     title: 'Développeurs : API, tarifs et sécurité.',

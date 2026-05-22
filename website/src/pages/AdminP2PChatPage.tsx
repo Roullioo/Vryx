@@ -112,8 +112,7 @@ export function AdminP2PChatPage() {
             Flux technique
           </summary>
           <p className="border-t border-border/60 px-3 py-2.5 text-[11px] leading-relaxed text-muted sm:px-3.5 sm:text-xs">
-            Navigateur → <span className="font-mono text-fg/90">/api/admin/p2p/chat/stream</span> → initiateur{' '}
-            <span className="font-mono text-fg/90">VRYX_INITIATOR_CHAT_URL</span> → workers P2P (gRPC).
+            Navigateur → API admin → orchestrateur interne → workers distribués.
           </p>
         </details>
       </div>

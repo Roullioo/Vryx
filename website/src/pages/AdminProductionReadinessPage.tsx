@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AdminShell } from '../components/admin/AdminShell'
 import { apiJson } from '../lib/api'
+import { displayLabel, displayMaybeCode } from '../lib/displayLabels'
 
 type Readiness = {
   score: number
@@ -194,7 +195,7 @@ export function AdminProductionReadinessPage() {
 
       <div className="space-y-6">
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <MetricCard label="Score readiness" value={scoreLabel} hint={ready?.grade || 'Chargement'} tone={ready ? scoreTone(ready.score) : 'text-muted'} />
+          <MetricCard label="Score readiness" value={scoreLabel} hint={ready ? displayLabel(ready.grade) : 'Chargement'} tone={ready ? scoreTone(ready.score) : 'text-muted'} />
           <MetricCard label="Succès golden path" value={ready ? `${numberFr(ready.metrics.successRate, 2)} %` : '—'} hint={`${ready?.metrics.recentEmptyResponses ?? 0} réponse vide`} tone="text-success" />
           <MetricCard label="TPS p50 / best" value={ready ? `${numberFr(ready.metrics.tpsP50, 2)} / ${numberFr(ready.metrics.tpsBest, 2)}` : '—'} hint={`cible ${ready?.goldenPath.minDecodeTps ?? 10} TPS`} tone="text-electric" />
           <MetricCard label="TTFT p95" value={ready ? `${numberFr(ready.metrics.ttftP95)} ms` : '—'} hint={`max ${numberFr(ready?.goldenPath.maxTtftP95Ms ?? 0)} ms`} tone="text-warning" />
@@ -220,7 +221,7 @@ export function AdminProductionReadinessPage() {
               <p className="text-xs font-semibold uppercase tracking-wide text-muted">Dernier benchmark</p>
               <p className="mt-2 text-sm text-fg">
                 {latestBenchmark
-                  ? `${latestBenchmark.model} · ${latestBenchmark.status} · ${numberFr(latestBenchmark.tps, 2)} TPS · ${numberFr(latestBenchmark.ttftMs)} ms TTFT · ${dateTime(latestBenchmark.createdAt)}`
+                  ? `${latestBenchmark.model} · ${displayLabel(latestBenchmark.status)} · ${numberFr(latestBenchmark.tps, 2)} TPS · ${numberFr(latestBenchmark.ttftMs)} ms TTFT · ${dateTime(latestBenchmark.createdAt)}`
                   : 'Aucun benchmark récent.'}
               </p>
               {latestBenchmark?.error ? <p className="mt-2 text-xs text-alert">{latestBenchmark.error}</p> : null}
@@ -242,9 +243,9 @@ export function AdminProductionReadinessPage() {
         </section>
 
         <section className="grid gap-5 lg:grid-cols-3">
-          <ListPanel title="Blockers" items={ready?.blockers ?? []} empty="Aucun blocker déclaré." tone="text-alert" />
-          <ListPanel title="Warnings" items={ready?.warnings ?? []} empty="Aucun warning déclaré." tone="text-warning" />
-          <ListPanel title="Actions" items={ready?.actions ?? []} empty="Aucune action requise." tone="text-electric" />
+          <ListPanel title="Blockers" items={(ready?.blockers ?? []).map(displayMaybeCode)} empty="Aucun blocker déclaré." tone="text-alert" />
+          <ListPanel title="Warnings" items={(ready?.warnings ?? []).map(displayMaybeCode)} empty="Aucun warning déclaré." tone="text-warning" />
+          <ListPanel title="Actions" items={(ready?.actions ?? []).map(displayMaybeCode)} empty="Aucune action requise." tone="text-electric" />
         </section>
       </div>
     </AdminShell>

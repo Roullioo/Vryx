@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
 import type { PoolGraphLink, PoolGraphNode } from '../components/admin/PoolNetworkGraph'
 import { apiJson, apiUrl } from '../lib/api'
+import { displayLabel } from '../lib/displayLabels'
 
 const PoolNetworkGraph = lazy(() =>
   import('../components/admin/PoolNetworkGraph').then((m) => ({ default: m.PoolNetworkGraph })),
@@ -477,7 +478,7 @@ function WorkerCard({ w, pingMs }: { w: RegisteredWorker; pingMs?: number | null
         <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase ${
           !w.online ? 'bg-warning/10 text-warning' : w.desiredState && w.desiredState !== 'active' ? 'bg-electric/10 text-electric' : 'bg-success/10 text-success'
         }`}>
-          {!w.online ? `il y a ${timeAgo(w.secondsSinceHeartbeat)}` : w.desiredState && w.desiredState !== 'active' ? w.desiredState : 'En ligne'}
+          {!w.online ? `il y a ${timeAgo(w.secondsSinceHeartbeat)}` : w.desiredState && w.desiredState !== 'active' ? displayLabel(w.desiredState) : 'En ligne'}
         </span>
       </div>
 
@@ -520,7 +521,7 @@ function WorkerCard({ w, pingMs }: { w: RegisteredWorker; pingMs?: number | null
       </div>
 
       <div className="mt-3 flex flex-wrap gap-3 text-[10px] text-muted">
-        {w.grpcPort && <span>gRPC {w.grpcPort}</span>}
+        {w.grpcPort && <span>interne {w.grpcPort}</span>}
         {w.p2pPort && <span>P2P {w.p2pPort}</span>}
         {w.ownerEmail && <span>Propriétaire : {w.ownerEmail}</span>}
         {w.lastCommandStatus && <span>Commande : {w.lastCommandStatus}</span>}
@@ -704,8 +705,8 @@ export function AdminWorkersPage() {
 /* ─── Page détail worker ─────────────────────────────────────────────────── */
 
 function workerPingMethodLabel(method: string | undefined | null): string {
-  if (method === 'tcp_grpc') return 'TCP (port gRPC)'
-  if (method === 'tcp_p2p') return 'TCP (port P2P)'
+  if (method === 'tcp_grpc') return 'Connexion interne'
+  if (method === 'tcp_p2p') return 'Connexion directe'
   if (method === 'icmp') return 'ICMP'
   return method || '—'
 }
@@ -923,12 +924,12 @@ export function AdminWorkerDetailPage() {
   const statRows = [
     { label: 'Peer ID', value: worker.peerId, mono: true },
     { label: 'IP publique', value: worker.publicIp ?? '—' },
-    { label: 'Port gRPC', value: String(worker.grpcPort ?? '—') },
+    { label: 'Port interne', value: String(worker.grpcPort ?? '—') },
     { label: 'Port P2P', value: String(worker.p2pPort ?? '—') },
     { label: 'Mode', value: worker.mode },
     { label: 'Modèle', value: worker.model ?? '—' },
     { label: 'Modèle désiré', value: worker.desiredModel ?? worker.model ?? '—' },
-    { label: 'État désiré', value: worker.desiredState ?? 'active' },
+    { label: 'État désiré', value: displayLabel(worker.desiredState ?? 'active') },
     { label: 'Mémoire allouée', value: fmtVramMb(worker.allocatedVramMb, worker.runtimeBackend) ?? '—' },
     { label: 'Mémoire désirée', value: fmtVramMb(worker.desiredAllocatedVramMb, worker.runtimeBackend) ?? '—' },
     { label: 'Commande', value: worker.lastCommandStatus ? `${worker.lastCommandStatus}${worker.lastCommandError ? ` · ${worker.lastCommandError}` : ''}` : '—' },
@@ -1060,7 +1061,7 @@ export function AdminWorkerDetailPage() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-[10px] font-semibold uppercase tracking-wide text-muted">Health shard local</p>
                 <span className={detailedHealth.shardSummary.ok ? 'text-xs font-bold text-success' : 'text-xs font-bold text-warning'}>
-                  {detailedHealth.shardSummary.ready}/{detailedHealth.shardSummary.count} ready · {detailedHealth.shardSummary.loading} loading
+                  {detailedHealth.shardSummary.ready}/{detailedHealth.shardSummary.count} prêts · {detailedHealth.shardSummary.loading} en chargement
                 </span>
               </div>
               {detailedHealth.shardSummary.errors.length > 0 && (
@@ -1072,7 +1073,7 @@ export function AdminWorkerDetailPage() {
                     <div key={`${s.sessionId || idx}`} className="rounded-xl border border-border bg-card px-3 py-2">
                       <p className="truncate text-[11px] font-mono text-fg">{s.sessionId || 'session inconnue'}</p>
                       <p className="mt-1 text-[11px] text-muted">
-                        layers {s.layers || '—'} · {s.weightsLoaded ?? 0} poids · {s.weightQuantization || '—'} · {s.ready ? 'ready' : s.loading ? 'loading' : 'not ready'}
+                        layers {s.layers || '—'} · {s.weightsLoaded ?? 0} poids · {s.weightQuantization || '—'} · {s.ready ? 'prêt' : s.loading ? 'chargement' : 'pas prêt'}
                       </p>
                     </div>
                   ))}
@@ -1132,7 +1133,7 @@ export function AdminWorkerDetailPage() {
             <span className={`rounded-full px-3 py-1 text-[11px] font-bold uppercase ${
               worker.desiredState && worker.desiredState !== 'active' ? 'bg-warning/10 text-warning' : 'bg-success/10 text-success'
             }`}>
-              désiré : {worker.desiredState || 'active'}
+              désiré : {displayLabel(worker.desiredState || 'active')}
             </span>
           </div>
 
@@ -1310,7 +1311,7 @@ export function AdminWorkerDetailPage() {
                     : '—'}
                 </span>
                 <span className={cmd.status === 'failed' ? 'text-alert' : cmd.status === 'acknowledged' ? 'text-success' : 'text-warning'}>
-                  {cmd.status}
+                  {displayLabel(cmd.status)}
                 </span>
                 <span className="text-muted">{cmd.createdAt ? new Date(cmd.createdAt).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '—'}</span>
                 <span className="text-right">

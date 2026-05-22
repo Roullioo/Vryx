@@ -4,22 +4,16 @@ import { VryxLogo } from '../brand/VryxLogo'
 export function HeroSection() {
   return (
     <section
-      className="relative isolate -mt-[4.25rem] flex min-h-svh flex-col overflow-hidden border-b border-border pt-[4.25rem]"
+      className="page-hero min-h-svh"
       aria-labelledby="hero-heading"
     >
-      <div
-        className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-        aria-hidden
-      >
+      <div className="page-hero-media-shell" aria-hidden>
         <div
-          className="absolute inset-0 scale-105 bg-cover bg-center bg-no-repeat blur-[3px]"
-          style={{ backgroundImage: "url('/bgcolor.png')" }}
+          className="page-hero-media blur-[3px]"
+          style={{ backgroundImage: "url('/heroes/home-hero.webp')" }}
         />
       </div>
-      <div
-        className="hero-overlay absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
-        aria-hidden
-      />
+      <div className="page-hero-overlay" aria-hidden />
 
       <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-4 pb-16 text-center sm:pb-20">
         <motion.div

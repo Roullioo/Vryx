@@ -15,8 +15,35 @@ type EnterpriseQuote = {
   monthlyEstimateEur: number
   setupEstimateEur: number
   status: string
+  commercialStage: string
+  pilotAmountEur: number | null
+  expectedCloseDate: string | null
+  nextStep: string
+  signedDocumentUrl: string
   notes: string
   createdAt: string | null
+  updatedAt?: string | null
+  updatedByEmail?: string | null
+  updatedByUserId?: string | number | null
+}
+
+const statusLabels: Record<string, string> = {
+  new: 'Nouveau',
+  contacted: 'Contacté',
+  loi_requested: 'LOI demandée',
+  loi_received: 'LOI reçue',
+  paid_pilot: 'Pilote payant',
+  won: 'Gagné',
+  lost: 'Perdu',
+}
+
+const stageLabels: Record<string, string> = {
+  prospect: 'Prospect',
+  letter_of_interest: "Lettre d'intérêt",
+  paid_pilot: 'Pilote payant',
+  pilot_running: 'Pilote en cours',
+  customer: 'Client',
+  lost: 'Perdu',
 }
 
 function money(value: number) {
@@ -35,7 +62,9 @@ function dateTime(value: string | null) {
 
 export function AdminEnterpriseQuotesPage() {
   const [quotes, setQuotes] = useState<EnterpriseQuote[]>([])
+  const [editing, setEditing] = useState<EnterpriseQuote | null>(null)
   const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -59,15 +88,54 @@ export function AdminEnterpriseQuotesPage() {
 
   const pipelineValue = quotes.reduce((sum, quote) => sum + quote.monthlyEstimateEur, 0)
   const newQuotes = quotes.filter((quote) => quote.status === 'new').length
+  const interestCount = quotes.filter((quote) => quote.commercialStage === 'letter_of_interest' || quote.status === 'loi_received').length
+  const paidPilots = quotes.filter((quote) => quote.commercialStage === 'paid_pilot' || quote.commercialStage === 'pilot_running' || quote.status === 'paid_pilot')
+  const paidPilotValue = paidPilots.reduce((sum, quote) => sum + Number(quote.pilotAmountEur || 0), 0)
+
+  async function saveQuote() {
+    if (!editing) return
+    setSaving(true)
+    setError('')
+    const r = await apiJson<{ ok: true }>(`/api/admin/enterprise/quotes/${encodeURIComponent(editing.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        status: editing.status,
+        commercialStage: editing.commercialStage,
+        pilotAmountEur: editing.pilotAmountEur,
+        expectedCloseDate: editing.expectedCloseDate,
+        nextStep: editing.nextStep,
+        signedDocumentUrl: editing.signedDocumentUrl,
+        notes: editing.notes,
+      }),
+    })
+    setSaving(false)
+    if (!r.ok) {
+      setError(r.error)
+      return
+    }
+    setQuotes((rows) => rows.map((row) => (row.id === editing.id ? editing : row)))
+    setEditing(null)
+  }
 
   return (
     <AdminShell title="Enterprise" subtitle="Demandes commerciales B2B et pipeline estimé">
       {error ? <div className="mb-5 rounded-xl border border-alert/40 bg-alert/8 px-4 py-3 text-sm text-alert">{error}</div> : null}
       <div className="space-y-5">
-        <section className="grid gap-3 sm:grid-cols-3">
+        <section className="grid gap-3 sm:grid-cols-5">
           <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Demandes</p><p className="mt-1 font-display text-2xl font-bold text-fg">{quotes.length}</p></div>
           <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Nouvelles</p><p className="mt-1 font-display text-2xl font-bold text-electric">{newQuotes}</p></div>
+          <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Lettres d'intérêt</p><p className="mt-1 font-display text-2xl font-bold text-accent">{interestCount}</p></div>
+          <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Pilotes payants</p><p className="mt-1 font-display text-2xl font-bold text-success">{paidPilots.length}</p></div>
           <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Pipeline mensuel</p><p className="mt-1 font-display text-2xl font-bold text-success">{money(pipelineValue)}</p></div>
+        </section>
+        <section className="panel p-5">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-fg">Preuves commerciales investisseur</p>
+              <p className="mt-1 text-xs text-muted">Objectif court terme : 2-3 lettres d'intérêt signées ou au moins un pilote payant traçable.</p>
+            </div>
+            <p className="font-mono text-sm font-semibold text-success">{money(paidPilotValue)} de pilotes</p>
+          </div>
         </section>
 
         <section className="overflow-x-auto panel">
@@ -78,13 +146,15 @@ export function AdminEnterpriseQuotesPage() {
                 <th className="px-4 py-3">Offre</th>
                 <th className="px-4 py-3">Volume</th>
                 <th className="px-4 py-3">Confidentialité</th>
+                <th className="px-4 py-3">Preuve</th>
                 <th className="px-4 py-3 text-right">Estimation</th>
                 <th className="px-4 py-3">Créée</th>
+                <th className="px-4 py-3"></th>
               </tr>
             </thead>
             <tbody>
               {quotes.length === 0 ? (
-                <tr><td colSpan={6} className="px-4 py-8 text-muted">Aucune demande Enterprise.</td></tr>
+                <tr><td colSpan={8} className="px-4 py-8 text-muted">Aucune demande Enterprise.</td></tr>
               ) : quotes.map((quote) => (
                 <tr key={quote.id} className="border-b border-border/70 align-top hover:bg-surface/40">
                   <td className="px-4 py-3">
@@ -98,17 +168,81 @@ export function AdminEnterpriseQuotesPage() {
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-fg">{compact(quote.monthlyTokens)} tokens/mois<br />{quote.latencyTargetMs} ms cible</td>
                   <td className="px-4 py-3 text-xs text-muted">{quote.privacyLevel}</td>
+                  <td className="px-4 py-3">
+                    <span className="rounded-md bg-accent/10 px-2 py-1 text-xs font-semibold text-accent">{stageLabels[quote.commercialStage] || quote.commercialStage}</span>
+                    <p className="mt-2 text-xs text-muted">{statusLabels[quote.status] || quote.status}</p>
+                    {quote.pilotAmountEur ? <p className="mt-1 font-mono text-xs text-success">{money(quote.pilotAmountEur)} pilote</p> : null}
+                    {quote.nextStep ? <p className="mt-1 max-w-xs text-xs text-muted">{quote.nextStep}</p> : null}
+                  </td>
                   <td className="px-4 py-3 text-right">
                     <p className="font-mono font-semibold text-fg">{money(quote.monthlyEstimateEur)} / mois</p>
                     <p className="text-xs text-muted">setup {money(quote.setupEstimateEur)}</p>
                   </td>
                   <td className="px-4 py-3 text-xs text-muted">{dateTime(quote.createdAt)}</td>
+                  <td className="px-4 py-3 text-right">
+                    <button type="button" onClick={() => setEditing(quote)} className="rounded-xl border border-border px-3 py-2 text-xs font-semibold text-fg hover:bg-surface">
+                      Qualifier
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </section>
       </div>
+      {editing ? (
+        <div className="fixed inset-0 z-150 flex items-end justify-center bg-black/60 p-3 backdrop-blur-sm sm:items-center">
+          <div className="max-h-[92dvh] w-full max-w-2xl overflow-y-auto rounded-3xl border border-border bg-card p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="font-display text-lg font-semibold text-fg">{editing.company}</h2>
+                <p className="text-xs text-muted">{editing.email}</p>
+              </div>
+              <button type="button" onClick={() => setEditing(null)} className="rounded-xl border border-border px-3 py-2 text-sm text-fg">Fermer</button>
+            </div>
+            <div className="mt-5 grid gap-3 sm:grid-cols-2">
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Statut</span>
+                <select value={editing.status} onChange={(e) => setEditing({ ...editing, status: e.target.value })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent">
+                  {Object.entries(statusLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              </label>
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Étape commerciale</span>
+                <select value={editing.commercialStage} onChange={(e) => setEditing({ ...editing, commercialStage: e.target.value })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent">
+                  {Object.entries(stageLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              </label>
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Montant pilote payant (€)</span>
+                <input type="number" min="0" value={editing.pilotAmountEur ?? ''} onChange={(e) => setEditing({ ...editing, pilotAmountEur: e.target.value === '' ? null : Number(e.target.value) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 font-mono text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Date cible</span>
+                <input type="date" value={editing.expectedCloseDate ?? ''} onChange={(e) => setEditing({ ...editing, expectedCloseDate: e.target.value || null })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 font-mono text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm sm:col-span-2">
+                <span className="text-muted">Lien document signé</span>
+                <input value={editing.signedDocumentUrl} onChange={(e) => setEditing({ ...editing, signedDocumentUrl: e.target.value })} placeholder="URL Drive/DocuSign/PDF signé" className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm sm:col-span-2">
+                <span className="text-muted">Prochaine action</span>
+                <input value={editing.nextStep} onChange={(e) => setEditing({ ...editing, nextStep: e.target.value })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm sm:col-span-2">
+                <span className="text-muted">Notes</span>
+                <textarea value={editing.notes} onChange={(e) => setEditing({ ...editing, notes: e.target.value })} rows={4} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+              </label>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" onClick={() => setEditing(null)} className="rounded-xl border border-border px-4 py-2 text-sm text-fg">Annuler</button>
+              <button type="button" disabled={saving} onClick={() => void saveQuote()} className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-on-accent disabled:opacity-50">
+                {saving ? 'Sauvegarde…' : 'Sauvegarder'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </AdminShell>
   )
 }

@@ -65,6 +65,7 @@ export type AdminPricing = {
   minVryxNetMarginPercent: number
   updatedAt: string | null
   updatedByUserId: string | number | null
+  updatedByEmail?: string | null
 }
 
 export type PricingTier = {
@@ -94,6 +95,9 @@ export type PrivatePoolPlan = {
   tokenDiscountPercent: number
   isPublic: boolean
   sortOrder: number
+  updatedAt?: string | null
+  updatedByUserId?: string | number | null
+  updatedByEmail?: string | null
 }
 
 export type FineTuningPlan = {
@@ -163,6 +167,20 @@ export type CatalogModel = {
   runnable?: boolean
   ready?: boolean
   lastSeenAt?: string | null
+  updatedAt?: string | null
+  updatedByUserId?: string | number | null
+  updatedByEmail?: string | null
+}
+
+export type PricingAuditEntry = {
+  id: number
+  entityType: string
+  entityId: string
+  before: unknown
+  after: unknown
+  updatedByUserId: string | number | null
+  updatedByEmail: string | null
+  createdAt: string
 }
 
 export function formatPricingLabel(value: number | null | undefined) {
@@ -209,6 +227,8 @@ export async function fetchAdminPricingBundle() {
     subscriptionPlans: SubscriptionPlan[]
     privatePoolPlans: PrivatePoolPlan[]
     fineTuningPlans: FineTuningPlan[]
+    models: CatalogModel[]
+    audit: PricingAuditEntry[]
   }>('/api/admin/pricing')
 }
 

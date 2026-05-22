@@ -1,209 +1,159 @@
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
-import { RACE_POOL_FAQ, RACE_POOL_STEPS } from '../data/racePoolContent'
 
-const pillars = [
+const currentPath = [
   {
-    title: 'La Course',
-    text: 'Sur un bloc mis en course, plusieurs GPU peuvent recevoir le même fragment ; le premier résultat valide fait avancer le graphe, les autres tentatives sur ce bloc sont coupées.',
+    title: 'API et réservation',
+    body: 'La requête arrive par l’API Vryx. Le service vérifie le compte, le modèle et les crédits, puis réserve les workers compatibles selon leur disponibilité, leur mémoire et leur état de charge.',
   },
   {
-    title: 'Le Relais',
-    text: 'Les très grands modèles se découpent : un groupe enchaîne après l’autre sans saturer une seule machine.',
+    title: 'Construction du chemin',
+    body: 'Le réseau choisit le meilleur chemin d’exécution selon la disponibilité réelle, les liaisons directes possibles et les contraintes du run en cours.',
   },
   {
-    title: 'Euros partout',
-    text: 'Carte côté client, virement SEPA côté worker, même filet de sécurité qu’ailleurs sur Vryx.',
+    title: 'Pipeline distribué',
+    body: 'Pour les modèles distribués, le calcul est réparti entre plusieurs workers. Chaque étape exécute sa part puis transmet le résultat au segment suivant.',
   },
+  {
+    title: 'Mesure et preuve',
+    body: 'Chaque run produit une trace : workers utilisés, tokens, latence, débit, erreurs et coût estimé. Ces données alimentent ensuite les métriques publiques et les benchmarks.',
+  },
+] as const
+
+const truthCards = [
+  {
+    title: 'Ce qui tourne vraiment aujourd’hui',
+    body: 'Le chemin public valide repose sur une orchestration distribuée : les workers sont déclarés, sélectionnés puis coordonnés dans un pipeline mesurable.',
+  },
+  {
+    title: 'Ce qui est optionnel',
+    body: 'La course pure, ou duplication d’un même bloc entre plusieurs workers, reste une stratégie possible sur certains cas critiques. Ce n’est pas le chemin unique de production.',
+  },
+  {
+    title: 'Ce qui est mesurable',
+    body: 'Les preuves existent : benchmarks, affectation des workers, score de readiness, tokens, latence, débit et stabilité sur une fenêtre propre.',
+  },
+] as const
+
+const requirements = [
+  'Accès internes protégés et séparés des routes publiques',
+  'Authentification worker obligatoire en production',
+  'Routes publiques expurgées pour masquer les identifiants et détails sensibles',
+  'Readiness score calculé sur une fenêtre propre et archivable',
+  'Audit de dépendances et contrôles de sécurité suivis dans la durée',
 ] as const
 
 export function RacePoolPage() {
   return (
-    <div className="border-b border-border bg-bg">
-      <section
-        className="relative isolate -mt-[4.25rem] flex min-h-[min(86vh,38rem)] flex-col overflow-hidden border-b border-border pt-[4.25rem] sm:min-h-[min(88vh,42rem)]"
-        aria-labelledby="race-pool-hero-heading"
-      >
+    <div className="bg-bg text-fg">
+      <section className="page-hero bg-[#07111f] text-white">
         <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-          aria-hidden
-        >
-          <div
-            className="absolute inset-0 scale-105 bg-cover bg-center bg-no-repeat blur-[3px]"
-            style={{ backgroundImage: "url('/datacenter.png')" }}
-          />
-        </div>
-        <div
-          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
+          className="absolute inset-0 opacity-45"
+          style={{ backgroundImage: "url('/heroes/race-pool-hero.webp')", backgroundPosition: 'center', backgroundSize: 'cover' }}
           aria-hidden
         />
-
-        <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-6 text-center sm:pb-16 sm:pt-8">
-          <motion.div
-            initial={{ opacity: 0, y: 14 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
-            className="flex max-w-2xl flex-col items-center"
-          >
-            <h1
-              id="race-pool-hero-heading"
-              className="font-display text-balance text-3xl font-semibold leading-tight tracking-tight text-white drop-shadow-[0_2px_24px_rgba(0,0,0,0.45)] sm:text-4xl md:text-[2.35rem]"
-            >
-              Course et Relais
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(4,12,24,.94),rgba(4,12,24,.78)_42%,rgba(4,12,24,.42))]" aria-hidden />
+        <div className="relative mx-auto grid min-h-[inherit] max-w-6xl items-center gap-10 px-4 py-14 sm:px-6 lg:grid-cols-[1.05fr_.95fr] lg:px-8">
+          <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.45 }}>
+            <p className="text-xs font-semibold uppercase text-cyan-100/75">Architecture réseau actuelle</p>
+            <h1 className="mt-5 max-w-3xl font-display text-4xl font-semibold leading-[1.02] text-white sm:text-5xl lg:text-6xl">
+              Comment Vryx orchestre vraiment un pool de workers IA.
             </h1>
-            <p className="mt-4 max-w-xl text-pretty text-base leading-snug text-white/88 sm:mt-5 sm:text-lg">
-              Parallélisme compétitif, puis enchaînement, pour rester rapide même avec des connexions variables.
+            <p className="mt-5 max-w-2xl text-base leading-8 text-white/72 sm:text-lg">
+              Race Pool n’est pas une promesse abstraite : c’est la couche d’orchestration qui sélectionne, réserve,
+              connecte et mesure des workers distribués. Le chemin stable actuel repose sur un pipeline distribué,
+              avec adaptation automatique selon la connectivité disponible.
             </p>
-            <Link
-              to="/comparatif"
-              className="mt-8 inline-flex min-h-11 w-full max-w-xs items-center justify-center rounded-xl border border-transparent bg-white px-6 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-white/90 dark:border-white/20 dark:bg-card/95 dark:text-fg dark:backdrop-blur-md dark:hover:bg-card sm:mt-9 sm:w-auto sm:px-8 sm:text-base"
-            >
-              Comparer solo et pool
-            </Link>
+            <div className="mt-8 flex flex-wrap gap-3">
+              <Link to="/network" className="rounded-lg bg-white px-5 py-3 text-sm font-semibold text-slate-950 hover:bg-white/90">
+                Voir le réseau live
+              </Link>
+              <Link to="/enterprise" className="rounded-lg border border-white/25 bg-white/10 px-5 py-3 text-sm font-semibold text-white hover:bg-white/15">
+                Offres B2B
+              </Link>
+            </div>
           </motion.div>
-        </div>
-      </section>
 
-      <section className="border-b border-border bg-bg py-14 sm:py-18" aria-labelledby="race-architecture">
-        <div className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
-          <h2 id="race-architecture" className="font-display text-center text-2xl font-semibold text-fg sm:text-3xl">
-            Deux briques d’architecture
-          </h2>
-          <p className="mx-auto mt-3 max-w-2xl text-center text-sm leading-relaxed text-muted sm:text-base">
-            La Race-Pool compense l’irrégularité d’Internet chez les particuliers sans retomber sur un datacenter
-            classique.
-          </p>
-          <div className="mt-10 grid gap-6 sm:grid-cols-2 sm:gap-8">
-            <article className="panel p-6 sm:p-7">
-              <h3 className="font-display text-lg font-semibold text-fg">La Course</h3>
-              <p className="mt-3 text-sm leading-relaxed text-muted sm:text-base">
-                La requête est d&apos;abord découpée selon la VRAM disponible. Pour une étape mise en course, le même
-                bloc utile peut partir vers plusieurs GPU en parallèle : le premier qui livre un résultat valide pour ce
-                bloc fait avancer le graphe ; les autres tentatives sur ce bloc sont stoppées. D&apos;autres fragments
-                de la même inférence tournent sur d&apos;autres nœuds.
-              </p>
-            </article>
-            <article className="panel p-6 sm:p-7">
-              <h3 className="font-display text-lg font-semibold text-fg">Le Relais</h3>
-              <p className="mt-3 text-sm leading-relaxed text-muted sm:text-base">
-                Quand une étape dépasse ce qu&apos;une carte peut traiter seule, des groupes enchaînent : chaque segment
-                reçoit une partie du calcul, puis passe le relais au suivant sans saturer la mémoire d&apos;un seul
-                poste.
-              </p>
-            </article>
-          </div>
-        </div>
-      </section>
-
-      <section
-        className="relative isolate overflow-hidden border-b border-border py-16 sm:py-20 lg:py-24"
-        aria-labelledby="race-cycle-heading"
-      >
-        <div
-          className="absolute inset-0 bg-cover bg-center bg-no-repeat"
-          style={{ backgroundImage: "url('/mid.png')" }}
-          aria-hidden
-        />
-        <div className="hero-overlay absolute inset-0" aria-hidden />
-        <div className="relative z-10 mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
-          <div className="mx-auto max-w-2xl text-center">
-            <p className="font-mono text-[0.7rem] font-medium uppercase tracking-[0.22em] text-white/45">
-              Parcours
-            </p>
-            <h2 id="race-cycle-heading" className="mt-2 font-display text-2xl font-semibold tracking-tight text-white sm:text-3xl">
-              Cycle d’une requête
-            </h2>
-            <p className="mt-3 text-sm leading-relaxed text-white/72 sm:text-base">
-              Du multi-cast au signal de fin : quatre étapes sur le fil de la requête.
-            </p>
-          </div>
-
-          <ol className="mx-auto mt-12 grid max-w-4xl list-none gap-5 p-0 sm:grid-cols-2 lg:mt-16 lg:max-w-none lg:grid-cols-4 lg:gap-4">
-            {RACE_POOL_STEPS.map((s, i) => {
-              const step = String(i + 1).padStart(2, '0')
-              return (
-                <li
-                  key={s.title}
-                  className="flex flex-col rounded-2xl border border-white/10 bg-black/50 px-5 pb-5 pt-6 text-center shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset] sm:px-6 sm:pb-6 sm:pt-7"
-                >
-                  <div className="mx-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-white/20 bg-page-hero/85 font-mono text-xs font-semibold tabular-nums text-white dark:bg-black/50">
-                    {step}
-                  </div>
-                  <h3 className="font-display mt-4 text-base font-semibold text-white sm:text-lg">{s.title}</h3>
-                  <p className="mt-2 grow text-pretty text-sm leading-relaxed text-white/68">{s.body}</p>
-                </li>
-              )
-            })}
-          </ol>
-        </div>
-      </section>
-
-      <section className="border-b border-border bg-surface py-14 sm:py-18" aria-labelledby="race-pillars-heading">
-        <div className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
-          <h2 id="race-pillars-heading" className="text-center font-display text-2xl font-semibold text-fg sm:text-3xl">
-            Pourquoi ce modèle
-          </h2>
-          <p className="mx-auto mt-3 max-w-2xl text-center text-sm text-muted sm:text-base">
-            Parallélisme utile, coût marginal maîtrisé, même devise partout.
-          </p>
-          <ul className="mt-10 grid gap-5 sm:grid-cols-3">
-            {pillars.map((p, i) => (
-              <motion.li
-                key={p.title}
-                initial={{ opacity: 0, y: 12 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true }}
-                transition={{ delay: i * 0.05 }}
-                className="panel p-5 sm:p-6"
-              >
-                <h3 className="font-display text-lg font-semibold text-fg">{p.title}</h3>
-                <p className="mt-3 text-sm leading-relaxed text-muted">{p.text}</p>
-              </motion.li>
-            ))}
-          </ul>
-        </div>
-      </section>
-
-      <section className="bg-bg py-14 sm:py-18" aria-labelledby="faq-rp-heading">
-        <div className="mx-auto max-w-3xl px-4 sm:px-6 lg:px-8">
-          <h2 id="faq-rp-heading" className="text-center font-display text-2xl font-semibold text-fg sm:text-3xl">
-            Questions fréquentes
-          </h2>
-          <div className="mt-8 space-y-3">
-            {RACE_POOL_FAQ.map((item) => (
-              <details
-                key={item.q}
-                className="group panel px-4 py-1 open:border-accent/30"
-              >
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 py-3 font-medium text-fg [&::-webkit-details-marker]:hidden">
-                  <span>{item.q}</span>
-                  <span className="shrink-0 text-muted transition-transform group-open:rotate-180" aria-hidden>
-                    <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="m19 9-7 7-7-7" />
-                    </svg>
+            <div className="rounded-lg border border-white/14 bg-white/8 p-4 backdrop-blur-xl">
+            <div className="grid gap-3">
+              {['Client API', 'Contrôle d’accès', 'Réservation', 'Coordination', 'Workers actifs'].map((label, index) => (
+                <div key={label} className="flex items-center gap-3 rounded-lg border border-white/10 bg-black/20 px-4 py-3">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-full bg-cyan-200 text-xs font-bold text-slate-950">
+                    {index + 1}
                   </span>
-                </summary>
-                <p className="border-t border-border/80 pb-4 text-sm leading-relaxed text-muted">{item.a}</p>
-              </details>
+                  <span className="text-sm font-semibold text-white">{label}</span>
+                  <span className="ml-auto h-2 w-16 rounded-full bg-gradient-to-r from-cyan-200 to-emerald-200" />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="border-b border-border bg-card py-14 sm:py-18">
+        <div className="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
+          <div className="max-w-3xl">
+            <p className="text-xs font-semibold uppercase text-accent">Mise à jour produit</p>
+            <h2 className="mt-3 font-display text-3xl font-semibold sm:text-4xl">Race Pool, sans folklore.</h2>
+            <p className="mt-4 text-base leading-8 text-muted">
+              La page a été réécrite pour refléter l’infrastructure actuelle : un réseau distribué, des workers
+              déclarés, une orchestration de réservation et un pipeline qui produit des preuves exploitables.
+            </p>
+          </div>
+          <div className="mt-8 grid gap-4 md:grid-cols-3">
+            {truthCards.map((card) => (
+              <article key={card.title} className="rounded-lg border border-border bg-bg p-5">
+                <h3 className="text-lg font-semibold">{card.title}</h3>
+                <p className="mt-3 text-sm leading-7 text-muted">{card.body}</p>
+              </article>
             ))}
           </div>
         </div>
       </section>
 
-      <section className="border-t border-border bg-surface py-12 sm:py-14" aria-labelledby="cta-rp-heading">
-        <div className="mx-auto max-w-2xl px-4 text-center sm:px-6 lg:px-8">
-          <h2 id="cta-rp-heading" className="font-display text-xl font-semibold text-fg sm:text-2xl">
-            Passer au chiffrage
-          </h2>
-          <p className="mt-2 text-sm leading-relaxed text-muted sm:text-base">
-            Projettez vos volumes et comparez avec votre grille actuelle.
-          </p>
-          <Link
-            to="/simulateur"
-            className="btn-primary mx-auto mt-8 inline-flex min-h-11 items-center justify-center rounded-xl px-8 py-3 text-sm font-semibold sm:text-base"
-          >
-            Ouvrir le simulateur
-          </Link>
+      <section className="border-b border-border bg-bg py-14 sm:py-18">
+        <div className="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
+          <div className="grid gap-8 lg:grid-cols-[.8fr_1.2fr]">
+            <div>
+              <p className="text-xs font-semibold uppercase text-accent">Chemin d’une requête</p>
+              <h2 className="mt-3 font-display text-3xl font-semibold sm:text-4xl">Du prompt à la preuve.</h2>
+              <p className="mt-4 text-sm leading-7 text-muted">
+                Le but n’est plus de vendre une fonction spectaculaire : le but est de montrer un chemin stable,
+                auditable, facturable et répétable.
+              </p>
+            </div>
+            <ol className="grid list-none gap-4 p-0 md:grid-cols-2">
+              {currentPath.map((step, index) => (
+                <li key={step.title} className="rounded-lg border border-border bg-card p-5">
+                  <p className="font-mono text-xs font-semibold text-accent">{String(index + 1).padStart(2, '0')}</p>
+                  <h3 className="mt-3 text-lg font-semibold">{step.title}</h3>
+                  <p className="mt-2 text-sm leading-7 text-muted">{step.body}</p>
+                </li>
+              ))}
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <section className="border-b border-border bg-card py-14 sm:py-18">
+        <div className="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
+          <div className="grid gap-8 lg:grid-cols-[1fr_.9fr] lg:items-start">
+            <div>
+              <p className="text-xs font-semibold uppercase text-accent">Exigences de production</p>
+              <h2 className="mt-3 font-display text-3xl font-semibold sm:text-4xl">Ce qui rend le pool défendable.</h2>
+              <p className="mt-4 text-base leading-8 text-muted">
+                Vryx doit être jugé comme une infrastructure B2B : accès protégés, traces propres, facturation,
+                observabilité et contrôles continus. Les briques utiles sont maintenant visibles dans le produit.
+              </p>
+            </div>
+            <ul className="grid gap-3">
+              {requirements.map((item) => (
+                <li key={item} className="rounded-lg border border-border bg-bg px-4 py-3 text-sm font-medium">
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       </section>
     </div>

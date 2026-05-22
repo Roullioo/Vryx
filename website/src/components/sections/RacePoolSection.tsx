@@ -13,7 +13,7 @@ export function RacePoolSection() {
     >
       <div
         className="absolute inset-0 bg-cover bg-center bg-no-repeat"
-        style={{ backgroundImage: "url('/mid.png')" }}
+        style={{ backgroundImage: "url('/heroes/mid-section.webp')" }}
         aria-hidden
       />
       <div className="hero-overlay absolute inset-0" aria-hidden />

@@ -103,7 +103,7 @@ export function AdminOverviewPage() {
             <MetricCard label="Utilisateurs totaux" value={site ? site.stats.totalUsers.toLocaleString('fr-FR') : '—'} hint={site ? `${site.stats.totalAdmins} admin(s)` : undefined} />
             <MetricCard label="Inscriptions 24 h" value={site ? `+${site.stats.newUsers24h}` : '—'} hint={site ? `+${site.stats.newUsers7d} sur 7 j` : undefined} tone="success" />
             <MetricCard label="Connexions 24 h" value={site ? site.stats.activeUsers24h.toLocaleString('fr-FR') : '—'} hint={site ? `${site.stats.activeUsers7d} sur 7 j` : undefined} tone="electric" />
-            <MetricCard label="Workers (gRPC)" value={node ? String(node.workers.length) : '—'} hint={node ? `${node.workers.filter((w) => w.status === 'online').length} en ligne` : undefined} />
+            <MetricCard label="Workers connectés" value={node ? String(node.workers.length) : '—'} hint={node ? `${node.workers.filter((w) => w.status === 'online').length} en ligne` : undefined} />
           </div>
         </section>
 

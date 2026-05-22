@@ -173,6 +173,105 @@ function normalizeWorkerSteps(v: unknown): SessionWorkerStep[] {
     .filter((step) => step.peerId.length > 0)
 }
 
+function asObject(v: unknown): Record<string, unknown> | null {
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>
+  return null
+}
+
+function normalizeTokenStepsFromPipelineTrace(traceLike: unknown): SessionTokenStep[] {
+  const trace = asObject(traceLike)
+  if (!trace) return []
+
+  const generationRaw = Array.isArray(trace.generation_steps)
+    ? (trace.generation_steps as unknown[])
+    : []
+  const tokenSteps: SessionTokenStep[] = []
+
+  for (const item of generationRaw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const o = item as Record<string, unknown>
+    const tokenIndex = asNum(o.tokenIndex ?? o.token_index)
+    if (!tokenIndex) continue
+    const hopList = Array.isArray(o.hop_ms)
+      ? o.hop_ms
+      : Array.isArray(o.hops)
+        ? o.hops
+        : []
+    const hopMs = hopList
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+      .reduce((sum, current) => sum + current, 0)
+    const fallback = asNum(o.totalMs ?? o.total_ms)
+    const totalMs = hopMs > 0 ? hopMs : fallback
+    tokenSteps.push({
+      tokenIndex,
+      totalMs: Math.max(0, totalMs),
+      hopCount: Math.max(1, hopList.length),
+      tps: totalMs > 0 ? Number((1000 / totalMs).toFixed(3)) : undefined,
+    })
+  }
+
+  if (tokenSteps.length > 0) {
+    return tokenSteps.sort((a, b) => a.tokenIndex - b.tokenIndex)
+  }
+
+  const events = Array.isArray(trace.token_events)
+    ? (trace.token_events as unknown[])
+    : []
+
+  let prevElapsed = 0
+  let nextTokenIndex = 1
+  for (const item of events) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const o = item as Record<string, unknown>
+    const tokenIndex = asNum(o.tokenIndex ?? o.token_index, nextTokenIndex)
+    nextTokenIndex = tokenIndex + 1
+    const elapsedMs = Math.max(0, asNum(o.elapsed_ms ?? o.elapsedMs ?? o.ts_ms))
+    const stepMs = Math.max(0, elapsedMs > prevElapsed ? elapsedMs - prevElapsed : elapsedMs)
+    prevElapsed = Math.max(prevElapsed, elapsedMs)
+    tokenSteps.push({
+      tokenIndex,
+      totalMs: stepMs,
+      hopCount: 1,
+      tps: stepMs > 0 ? Number((1000 / stepMs).toFixed(3)) : undefined,
+      cumulativeTps: elapsedMs > 0 ? Number(((tokenIndex * 1000) / elapsedMs).toFixed(3)) : undefined,
+    })
+  }
+
+  return tokenSteps.sort((a, b) => a.tokenIndex - b.tokenIndex)
+}
+
+function normalizeLoadStepsFromPipelineTrace(traceLike: unknown): SessionLoadStep[] {
+  const trace = asObject(traceLike)
+  if (!trace) return []
+  const loadRaw = trace.steps_load
+  if (!Array.isArray(loadRaw)) return []
+  return loadRaw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => ({
+      rank: asNum(item.rank),
+      peerId: asStr(item.peer ?? item.peer_id ?? item.node),
+      loadMs: Math.max(0, asNum(item.loadMs ?? item.load_ms)),
+    }))
+    .filter((step) => step.peerId.length > 0)
+}
+
+function normalizeWorkerStepsFromPipelineTrace(traceLike: unknown): SessionWorkerStep[] {
+  const trace = asObject(traceLike)
+  if (!trace) return []
+  const workersRaw = trace.steps
+  if (!Array.isArray(workersRaw)) return []
+  return workersRaw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => ({
+      rank: asNum(item.rank),
+      peerId: asStr(item.peer ?? item.peer_id),
+      role: asStr(item.role, 'étape'),
+      latencyMs: Math.max(0, asNum(item.latencyMs ?? item.latency_ms)),
+      outRows: asNumOrNull(item.outRows ?? item.out_rows) ?? undefined,
+    }))
+    .filter((step) => step.peerId.length > 0)
+}
+
 function normalizeQuantization(v: unknown): WorkSession['requestedQuantization'] {
   return v === 'q4' || v === 'int8' || v === 'fp16' ? v : undefined
 }
@@ -194,8 +293,28 @@ export function normalizeSession(raw: unknown): WorkSession {
   const tokenSteps = normalizeTokenSteps(s.tokenSteps ?? s.token_steps)
   const loadSteps = normalizeLoadSteps(s.loadSteps ?? s.load_steps)
   const workerSteps = normalizeWorkerSteps(s.workerSteps ?? s.worker_steps)
+  const pipelineTrace = asObject(s.pipeline_trace ?? s.pipelineTrace)
+  const metrics = asObject(s.metrics)
+  const normalizedTokenSteps = tokenSteps.length > 0 ? tokenSteps : normalizeTokenStepsFromPipelineTrace(pipelineTrace)
+  const normalizedLoadSteps = loadSteps.length > 0 ? loadSteps : normalizeLoadStepsFromPipelineTrace(pipelineTrace)
+  const normalizedWorkerSteps = workerSteps.length > 0 ? workerSteps : normalizeWorkerStepsFromPipelineTrace(pipelineTrace)
+  const tracePeers = pipelineTrace?.peers
+  const peersFromTrace = Array.isArray(tracePeers)
+    ? (tracePeers as unknown[]).filter((entry): entry is string => typeof entry === 'string')
+    : []
+  const peersFromTraceFallback = peersFromTrace.length > 0 ? peersFromTrace : []
   const fallbackPeers =
-    peers.length > 0 ? peers : routingPath.length > 0 ? routingPath : workerSteps.length > 0 ? workerSteps.map((w) => w.peerId) : workerPeerId ? [workerPeerId] : []
+    peers.length > 0
+      ? peers
+      : routingPath.length > 0
+        ? routingPath
+        : normalizedWorkerSteps.length > 0
+          ? normalizedWorkerSteps.map((w) => w.peerId)
+          : peersFromTraceFallback.length > 0
+            ? peersFromTraceFallback
+            : workerPeerId
+              ? [workerPeerId]
+              : []
 
   return {
     id: asStr(s.id, `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
@@ -209,11 +328,26 @@ export function normalizeSession(raw: unknown): WorkSession {
     computeTimeMs: asNumOrNull(s.computeTimeMs ?? s.compute_time_ms) ?? undefined,
     routingPath: routingPath.length > 0 ? routingPath : undefined,
     promptTokens: Math.max(0, asNum(s.promptTokens ?? s.prompt_tokens)),
-    completionTokens: Math.max(0, asNum(s.completionTokens ?? s.completion_tokens ?? s.tokens_generated)),
+    completionTokens: Math.max(
+      0,
+      asNum(
+        s.completionTokens ??
+          s.completion_tokens ??
+          s.tokens_generated ??
+          s.tokensGenerated ??
+          metrics?.completion_tokens ??
+          pipelineTrace?.completion_tokens,
+      ),
+    ),
     totalTokens: Math.max(
       0,
       asNum(
-        s.totalTokens ?? s.total_tokens,
+        s.totalTokens ??
+          s.total_tokens ??
+          metrics?.total_tokens ??
+          pipelineTrace?.total_tokens ??
+          pipelineTrace?.totalTokens ??
+          asNum(asObject(pipelineTrace?.metrics)?.total_tokens),
         asNum(s.promptTokens ?? s.prompt_tokens) + asNum(s.completionTokens ?? s.completion_tokens ?? s.tokens_generated),
       ),
     ),
@@ -227,9 +361,9 @@ export function normalizeSession(raw: unknown): WorkSession {
     pipelineLayout: asStr(s.pipelineLayout ?? s.pipeline_layout),
     pipelineOk: Boolean(s.pipelineOk ?? s.pipeline_ok),
     peers: fallbackPeers,
-    tokenSteps,
-    loadSteps,
-    workerSteps,
+    tokenSteps: normalizedTokenSteps,
+    loadSteps: normalizedLoadSteps,
+    workerSteps: normalizedWorkerSteps,
     workerInfo: s.workerInfo && typeof s.workerInfo === 'object' && !Array.isArray(s.workerInfo)
       ? s.workerInfo as WorkSession['workerInfo']
       : undefined,

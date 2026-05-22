@@ -52,6 +52,18 @@ Artefacts :
 - Vryx Private Pool : capacite dediee/semi-dediee, SLA, privacy renforcee.
 - Vryx Custom AI : RAG, fine-tuning, LoRA ou projet IA metier avec devis.
 
+## Preuves commerciales a collecter
+
+Objectif court terme : 2-3 lettres d'interet signees ou au moins 1 pilote payant.
+
+Suivi produit :
+
+- `/admin/enterprise` suit maintenant les demandes B2B, lettres d'interet, pilotes payants, montant pilote, prochaine action et lien vers document signe.
+- Les templates sont disponibles dans `docs/LETTER_OF_INTEREST_TEMPLATE.md` et `docs/PAID_PILOT_TEMPLATE.md`.
+- Le pipeline de preuve est decrit dans `docs/COMMERCIAL_PROOF_PIPELINE.md`.
+
+Important : une lettre d'interet ne devient une preuve investisseur qu'une fois signee par un prospect reel. Un pilote payant doit etre lie a une facture, un paiement ou un bon de commande.
+
 ## Roadmap 90 jours
 
 - Jours 1-15 : securite production, routes redacted, worker auth obligatoire, secrets stricts.
@@ -93,3 +105,6 @@ Artefacts :
 - `docs/DPA_DRAFT.md`
 - `docs/INCIDENT_RESPONSE.md`
 - `docs/WORKER_TERMS_DRAFT.md`
+- `docs/LETTER_OF_INTEREST_TEMPLATE.md`
+- `docs/PAID_PILOT_TEMPLATE.md`
+- `docs/COMMERCIAL_PROOF_PIPELINE.md`

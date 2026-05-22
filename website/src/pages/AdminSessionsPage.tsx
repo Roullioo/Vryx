@@ -12,6 +12,7 @@ import {
   normalizeSession,
   type WorkSession,
 } from '../lib/sessions'
+import { displayLabel } from '../lib/displayLabels'
 
 /* ─── Helpers ─────────────────────────────────────────────────────────────── */
 function fmt(n: number) { return n.toLocaleString('fr-FR') }
@@ -297,7 +298,7 @@ function FlowDiagram({ session }: { session: WorkSession }) {
               <div className="flex h-16 w-36 items-center justify-center rounded-xl border-2 border-electric/35 bg-electric/10 shadow-sm dark:border-electric/40 dark:bg-electric/15">
                 <div className="text-center">
                   <p className="text-[11px] font-bold text-electric">VPS / Initiateur</p>
-                  <p className="text-[9px] text-muted">gRPC → Python</p>
+                  <p className="text-[9px] text-muted">traitement interne</p>
                   {vps > 0 && <p className="text-[9px] font-mono text-electric/80">{ms(vps)}</p>}
                 </div>
               </div>
@@ -312,7 +313,7 @@ function FlowDiagram({ session }: { session: WorkSession }) {
                     {isDaisyChain
                       ? 'relais séquentiel'
                       : s.pipelineLayout === 'row_split_tensor_parallel'
-                        ? 'ancien TP'
+                        ? 'ancienne trace'
                         : 'P2P'}
                   </p>
                 </div>
@@ -378,7 +379,7 @@ function FlowDiagram({ session }: { session: WorkSession }) {
                 <div className="flex flex-col items-center px-2">
                   <div className="h-0.5 w-10 bg-success/50" />
                   <p className="text-[9px] text-muted whitespace-nowrap">
-                    {s.pipelineLayout === 'row_split_tensor_parallel' ? 'sortie TP' : 'réponse'}
+                    {s.pipelineLayout === 'row_split_tensor_parallel' ? 'sortie distribuée' : 'réponse'}
                   </p>
                 </div>
               </>
@@ -562,7 +563,7 @@ function SessionCard({ session, onDelete }: { session: WorkSession; onDelete: ()
           )}
           {s.stopReason && s.stopReason !== 'null' && (
             <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[9px] text-warning">
-              {s.stopReason}
+              {displayLabel(s.stopReason)}
             </span>
           )}
         </div>
@@ -784,7 +785,7 @@ export function AdminSessionDetailPage() {
           )}
           {safeSession.stopReason && safeSession.stopReason !== 'null' && (
             <span className="inline-flex items-center gap-1 rounded-full bg-warning/10 px-3 py-1 text-xs font-semibold text-warning">
-              arrêt : {safeSession.stopReason}
+              arrêt : {displayLabel(safeSession.stopReason)}
             </span>
           )}
         </div>
@@ -795,14 +796,13 @@ export function AdminSessionDetailPage() {
           <p className="mt-2 text-xs leading-relaxed text-muted">
             {safeSession.pipelineLayout === 'pipeline_relay_daisy_chain' ? (
               <>
-                <strong>Pipeline Parallelism (Daisy Chain) :</strong> Les tenseurs ont traversé les nœuds dans l&apos;ordre du{' '}
-                <span className="font-mono">routing_path</span> : chaque pair calcule son segment puis passe au suivant (relais séquentiel), 
-                sans passer par une API Web2 centralisée.
+                <strong>Pipeline distribué :</strong> la requête traverse les nœuds dans l&apos;ordre prévu. Chaque worker calcule son segment,
+                puis transmet le relais au suivant sans passer par une API centralisée.
               </>
             ) : safeSession.pipelineLayout === 'row_split_tensor_parallel' ? (
               <>
-                <strong>Ancienne trace Tensor Parallelism :</strong> ce layout row-split est conservé seulement pour lire les anciennes sessions.
-                Le chat admin actuel utilise la chaîne de relais Daisy Chain via <span className="font-mono">routing_path</span>.
+                <strong>Ancienne trace distribuée :</strong> ce mode est conservé seulement pour relire les anciennes sessions.
+                Le chat admin actuel utilise une chaîne de relais plus stable.
               </>
             ) : safeSession.pipelineLayout === 'distributed_fanout' ? (
               <>
@@ -811,8 +811,8 @@ export function AdminSessionDetailPage() {
               </>
             ) : (
               <>
-                <strong>Pipeline P2P natif :</strong> L&apos;initiateur Rust orchestre l&apos;inférence via gRPC et libp2p ; les segments peuvent transiter en{' '}
-                <strong>chaîne de relais</strong> (Daisy Chain, <span className="font-mono">routing_path</span>) ou en parallèle selon le layout du tour.
+                <strong>Pipeline distribué natif :</strong> l&apos;orchestrateur répartit l&apos;inférence entre plusieurs nœuds. Les segments peuvent transiter
+                en chaîne de relais ou en parallèle selon le mode du tour.
               </>
             )}
           </p>

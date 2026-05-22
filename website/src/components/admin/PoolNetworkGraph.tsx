@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ForceGraph2D from 'react-force-graph-2d'
-import ForceGraph3D from 'react-force-graph-3d'
-import * as THREE from 'three'
+import type { ForceGraphMethods as ForceGraph2DMethods } from 'react-force-graph-2d'
 import { apiJson } from '../../lib/api'
+import { displayLabel } from '../../lib/displayLabels'
+import type { PoolNetworkGraph3DProps } from './PoolNetworkGraph3D'
 
 export type PoolGraphNode = {
   id: string
@@ -47,6 +48,9 @@ type Props = {
 }
 
 const ORCH_ID = 'vps-core'
+const PoolNetworkGraph3D = lazy(() =>
+  import('./PoolNetworkGraph3D').then((m) => ({ default: m.PoolNetworkGraph3D })),
+)
 
 function IconCloseX({ className }: { className?: string }) {
   return (
@@ -120,20 +124,20 @@ function workerStatusLabel(n: PoolGraphNode): string {
   if (n.status === 'computing') return 'Calcul en cours'
   if (n.status === 'timeout') return 'Timeout / hors ligne'
   if (n.status === 'idle') return 'En veille (connecté)'
-  return n.status || '—'
+  return displayLabel(n.status)
 }
 
 function probeMethodLabel(method: string | undefined | null): string {
-  if (method === 'tcp_grpc') return 'TCP (gRPC)'
-  if (method === 'tcp_p2p') return 'TCP (P2P)'
+  if (method === 'tcp_grpc') return 'Connexion interne'
+  if (method === 'tcp_p2p') return 'Connexion directe'
   if (method === 'icmp') return 'ICMP'
   return ''
 }
 
 export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, pipelineActive }: Props) {
-  const safeIncomingNodes = Array.isArray(incomingNodes) ? incomingNodes : []
-  const safeIncomingLinks = Array.isArray(incomingLinks) ? incomingLinks : []
-  const fgRef = useRef<any>(null)
+  const safeIncomingNodes = useMemo(() => (Array.isArray(incomingNodes) ? incomingNodes : []), [incomingNodes])
+  const safeIncomingLinks = useMemo(() => (Array.isArray(incomingLinks) ? incomingLinks : []), [incomingLinks])
+  const fgRef = useRef<ForceGraph2DMethods<PoolGraphNode, PoolGraphLink> | undefined>(undefined)
   const mouseRef = useRef({ x: 0, y: 0 })
   const posRef = useRef<Map<string, { x: number; y: number; vx?: number; vy?: number }>>(new Map())
   const [mode2d, setMode2d] = useState(true)
@@ -158,6 +162,7 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
   const [livePingMethod, setLivePingMethod] = useState<string | null>(null)
   const [livePingErr, setLivePingErr] = useState<string | null>(null)
   const [livePingBusy, setLivePingBusy] = useState(false)
+  const selectedId = selected?.id ?? null
 
   useEffect(() => {
     const prev = posRef.current
@@ -212,14 +217,8 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
   }, [safeIncomingNodes, safeIncomingLinks])
 
   useEffect(() => {
-    if (!selected || selected.id === ORCH_ID) {
-      setLivePingMs(null)
-      setLivePingMethod(null)
-      setLivePingErr(null)
-      setLivePingBusy(false)
-      return
-    }
-    const peerId = selected.id
+    if (!selectedId || selectedId === ORCH_ID) return
+    const peerId = selectedId
     let cancelled = false
     let errorStreak = 0
     const run = async () => {
@@ -258,14 +257,13 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
       cancelled = true
       window.clearInterval(iv)
     }
-  }, [selected?.id])
+  }, [selectedId])
 
   const backgroundPaint = useCallback(
     (ctx: CanvasRenderingContext2D, globalScale: number) => {
-      const data = fgRef.current?.graphData?.()
-      if (!data?.nodes?.length) return
+      if (!graphData.nodes.length) return
       const byGroup = new Map<string, PoolGraphNode[]>()
-      for (const n of data.nodes as PoolGraphNode[]) {
+      for (const n of graphData.nodes) {
         if (n.id === ORCH_ID || n.x == null || n.y == null) continue
         const g = n.group || 'pool'
         if (!byGroup.has(g)) byGroup.set(g, [])
@@ -292,7 +290,7 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
         ctx.stroke()
       }
     },
-    [],
+    [graphData.nodes],
   )
 
   const nodeRelSize = useCallback((n: PoolGraphNode) => Math.max(2.5, Math.sqrt(Number(n.val) || 1) * 2.2), [])
@@ -307,12 +305,6 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
         }
         if (typeof fg.zoom === 'function') {
           fg.zoom(2.2, 400)
-        } else if (typeof fg.cameraPosition === 'function') {
-          fg.cameraPosition(
-            { x: node.x, y: node.y, z: 260 },
-            { x: node.x, y: node.y, z: 0 },
-            500,
-          )
         }
       }
     },
@@ -356,7 +348,7 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
 
   const persistPositions = useCallback(() => {
     try {
-      fgRef.current?.graphData()?.nodes?.forEach((n: PoolGraphNode) => {
+      graphData.nodes.forEach((n) => {
         if (typeof n.x === 'number' && typeof n.y === 'number') {
           posRef.current.set(n.id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy })
         }
@@ -364,10 +356,9 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
     } catch {
       /* ignore */
     }
-  }, [])
+  }, [graphData.nodes])
 
   const commonProps = {
-    ref: fgRef,
     graphData,
     backgroundColor: 'rgba(15, 17, 28, 0.92)',
     linkDirectionalParticles: linkParticlesCb,
@@ -404,8 +395,9 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
   const fg2d = (
     <ForceGraph2D<PoolGraphNode, PoolGraphLink>
       {...commonProps}
+      ref={fgRef}
       nodeRelSize={6}
-      nodeVal={nodeRelSize as any}
+      nodeVal={nodeRelSize}
       nodeLabel={() => ''}
       nodeCanvasObjectMode={() => 'replace'}
       onRenderFramePre={backgroundPaint}
@@ -433,32 +425,11 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
     />
   )
 
-  const fg3d = (
-    <ForceGraph3D<PoolGraphNode, PoolGraphLink>
-      {...commonProps}
-      nodeThreeObject={(node: PoolGraphNode) => {
-        const hue = hueFromString(node.group || '')
-        const size = Math.max(3, Math.cbrt(Number(node.val) || 1) * 2.5)
-        const mesh = new THREE.Mesh(
-          new THREE.SphereGeometry(size, 18, 18),
-          new THREE.MeshLambertMaterial({
-            color:
-              node.status === 'timeout'
-                ? 0xf97316
-                : node.status === 'computing'
-                  ? 0x5eead4
-                  : new THREE.Color().setHSL(((hue % 360) / 360 + 1) % 1, 0.65, 0.55),
-            transparent: true,
-            opacity: 0.92,
-          }),
-        )
-        return mesh
-      }}
-      nodeThreeObjectExtend={false}
-      linkOpacity={0.35}
-      onEngineStop={persistPositions}
-    />
-  )
+  const fg3dProps: PoolNetworkGraph3DProps = {
+    commonProps,
+    hueFromString,
+    persistPositions,
+  }
 
   return (
     <div className="relative isolate w-full">
@@ -493,7 +464,19 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
           mouseRef.current = { x: e.clientX, y: e.clientY }
         }}
       >
-        {mode2d ? fg2d : fg3d}
+        {mode2d ? (
+          fg2d
+        ) : (
+          <Suspense
+            fallback={
+              <div className="flex h-full min-h-[300px] items-center justify-center text-xs font-semibold uppercase tracking-wide text-slate-300">
+                Chargement de la vue 3D…
+              </div>
+            }
+          >
+            <PoolNetworkGraph3D {...fg3dProps} />
+          </Suspense>
+        )}
 
         {hover && (
           <div

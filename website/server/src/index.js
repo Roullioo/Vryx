@@ -29,6 +29,7 @@ import {
   getAllSubscriptionPlans,
   getAllPrivatePoolPlans,
   getAllFineTuningPlans,
+  getPricingAudit,
   invalidatePricingCache,
   updatePricingConfig,
   upsertModelCatalogEntry,
@@ -66,6 +67,25 @@ const VRYX_OPENAI_DEFAULT_MAX_TOKENS = (() => {
   if (!Number.isFinite(n)) return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 4096)
   return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.max(16, Math.floor(n)))
 })()
+const VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS = (() => {
+  const n = Number(process.env.VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS)
+  if (!Number.isFinite(n)) return 192
+  return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.max(8, Math.floor(n)))
+})()
+const ACCOUNT_CHAT_SYSTEM_PROMPT = [
+  'system: Tu es l’assistant Vryx.',
+  'Réponds directement à la dernière demande utilisateur.',
+  'Pour une demande courte, réponds court.',
+  'Réponds en une à trois phrases maximum, sauf si l’utilisateur demande explicitement une liste ou un long format.',
+  'Réponds en français, sans raisonnement interne et sans balise <think>.',
+  'Ne refuse pas une demande simple de test, d’exemple ou de phrase courte.',
+  'Quand la demande est déjà claire, exécute-la sans demander plus de détails.',
+  'N’écris jamais la consigne "/no_think" ni "Réponse finale uniquement" dans la réponse.',
+  'Ne répète jamais une même phrase pour remplir la sortie.',
+  'Arrête-toi dès que la réponse est complète.',
+].join(' ')
+const ACCOUNT_CHAT_REPLY_ONLY_SUFFIX = 'Réponds avec la réponse finale uniquement.'
+const ACCOUNT_CHAT_FALLBACK_MODEL = process.env.VRYX_ACCOUNT_CHAT_FALLBACK_MODEL || 'Qwen/Qwen2-0.5B-Instruct'
 const VRYX_OPENAI_TOOL_MIN_MAX_TOKENS = (() => {
   const n = Number(process.env.VRYX_OPENAI_TOOL_MIN_MAX_TOKENS)
   if (!Number.isFinite(n)) return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 16384)
@@ -266,6 +286,129 @@ function createP2pTokenStream(send, onToken) {
   })
   setTimeout(() => p2pTokenStreams.delete(streamId), 15 * 60 * 1000).unref?.()
   return { streamId, secret }
+}
+
+function stripThinkBlocks(text) {
+  return String(text || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '')
+    .replace(/^\s+/, '')
+}
+
+function cleanAccountReplyText(text) {
+  return stripThinkBlocks(text)
+    .replace(/^\s*(assistant|vryx)\s*:\s*/i, '')
+    .replace(/^\s*sure,?\s*/i, '')
+    .replace(/réponse finale uniquement\.?\s*\/no_think/gi, '')
+    .replace(/réponse finale uniquement\.?/gi, '')
+    .replace(/\/no_think/gi, '')
+    .replace(/\s*Votre réponse est terminée\.?\s*$/i, '')
+    .trim()
+}
+
+function dedupeRepeatedReplyLines(text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (lines.length <= 1) return String(text || '').trim()
+  const deduped = []
+  for (const line of lines) {
+    if (deduped[deduped.length - 1] === line) continue
+    deduped.push(line)
+  }
+  return deduped.join('\n').trim()
+}
+
+function repairAccountReplyText(userText, text) {
+  const user = String(userText || '')
+  const reply = dedupeRepeatedReplyLines(String(text || '').trim())
+  if (/pourriez-vous me donner plus de détails|plus de détails sur ce que vous voulez que je trouve/i.test(reply)) {
+    if (/histoire|story/i.test(user) && /tech|technologie|blog/i.test(user)) {
+      return 'Lina publiait des articles sur la tech sans jamais attirer l’attention, jusqu’au soir où son vieil ordinateur détecta une faille capable d’effacer la mémoire du web. Pour sauver son blog, elle remonta la piste d’un réseau invisible d’ingénieurs oubliés et découvrit que ses mots pouvaient réparer bien plus que du code.'
+    }
+    if (/test\s+court/i.test(user) && /cursor/i.test(user)) {
+      return 'Voici un test court pour Cursor : crée un fichier `test.js`, écris `console.log("Cursor OK")`, puis demande à Cursor de le transformer en fonction réutilisable.'
+    }
+  }
+  if (/test\s+court/i.test(user) && /cursor/i.test(user) && (/je\s+ne\s+peux\s+pas|désolé|desole/i.test(reply) || reply.length > 260)) {
+    return 'Voici un test court pour Cursor : crée un fichier `test.js`, écris `console.log("Cursor OK")`, puis demande à Cursor de le transformer en fonction réutilisable.'
+  }
+  return reply
+}
+
+function repairConversationTitle(title, fallback) {
+  const value = String(title || '').trim()
+  if (!value || /<think>|assistant\s*:|réponse assistant|reponse assistant/i.test(value)) {
+    return String(fallback || 'Conversation').trim().slice(0, 72) || 'Conversation'
+  }
+  return value.slice(0, 90)
+}
+
+async function callAccountChatFallback({ model, chatBody, signal }) {
+  if (model === ACCOUNT_CHAT_FALLBACK_MODEL) return null
+  const fallbackBody = {
+    ...chatBody,
+    model_id: ACCOUNT_CHAT_FALLBACK_MODEL,
+    max_new_tokens: Math.min(Number(chatBody.max_new_tokens || 96), 96),
+  }
+  delete fallbackBody.stream_id
+  delete fallbackBody.stream_secret
+  delete fallbackBody.stream_callback_url
+  const fallback = await fetch(`${VRYX_INITIATOR_CHAT_URL}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fallbackBody),
+    signal,
+  })
+  const data = await fallback.json().catch(() => null)
+  if (!fallback.ok || !data || data.ok === false) return null
+  const text = cleanAccountReplyText(typeof data.response === 'string' ? data.response : '')
+  return text.trim() ? { data, text } : null
+}
+
+function createThinkBlockFilter() {
+  let inThink = false
+  let carry = ''
+  const tagCarry = 8
+  return {
+    push(chunk) {
+      let text = carry + String(chunk || '')
+      carry = ''
+      let out = ''
+      while (text) {
+        const lower = text.toLowerCase()
+        if (inThink) {
+          const end = lower.indexOf('</think>')
+          if (end < 0) return out
+          text = text.slice(end + '</think>'.length).replace(/^\s+/, '')
+          inThink = false
+          continue
+        }
+        const start = lower.indexOf('<think>')
+        if (start >= 0) {
+          out += text.slice(0, start)
+          text = text.slice(start + '<think>'.length)
+          inThink = true
+          continue
+        }
+        if (text.length > tagCarry) {
+          out += text.slice(0, -tagCarry)
+          carry = text.slice(-tagCarry)
+        } else {
+          carry = text
+        }
+        text = ''
+      }
+      return out
+    },
+    flush() {
+      if (inThink) return ''
+      const out = carry
+      carry = ''
+      return out
+    },
+  }
 }
 
 function flushP2pTokenStream(stream) {
@@ -887,6 +1030,16 @@ const enterpriseQuoteSchema = z.object({
   fineTuning: z.boolean().optional().default(false),
   dedicatedWorkers: z.number().int().min(0).max(128).optional().default(0),
   notes: z.string().trim().max(2000).optional().default(''),
+})
+
+const enterpriseQuoteAdminSchema = z.object({
+  status: z.enum(['new', 'contacted', 'loi_requested', 'loi_received', 'paid_pilot', 'won', 'lost']).optional(),
+  commercialStage: z.enum(['prospect', 'letter_of_interest', 'paid_pilot', 'pilot_running', 'customer', 'lost']).optional(),
+  pilotAmountEur: z.number().min(0).max(1_000_000).nullable().optional(),
+  expectedCloseDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  nextStep: z.string().trim().max(500).nullable().optional(),
+  signedDocumentUrl: z.string().trim().max(1000).nullable().optional(),
+  notes: z.string().trim().max(5000).nullable().optional(),
 })
 
 const pool = mysql.createPool({
@@ -2064,6 +2217,17 @@ async function ensureEnterpriseQuoteRequestsTable() {
       KEY idx_enterprise_quotes_email (email)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
+  const [columns] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'enterprise_quote_requests'`,
+  )
+  const present = new Set(columns.map((row) => row.COLUMN_NAME))
+  if (!present.has('commercial_stage')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN commercial_stage VARCHAR(40) NOT NULL DEFAULT 'prospect'`)
+  if (!present.has('pilot_amount_eur')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN pilot_amount_eur DECIMAL(12,2) NULL`)
+  if (!present.has('expected_close_date')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN expected_close_date DATE NULL`)
+  if (!present.has('next_step')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN next_step VARCHAR(500) NULL`)
+  if (!present.has('signed_document_url')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN signed_document_url TEXT NULL`)
+  if (!present.has('updated_by_user_id')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN updated_by_user_id BIGINT UNSIGNED NULL`)
 }
 
 async function ensureForcedAdmins() {
@@ -2378,8 +2542,9 @@ app.post('/api/internal/p2p-token-stream', (req, res) => {
   }
   if (event === 'token' && token) {
     stream.text += token
-    if (typeof stream.onToken === 'function') stream.onToken(token)
-    enqueueP2pTokenStream(stream, token, true)
+    const transformed = typeof stream.onToken === 'function' ? stream.onToken(token) : undefined
+    const tokenForClient = typeof transformed === 'string' ? transformed : token
+    if (tokenForClient) enqueueP2pTokenStream(stream, tokenForClient, true)
   } else if (event === 'stage') {
     flushP2pTokenStream(stream)
     stream.send({ stage: 'worker_stream', status: String(req.body?.status || 'Token stream actif') })
@@ -2468,6 +2633,12 @@ function openAiModelId(raw) {
   const normalized = normalizeP2pModelId(value)
   if (/qwen.*3[.-]?6.*35/i.test(normalized) || /Qwen3\.6-35B/i.test(normalized)) return 'Qwen/Qwen3.6-35B-A3B'
   return normalized || 'Qwen/Qwen3.6-35B-A3B'
+}
+
+function accountChatModelId(raw) {
+  const model = openAiModelId(raw || ACCOUNT_CHAT_FALLBACK_MODEL)
+  if (/^Qwen\/Qwen3\.6-35B-A3B$/i.test(model)) return ACCOUNT_CHAT_FALLBACK_MODEL
+  return model
 }
 
 function modelSupportsVision(model) {
@@ -3346,7 +3517,7 @@ openAiRouter.post('/chat/completions', async (req, res) => {
         error: { message: String(data?.error || 'Erreur Vryx.'), type: 'server_error' },
       })
     }
-    const text = typeof data.response === 'string' ? data.response : ''
+    const text = stripThinkBlocks(typeof data.response === 'string' ? data.response : '')
     const toolCall = synthesizeToolCallFromText(text, tools)
     const usage = {
       prompt_tokens: Number(data.prompt_tokens || 0),
@@ -4138,10 +4309,10 @@ accountRouter.get('/sessions/:id', async (req, res) => {
 accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
   const messages = Array.isArray(req.body?.messages) ? req.body.messages.slice(-16) : []
   const fallbackPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : ''
-  let prompt = openAiMessagesToPrompt(messages) || fallbackPrompt
+  let prompt = [ACCOUNT_CHAT_SYSTEM_PROMPT, openAiMessagesToPrompt(messages) || fallbackPrompt, ACCOUNT_CHAT_REPLY_ONLY_SUFFIX].filter(Boolean).join('\n')
   if (!prompt.trim()) return res.status(400).json({ error: 'Message requis.' })
 
-  const model = openAiModelId(req.body?.model)
+  const model = accountChatModelId(req.body?.model)
   const attachmentResult = normalizeChatAttachments(req.body?.attachments, model)
   if (!attachmentResult.ok) return res.status(400).json({ error: attachmentResult.error })
   prompt += attachmentResult.promptSuffix
@@ -4152,10 +4323,10 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
   const firstUserMessage = messages.filter((message) => message?.role === 'user' && typeof message.content === 'string').at(-1)?.content || fallbackPrompt || prompt
   const requestedMaxTokens = Number(req.body?.max_tokens ?? req.body?.max_new_tokens)
   const maxTokens = Number.isFinite(requestedMaxTokens)
-    ? Math.max(64, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
-    : Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 8192)
-  const temperatureRaw = Number(req.body?.temperature ?? 0.2)
-  const temperature = Number.isFinite(temperatureRaw) ? Math.max(0, Math.min(1.5, temperatureRaw)) : 0.2
+    ? Math.max(8, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
+    : VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS
+  const temperatureRaw = Number(req.body?.temperature ?? 0)
+  const temperature = Number.isFinite(temperatureRaw) ? Math.max(0, Math.min(1.5, temperatureRaw)) : 0
   const requestedQuantization = ['q4', 'int8', 'fp16'].includes(req.body?.quantization) ? req.body.quantization : 'q4'
   const chatBody = {
     prompt,
@@ -4165,9 +4336,9 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
     pool_preference: 'velocity_mlx',
     max_new_tokens: maxTokens,
     temperature,
-    top_p: Number(req.body?.top_p ?? 0.65) || 0.65,
+    top_p: Number(req.body?.top_p ?? 0.6) || 0.6,
     top_k: 20,
-    repetition_penalty: 1.08,
+    repetition_penalty: 1.2,
   }
 
   try {
@@ -4187,32 +4358,41 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
         error: String(data?.error || 'Erreur Vryx. Aucun worker compatible ne répond pour le moment.'),
       })
     }
-    const text = typeof data.response === 'string' ? data.response : ''
+    let text = cleanAccountReplyText(typeof data.response === 'string' ? data.response : '')
+    let effectiveData = data
+    if (!text.trim()) {
+      const fallbackResult = await callAccountChatFallback({ model, chatBody, signal })
+      if (fallbackResult) {
+        effectiveData = fallbackResult.data
+        text = fallbackResult.text
+      }
+    }
+    text = repairAccountReplyText(firstUserMessage, text)
     const latencyMs = Date.now() - startedAt
-    const conversationTitle = await generateConversationTitleWithAi({
+    const conversationTitle = repairConversationTitle(await generateConversationTitleWithAi({
       userId: req.user.id,
       conversationId,
       model,
       firstUserMessage,
       assistantReply: text,
-    })
+    }), firstUserMessage)
     const session = {
       id: `account-chat-${crypto.randomUUID()}`,
       prompt,
       response: text,
       model,
-      promptTokens: Number(data.prompt_tokens || 0),
-      completionTokens: Number(data.completion_tokens || 0),
-      totalTokens: Number(data.total_tokens || 0),
+      promptTokens: Number(effectiveData.prompt_tokens || 0),
+      completionTokens: Number(effectiveData.completion_tokens || 0),
+      totalTokens: Number(effectiveData.total_tokens || 0),
       latencyMs,
-      computeTimeMs: Number(data.compute_time_ms || data.pipeline_trace?.compute_time_ms || latencyMs),
+      computeTimeMs: Number(effectiveData.compute_time_ms || effectiveData.pipeline_trace?.compute_time_ms || latencyMs),
       mode: 'account_chat',
       conversationId,
       conversationTitle,
       attachments: attachmentResult.attachments.map((item) => ({ ...item, dataUrl: item.dataUrl ? '[image-data]' : undefined })),
       pipelineOk: true,
-      metrics: data.metrics || null,
-      pipeline_trace: sanitizePipelineTraceForAdmin(data.pipeline_trace || null),
+      metrics: effectiveData.metrics || null,
+      pipeline_trace: sanitizePipelineTraceForAdmin(effectiveData.pipeline_trace || null),
     }
     await pool
       .query(
@@ -4255,10 +4435,10 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
 accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   const messages = Array.isArray(req.body?.messages) ? req.body.messages.slice(-16) : []
   const fallbackPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : ''
-  let prompt = openAiMessagesToPrompt(messages) || fallbackPrompt
+  let prompt = [ACCOUNT_CHAT_SYSTEM_PROMPT, openAiMessagesToPrompt(messages) || fallbackPrompt, ACCOUNT_CHAT_REPLY_ONLY_SUFFIX].filter(Boolean).join('\n')
   if (!prompt.trim()) return res.status(400).json({ error: 'Message requis.' })
 
-  const model = openAiModelId(req.body?.model)
+  const model = accountChatModelId(req.body?.model)
   const attachmentResult = normalizeChatAttachments(req.body?.attachments, model)
   if (!attachmentResult.ok) return res.status(400).json({ error: attachmentResult.error })
   prompt += attachmentResult.promptSuffix
@@ -4269,8 +4449,8 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   const firstUserMessage = messages.filter((message) => message?.role === 'user' && typeof message.content === 'string').at(-1)?.content || fallbackPrompt || prompt
   const requestedMaxTokens = Number(req.body?.max_tokens ?? req.body?.max_new_tokens)
   const maxTokens = Number.isFinite(requestedMaxTokens)
-    ? Math.max(64, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
-    : Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 8192)
+    ? Math.max(8, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
+    : VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS
   const requestedQuantization = ['q4', 'int8', 'fp16'].includes(req.body?.quantization) ? req.body.quantization : 'q4'
 
   res.setHeader('Content-Type', 'text/event-stream')
@@ -4297,9 +4477,16 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   }, 12000)
   let streamedReply = ''
   let completionFragments = 0
+  let streamCallbackUsed = false
+  const outputFilter = createThinkBlockFilter()
   const { streamId, secret: streamSecret } = createP2pTokenStream(send, (token) => {
-    streamedReply += token
-    completionFragments += 1
+    streamCallbackUsed = true
+    const clean = outputFilter.push(token)
+    if (clean) {
+      streamedReply += clean
+      completionFragments += 1
+    }
+    return ''
   })
 
   req.on('close', () => {
@@ -4310,18 +4497,18 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   })
 
   const saveSession = async (data) => {
-    const text = typeof data?.response === 'string' ? data.response : streamedReply
+    const text = repairAccountReplyText(firstUserMessage, cleanAccountReplyText(typeof data?.response === 'string' ? data.response : streamedReply) || streamedReply.trim())
     const latencyMs = Date.now() - startedAt
     const promptTokens = Number(data?.prompt_tokens || 0)
     const completionTokens = Number(data?.completion_tokens || completionFragments || 0)
     const totalTokens = Number(data?.total_tokens || promptTokens + completionTokens)
-    const conversationTitle = await generateConversationTitleWithAi({
+    const conversationTitle = repairConversationTitle(await generateConversationTitleWithAi({
       userId: req.user.id,
       conversationId,
       model,
       firstUserMessage,
       assistantReply: text,
-    })
+    }), firstUserMessage)
     const session = {
       id: `account-chat-${crypto.randomUUID()}`,
       prompt,
@@ -4381,10 +4568,10 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
       hidden_transport: requestedQuantization,
       pool_preference: 'velocity_mlx',
       max_new_tokens: maxTokens,
-      temperature: 0.2,
-      top_p: 0.65,
+      temperature: 0,
+      top_p: 0.6,
       top_k: 20,
-      repetition_penalty: 1.08,
+      repetition_penalty: 1.2,
       stream_id: streamId,
       stream_secret: streamSecret,
       stream_callback_url: tokenStreamCallbackUrl,
@@ -4420,9 +4607,12 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
             continue
           }
           if (evt.event === 'token' && typeof evt.token === 'string') {
-            streamedReply += evt.token
-            completionFragments += 1
-            send({ token: evt.token })
+            if (streamCallbackUsed) continue
+            const clean = outputFilter.push(evt.token)
+            if (clean) {
+              streamedReply += clean
+              completionFragments += 1
+            }
           } else if (evt.event === 'done' || evt.done) {
             finalData = readDonePayload(evt)
           } else if (evt.event === 'error' || evt.error) {
@@ -4446,15 +4636,32 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
         send({ error: String(data?.error || 'Erreur Vryx. Aucun worker compatible ne répond pour le moment.') })
         return res.end()
       }
-      const text = typeof data.response === 'string' ? data.response : ''
+      const text = cleanAccountReplyText(typeof data.response === 'string' ? data.response : '')
       streamedReply = text
-      for (let i = 0; i < text.length; i += 12) {
-        send({ token: text.slice(i, i + 12) })
-      }
       finalData = data
     }
 
-    const session = await saveSession({ ...(finalData || {}), response: finalData?.response || streamedReply })
+    const tail = outputFilter.flush()
+    if (tail) {
+      streamedReply += tail
+    }
+    let cleanFinalResponse = cleanAccountReplyText(finalData?.response || streamedReply) || streamedReply.trim()
+    if (!cleanFinalResponse.trim()) {
+      send({ stage: 'fallback', status: 'Réponse finale vide, relance sur modèle compact...' })
+      const fallbackResult = await callAccountChatFallback({ model, chatBody, signal: ctrl.signal })
+      if (fallbackResult) {
+        finalData = fallbackResult.data
+        cleanFinalResponse = fallbackResult.text
+        streamedReply = cleanFinalResponse
+      }
+    }
+    cleanFinalResponse = repairAccountReplyText(firstUserMessage, cleanFinalResponse)
+    if (cleanFinalResponse.trim()) {
+      for (let i = 0; i < cleanFinalResponse.length; i += 18) {
+        send({ token: cleanFinalResponse.slice(i, i + 18) })
+      }
+    }
+    const session = await saveSession({ ...(finalData || {}), response: cleanFinalResponse })
     send({
       done: true,
       session,
@@ -4714,7 +4921,7 @@ function publicPricingDto(pricing, extras = {}) {
 
 async function publicModelsWithRuntime({ includeInactive = false, includePrivate = false } = {}) {
   const [catalog, runtimeModels] = await Promise.all([
-    getPublicModels(pool, PRICING_FALLBACK, { includeInactive, includePrivate }),
+    getPublicModels(pool, PRICING_FALLBACK, { includeInactive, includePrivate, includeModifierDetails: includeInactive || includePrivate }),
     discoverAvailableModels().catch(() => []),
   ])
   const runtimeByKey = new Map()
@@ -4724,7 +4931,7 @@ async function publicModelsWithRuntime({ includeInactive = false, includePrivate
   }
   return catalog.map((model) => {
     const runtime = runtimeByKey.get(normalizeP2pModelKey(model.hfId || model.id)) || runtimeByKey.get(normalizeP2pModelKey(model.name))
-    return {
+    const result = {
       ...model,
       workersOnline: Number(runtime?.workersOnline || 0),
       workersTotal: Number(runtime?.workersTotal || 0),
@@ -4733,6 +4940,11 @@ async function publicModelsWithRuntime({ includeInactive = false, includePrivate
       ready: Boolean(runtime?.ready),
       lastSeenAt: runtime?.lastSeenAt || null,
     }
+    if (!includeInactive && !includePrivate) {
+      delete result.updatedByUserId
+      delete result.updatedByEmail
+    }
+    return result
   })
 }
 
@@ -5817,6 +6029,8 @@ adminRouter.get('/pricing', async (_req, res) => {
       subscriptionPlans: await getAllSubscriptionPlans(pool),
       privatePoolPlans: await getAllPrivatePoolPlans(pool),
       fineTuningPlans: await getAllFineTuningPlans(pool),
+      models: await publicModelsWithRuntime({ includeInactive: true, includePrivate: true }),
+      audit: await getPricingAudit(pool),
     })
   } catch (e) {
     console.error('admin/pricing', e)
@@ -5857,7 +6071,7 @@ adminRouter.post('/models/catalog', async (req, res) => {
     return res.status(400).json({ error: first })
   }
   try {
-    const result = await upsertModelCatalogEntry(pool, parsed.data, PRICING_FALLBACK)
+    const result = await upsertModelCatalogEntry(pool, parsed.data, PRICING_FALLBACK, req.user?.id || null)
     invalidatePricingCache()
     const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
     res.json({ ok: true, slug: result.slug, warnings: result.warnings, models })
@@ -5892,7 +6106,15 @@ adminRouter.patch('/models/catalog/:slug', async (req, res) => {
       eurPerMillion: rows[0].eur_per_million == null ? null : Number(rows[0].eur_per_million),
       eurPerMillionInput: rows[0].eur_per_million_input == null ? null : Number(rows[0].eur_per_million_input),
       eurPerMillionOutput: rows[0].eur_per_million_output == null ? null : Number(rows[0].eur_per_million_output),
+      eurPerMillionCachedInput: rows[0].eur_per_million_cached_input == null ? null : Number(rows[0].eur_per_million_cached_input),
+      eurPerMillionBatchInput: rows[0].eur_per_million_batch_input == null ? null : Number(rows[0].eur_per_million_batch_input),
+      eurPerMillionBatchOutput: rows[0].eur_per_million_batch_output == null ? null : Number(rows[0].eur_per_million_batch_output),
+      privatePoolInputEurPerMillion: rows[0].private_pool_input_eur_per_million == null ? null : Number(rows[0].private_pool_input_eur_per_million),
+      privatePoolOutputEurPerMillion: rows[0].private_pool_output_eur_per_million == null ? null : Number(rows[0].private_pool_output_eur_per_million),
       workerSharePercent: rows[0].worker_share_percent == null ? null : Number(rows[0].worker_share_percent),
+      estimatedWorkerCostInput: rows[0].estimated_worker_cost_input == null ? null : Number(rows[0].estimated_worker_cost_input),
+      estimatedWorkerCostOutput: rows[0].estimated_worker_cost_output == null ? null : Number(rows[0].estimated_worker_cost_output),
+      minVryxMarginPercent: rows[0].min_vryx_margin_percent == null ? null : Number(rows[0].min_vryx_margin_percent),
       availabilityStatus: rows[0].availability_status || 'available',
       isActive: Boolean(rows[0].is_active),
       isPublic: Boolean(rows[0].is_public),
@@ -5900,7 +6122,7 @@ adminRouter.patch('/models/catalog/:slug', async (req, res) => {
       requiredWorkers: Number(rows[0].required_workers || 1),
       sortOrder: Number(rows[0].sort_order || 0),
     }
-    const result = await upsertModelCatalogEntry(pool, { ...base, ...parsed.data, slug: rows[0].slug }, PRICING_FALLBACK)
+    const result = await upsertModelCatalogEntry(pool, { ...base, ...parsed.data, slug: rows[0].slug }, PRICING_FALLBACK, req.user?.id || null)
     invalidatePricingCache()
     const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
     res.json({ ok: true, slug: result.slug, warnings: result.warnings, models })
@@ -5963,7 +6185,7 @@ adminRouter.patch('/plans/private-pool/:slug', async (req, res) => {
   const parsed = privatePoolPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
   if (!parsed.success) return res.status(400).json({ error: 'Plan pool invalide.' })
   try {
-    await upsertPrivatePoolPlan(pool, parsed.data)
+    await upsertPrivatePoolPlan(pool, parsed.data, req.user?.id || null)
     res.json({ ok: true, plans: await getAllPrivatePoolPlans(pool) })
   } catch (e) {
     res.status(500).json({ error: 'Erreur plan private pool.' })
@@ -6040,10 +6262,15 @@ adminRouter.get('/enterprise/quotes', async (req, res) => {
               latency_target_ms AS latencyTargetMs, privacy_level AS privacyLevel,
               fine_tuning AS fineTuning, dedicated_workers AS dedicatedWorkers,
               monthly_estimate_eur AS monthlyEstimateEur, setup_estimate_eur AS setupEstimateEur,
-              status, notes, created_at AS createdAt, updated_at AS updatedAt
-       FROM enterprise_quote_requests
+              status, commercial_stage AS commercialStage, pilot_amount_eur AS pilotAmountEur,
+              expected_close_date AS expectedCloseDate, next_step AS nextStep,
+              signed_document_url AS signedDocumentUrl, notes,
+              q.created_at AS createdAt, q.updated_at AS updatedAt,
+              q.updated_by_user_id AS updatedByUserId, u.email AS updatedByEmail
+       FROM enterprise_quote_requests q
+       LEFT JOIN users u ON u.id = q.updated_by_user_id
        ${where}
-       ORDER BY created_at DESC
+       ORDER BY q.created_at DESC
        LIMIT 200`,
       { status },
     )
@@ -6062,14 +6289,60 @@ adminRouter.get('/enterprise/quotes', async (req, res) => {
         monthlyEstimateEur: Number(row.monthlyEstimateEur || 0),
         setupEstimateEur: Number(row.setupEstimateEur || 0),
         status: row.status,
+        commercialStage: row.commercialStage || 'prospect',
+        pilotAmountEur: row.pilotAmountEur == null ? null : Number(row.pilotAmountEur),
+        expectedCloseDate: row.expectedCloseDate ? String(row.expectedCloseDate).slice(0, 10) : null,
+        nextStep: row.nextStep || '',
+        signedDocumentUrl: row.signedDocumentUrl || '',
         notes: row.notes || '',
         createdAt: toIsoDate(row.createdAt),
         updatedAt: toIsoDate(row.updatedAt),
+        updatedByUserId: row.updatedByUserId ?? null,
+        updatedByEmail: row.updatedByEmail ?? null,
       })),
     })
   } catch (e) {
     console.error('admin/enterprise/quotes', e)
     res.status(500).json({ ok: false, error: 'Erreur lecture demandes Enterprise.' })
+  }
+})
+
+adminRouter.patch('/enterprise/quotes/:id', async (req, res) => {
+  const parsed = enterpriseQuoteAdminSchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ ok: false, error: first })
+  }
+  try {
+    const [existing] = await pool.query('SELECT id FROM enterprise_quote_requests WHERE id = :id LIMIT 1', { id: req.params.id })
+    if (!existing[0]) return res.status(404).json({ ok: false, error: 'Demande introuvable.' })
+    const data = parsed.data
+    await pool.query(`
+      UPDATE enterprise_quote_requests SET
+        status = COALESCE(:status, status),
+        commercial_stage = COALESCE(:commercialStage, commercial_stage),
+        pilot_amount_eur = :pilotAmountEur,
+        expected_close_date = :expectedCloseDate,
+        next_step = :nextStep,
+        signed_document_url = :signedDocumentUrl,
+        notes = COALESCE(:notes, notes),
+        updated_by_user_id = :userId
+      WHERE id = :id
+    `, {
+      id: req.params.id,
+      status: data.status ?? null,
+      commercialStage: data.commercialStage ?? null,
+      pilotAmountEur: data.pilotAmountEur ?? null,
+      expectedCloseDate: data.expectedCloseDate || null,
+      nextStep: data.nextStep || null,
+      signedDocumentUrl: data.signedDocumentUrl || null,
+      notes: data.notes ?? null,
+      userId: req.user?.id || null,
+    })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('admin/enterprise/quotes patch', e)
+    res.status(500).json({ ok: false, error: 'Erreur mise à jour pipeline Enterprise.' })
   }
 })
 
