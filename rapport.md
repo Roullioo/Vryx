@@ -1,5 +1,34 @@
 # Rapport : réduction du « mur » perçu (admin chat P2P)
 
+## Mise à jour : refonte Vryx unifiée pricing, modèles, DA et admin (22 mai 2026)
+
+### Ce qu’il se passait avant
+
+- Le pricing était fragmenté : `0,30 €/M tokens` côté front et `VRYX_EUR_PER_MILLION` côté API, sans écran admin pour publier ou masquer la grille.
+- Le catalogue marketing des modèles et le catalogue runtime P2P étaient séparés, ce qui empêchait d’afficher un prix par modèle et une disponibilité cohérente.
+- L’admin ne proposait pas d’écrans dédiés pour modifier le tarif global, les remises volume ou le catalogue modèles.
+- Le branding gardait des traces visibles de « Velocity » et le cookie d’auth principal portait encore l’ancien nom.
+- Le design system alternait entre sections blanches, hero galactique et admin gris isolé ; la navbar n’était pas fixe.
+- Aucune base i18n FR/EN n’était branchée.
+
+### Ce qu’il se passe maintenant
+
+- MariaDB crée et seed automatiquement `pricing_config` et `model_catalog`; l’API expose `/api/public/pricing`, `/api/public/models`, `/api/admin/pricing` et `/api/admin/models/catalog`.
+- Le site public consomme ces APIs sur `/panel/modeles`, `/simulateur`, `/clients` et `/status`; si le prix n’est pas publié, l’interface affiche « Sur devis » au lieu d’un faux prix.
+- L’admin dispose de `/admin/parametres/pricing` et `/admin/modeles` pour publier le prix, gérer TVA, commission workers, remises volume, statuts actif/public et prix override.
+- Le branding émet désormais le cookie `vryx_token` et accepte encore `velocity_token` pendant la migration; les labels UI affichent Vryx, tout en gardant les valeurs API `velocity_mlx` / `velocity_vllm` compatibles.
+- Les tokens CSS sont alignés sur une DA bleu nuit / cyan, la navbar est fixe, des primitives `VryxCard`, `VryxButton`, `VryxBadge` et `VryxInput` sont disponibles.
+- `react-i18next` est initialisé en FR par défaut avec EN optionnel et un sélecteur de langue dans le footer.
+- La CI ajoute le test pricing/models et la documentation `INFRASTRUCTURE_A_Z.md` décrit les nouvelles tables et routes.
+
+### Vérifications locales et production
+
+- `npm run build` dans `website/` : OK.
+- `npm run lint:refonte` dans `website/` : OK (fichiers refonte uniquement).
+- `npm run test:pricing-models` dans `website/server/` : OK (`computeEffectiveModelPrice`, slugify).
+- Déploiement VPS (`website_deploy.py`) : OK — PM2 `vryx-api` online, `/api/public/pricing` et `/api/public/models` répondent (prix masqué tant que `pricing_published=false` en BDD).
+- Billing interne (API keys, devis enterprise, benchmarks, chat P2P) lit désormais le tarif via `getPricingConfig()` / cache 30 s au lieu de l’env seul.
+
 ## Mise à jour critique : TPS et latence pipeline P2P (15 mai 2026)
 
 ### Ce qu'il se passait avant

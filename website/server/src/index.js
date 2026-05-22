@@ -19,6 +19,14 @@ import { createObservability, registerObservabilityMiddleware, registerObservabi
 import { registerPublicStatusRoutes } from './public-status.js'
 import { buildInferenceLog } from './inference-metrics.js'
 import { registerAdminInferenceRoutes } from './admin-inference-routes.js'
+import {
+  ensurePricingAndModelCatalogTables,
+  getPricingConfig,
+  getPublicModels,
+  invalidatePricingCache,
+  updatePricingConfig,
+  upsertModelCatalogEntry,
+} from './pricing-models.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -87,7 +95,8 @@ const FORCED_ADMIN_EMAILS = (
   .filter(Boolean)
 const JWT_SECRET = process.env.JWT_SECRET
 const JWT_EXPIRES_DAYS = Math.min(30, Math.max(1, Number(process.env.JWT_EXPIRES_DAYS) || 7))
-const COOKIE_NAME = 'velocity_token'
+const COOKIE_NAME = 'vryx_token'
+const LEGACY_COOKIE_NAME = 'velocity_token'
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 const NODE_ENV = process.env.NODE_ENV || 'development'
 const IS_PRODUCTION = NODE_ENV === 'production'
@@ -222,7 +231,7 @@ function csrfProtection(req, res, next) {
       return res.status(403).json({ error: 'CSRF Protection: Invalid request referer.' })
     }
   } else {
-    const hasAuthCookie = req.cookies && req.cookies[COOKIE_NAME]
+    const hasAuthCookie = req.cookies && (req.cookies[COOKIE_NAME] || req.cookies[LEGACY_COOKIE_NAME])
     if (hasAuthCookie) {
       return res.status(403).json({ error: 'CSRF Protection: Missing request origin or referer.' })
     }
@@ -437,6 +446,11 @@ function workerCapabilities(workerLike) {
 const ACCOUNT_PLAN_NAME = 'Scale'
 const VRYX_ESTIMATED_GROSS_MARGIN = clampPercent(Number(process.env.VRYX_ESTIMATED_GROSS_MARGIN_PERCENT || 72))
 const VRYX_WORKER_REWARD_SHARE = clampPercent(Number(process.env.VRYX_WORKER_REWARD_SHARE_PERCENT || 58))
+const PRICING_FALLBACK = {
+  eurPerMillion: VRYX_EUR_PER_MILLION,
+  grossMarginPercent: VRYX_ESTIMATED_GROSS_MARGIN,
+  workerRewardSharePercent: VRYX_WORKER_REWARD_SHARE,
+}
 
 function clampPercent(value) {
   if (!Number.isFinite(value)) return 0
@@ -658,9 +672,18 @@ function toUserSessionSummary(row) {
   }
 }
 
-function toMoneyAmount(tokens) {
+async function resolveBillingEurPerMillion() {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+    return pricing.defaultEurPerMillion
+  } catch {
+    return VRYX_EUR_PER_MILLION
+  }
+}
+
+function toMoneyAmount(tokens, eurPerMillion = VRYX_EUR_PER_MILLION) {
   if (!Number.isFinite(tokens) || tokens <= 0) return 0
-  return Number(((tokens / 1_000_000) * VRYX_EUR_PER_MILLION).toFixed(4))
+  return Number(((tokens / 1_000_000) * eurPerMillion).toFixed(4))
 }
 
 function toEuroAmount(value, precision = 6) {
@@ -669,18 +692,19 @@ function toEuroAmount(value, precision = 6) {
   return Number(n.toFixed(precision))
 }
 
-function euroFromTokens(tokens) {
+function euroFromTokens(tokens, eurPerMillion = VRYX_EUR_PER_MILLION) {
   if (!Number.isFinite(tokens) || tokens <= 0) return 0
-  return toEuroAmount((tokens / 1_000_000) * VRYX_EUR_PER_MILLION)
+  return toEuroAmount((tokens / 1_000_000) * eurPerMillion)
 }
 
 function estimatePromptTokens(prompt) {
   return Math.max(1, Math.ceil(String(prompt || '').length / 4))
 }
 
-function estimateEnterpriseQuote(input) {
+async function estimateEnterpriseQuote(input) {
+  const billingRate = await resolveBillingEurPerMillion()
   const monthlyTokens = Math.max(1_000_000, Number(input.monthlyTokens || 0))
-  const usageBase = euroFromTokens(monthlyTokens)
+  const usageBase = euroFromTokens(monthlyTokens, billingRate)
   const offerMultiplier =
     input.offer === 'private_pool' ? 5
       : input.offer === 'knowledge_ai' ? 3.5
@@ -703,7 +727,7 @@ function estimateEnterpriseQuote(input) {
   return {
     monthlyEstimateEur: toEuroAmount(monthlyEstimate, 2),
     setupEstimateEur: toEuroAmount(setupEstimate, 2),
-    unitTokenCostEurPerMillion: VRYX_EUR_PER_MILLION,
+    unitTokenCostEurPerMillion: billingRate,
     assumptions: {
       monthlyTokens,
       offerMultiplier,
@@ -1987,16 +2011,16 @@ async function ensureForcedAdmins() {
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, {
     expiresIn: `${JWT_EXPIRES_DAYS}d`,
-    issuer: 'velocity-api',
-    audience: 'velocity-web',
+    issuer: 'vryx-api',
+    audience: 'vryx-web',
   })
 }
 
 function verifyToken(token) {
   try {
     return jwt.verify(token, JWT_SECRET, {
-      issuer: 'velocity-api',
-      audience: 'velocity-web',
+      issuer: ['vryx-api', 'velocity-api'],
+      audience: ['vryx-web', 'velocity-web'],
     })
   } catch {
     return null
@@ -2021,11 +2045,17 @@ function clearAuthCookie(res) {
     sameSite: 'lax',
     path: '/',
   })
+  res.clearCookie(LEGACY_COOKIE_NAME, {
+    httpOnly: true,
+    secure: COOKIE_SECURE,
+    sameSite: 'lax',
+    path: '/',
+  })
 }
 
 function authMiddleware(req, res, next) {
   const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]
-  const token = bearer || req.cookies?.[COOKIE_NAME]
+  const token = bearer || req.cookies?.[COOKIE_NAME] || req.cookies?.[LEGACY_COOKIE_NAME]
   if (!token) {
     req.user = null
     return next()
@@ -2138,7 +2168,8 @@ async function ensureApiCreditForRequest(req, { prompt, maxTokens }) {
   const userId = Number(req.apiUser?.id)
   if (!Number.isFinite(userId) || userId <= 0) return { ok: true, estimatedCostEur: 0, balanceEur: 0 }
   const estimatedTokens = estimatePromptTokens(prompt) + Math.max(1, Math.floor(Number(maxTokens) || 0))
-  const estimatedCostEur = euroFromTokens(estimatedTokens)
+  const billingRate = await resolveBillingEurPerMillion()
+  const estimatedCostEur = euroFromTokens(estimatedTokens, billingRate)
   if (!VRYX_BILLING_ENFORCE_CREDITS) return { ok: true, estimatedCostEur, balanceEur: null }
   const balanceEur = await getUserCreditBalance(userId)
   if (balanceEur + 0.000001 < estimatedCostEur) {
@@ -2154,7 +2185,8 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
   const prompt = Math.max(0, Math.floor(Number(promptTokens) || 0))
   const completion = Math.max(0, Math.floor(Number(completionTokens) || 0))
   const total = Math.max(prompt + completion, Math.floor(Number(totalTokens) || 0))
-  const cost = euroFromTokens(total)
+  const billingRate = await resolveBillingEurPerMillion()
+  const cost = euroFromTokens(total, billingRate)
   const conn = await pool.getConnection()
   try {
     await conn.beginTransaction()
@@ -2309,7 +2341,7 @@ app.post('/api/enterprise/quote', enterpriseQuoteLimiter, async (req, res) => {
     return res.status(400).json({ ok: false, error: first })
   }
   const data = parsed.data
-  const estimate = estimateEnterpriseQuote(data)
+  const estimate = await estimateEnterpriseQuote(data)
   try {
     const [result] = await pool.query(
       `INSERT INTO enterprise_quote_requests
@@ -3631,8 +3663,9 @@ accountRouter.get('/overview', async (req, res) => {
     monthTokens += apiTokensMonth
     const requestsThisMonth = Number(sessionRows.length) + Number(apiUsageMonth?.apiRequests || 0)
     const usagePercent = clampPercent((monthTokens / VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET) * 100)
-    const spendThisMonth = toEuroAmount(toMoneyAmount(monthTokens - apiTokensMonth) + apiCostMonth, 4)
-    const costPerMillionTokens = monthTokens > 0 ? spendThisMonth / (monthTokens / 1_000_000) : toMoneyAmount(1_000_000)
+    const billingRate = await resolveBillingEurPerMillion()
+    const spendThisMonth = toEuroAmount(toMoneyAmount(monthTokens - apiTokensMonth, billingRate) + apiCostMonth, 4)
+    const costPerMillionTokens = monthTokens > 0 ? spendThisMonth / (monthTokens / 1_000_000) : billingRate
     const estimatedGrossMarginEur = spendThisMonth * (VRYX_ESTIMATED_GROSS_MARGIN / 100)
     const estimatedWorkerRewardsEur = spendThisMonth * (VRYX_WORKER_REWARD_SHARE / 100)
     const creditBalance = await getUserCreditBalance(userId)
@@ -4558,6 +4591,65 @@ registerPublicStatusRoutes(app, {
   eurPerMillion: VRYX_EUR_PER_MILLION,
   grossMarginPercent: VRYX_ESTIMATED_GROSS_MARGIN,
   workerRewardSharePercent: VRYX_WORKER_REWARD_SHARE,
+  getPricingConfig: () => getPricingConfig(pool, PRICING_FALLBACK),
+})
+
+function publicPricingDto(pricing) {
+  return {
+    published: Boolean(pricing.pricingPublished),
+    eurPerMillionTokens: pricing.pricingPublished ? pricing.defaultEurPerMillion : null,
+    eurPerThousandTokens: pricing.pricingPublished ? Number((pricing.defaultEurPerMillion / 1000).toFixed(6)) : null,
+    vatPercent: pricing.vatPercent,
+    workerRewardSharePercent: pricing.workerRewardSharePercent,
+    estimatedGrossMarginPercent: pricing.estimatedGrossMarginPercent,
+    volumeDiscounts: pricing.volumeDiscounts,
+    updatedAt: pricing.updatedAt,
+  }
+}
+
+async function publicModelsWithRuntime({ includeInactive = false, includePrivate = false } = {}) {
+  const [catalog, runtimeModels] = await Promise.all([
+    getPublicModels(pool, PRICING_FALLBACK, { includeInactive, includePrivate }),
+    discoverAvailableModels().catch(() => []),
+  ])
+  const runtimeByKey = new Map()
+  for (const model of runtimeModels || []) {
+    const keys = [model.id, model.label].map(normalizeP2pModelKey).filter(Boolean)
+    for (const key of keys) runtimeByKey.set(key, model)
+  }
+  return catalog.map((model) => {
+    const runtime = runtimeByKey.get(normalizeP2pModelKey(model.hfId || model.id)) || runtimeByKey.get(normalizeP2pModelKey(model.name))
+    return {
+      ...model,
+      workersOnline: Number(runtime?.workersOnline || 0),
+      workersTotal: Number(runtime?.workersTotal || 0),
+      requiredWorkers: Number(model.requiredWorkers || runtime?.requiredWorkers || 1),
+      runnable: Boolean(runtime?.runnable),
+      ready: Boolean(runtime?.ready),
+      lastSeenAt: runtime?.lastSeenAt || null,
+    }
+  })
+}
+
+app.get('/api/public/pricing', async (_req, res) => {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+    res.json({ ok: true, pricing: publicPricingDto(pricing) })
+  } catch (e) {
+    console.error('public/pricing', e)
+    res.status(500).json({ error: 'Erreur lecture pricing.' })
+  }
+})
+
+app.get('/api/public/models', async (_req, res) => {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+    const models = await publicModelsWithRuntime()
+    res.json({ ok: true, pricing: publicPricingDto(pricing), models })
+  } catch (e) {
+    console.error('public/models', e)
+    res.status(500).json({ error: 'Erreur lecture modèles.' })
+  }
 })
 
 /** Cible interdite pour sondes latence depuis le VPS (boucle locale / métadonnées). */
@@ -5491,6 +5583,137 @@ const adminRouter = express.Router()
 adminRouter.use(requireAdmin)
 registerObservabilityRoutes(adminRouter, observability)
 registerAdminInferenceRoutes(adminRouter, { pool })
+
+const pricingConfigBodySchema = z.object({
+  defaultEurPerMillion: z.number().positive().max(1000),
+  pricingPublished: z.boolean(),
+  vatPercent: z.number().min(0).max(100),
+  workerRewardSharePercent: z.number().min(0).max(100),
+  volumeDiscounts: z.array(z.object({
+    minMonthlyMillions: z.number().min(0).max(10_000_000),
+    discountPercent: z.number().min(0).max(95),
+  })).max(12).optional().default([]),
+})
+
+const modelCatalogBodySchema = z.object({
+  slug: z.string().trim().max(120).optional(),
+  hfId: z.string().trim().max(180).nullable().optional(),
+  name: z.string().trim().min(1).max(180),
+  provider: z.string().trim().min(1).max(100),
+  family: z.string().trim().min(1).max(100),
+  paramsNote: z.string().trim().max(120).nullable().optional(),
+  contextTokens: z.number().int().min(0).max(20_000_000).optional().default(0),
+  modalities: z.array(z.string().trim().min(1).max(40)).max(12).optional().default([]),
+  openWeights: z.boolean().optional().default(true),
+  weightGb: z.number().min(0).max(10_000).nullable().optional(),
+  eurPerMillion: z.number().positive().max(1000).nullable().optional(),
+  isActive: z.boolean().optional().default(true),
+  isPublic: z.boolean().optional().default(true),
+  minVramMb: z.number().int().min(0).max(1_000_000).nullable().optional(),
+  requiredWorkers: z.number().int().min(1).max(256).optional().default(1),
+  sortOrder: z.number().int().min(-1_000_000).max(1_000_000).optional().default(0),
+})
+
+adminRouter.get('/pricing', async (_req, res) => {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK, { force: true })
+    res.json({ ok: true, pricing })
+  } catch (e) {
+    console.error('admin/pricing', e)
+    res.status(500).json({ error: 'Erreur lecture pricing.' })
+  }
+})
+
+adminRouter.patch('/pricing', async (req, res) => {
+  const parsed = pricingConfigBodySchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ error: first })
+  }
+  try {
+    const pricing = await updatePricingConfig(pool, parsed.data, PRICING_FALLBACK, req.user?.id || null)
+    res.json({ ok: true, pricing })
+  } catch (e) {
+    console.error('admin/pricing patch', e)
+    res.status(500).json({ error: 'Erreur mise à jour pricing.' })
+  }
+})
+
+adminRouter.get('/models/catalog', async (_req, res) => {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK, { force: true })
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, pricing, models })
+  } catch (e) {
+    console.error('admin/models/catalog', e)
+    res.status(500).json({ error: 'Erreur lecture catalogue modèles.' })
+  }
+})
+
+adminRouter.post('/models/catalog', async (req, res) => {
+  const parsed = modelCatalogBodySchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ error: first })
+  }
+  try {
+    const slug = await upsertModelCatalogEntry(pool, parsed.data)
+    invalidatePricingCache()
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, slug, models })
+  } catch (e) {
+    console.error('admin/models/catalog post', e)
+    res.status(500).json({ error: 'Erreur sauvegarde modèle.' })
+  }
+})
+
+adminRouter.patch('/models/catalog/:slug', async (req, res) => {
+  const parsed = modelCatalogBodySchema.partial().safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ error: first })
+  }
+  try {
+    const [rows] = await pool.query('SELECT * FROM model_catalog WHERE slug = :slug LIMIT 1', { slug: req.params.slug })
+    if (!rows[0]) return res.status(404).json({ error: 'Modèle introuvable.' })
+    const base = {
+      slug: rows[0].slug,
+      hfId: rows[0].hf_id,
+      name: rows[0].name,
+      provider: rows[0].provider,
+      family: rows[0].family,
+      paramsNote: rows[0].params_note,
+      contextTokens: Number(rows[0].context_tokens || 0),
+      modalities: JSON.parse(rows[0].modalities_json || '[]'),
+      openWeights: Boolean(rows[0].open_weights),
+      weightGb: rows[0].weight_gb == null ? null : Number(rows[0].weight_gb),
+      eurPerMillion: rows[0].eur_per_million == null ? null : Number(rows[0].eur_per_million),
+      isActive: Boolean(rows[0].is_active),
+      isPublic: Boolean(rows[0].is_public),
+      minVramMb: rows[0].min_vram_mb == null ? null : Number(rows[0].min_vram_mb),
+      requiredWorkers: Number(rows[0].required_workers || 1),
+      sortOrder: Number(rows[0].sort_order || 0),
+    }
+    const slug = await upsertModelCatalogEntry(pool, { ...base, ...parsed.data, slug: rows[0].slug })
+    invalidatePricingCache()
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, slug, models })
+  } catch (e) {
+    console.error('admin/models/catalog patch', e)
+    res.status(500).json({ error: 'Erreur mise à jour modèle.' })
+  }
+})
+
+adminRouter.delete('/models/catalog/:slug', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM model_catalog WHERE slug = :slug', { slug: req.params.slug })
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, models })
+  } catch (e) {
+    console.error('admin/models/catalog delete', e)
+    res.status(500).json({ error: 'Erreur suppression modèle.' })
+  }
+})
 
 adminRouter.get('/billing/summary', async (_req, res) => {
   try {
@@ -6480,6 +6703,7 @@ adminRouter.get('/models/plan', async (req, res) => {
 })
 
 adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
+  const billingRate = await resolveBillingEurPerMillion()
   const model = normalizeP2pModelId(req.body?.model || '') || 'Qwen/Qwen3.6-35B-A3B'
   const prompt = typeof req.body?.prompt === 'string' && req.body.prompt.trim()
     ? req.body.prompt.trim()
@@ -6498,7 +6722,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         plan: JSON.stringify(reservation.plan || null),
         error: 'Aucun plan worker stable disponible pour ce benchmark.',
         createdBy: req.user.id,
-        costPerMillion: VRYX_EUR_PER_MILLION,
+        costPerMillion: billingRate,
       },
     ).catch(() => {})
     return res.status(409).json({
@@ -6556,7 +6780,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         promptTokens: Number(data?.prompt_tokens || 0),
         completionTokens,
         totalTokens: Number(data?.total_tokens || 0),
-        costPerMillion: VRYX_EUR_PER_MILLION,
+        costPerMillion: billingRate,
         plan: JSON.stringify(reservation.plan || null),
         error: data?.error ? String(data.error).slice(0, 500) : null,
         createdBy: req.user.id,
@@ -6575,7 +6799,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         promptTokens: Number(data?.prompt_tokens || 0),
         completionTokens,
         totalTokens: Number(data?.total_tokens || 0),
-        costPerMillionEur: VRYX_EUR_PER_MILLION,
+        costPerMillionEur: billingRate,
       },
       responsePreview: typeof data?.response === 'string' ? data.response.slice(0, 500) : '',
       error: data?.error || null,
@@ -6593,7 +6817,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         plan: JSON.stringify(reservation.plan || null),
         error: String(e?.message || 'Benchmark impossible.').slice(0, 500),
         createdBy: req.user.id,
-        costPerMillion: VRYX_EUR_PER_MILLION,
+        costPerMillion: billingRate,
       },
     ).catch(() => {})
     await releaseWorkerReservation(reservation.jobId, 'failed')
@@ -7052,6 +7276,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     : 'shard'
   const requestId = req.requestId || crypto.randomUUID()
   const startedAt = Date.now()
+  const billingRate = await resolveBillingEurPerMillion()
   let firstTokenAt = null
   res.setHeader('X-Vryx-Request-Id', requestId)
   res.setHeader('Content-Type', 'text/event-stream')
@@ -7126,7 +7351,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       data,
       pipelineTrace,
       error,
-      costEur: data ? toMoneyAmount(Number(data.total_tokens ?? data.totalTokens ?? 0) || 0) : 0,
+      costEur: data ? toMoneyAmount(Number(data.total_tokens ?? data.totalTokens ?? 0) || 0, billingRate) : 0,
     }))
   }
   const ctrl = new AbortController()
@@ -7957,10 +8182,11 @@ async function start() {
   await ensureApiKeyUsageTable()
   await ensureBillingTables()
   await ensureEnterpriseQuoteRequestsTable()
+  await ensurePricingAndModelCatalogTables(pool, PRICING_FALLBACK)
   await ensureForcedAdmins()
   nodeMonitor.startSampling()
   app.listen(PORT, '127.0.0.1', () => {
-    console.log(`API Velocity sur http://127.0.0.1:${PORT}`)
+    console.log(`API Vryx sur http://127.0.0.1:${PORT}`)
   })
 }
 

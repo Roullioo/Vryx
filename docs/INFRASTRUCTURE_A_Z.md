@@ -129,6 +129,24 @@ Schéma **créé et migré automatiquement** au démarrage de `website/server/sr
 | `created_at` | TIMESTAMP | Création |
 | `updated_at` | TIMESTAMP | Dernière MAJ |
 
+### Tables `pricing_config` et `model_catalog`
+
+La grille commerciale est centralisée en MariaDB pour que le site public, le simulateur et l’admin lisent la même source.
+
+| Table | Rôle |
+|-------|------|
+| `pricing_config` | Ligne singleton `id=1` : tarif global en euros par million de tokens, publication du prix, TVA, part worker et remises volume JSON. |
+| `model_catalog` | Catalogue d’affichage : slug, `hf_id`, nom, provider, famille, contexte, modalités, VRAM indicative, prix override, statut actif/public et besoins worker. |
+
+Routes associées :
+
+| Route | Accès | Rôle |
+|-------|-------|------|
+| `GET /api/public/pricing` | Public | Expose le tarif publié ou `published=false` pour afficher « sur devis ». |
+| `GET /api/public/models` | Public | Expose les modèles actifs/publics enrichis avec disponibilité runtime. |
+| `GET/PATCH /api/admin/pricing` | Admin | Lit et édite la grille commerciale. |
+| `GET/POST/PATCH /api/admin/models/catalog` | Admin | Lit et édite le catalogue modèles. |
+
 ---
 
 ## 4. Site web — React + Express
@@ -150,6 +168,8 @@ Schéma **créé et migré automatiquement** au démarrage de `website/server/sr
 | `/admin/chat-p2p` | **Chat P2P** (SSE, métriques pipeline) |
 | `/admin/workers`, `/admin/workers/:peerId` | Workers |
 | `/admin/sessions`, `/admin/sessions/:sessionId` | Sessions P2P historisées |
+| `/admin/parametres/pricing` | Pricing global, publication et remises volume |
+| `/admin/modeles` | Catalogue modèles, prix override et disponibilité |
 
 **Composants admin notables :**
 

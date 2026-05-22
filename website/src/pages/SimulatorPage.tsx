@@ -1,11 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
+import { useTranslation } from 'react-i18next'
 import { EurSign } from '../components/icons/Icons'
 import { GPU_CATALOG, type GpuTier } from '../data/gpuCatalog'
 import { STORYTELLING } from '../data/storytelling'
 import {
-  VELOCITY_EUR_PER_MILLION,
+  VRYX_EUR_PER_MILLION_FALLBACK,
   WORKER_EUR_PER_TFLOP_HOUR,
   computeFleetWorkerProfit,
   computeWorkerGpuProfit,
@@ -15,6 +16,7 @@ import {
   type FleetLine,
   type WorkerSimMode,
 } from '../lib/simulator'
+import { fetchPublicPricing } from '../lib/pricingModels'
 
 const PRESETS = [
   { label: 'Démarrage', millions: 5, ref: 4.2 },
@@ -54,7 +56,10 @@ function Sparkline({ values }: { values: number[] }) {
 }
 
 export function SimulatorPage() {
+  const { t } = useTranslation('public')
   const [tab, setTab] = useState<TabId>('inference')
+  const [vryxEurPerMillion, setVryxEurPerMillion] = useState<number | null>(VRYX_EUR_PER_MILLION_FALLBACK)
+  const [pricingPublished, setPricingPublished] = useState(true)
 
   const [millions, setMillions] = useState(25)
   const [refEur, setRefEur] = useState(4.5)
@@ -68,9 +73,24 @@ export function SimulatorPage() {
         referenceEurPerMillion: refEur,
         poolCandidateCount: poolN,
         avgOutputTokensPerRequest: outTok,
+        vryxEurPerMillion,
       }),
-    [millions, refEur, poolN, outTok],
+    [millions, refEur, poolN, outTok, vryxEurPerMillion],
   )
+
+  useEffect(() => {
+    let cancelled = false
+    fetchPublicPricing().then((r) => {
+      if (cancelled) return
+      if (r.ok) {
+        setPricingPublished(r.data.pricing.published)
+        setVryxEurPerMillion(r.data.pricing.eurPerMillionTokens ?? null)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const latGainPct =
     result.estimatedSoloP50Ms > 0
@@ -85,10 +105,11 @@ export function SimulatorPage() {
           referenceEurPerMillion: refEur,
           poolCandidateCount: poolN,
           avgOutputTokensPerRequest: outTok,
+          vryxEurPerMillion,
         })
         return { millions: m, solo: r.monthlySoloEuro, pool: r.monthlyPoolEuro }
       }),
-    [refEur, poolN, outTok],
+    [refEur, poolN, outTok, vryxEurPerMillion],
   )
   const chartMax = Math.max(...chartRows.flatMap((r) => [r.solo, r.pool]), 1)
   const chartAreaPx = 160
@@ -241,7 +262,7 @@ export function SimulatorPage() {
               }`}
               onClick={() => setTab('inference')}
             >
-              Coût inférence
+              Coût {t('simulator.inference').toLowerCase()}
             </button>
             <button
               type="button"
@@ -252,7 +273,7 @@ export function SimulatorPage() {
               }`}
               onClick={() => setTab('worker')}
             >
-              Rentabilité worker
+              {t('simulator.worker')}
             </button>
           </div>
         </div>
@@ -416,8 +437,14 @@ export function SimulatorPage() {
                     <EurSign className="text-accent" />
                   </p>
                   <p className="mt-1 text-xs text-muted">
-                    / mois · {VELOCITY_EUR_PER_MILLION.toFixed(2)}
-                    <EurSign /> / M tokens
+                    / mois · {pricingPublished && vryxEurPerMillion != null ? (
+                      <>
+                        {vryxEurPerMillion.toFixed(4)}
+                        <EurSign /> / M tokens
+                      </>
+                    ) : (
+                      t('pricing.onQuote').toLowerCase()
+                    )}
                   </p>
                 </div>
               </div>

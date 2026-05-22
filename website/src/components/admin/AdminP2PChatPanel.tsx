@@ -677,9 +677,9 @@ export function AdminP2PChatPanel({
         <p className="text-[9px] font-semibold uppercase tracking-wide text-muted leading-none">Pool de calcul</p>
         <div className="grid grid-cols-2 gap-1 sm:grid-cols-4">
           {[
-            { id: 'auto' as const, short: 'Auto', title: 'Auto', desc: 'Velocity si saine, sinon legacy.' },
-            { id: 'velocity_mlx' as const, short: 'MLX', title: 'Velocity MLX', desc: 'Pool Mac optimisée.' },
-            { id: 'velocity_vllm' as const, short: 'vLLM', title: 'Velocity vLLM', desc: 'Pool Nvidia PagedAttention.' },
+            { id: 'auto' as const, short: 'Auto', title: 'Auto', desc: 'Vryx si saine, sinon legacy.' },
+            { id: 'velocity_mlx' as const, short: 'MLX', title: 'Vryx MLX', desc: 'Pool Mac optimisée.' },
+            { id: 'velocity_vllm' as const, short: 'vLLM', title: 'Vryx vLLM', desc: 'Pool Nvidia PagedAttention.' },
             { id: 'legacy_pytorch' as const, short: 'PyTorch', title: 'Legacy PyTorch', desc: 'Chemin stable actuel.' },
           ].map((item) => {
             const selected = poolPreference === item.id

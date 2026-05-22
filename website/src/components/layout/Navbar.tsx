@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, NavLink, useLocation } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { IconChevronDown } from '../icons/Icons'
 import { VryxLogo } from '../brand/VryxLogo'
 import { useAuth } from '../../context/AuthContext'
@@ -8,13 +9,13 @@ import { ThemeToggle } from './ThemeToggle'
 import { fetchAccountOverview, type AccountOverview } from '../../lib/account'
 
 const routeLinks = [
-  { to: '/clients', label: 'Clients' },
-  { to: '/enterprise', label: 'Enterprise' },
-  { to: '/race-pool', label: 'Race-Pool' },
-  { to: '/simulateur', label: 'Simulateur' },
-  { to: '/comparatif', label: 'Gains solo / pool' },
-  { to: '/workers', label: 'Workers' },
-  { to: '/network', label: 'Network' },
+  { to: '/clients', labelKey: 'nav.clients' },
+  { to: '/enterprise', labelKey: 'nav.enterprise' },
+  { to: '/race-pool', labelKey: 'nav.racePool' },
+  { to: '/simulateur', labelKey: 'nav.simulator' },
+  { to: '/comparatif', labelKey: 'nav.comparison' },
+  { to: '/workers', labelKey: 'nav.workers' },
+  { to: '/network', labelKey: 'nav.network' },
 ]
 
 export function Navbar() {
@@ -23,6 +24,7 @@ export function Navbar() {
   const [accountOverviewLoading, setAccountOverviewLoading] = useState(false)
   const [accountOverviewError, setAccountOverviewError] = useState('')
   const { pathname } = useLocation()
+  const { t } = useTranslation()
   const { user, loading, logout } = useAuth()
   const { resolvedTheme } = useTheme()
   const accountDetailsRef = useRef<HTMLDetailsElement>(null)
@@ -58,30 +60,38 @@ export function Navbar() {
     setMenuOpen(false)
   }, [logout])
 
-  const loadAccountOverview = useCallback(async () => {
+  /* eslint-disable react-hooks/set-state-in-effect -- reset compte au logout */
+  useEffect(() => {
+    let cancelled = false
     if (!user) {
       setAccountOverview(null)
-      return
+      setAccountOverviewError('')
+      setAccountOverviewLoading(false)
+      return () => {
+        cancelled = true
+      }
     }
     setAccountOverviewLoading(true)
     setAccountOverviewError('')
-    const result = await fetchAccountOverview()
-    if (!result.ok) {
-      setAccountOverviewError(result.error)
-      setAccountOverview(null)
+    fetchAccountOverview().then((result) => {
+      if (cancelled) return
+      if (!result.ok) {
+        setAccountOverviewError(result.error)
+        setAccountOverview(null)
+        setAccountOverviewLoading(false)
+        return
+      }
+      setAccountOverview(result.data)
       setAccountOverviewLoading(false)
-      return
+    })
+    return () => {
+      cancelled = true
     }
-    setAccountOverview(result.data)
-    setAccountOverviewLoading(false)
   }, [user])
-
-  useEffect(() => {
-    void loadAccountOverview()
-  }, [loadAccountOverview])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   return (
-    <header className="relative z-30 w-full bg-transparent">
+    <header className="fixed inset-x-0 top-0 z-40 w-full bg-transparent pt-[env(safe-area-inset-top)] backdrop-blur-sm">
       <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3.5 sm:px-6 lg:px-8">
         <div onClick={() => setMenuOpen(false)}>
           <VryxLogo to="/" tone={lightNav ? 'light' : 'dark'} markSize="sm" className="py-0.5" />
@@ -90,17 +100,17 @@ export function Navbar() {
         <nav className="hidden items-center gap-4 xl:gap-5 lg:flex" aria-label="Navigation principale">
           {routeLinks.map((l) => (
             <NavLink key={l.to} to={l.to} className={navRouteClass}>
-              {l.label}
+              {t(l.labelKey)}
             </NavLink>
           ))}
           {!loading && user && (
             <NavLink to="/panel/modeles" className={navRouteClass}>
-              Modèles IA
+              {t('nav.models')}
             </NavLink>
           )}
           {!loading && user?.isAdmin && (
             <NavLink to="/admin" className={navRouteClass}>
-              Admin
+              {t('nav.admin')}
             </NavLink>
           )}
         </nav>
@@ -119,7 +129,7 @@ export function Navbar() {
                         : 'btn-primary'
                   }`}
                 >
-                  Mon compte
+                  {t('nav.account')}
                   <IconChevronDown className="h-4 w-4 opacity-90" aria-hidden />
                 </summary>
                 <div className="absolute right-0 z-50 mt-2 w-[min(calc(100vw-2rem),22rem)] rounded-xl border border-border bg-card p-5 shadow-lg">
@@ -193,7 +203,7 @@ export function Navbar() {
                 }`}
                 onClick={() => setMenuOpen(false)}
               >
-                Mon compte
+                  {t('nav.account')}
               </Link>
               <Link
                 to="/inscription"
@@ -220,7 +230,7 @@ export function Navbar() {
               }`}
               onClick={() => setMenuOpen(false)}
             >
-              Mon compte
+              {t('nav.account')}
             </Link>
           ) : !loading ? (
             <Link
@@ -235,7 +245,7 @@ export function Navbar() {
               }`}
               onClick={() => setMenuOpen(false)}
             >
-              Mon compte
+              {t('nav.account')}
             </Link>
           ) : (
             <span
@@ -297,7 +307,7 @@ export function Navbar() {
                 }
                 onClick={() => setMenuOpen(false)}
               >
-                {l.label}
+                {t(l.labelKey)}
               </NavLink>
             ))}
             {!loading && user && (
@@ -308,7 +318,7 @@ export function Navbar() {
                 }`}
                 onClick={() => setMenuOpen(false)}
               >
-                Mon compte, tableau de bord
+                {t('nav.account')}, tableau de bord
               </Link>
             )}
             {!loading && user?.isAdmin && (
@@ -346,7 +356,7 @@ export function Navbar() {
                 }
                 onClick={() => setMenuOpen(false)}
               >
-                Modèles IA
+                {t('nav.models')}
               </NavLink>
             )}
             {!loading && user ? (

@@ -90,6 +90,8 @@ const navItems: NavItem[] = [
   { to: '/admin/noeud', label: 'Nœud Vryx', icon: <IconServer /> },
   { to: '/admin/chat-p2p', label: 'Chat P2P', icon: <IconChat /> },
   { to: '/admin/workers', label: 'Workers', icon: <IconWorkers /> },
+  { to: '/admin/modeles', label: 'Modèles', icon: <IconServer /> },
+  { to: '/admin/parametres/pricing', label: 'Pricing', icon: <IconPulse /> },
   { to: '/admin/sessions', label: 'Sessions', icon: <IconSessions /> },
   { to: '/admin/observabilite', label: 'Observabilité', icon: <IconPulse /> },
   { to: '/admin/production-readiness', label: 'Readiness', icon: <IconPulse /> },

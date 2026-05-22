@@ -1,10 +1,11 @@
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { ClientPythonSnippet } from '../components/clients/ClientPythonSnippet'
 import { EurSign } from '../components/icons/Icons'
 import { CLIENT_ENDPOINTS, CLIENT_FAQ } from '../data/clientsContent'
-import { VELOCITY_EUR_PER_MILLION } from '../lib/simulator'
 import { useAuth } from '../context/AuthContext'
+import { fetchPublicPricing } from '../lib/pricingModels'
 
 const highlights = [
   {
@@ -23,7 +24,22 @@ const highlights = [
 
 export function ClientsPage() {
   const { user } = useAuth()
-  const priceLabel = VELOCITY_EUR_PER_MILLION.toLocaleString('fr-FR', {
+  const [price, setPrice] = useState<number | null>(null)
+  const [pricingPublished, setPricingPublished] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    fetchPublicPricing().then((r) => {
+      if (cancelled) return
+      if (r.ok) {
+        setPrice(r.data.pricing.eurPerMillionTokens)
+        setPricingPublished(r.data.pricing.published)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+  const priceLabel = (price ?? 0).toLocaleString('fr-FR', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })
@@ -145,17 +161,23 @@ export function ClientsPage() {
           <div className="grid gap-10 lg:grid-cols-2 lg:items-center">
             <div>
               <h2 id="tarifs-clients" className="font-display text-2xl font-bold text-white sm:text-3xl">
-                Tarif public
+                {pricingPublished ? 'Tarif public' : 'Tarifs sur devis'}
               </h2>
               <p className="mt-3 text-sm text-white/75 sm:text-base">
                 Un prix unique par million de tokens pour simplifier vos prévisions. Ajustements volume
                 possibles sur devis entreprise.
               </p>
-              <p className="font-display mt-8 text-4xl font-bold text-white sm:text-5xl">
-                {priceLabel}
-                <EurSign className="text-white" />{' '}
-                <span className="text-lg font-medium text-white/65 sm:text-xl">/ million de tokens</span>
-              </p>
+              {pricingPublished && price != null ? (
+                <p className="font-display mt-8 text-4xl font-bold text-white sm:text-5xl">
+                  {priceLabel}
+                  <EurSign className="text-white" />{' '}
+                  <span className="text-lg font-medium text-white/65 sm:text-xl">/ million de tokens</span>
+                </p>
+              ) : (
+                <p className="mt-8 rounded-2xl border border-white/15 bg-black/35 px-5 py-4 text-sm leading-relaxed text-white/80">
+                  Les prix publics sont en cours de calibration. L’admin Vryx peut les publier dès que la grille est validée.
+                </p>
+              )}
               <Link
                 to="/simulateur"
                 className="mt-8 inline-flex text-sm font-semibold text-sky-300 underline-offset-2 transition-colors hover:text-sky-200 hover:underline"

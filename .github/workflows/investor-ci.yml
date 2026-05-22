@@ -24,6 +24,7 @@ jobs:
           cache-dependency-path: website/package-lock.json
       - run: npm ci
       - run: npm audit --audit-level=moderate
+      - run: npm run lint:refonte
       - run: npm run build
 
   api:
@@ -43,9 +44,11 @@ jobs:
       - run: npm ci
       - run: npm audit --audit-level=moderate
       - run: npm run test:production-readiness
+      - run: npm run test:pricing-models
       - name: Syntax check scripts and server
         run: |
           node --check src/index.js
+          node --check scripts/pricing-models-api-test.mjs
           node --check scripts/golden-path-benchmark-cron.mjs
           node --check scripts/worker-command-e2e.mjs
 

@@ -35,8 +35,9 @@ type PublicStatus = {
   ok: boolean
   sampledAt: string
   pricing: {
-    eurPerMillionTokens: number
-    eurPerThousandTokens: number
+    published?: boolean
+    eurPerMillionTokens: number | null
+    eurPerThousandTokens: number | null
     estimatedGrossMarginPercent: number
     workerRewardSharePercent: number
   }
@@ -73,7 +74,7 @@ type PublicStatus = {
     latencyFirstTokenMs: number
     tpsAverageActive: number
     tpsP95Active: number
-    costEstimatedEurPerMillion: number
+    costEstimatedEurPerMillion: number | null
     sampleSize: number
     note: string
   }
@@ -119,11 +120,13 @@ function MetricCard({ label, value, hint, accent }: { label: string; value: stri
 export function StatusPage() {
   const [status, setStatus] = useState<PublicStatus | null>(null)
   const [error, setError] = useState('')
+  const [modelFilter, setModelFilter] = useState('')
 
   useEffect(() => {
     let active = true
     const load = async () => {
-      const result = await apiJson<PublicStatus>('/api/public/network-status')
+      const suffix = modelFilter ? `?model=${encodeURIComponent(modelFilter)}` : ''
+      const result = await apiJson<PublicStatus>(`/api/public/network-status${suffix}`)
       if (!active) return
       if (result.ok) {
         setStatus(result.data)
@@ -138,10 +141,11 @@ export function StatusPage() {
       active = false
       window.clearInterval(timer)
     }
-  }, [])
+  }, [modelFilter])
 
   const topModels = useMemo(() => (status?.models || []).slice(0, 8), [status])
   const liveWorkers = useMemo(() => (status?.workers || []).filter((worker) => worker.live).slice(0, 10), [status])
+  const pricingLabel = status?.pricing.published === false ? 'Sur devis' : fmtEur(status?.pricing.eurPerMillionTokens)
 
   return (
     <main className="min-h-screen overflow-hidden bg-[#050713] text-white">
@@ -190,11 +194,28 @@ export function StatusPage() {
             <div className="mt-8 rounded-2xl border border-rose-300/25 bg-rose-400/10 p-4 text-sm text-rose-100">{error}</div>
           ) : null}
 
+          <div className="mt-8 flex flex-col gap-3 rounded-[1.4rem] border border-white/12 bg-white/8 p-4 backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.18em] text-white/45">Filtrer les métriques</p>
+              <p className="mt-1 text-sm text-white/60">Le filtre s’applique aux sessions publiques 24h.</p>
+            </div>
+            <select
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+              className="min-h-11 rounded-xl border border-white/15 bg-black/35 px-3 text-sm text-white outline-none focus:border-cyan-200"
+            >
+              <option value="">Tous les modèles</option>
+              {topModels.map((m) => (
+                <option key={m.id} value={m.id}>{m.label || m.id}</option>
+              ))}
+            </select>
+          </div>
+
           <div className="mt-10 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard label="Workers online" value={fmtInt(status?.network.workersOnline)} hint={`${fmtInt(status?.network.workersRegistered)} enregistrés`} accent="#7dd3fc" />
             <MetricCard label="TPS actif" value={fmtTps(status?.network.tpsActiveAvg)} hint={`p95 ${fmtTps(status?.network.tpsActiveP95)} TPS`} accent="#a7f3d0" />
             <MetricCard label="TTFT p50" value={fmtMs(status?.network.ttftP50Ms)} hint={`latence p95 ${fmtMs(status?.network.latencyP95Ms)}`} accent="#f0abfc" />
-            <MetricCard label="Prix public" value={fmtEur(status?.pricing.eurPerMillionTokens)} hint="par million de tokens" accent="#fde68a" />
+            <MetricCard label="Prix public" value={pricingLabel} hint={status?.pricing.published === false ? 'non publié' : 'par million de tokens'} accent="#67e8f9" />
           </div>
 
           <div className="mt-8 grid gap-5 xl:grid-cols-[1.1fr_.9fr]">
@@ -219,7 +240,7 @@ export function StatusPage() {
                 </div>
                 <div className="rounded-2xl bg-white/7 p-4">
                   <p className="text-xs text-white/45">Coût estimé</p>
-                  <p className="mt-2 font-mono text-xl font-bold">{fmtEur(status?.benchmark.costEstimatedEurPerMillion)}</p>
+                  <p className="mt-2 font-mono text-xl font-bold">{status?.pricing.published === false ? 'Sur devis' : fmtEur(status?.benchmark.costEstimatedEurPerMillion)}</p>
                 </div>
               </div>
               <p className="mt-5 text-sm leading-6 text-white/55">{status?.benchmark.note}</p>

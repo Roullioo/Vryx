@@ -122,10 +122,12 @@ export function registerPublicStatusRoutes(app, options) {
     eurPerMillion,
     grossMarginPercent,
     workerRewardSharePercent,
+    getPricingConfig,
   } = options
 
-  app.get('/api/public/network-status', async (_req, res) => {
+  app.get('/api/public/network-status', async (req, res) => {
     try {
+      const requestedModel = typeof req.query.model === 'string' ? req.query.model.trim().toLowerCase() : ''
       const [workerRows, ledgerRows, sessionRows, apiRows, models] = await Promise.all([
         pool.query(
           `SELECT peer_id AS peerId, mode, model, gpu_name AS gpuName,
@@ -167,6 +169,9 @@ export function registerPublicStatusRoutes(app, options) {
         ),
         discoverAvailableModels(),
       ])
+      const pricingConfig = getPricingConfig ? await getPricingConfig() : null
+      const effectiveEurPerMillion = pricingConfig?.pricingPublished ? Number(pricingConfig.defaultEurPerMillion || eurPerMillion) : Number(eurPerMillion)
+      const effectiveWorkerRewardShare = Number(pricingConfig?.workerRewardSharePercent ?? workerRewardSharePercent)
 
       const exposeWorkerDetails = process.env.VRYX_PUBLIC_EXPOSE_WORKER_DETAILS === '1'
       const workers = (workerRows[0] || []).map((row, index) => {
@@ -209,7 +214,10 @@ export function registerPublicStatusRoutes(app, options) {
         }
       })
 
-      const sessions = (sessionRows[0] || []).map(sessionMetrics).filter((item) => item.completionTokens > 0)
+      const sessions = (sessionRows[0] || [])
+        .map(sessionMetrics)
+        .filter((item) => item.completionTokens > 0)
+        .filter((item) => !requestedModel || String(item.model || '').toLowerCase().includes(requestedModel))
       const activeTps = sessions.map((item) => item.tps).filter((value) => value > 0)
       const latencySamples = sessions.map((item) => item.latencyMs).filter((value) => value > 0)
       const ttftSamples = sessions.map((item) => item.ttftMs).filter((value) => value > 0)
@@ -231,8 +239,10 @@ export function registerPublicStatusRoutes(app, options) {
         ? Number(((uptimeSamples.reduce((sum, value) => sum + value, 0) / uptimeSamples.length) * 100).toFixed(2))
         : 0
       const tokens24h = Number(ledger.tokens24h || 0)
-      const revenue24h = Number(((tokens24h / 1_000_000) * eurPerMillion).toFixed(6))
-      const workerRewards24h = Number((revenue24h * (workerRewardSharePercent / 100)).toFixed(6))
+      const revenue24h = pricingConfig?.pricingPublished
+        ? Number(((tokens24h / 1_000_000) * effectiveEurPerMillion).toFixed(6))
+        : 0
+      const workerRewards24h = Number((revenue24h * (effectiveWorkerRewardShare / 100)).toFixed(6))
       const infraCost24h = Number(process.env.VRYX_PUBLIC_INFRA_COST_24H_EUR || '0')
       const electricityCost24h = Number(process.env.VRYX_PUBLIC_ELECTRICITY_COST_24H_EUR || '0')
       const netMargin24h = Number((revenue24h - workerRewards24h - infraCost24h - electricityCost24h).toFixed(6))
@@ -267,10 +277,12 @@ export function registerPublicStatusRoutes(app, options) {
         sampledAt: new Date().toISOString(),
         publicExposure: exposeWorkerDetails ? 'worker_details_enabled' : 'redacted',
         pricing: {
-          eurPerMillionTokens: eurPerMillion,
-          eurPerThousandTokens: Number((eurPerMillion / 1000).toFixed(6)),
+          published: pricingConfig ? Boolean(pricingConfig.pricingPublished) : true,
+          eurPerMillionTokens: pricingConfig?.pricingPublished ? effectiveEurPerMillion : null,
+          eurPerThousandTokens: pricingConfig?.pricingPublished ? Number((effectiveEurPerMillion / 1000).toFixed(6)) : null,
           estimatedGrossMarginPercent: grossMarginPercent,
-          workerRewardSharePercent,
+          workerRewardSharePercent: effectiveWorkerRewardShare,
+          volumeDiscounts: pricingConfig?.volumeDiscounts || [],
         },
         network: {
           workersRegistered: workers.length,
@@ -312,7 +324,7 @@ export function registerPublicStatusRoutes(app, options) {
           latencyFirstTokenMs: percentile(ttftSamples, 50),
           tpsAverageActive: activeTps.length ? Number((activeTps.reduce((sum, value) => sum + value, 0) / activeTps.length).toFixed(3)) : 0,
           tpsP95Active: percentile(activeTps, 95),
-          costEstimatedEurPerMillion: eurPerMillion,
+          costEstimatedEurPerMillion: pricingConfig?.pricingPublished ? effectiveEurPerMillion : null,
           sampleSize: sessions.length,
           note:
             sessions.length > 0

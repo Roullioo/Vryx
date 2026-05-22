@@ -21,6 +21,8 @@ import { AdminSessionsPage, AdminSessionDetailPage } from './pages/AdminSessions
 import { AdminObservabilityPage } from './pages/AdminObservabilityPage'
 import { AdminProductionReadinessPage } from './pages/AdminProductionReadinessPage'
 import { AdminEnterpriseQuotesPage } from './pages/AdminEnterpriseQuotesPage'
+import { AdminPricingPage } from './pages/AdminPricingPage'
+import { AdminModelsCatalogPage } from './pages/AdminModelsCatalogPage'
 
 export default function App() {
   return (
@@ -48,6 +50,8 @@ export default function App() {
         <Route path="admin/sessions/:sessionId" element={<AdminSessionDetailPage />} />
         <Route path="admin/observabilite" element={<AdminObservabilityPage />} />
         <Route path="admin/production-readiness" element={<AdminProductionReadinessPage />} />
+        <Route path="admin/parametres/pricing" element={<AdminPricingPage />} />
+        <Route path="admin/modeles" element={<AdminModelsCatalogPage />} />
         <Route path="admin/enterprise" element={<AdminEnterpriseQuotesPage />} />
         <Route path="connexion" element={<LoginPage />} />
         <Route path="inscription" element={<RegisterPage />} />
