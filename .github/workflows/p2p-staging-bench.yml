@@ -2,26 +2,44 @@ name: P2P Staging Bench
 
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        description: Model id to benchmark.
+        required: false
+        default: Qwen/Qwen2-0.5B-Instruct
+      tokens:
+        description: Comma-separated max_new_tokens values.
+        required: false
+        default: '16,32'
+      min_compute_workers:
+        description: Minimum compute workers required in the trace.
+        required: false
+        default: '2'
+      target_tps:
+        description: Minimum best TPS required for this staging bench.
+        required: false
+        default: '0.1'
   workflow_call:
   push:
     tags:
       - 'v*'
 
 jobs:
-  qwen36-dual-worker-bench:
-    name: Qwen 3.6 35B dual-worker shard bench
+  dual-worker-bench:
+    name: Dual-worker staging shard bench
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       VRYX_BENCH_URL: ${{ secrets.VRYX_BENCH_URL }}
-      VRYX_BENCH_MODEL: Qwen/Qwen3.6-35B-A3B
+      VRYX_BENCH_TOKEN: ${{ secrets.VRYX_BENCH_TOKEN }}
+      VRYX_BENCH_MODEL: ${{ inputs.model || vars.VRYX_BENCH_MODEL || 'Qwen/Qwen2-0.5B-Instruct' }}
       VRYX_BENCH_LOAD_MODE: shard
       VRYX_BENCH_FORCE_DISTRIBUTED: '1'
-      VRYX_BENCH_MIN_COMPUTE_WORKERS: '2'
+      VRYX_BENCH_MIN_COMPUTE_WORKERS: ${{ inputs.min_compute_workers || vars.VRYX_BENCH_MIN_COMPUTE_WORKERS || '2' }}
       VRYX_BENCH_QUANT: q4
       VRYX_BENCH_POOL: velocity_mlx
-      VRYX_BENCH_TOKENS: '64,128'
-      VRYX_BENCH_TARGET_TPS: '10'
+      VRYX_BENCH_TOKENS: ${{ inputs.tokens || vars.VRYX_BENCH_TOKENS || '16,32' }}
+      VRYX_BENCH_TARGET_TPS: ${{ inputs.target_tps || vars.VRYX_BENCH_TARGET_TPS || '0.1' }}
       VRYX_BENCH_HTTP_TIMEOUT: '2400'
     steps:
       - uses: actions/checkout@v4
@@ -32,14 +50,16 @@ jobs:
 
       - name: Check staging bench endpoint
         run: |
-          if [ -z "$VRYX_BENCH_URL" ]; then
-            echo "VRYX_BENCH_URL secret is not configured; skipping optional staging bench."
+          if [ -z "$VRYX_BENCH_URL" ] || [ -z "$VRYX_BENCH_TOKEN" ]; then
+            echo "VRYX_BENCH_URL or VRYX_BENCH_TOKEN secret is not configured; skipping optional staging bench."
             echo "VRYX_SKIP_BENCH=1" >> "$GITHUB_ENV"
           fi
 
       - name: Run forced P2P shard bench
         if: env.VRYX_SKIP_BENCH != '1'
-        run: python3 nodeAndWorker/scripts/bench_vps_chat_tps.py | tee p2p-staging-bench.jsonl
+        run: |
+          set -o pipefail
+          python3 nodeAndWorker/scripts/bench_vps_chat_tps.py | tee p2p-staging-bench.jsonl
 
       - name: Upload bench artifact
         if: always() && env.VRYX_SKIP_BENCH != '1'

@@ -116,6 +116,8 @@ const VRYX_BILLING_ENFORCE_CREDITS = process.env.VRYX_BILLING_ENFORCE_CREDITS ==
 const VRYX_BILLING_CREDIT_PACKAGES = parseCreditPackages(process.env.VRYX_BILLING_CREDIT_PACKAGES_EUR || '50,100,500,2000')
 const VRYX_APP_BASE_URL = (process.env.VRYX_APP_BASE_URL || CORS_ORIGIN || 'https://vryx.eu').replace(/\/$/, '')
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
+const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim()
+const VRYX_BENCH_TOKEN = String(process.env.VRYX_BENCH_TOKEN || '').trim()
 
 /** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
 let pipelineChatSessions = 0
@@ -2239,7 +2241,14 @@ app.use(
     credentials: true,
   }),
 )
-app.use(express.json({ limit: JSON_BODY_LIMIT }))
+app.use(express.json({
+  limit: JSON_BODY_LIMIT,
+  verify: (req, _res, buf) => {
+    if (req.originalUrl === '/api/billing/stripe/webhook') {
+      req.rawBody = Buffer.from(buf)
+    }
+  },
+}))
 app.use(cookieParser())
 app.use(csrfProtection)
 app.use(authMiddleware)
@@ -4380,8 +4389,58 @@ accountRouter.delete('/sessions', async (req, res) => {
 
 app.use('/api/account', accountRouter)
 
+app.post('/api/internal/bench/chat', accountChatLimiter, async (req, res) => {
+  if (!VRYX_BENCH_TOKEN) return res.status(404).json({ ok: false })
+  const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
+  const headerToken = String(req.headers['x-vryx-bench-token'] || '').trim()
+  const token = bearer || headerToken
+  if (!tokenMatchesSecret(token, VRYX_BENCH_TOKEN)) {
+    return res.status(401).json({ ok: false, error: 'bench_unauthorized' })
+  }
+  try {
+    const upstream = await fetch(`${VRYX_INITIATOR_CHAT_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body || {}),
+      signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(Math.max(30_000, Math.min(2_400_000, Number(process.env.VRYX_BENCH_HTTP_TIMEOUT_MS || 600_000))))
+        : undefined,
+    })
+    const text = await upstream.text()
+    res.status(upstream.status)
+    res.type(upstream.headers.get('content-type') || 'application/json')
+    return res.send(text)
+  } catch (e) {
+    console.error('internal/bench/chat', e?.name === 'AbortError' ? 'timeout' : e)
+    return res.status(502).json({ ok: false, error: e?.name === 'AbortError' ? 'bench_timeout' : 'bench_proxy_failed' })
+  }
+})
+
+function verifyStripeWebhookSignature(req) {
+  if (!STRIPE_WEBHOOK_SECRET) return true
+  const signature = String(req.headers['stripe-signature'] || '')
+  const rawBody = req.rawBody
+  if (!signature || !rawBody) return false
+  const parts = Object.fromEntries(
+    signature
+      .split(',')
+      .map((part) => part.split('='))
+      .filter((pair) => pair.length === 2)
+      .map(([key, value]) => [key.trim(), value.trim()]),
+  )
+  const timestamp = parts.t
+  const expected = parts.v1
+  if (!timestamp || !expected) return false
+  const ageSeconds = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp))
+  if (!Number.isFinite(ageSeconds) || ageSeconds > 300) return false
+  const payload = `${timestamp}.${rawBody.toString('utf8')}`
+  const digest = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(payload).digest('hex')
+  return tokenMatchesSecret(digest, expected)
+}
+
 app.post('/api/billing/stripe/webhook', async (req, res) => {
   if (!STRIPE_SECRET_KEY) return res.status(501).json({ ok: false, error: 'Stripe non configuré.' })
+  if (!verifyStripeWebhookSignature(req)) return res.status(400).json({ ok: false, error: 'Signature Stripe invalide.' })
   try {
     const eventId = typeof req.body?.id === 'string' ? req.body.id : ''
     let event = req.body

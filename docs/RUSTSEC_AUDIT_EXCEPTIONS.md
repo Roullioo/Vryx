@@ -1,24 +1,23 @@
-# RustSec Audit Exceptions
+# RustSec Audit Status
 
 Last reviewed: 2026-05-22
 
-The `Investor CI` dependency scan remains blocking for new RustSec advisories. The workflow currently ignores the following known transitive advisories because they are pulled through `libp2p 0.53.2` and require a coordinated `libp2p` upgrade rather than a small direct dependency bump:
+The `Investor CI` dependency scan is blocking and runs `cargo audit` without advisory ignores.
 
-- `RUSTSEC-2025-0009` - `ring 0.16.20`, via `rcgen` / `libp2p-tls` / `libp2p-quic`.
-- `RUSTSEC-2026-0098` - `rustls-webpki 0.101.7`, via `libp2p-tls`.
-- `RUSTSEC-2026-0099` - `rustls-webpki 0.101.7`, via `libp2p-tls`.
-- `RUSTSEC-2026-0104` - `rustls-webpki 0.101.7`, via `libp2p-tls`.
-- `RUSTSEC-2026-0119` - `hickory-proto 0.24.4`, via `libp2p-dns` / `libp2p-mdns`.
+Previous transitive exceptions through `libp2p 0.53.2` have been removed:
+
+- `ring 0.16.20` is no longer present in `Cargo.lock`.
+- `rustls-webpki 0.101.7` is no longer present in `Cargo.lock`.
+- `hickory-proto 0.24.4` is no longer present in `Cargo.lock`.
+
+Current status:
+
+- `libp2p` is pinned to an upstream commit that contains the patched 0.57 stack.
+- DNS/mDNS discovery is not used by the daemon; Vryx production nodes use explicit IP multiaddrs.
+- `cargo audit` exits successfully with no vulnerability errors. It may still print allowed non-blocking maintenance warnings from transitive crates.
 
 Risk owner: Vryx engineering.
 
-Mitigation until upgrade:
+Reintroduction rule:
 
-- Keep worker and daemon secrets mandatory in production.
-- Keep public network data redacted and avoid exposing peer/IP internals.
-- Prefer the authenticated HTTPS API path for customer traffic; P2P daemon exposure is limited to worker transport.
-- Keep these advisories visible in CI logs so they are not forgotten.
-
-Removal condition:
-
-- Upgrade `libp2p` and its TLS/DNS stack so `ring`, `rustls-webpki`, and `hickory-proto` resolve to patched versions, then remove the `cargo audit --ignore` entries from `.github/workflows/investor-ci.yml`.
+- Any future RustSec advisory ignore must be documented here with owner, mitigation, and removal condition before it can be added to CI.

@@ -26,7 +26,16 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from typing import Any
+
+
+def _normalize_url(raw_url: str) -> str:
+    url = raw_url.strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.path.rstrip("/").endswith(("/api/chat", "/bench/chat")):
+        return url
+    return url.rstrip("/") + "/api/chat"
 
 
 def _env_list(name: str, default: str) -> list[int]:
@@ -69,7 +78,11 @@ def _chat(url: str, max_new_tokens: int, prompt: str, timeout_sec: float) -> dic
             if peer.strip()
         ]
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    bearer = os.environ.get("VRYX_BENCH_TOKEN", "").strip() or os.environ.get("VRYX_BENCH_BEARER", "").strip()
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     started = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
@@ -82,6 +95,8 @@ def _chat(url: str, max_new_tokens: int, prompt: str, timeout_sec: float) -> dic
 def _metric(data: dict[str, Any], tokens_requested: int) -> dict[str, Any]:
     trace = data.get("pipeline_trace") if isinstance(data.get("pipeline_trace"), dict) else {}
     bench = trace.get("benchmark") if isinstance(trace.get("benchmark"), dict) else {}
+    assignments = trace.get("assignments") if isinstance(trace.get("assignments"), list) else []
+    assignment_count = len(assignments)
     ct = int(data.get("completion_tokens") or 0)
     response = data.get("response")
     response_chars = len(response) if isinstance(response, str) else 0
@@ -122,17 +137,16 @@ def _metric(data: dict[str, Any], tokens_requested: int) -> dict[str, Any]:
         "layout": trace.get("layout"),
         "runtime_backend": runtime_backend,
         "model_id": trace.get("model_id") or data.get("model_id"),
-        "worker_count": trace.get("worker_count") or trace.get("peers_online"),
-        "compute_worker_count": trace.get("compute_worker_count") or trace.get("worker_count"),
+        "worker_count": trace.get("worker_count") or trace.get("peers_online") or assignment_count or None,
+        "compute_worker_count": trace.get("compute_worker_count") or trace.get("worker_count") or assignment_count or None,
         "visible_worker_count": trace.get("visible_worker_count") or trace.get("peers_online"),
         "available_peers": trace.get("available_peers"),
+        "assignment_count": assignment_count,
     }
 
 
 def main() -> int:
-    url = os.environ.get("VRYX_BENCH_URL", "http://127.0.0.1:3031/api/chat").strip()
-    if not url.endswith("/api/chat"):
-        url = url.rstrip("/") + "/api/chat"
+    url = _normalize_url(os.environ.get("VRYX_BENCH_URL", "http://127.0.0.1:3031/api/chat"))
     timeout_sec = float(os.environ.get("VRYX_BENCH_HTTP_TIMEOUT", "360"))
     target_tps = float(os.environ.get("VRYX_BENCH_TARGET_TPS", "50"))
     min_compute_workers = int(os.environ.get("VRYX_BENCH_MIN_COMPUTE_WORKERS", "0") or "0")
