@@ -798,8 +798,9 @@ export async function upsertPricingTier(pool, input) {
   return slug
 }
 
-export async function upsertSubscriptionPlan(pool, input) {
+export async function upsertSubscriptionPlan(pool, input, userId = null) {
   const slug = slugifyModel(input.slug)
+  const [beforeRows] = await pool.query('SELECT * FROM subscription_plans WHERE slug = :slug LIMIT 1', { slug })
   await pool.query(`
     INSERT INTO subscription_plans (slug, name, monthly_eur, description, is_public, sort_order)
     VALUES (:slug, :name, :monthlyEur, :description, :isPublic, :sortOrder)
@@ -808,6 +809,8 @@ export async function upsertSubscriptionPlan(pool, input) {
     slug, name: input.name, monthlyEur: Number(input.monthlyEur || 0), description: input.description || null,
     isPublic: input.isPublic === false ? 0 : 1, sortOrder: Math.floor(Number(input.sortOrder || 0)),
   })
+  const [afterRows] = await pool.query('SELECT * FROM subscription_plans WHERE slug = :slug LIMIT 1', { slug })
+  await writePricingAudit(pool, 'subscription_plan', slug, beforeRows[0] ?? null, afterRows[0] ?? null, userId)
   return slug
 }
 
@@ -833,8 +836,9 @@ export async function upsertPrivatePoolPlan(pool, input, userId = null) {
   return slug
 }
 
-export async function upsertFineTuningPlan(pool, input) {
+export async function upsertFineTuningPlan(pool, input, userId = null) {
   const slug = slugifyModel(input.slug)
+  const [beforeRows] = await pool.query('SELECT * FROM fine_tuning_plans WHERE slug = :slug LIMIT 1', { slug })
   await pool.query(`
     INSERT INTO fine_tuning_plans (slug, name, eur_per_million_training, setup_min_eur, setup_max_eur, deployment_monthly_min_eur, deployment_monthly_max_eur, is_public, sort_order)
     VALUES (:slug, :name, :trainEur, :setupMin, :setupMax, :deployMin, :deployMax, :isPublic, :sortOrder)
@@ -845,6 +849,8 @@ export async function upsertFineTuningPlan(pool, input) {
     deployMin: Number(input.deploymentMonthlyMinEur || 0), deployMax: Number(input.deploymentMonthlyMaxEur || 0),
     isPublic: input.isPublic === false ? 0 : 1, sortOrder: Math.floor(Number(input.sortOrder || 0)),
   })
+  const [afterRows] = await pool.query('SELECT * FROM fine_tuning_plans WHERE slug = :slug LIMIT 1', { slug })
+  await writePricingAudit(pool, 'fine_tuning_plan', slug, beforeRows[0] ?? null, afterRows[0] ?? null, userId)
   return slug
 }
 

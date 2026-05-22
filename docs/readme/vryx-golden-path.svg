@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620" role="img" aria-labelledby="title desc">
+  <title id="title">Vryx golden path and billing proof</title>
+  <desc id="desc">A sequence diagram showing API request, worker reservation, AI response, cost calculation, Stripe test and worker payout.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#062f35"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ecfeff"/>
+    </linearGradient>
+    <linearGradient id="ok" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#14b8a6"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <style>
+      .title { font-family: Inter, Arial, sans-serif; font-weight: 800; font-size: 40px; fill: #f8fafc; letter-spacing: 0; }
+      .subtitle { font-family: Inter, Arial, sans-serif; font-weight: 500; font-size: 18px; fill: #cbd5e1; }
+      .stepTitle { font-family: Inter, Arial, sans-serif; font-weight: 800; font-size: 17px; fill: #0f172a; }
+      .stepBody { font-family: Inter, Arial, sans-serif; font-weight: 500; font-size: 13px; fill: #475569; }
+      .num { font-family: Inter, Arial, sans-serif; font-weight: 900; font-size: 18px; fill: #ffffff; }
+      .metric { font-family: Inter, Arial, sans-serif; font-weight: 800; font-size: 21px; fill: #f8fafc; }
+      .metricLabel { font-family: Inter, Arial, sans-serif; font-weight: 600; font-size: 12px; fill: #a7f3d0; letter-spacing: 0.06em; }
+      .arrow { fill: none; stroke: #67e8f9; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrowhead); opacity: 0.72; }
+      .card { fill: #f8fafc; stroke: #a5f3fc; stroke-width: 1.4; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#67e8f9"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="620" rx="26" fill="url(#bg)"/>
+  <text class="title" x="70" y="70">Golden path investisseur</text>
+  <text class="subtitle" x="70" y="104">Une preuve de bout en bout : réseau live, requête API, réponse IA, coût, Stripe et payout worker.</text>
+
+  <g transform="translate(70 146)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#0f766e"/><text class="num" x="28" y="41">1</text>
+    <text class="stepTitle" x="24" y="74">Network page</text>
+    <text class="stepBody" x="24" y="98">workers live</text>
+    <text class="stepBody" x="24" y="116">route directe / relay</text>
+  </g>
+  <path class="arrow" d="M240 212 H300"/>
+
+  <g transform="translate(310 146)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#2563eb"/><text class="num" x="28" y="41">2</text>
+    <text class="stepTitle" x="24" y="74">Readiness 100</text>
+    <text class="stepBody" x="24" y="98">score 24h</text>
+    <text class="stepBody" x="24" y="116">benchs valides</text>
+  </g>
+  <path class="arrow" d="M480 212 H540"/>
+
+  <g transform="translate(550 146)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#7c3aed"/><text class="num" x="28" y="41">3</text>
+    <text class="stepTitle" x="24" y="74">Deux workers</text>
+    <text class="stepBody" x="24" y="98">reservation</text>
+    <text class="stepBody" x="24" y="116">busy guard</text>
+  </g>
+  <path class="arrow" d="M720 212 H780"/>
+
+  <g transform="translate(790 146)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#f59e0b"/><text class="num" x="28" y="41">4</text>
+    <text class="stepTitle" x="24" y="74">Bench CI réel</text>
+    <text class="stepBody" x="24" y="98">TPS / TTFT</text>
+    <text class="stepBody" x="24" y="116">0 réponse vide</text>
+  </g>
+  <path class="arrow" d="M960 212 H1020"/>
+
+  <g transform="translate(1030 146)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#dc2626"/><text class="num" x="28" y="41">5</text>
+    <text class="stepTitle" x="24" y="74">Requête API</text>
+    <text class="stepBody" x="24" y="98">chat completions</text>
+    <text class="stepBody" x="24" y="116">logs inference</text>
+  </g>
+
+  <path class="arrow" d="M1110 278 C1110 340 151 322 151 378"/>
+
+  <g transform="translate(70 378)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#0f766e"/><text class="num" x="28" y="41">6</text>
+    <text class="stepTitle" x="24" y="74">Réponse IA</text>
+    <text class="stepBody" x="24" y="98">stream tokens</text>
+    <text class="stepBody" x="24" y="116">TTFT mesure</text>
+  </g>
+  <path class="arrow" d="M240 444 H300"/>
+
+  <g transform="translate(310 378)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#2563eb"/><text class="num" x="28" y="41">7</text>
+    <text class="stepTitle" x="24" y="74">Coût calculé</text>
+    <text class="stepBody" x="24" y="98">input + output</text>
+    <text class="stepBody" x="24" y="116">ledger usage</text>
+  </g>
+  <path class="arrow" d="M480 444 H540"/>
+
+  <g transform="translate(550 378)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#7c3aed"/><text class="num" x="28" y="41">8</text>
+    <text class="stepTitle" x="24" y="74">Stripe test</text>
+    <text class="stepBody" x="24" y="98">checkout session</text>
+    <text class="stepBody" x="24" y="116">crédits prépayés</text>
+  </g>
+  <path class="arrow" d="M720 444 H780"/>
+
+  <g transform="translate(790 378)">
+    <rect class="card" x="0" y="0" width="162" height="132" rx="18"/>
+    <circle cx="34" cy="34" r="18" fill="#f59e0b"/><text class="num" x="28" y="41">9</text>
+    <text class="stepTitle" x="24" y="74">Worker payout</text>
+    <text class="stepBody" x="24" y="98">part worker</text>
+    <text class="stepBody" x="24" y="116">marge Vryx</text>
+  </g>
+  <path class="arrow" d="M960 444 H1020"/>
+
+  <g transform="translate(1030 378)">
+    <rect x="0" y="0" width="162" height="132" rx="18" fill="#22c55e" stroke="#86efac" stroke-width="1.4"/>
+    <circle cx="34" cy="34" r="18" fill="#064e3b"/>
+    <path d="M25 35 l6 6 l14 -16" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="stepTitle" x="24" y="74" fill="#052e16">Demo ready</text>
+    <text class="stepBody" x="24" y="98" fill="#064e3b">preuve technique</text>
+    <text class="stepBody" x="24" y="116" fill="#064e3b">preuve business</text>
+  </g>
+
+  <g transform="translate(70 550)">
+    <text class="metricLabel" x="0" y="0">INVESTOR SIGNAL</text>
+    <text class="metric" x="0" y="34">latence mesurée · coût tracé · paiement testable · reward worker auditable</text>
+  </g>
+</svg>
