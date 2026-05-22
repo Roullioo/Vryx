@@ -170,7 +170,15 @@ export function registerPublicStatusRoutes(app, options) {
         discoverAvailableModels(),
       ])
       const pricingConfig = getPricingConfig ? await getPricingConfig() : null
-      const effectiveEurPerMillion = pricingConfig?.pricingPublished ? Number(pricingConfig.defaultEurPerMillion || eurPerMillion) : Number(eurPerMillion)
+      const effectiveEurPerMillion = pricingConfig?.pricingPublished
+        ? Number(
+            pricingConfig.eurPerMillionTokens
+            ?? (pricingConfig.headline
+              ? (pricingConfig.headline.minInputEurPerMillion * 0.75 + pricingConfig.headline.minOutputEurPerMillion * 0.25)
+              : pricingConfig.defaultEurPerMillion)
+            ?? eurPerMillion,
+          )
+        : Number(eurPerMillion)
       const effectiveWorkerRewardShare = Number(pricingConfig?.workerRewardSharePercent ?? workerRewardSharePercent)
 
       const exposeWorkerDetails = process.env.VRYX_PUBLIC_EXPOSE_WORKER_DETAILS === '1'
@@ -278,6 +286,8 @@ export function registerPublicStatusRoutes(app, options) {
         publicExposure: exposeWorkerDetails ? 'worker_details_enabled' : 'redacted',
         pricing: {
           published: pricingConfig ? Boolean(pricingConfig.pricingPublished) : true,
+          minInputEurPerMillion: pricingConfig?.pricingPublished ? Number(pricingConfig.headline?.minInputEurPerMillion ?? effectiveEurPerMillion) : null,
+          minOutputEurPerMillion: pricingConfig?.pricingPublished ? Number(pricingConfig.headline?.minOutputEurPerMillion ?? effectiveEurPerMillion) : null,
           eurPerMillionTokens: pricingConfig?.pricingPublished ? effectiveEurPerMillion : null,
           eurPerThousandTokens: pricingConfig?.pricingPublished ? Number((effectiveEurPerMillion / 1000).toFixed(6)) : null,
           estimatedGrossMarginPercent: grossMarginPercent,

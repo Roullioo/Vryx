@@ -16,7 +16,7 @@ import {
   type FleetLine,
   type WorkerSimMode,
 } from '../lib/simulator'
-import { fetchPublicPricing } from '../lib/pricingModels'
+import { fetchPublicPricing, fetchPublicModels, computeBlendedPrice, type CatalogModel } from '../lib/pricingModels'
 
 const PRESETS = [
   { label: 'Démarrage', millions: 5, ref: 4.2 },
@@ -59,12 +59,32 @@ export function SimulatorPage() {
   const { t } = useTranslation('public')
   const [tab, setTab] = useState<TabId>('inference')
   const [vryxEurPerMillion, setVryxEurPerMillion] = useState<number | null>(VRYX_EUR_PER_MILLION_FALLBACK)
+  const [minInputEur, setMinInputEur] = useState<number | null>(0.02)
+  const [minOutputEur, setMinOutputEur] = useState<number | null>(0.06)
   const [pricingPublished, setPricingPublished] = useState(true)
+  const [models, setModels] = useState<CatalogModel[]>([])
+  const [selectedModelSlug, setSelectedModelSlug] = useState('')
+  const [inputRatioPercent, setInputRatioPercent] = useState(75)
 
   const [millions, setMillions] = useState(25)
   const [refEur, setRefEur] = useState(4.5)
   const [poolN, setPoolN] = useState(16)
   const [outTok, setOutTok] = useState(512)
+
+  const selectedModel = useMemo(
+    () => models.find((m) => m.slug === selectedModelSlug) ?? models[0] ?? null,
+    [models, selectedModelSlug],
+  )
+
+  const modelInputEur = selectedModel?.pricing?.inputEurPerMillion ?? selectedModel?.eurPerMillionInput ?? minInputEur
+  const modelOutputEur = selectedModel?.pricing?.outputEurPerMillion ?? selectedModel?.eurPerMillionOutput ?? minOutputEur
+
+  const effectiveVryxEurPerMillion = useMemo(() => {
+    if (modelInputEur != null && modelOutputEur != null) {
+      return computeBlendedPrice(modelInputEur, modelOutputEur, inputRatioPercent)
+    }
+    return vryxEurPerMillion
+  }, [modelInputEur, modelOutputEur, inputRatioPercent, vryxEurPerMillion])
 
   const result = useMemo(
     () =>
@@ -73,18 +93,27 @@ export function SimulatorPage() {
         referenceEurPerMillion: refEur,
         poolCandidateCount: poolN,
         avgOutputTokensPerRequest: outTok,
-        vryxEurPerMillion,
+        vryxEurPerMillion: effectiveVryxEurPerMillion,
       }),
-    [millions, refEur, poolN, outTok, vryxEurPerMillion],
+    [millions, refEur, poolN, outTok, effectiveVryxEurPerMillion],
   )
 
   useEffect(() => {
     let cancelled = false
-    fetchPublicPricing().then((r) => {
+    Promise.all([fetchPublicPricing(), fetchPublicModels()]).then(([pricingR, modelsR]) => {
       if (cancelled) return
-      if (r.ok) {
-        setPricingPublished(r.data.pricing.published)
-        setVryxEurPerMillion(r.data.pricing.eurPerMillionTokens ?? null)
+      if (pricingR.ok) {
+        setPricingPublished(pricingR.data.pricing.published)
+        setMinInputEur(pricingR.data.pricing.minInputEurPerMillion ?? pricingR.data.pricing.headline?.minInputEurPerMillion ?? null)
+        setMinOutputEur(pricingR.data.pricing.minOutputEurPerMillion ?? pricingR.data.pricing.headline?.minOutputEurPerMillion ?? null)
+        setVryxEurPerMillion(pricingR.data.pricing.eurPerMillionTokens ?? null)
+        setInputRatioPercent(pricingR.data.pricing.blendedInputRatioPercent ?? 75)
+      }
+      if (modelsR.ok) {
+        const list = modelsR.data.models.filter((m) => m.isPublic && m.isActive)
+        setModels(list)
+        const preferred = list.find((m) => m.slug === 'qwen3-5-9b') ?? list[0]
+        if (preferred) setSelectedModelSlug(preferred.slug)
       }
     })
     return () => {
@@ -105,11 +134,11 @@ export function SimulatorPage() {
           referenceEurPerMillion: refEur,
           poolCandidateCount: poolN,
           avgOutputTokensPerRequest: outTok,
-          vryxEurPerMillion,
+          vryxEurPerMillion: effectiveVryxEurPerMillion,
         })
         return { millions: m, solo: r.monthlySoloEuro, pool: r.monthlyPoolEuro }
       }),
-    [refEur, poolN, outTok, vryxEurPerMillion],
+    [refEur, poolN, outTok, effectiveVryxEurPerMillion],
   )
   const chartMax = Math.max(...chartRows.flatMap((r) => [r.solo, r.pool]), 1)
   const chartAreaPx = 160
@@ -288,6 +317,53 @@ export function SimulatorPage() {
             transition={{ duration: 0.35 }}
           >
             <div className="panel p-5 sm:p-6">
+              <label className="block font-mono text-xs uppercase tracking-wider text-muted">Modèle Vryx</label>
+              <select
+                value={selectedModel?.slug ?? ''}
+                onChange={(e) => setSelectedModelSlug(e.target.value)}
+                className="mt-3 w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-sm text-fg outline-none focus:border-accent"
+              >
+                {models.length === 0 ? (
+                  <option value="">Tarif headline (API)</option>
+                ) : (
+                  models.map((m) => (
+                    <option key={m.slug} value={m.slug}>
+                      {m.name}
+                      {m.pricing?.inputEurPerMillion != null
+                        ? ` — ${m.pricing.inputEurPerMillion.toFixed(4)}/${m.pricing.outputEurPerMillion.toFixed(4)} €/M`
+                        : ''}
+                    </option>
+                  ))
+                )}
+              </select>
+              {selectedModel && modelInputEur != null && modelOutputEur != null ? (
+                <p className="mt-2 text-xs text-muted">
+                  {modelInputEur.toFixed(4)} €/M input · {modelOutputEur.toFixed(4)} €/M output · blended{' '}
+                  {effectiveVryxEurPerMillion?.toFixed(4)} €/M
+                </p>
+              ) : null}
+            </div>
+
+            <div className="panel p-5 sm:p-6">
+              <label className="block font-mono text-xs uppercase tracking-wider text-muted">
+                Ratio input / output ({inputRatioPercent} % input)
+              </label>
+              <div className="mt-3 flex items-center gap-4">
+                <input
+                  type="range"
+                  min={10}
+                  max={90}
+                  step={5}
+                  value={inputRatioPercent}
+                  onChange={(e) => setInputRatioPercent(Number(e.target.value))}
+                  className="h-2 w-full flex-1 cursor-pointer accent-accent"
+                />
+                <span className="w-12 text-right font-mono text-sm text-fg">{inputRatioPercent}%</span>
+              </div>
+              <p className="mt-2 text-xs text-muted">75/25 par défaut — profil chat moyen.</p>
+            </div>
+
+            <div className="panel p-5 sm:p-6">
               <label className="block font-mono text-xs uppercase tracking-wider text-muted">
                 Volume (M tokens / mois)
               </label>
@@ -437,10 +513,10 @@ export function SimulatorPage() {
                     <EurSign className="text-accent" />
                   </p>
                   <p className="mt-1 text-xs text-muted">
-                    / mois · {pricingPublished && vryxEurPerMillion != null ? (
+                    / mois · {pricingPublished && modelInputEur != null && modelOutputEur != null ? (
                       <>
-                        {vryxEurPerMillion.toFixed(4)}
-                        <EurSign /> / M tokens
+                        {modelInputEur.toFixed(4)} € in / {modelOutputEur.toFixed(4)} € out
+                        {selectedModel ? ` · ${selectedModel.name}` : ''}
                       </>
                     ) : (
                       t('pricing.onQuote').toLowerCase()

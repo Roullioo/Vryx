@@ -144,8 +144,9 @@ export function AdminModelsCatalogPage() {
                 <dl className="mt-4 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-5">
                   <div><dt className="text-muted">Contexte</dt><dd className="font-mono text-fg">{formatContext(m.contextTokens)}</dd></div>
                   <div><dt className="text-muted">VRAM</dt><dd className="font-mono text-fg">{m.weightGb ? `${m.weightGb} Go` : '—'}</dd></div>
-                  <div><dt className="text-muted">Prix effectif</dt><dd className="font-mono text-fg">{formatPricingLabel(m.effectiveEurPerMillion)}</dd></div>
-                  <div><dt className="text-muted">Override</dt><dd className="font-mono text-fg">{formatPricingLabel(m.eurPerMillion)}</dd></div>
+                  <div><dt className="text-muted">Input / Output</dt><dd className="font-mono text-fg">{formatPricingLabel(m.pricing?.inputEurPerMillion ?? m.eurPerMillionInput)} / {formatPricingLabel(m.pricing?.outputEurPerMillion ?? m.eurPerMillionOutput)}</dd></div>
+                  <div><dt className="text-muted">Blended</dt><dd className="font-mono text-fg">{formatPricingLabel(m.pricing?.blendedEurPerMillion ?? m.effectiveEurPerMillion)}</dd></div>
+                  <div><dt className="text-muted">Worker share</dt><dd className="font-mono text-fg">{m.workerSharePercent ?? m.pricing?.workerSharePercent ?? '—'} %</dd></div>
                   <div><dt className="text-muted">Workers</dt><dd className="font-mono text-fg">{m.workersOnline || 0}/{m.requiredWorkers}</dd></div>
                 </dl>
               </article>
@@ -194,9 +195,35 @@ export function AdminModelsCatalogPage() {
                 <input type="number" value={editing.weightGb ?? ''} onChange={(e) => setEditing({ ...editing, weightGb: e.target.value === '' ? null : Number(e.target.value) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
               </label>
               <label className="space-y-1 text-sm">
-                <span className="text-muted">Prix override (€ / M)</span>
-                <input type="number" step="0.0001" value={editing.eurPerMillion ?? ''} onChange={(e) => setEditing({ ...editing, eurPerMillion: e.target.value === '' ? null : Number(e.target.value) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+                <span className="text-muted">Prix input (€ / M)</span>
+                <input type="number" step="0.0001" value={editing.eurPerMillionInput ?? editing.pricing?.inputEurPerMillion ?? ''} onChange={(e) => setEditing({ ...editing, eurPerMillionInput: e.target.value === '' ? undefined : Number(e.target.value) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
               </label>
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Prix output (€ / M)</span>
+                <input type="number" step="0.0001" value={editing.eurPerMillionOutput ?? editing.pricing?.outputEurPerMillion ?? ''} onChange={(e) => setEditing({ ...editing, eurPerMillionOutput: e.target.value === '' ? undefined : Number(e.target.value) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Tier pricing</span>
+                <input value={editing.pricingTier ?? editing.pricing?.tier ?? 'core'} onChange={(e) => setEditing({ ...editing, pricingTier: e.target.value })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm">
+                <span className="text-muted">Worker share (%)</span>
+                <input type="number" value={editing.workerSharePercent ?? editing.pricing?.workerSharePercent ?? ''} onChange={(e) => setEditing({ ...editing, workerSharePercent: e.target.value === '' ? undefined : Number(e.target.value) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />
+              </label>
+              <label className="space-y-1 text-sm sm:col-span-2">
+                <span className="text-muted">Disponibilité</span>
+                <select value={editing.availabilityStatus ?? 'available'} onChange={(e) => setEditing({ ...editing, availabilityStatus: e.target.value as CatalogModel['availabilityStatus'] })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent">
+                  <option value="available">Disponible</option>
+                  <option value="limited">Limité</option>
+                  <option value="reservation">Sur réservation</option>
+                  <option value="unavailable">Indisponible</option>
+                </select>
+              </label>
+              {editing.marginPreview && (
+                <div className="rounded-2xl border border-border bg-surface p-3 text-xs sm:col-span-2">
+                  <p>Marge estimée : {editing.marginPreview.netMarginPercent} % · Worker {editing.marginPreview.workerPayoutEur} € · Vryx {editing.marginPreview.vryxGrossEur} €</p>
+                </div>
+              )}
               <label className="space-y-1 text-sm">
                 <span className="text-muted">Modalités (séparées par virgule)</span>
                 <input value={editing.modalities.join(', ')} onChange={(e) => setEditing({ ...editing, modalities: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) })} className="w-full rounded-xl border border-border bg-surface px-3 py-2 text-fg outline-none focus:border-accent" />

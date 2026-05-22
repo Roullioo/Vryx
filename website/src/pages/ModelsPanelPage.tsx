@@ -5,7 +5,7 @@ import { useAuth } from '../context/AuthContext'
 import { IconSearch } from '../components/icons/Icons'
 import { ModelFamilyLogo } from '../components/ModelFamilyLogo'
 import { ProviderLogo } from '../components/ProviderLogo'
-import { fetchPublicModels, formatPricingLabel, type CatalogModel } from '../lib/pricingModels'
+import { fetchPublicModels, formatInputOutputLabel, formatPricingLabel, type CatalogModel } from '../lib/pricingModels'
 
 function formatContext(tokens: number): string {
   if (tokens >= 1_000_000) {
@@ -82,8 +82,14 @@ function ModelCard({
           <dd className="mt-0.5 font-mono text-sm text-fg">{formatVramGbLabel(vramGb)}</dd>
         </div>
         <div className="col-span-2">
-          <dt className="text-muted">Prix public</dt>
-          <dd className="mt-0.5 font-mono text-sm text-fg">{formatPricingLabel(m.effectiveEurPerMillion)} / million de tokens</dd>
+          <dt className="text-muted">Prix input / output</dt>
+          <dd className="mt-0.5 font-mono text-sm text-fg">
+            {formatInputOutputLabel(m.pricing?.inputEurPerMillion ?? m.eurPerMillionInput, m.pricing?.outputEurPerMillion ?? m.eurPerMillionOutput)}
+          </dd>
+        </div>
+        <div className="col-span-2">
+          <dt className="text-muted">Prix blended (chat moyen)</dt>
+          <dd className="mt-0.5 font-mono text-sm text-fg">{formatPricingLabel(m.pricing?.blendedEurPerMillion ?? m.effectiveEurPerMillion)} / M</dd>
         </div>
       </dl>
     </article>

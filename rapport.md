@@ -1,5 +1,29 @@
 # Rapport : réduction du « mur » perçu (admin chat P2P)
 
+## Mise à jour : Pricing V2 input/output, pool, B2B et garde-fous (22 mai 2026)
+
+### Ce qu’il se passait avant
+
+- Tarif unique **0,30 €/M tokens** (blended) côté site et billing : pas de distinction prompt/completion.
+- `recordApiKeyUsage` facturait `total_tokens × rate` sans tenir compte du modèle ni de la direction.
+- Pas de tiers pricing, plans B2B, Private Pool ni fine-tuning en base ; pas de garde-fous de marge admin.
+- Le simulateur et les pages publiques ne proposaient qu’un prix headline unique.
+
+### Ce qu’il se passe maintenant
+
+- **Schéma MariaDB V2** : `pricing_config` (headline min in/out, recharge Stripe, remise pool, marge min), `model_catalog` (input/output, tier, worker share, availability, pool), tables `pricing_tiers`, `subscription_plans`, `private_pool_plans`, `fine_tuning_plans`, `pricing_config_audit`.
+- **Moteur** `pricing-engine.js` : `computeRequestCost`, `computeBlendedPrice`, `validatePricingFloor`, `resolveModelRates`.
+- **Billing** : facturation `prompt × rate_in + completion × rate_out` ; colonnes `cost_input_eur`, `cost_output_eur`, `billing_mode`, `pricing_snapshot_json` sur `api_key_usage`.
+- **API publique** : `/api/public/pricing` expose headline 0,02/0,06 €, plans B2B/pool/finetune, recharge min 20 € ; `/api/public/models` retourne pricing in/out/blended par modèle.
+- **Admin** : `/admin/parametres/pricing` en onglets (Général, Volume, B2B, Pool, Fine-tuning) ; `/admin/modeles` avec prix in/out, tier, worker share, preview marge ; nav regroupée sous section « Pricing ».
+- **Site public** : `/clients`, `/panel/modeles`, `/status`, `/simulateur` affichent tarifs in/out ; simulateur avec sélecteur modèle et ratio input/output.
+- **Seed** : grille tiers nano→code, modèles clés (Qwen 0.5B, 9B, 35B, etc.), plans Developer→Scale et Private Pool S→XL ; `pricing_published=1`.
+
+### Vérifications
+
+- `npm run build`, `npm run lint:refonte`, `npm run test:pricing-models` : OK.
+- Déploiement VPS (`website_deploy.py`) : OK après correction doublon `pricingConfig` dans `public-status.js` ; PM2 `vryx-api` online, `/api/health` OK.
+
 ## Mise à jour : refonte Vryx unifiée pricing, modèles, DA et admin (22 mai 2026)
 
 ### Ce qu’il se passait avant

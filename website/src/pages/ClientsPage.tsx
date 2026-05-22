@@ -24,25 +24,29 @@ const highlights = [
 
 export function ClientsPage() {
   const { user } = useAuth()
-  const [price, setPrice] = useState<number | null>(null)
+  const [minInput, setMinInput] = useState<number | null>(0.02)
+  const [minOutput, setMinOutput] = useState<number | null>(0.06)
   const [pricingPublished, setPricingPublished] = useState(false)
+  const [subscriptionPlans, setSubscriptionPlans] = useState<{ name: string; monthlyEur: number }[]>([])
   useEffect(() => {
     let cancelled = false
     fetchPublicPricing().then((r) => {
       if (cancelled) return
       if (r.ok) {
-        setPrice(r.data.pricing.eurPerMillionTokens)
+        setMinInput(r.data.pricing.minInputEurPerMillion ?? r.data.pricing.headline?.minInputEurPerMillion ?? null)
+        setMinOutput(r.data.pricing.minOutputEurPerMillion ?? r.data.pricing.headline?.minOutputEurPerMillion ?? null)
         setPricingPublished(r.data.pricing.published)
+        setSubscriptionPlans(
+          (r.data.pricing.subscriptionPlans || [])
+            .filter((p) => p.isPublic && p.monthlyEur > 0)
+            .map((p) => ({ name: p.name, monthlyEur: p.monthlyEur })),
+        )
       }
     })
     return () => {
       cancelled = true
     }
   }, [])
-  const priceLabel = (price ?? 0).toLocaleString('fr-FR', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })
 
   return (
     <div className="border-b border-border bg-bg">
@@ -164,15 +168,19 @@ export function ClientsPage() {
                 {pricingPublished ? 'Tarif public' : 'Tarifs sur devis'}
               </h2>
               <p className="mt-3 text-sm text-white/75 sm:text-base">
-                Un prix unique par million de tokens pour simplifier vos prévisions. Ajustements volume
-                possibles sur devis entreprise.
+                Tarifs à partir de {minInput?.toFixed(2) ?? '0,02'} €/M input et {minOutput?.toFixed(2) ?? '0,06'} €/M output.
+                Prix par modèle, selon disponibilité réseau.
               </p>
-              {pricingPublished && price != null ? (
-                <p className="font-display mt-8 text-4xl font-bold text-white sm:text-5xl">
-                  {priceLabel}
-                  <EurSign className="text-white" />{' '}
-                  <span className="text-lg font-medium text-white/65 sm:text-xl">/ million de tokens</span>
-                </p>
+              {pricingPublished && minInput != null && minOutput != null ? (
+                <div className="mt-8 space-y-2">
+                  <p className="font-display text-3xl font-bold text-white sm:text-4xl">
+                    {minInput.toFixed(2)} €<span className="text-lg font-medium text-white/65"> / M input</span>
+                  </p>
+                  <p className="font-display text-2xl font-bold text-white sm:text-3xl">
+                    {minOutput.toFixed(2)} €<span className="text-lg font-medium text-white/65"> / M output</span>
+                  </p>
+                  <p className="text-sm text-white/70">Exemple : Qwen3.5 9B — 0,06 €/M input, 0,12 €/M output.</p>
+                </div>
               ) : (
                 <p className="mt-8 rounded-2xl border border-white/15 bg-black/35 px-5 py-4 text-sm leading-relaxed text-white/80">
                   Les prix publics sont en cours de calibration. L’admin Vryx peut les publier dès que la grille est validée.
@@ -184,6 +192,19 @@ export function ClientsPage() {
               >
                 Projeter vos millions de tokens dans le simulateur
               </Link>
+              {subscriptionPlans.length > 0 ? (
+                <div className="mt-8 rounded-2xl border border-white/15 bg-black/35 p-4 sm:p-5">
+                  <p className="font-mono text-[0.68rem] uppercase tracking-wide text-white/55">Plans B2B</p>
+                  <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {subscriptionPlans.map((plan) => (
+                      <li key={plan.name} className="flex items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/85">
+                        <span>{plan.name}</span>
+                        <span className="font-mono font-semibold">{plan.monthlyEur.toLocaleString('fr-FR')} €/mois</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
             <div className="overflow-x-auto rounded-xl border border-white/15 bg-black/40 backdrop-blur-md shadow-lg">
               <table className="w-full min-w-[20rem] text-left text-sm">

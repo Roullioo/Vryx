@@ -36,6 +36,8 @@ type PublicStatus = {
   sampledAt: string
   pricing: {
     published?: boolean
+    minInputEurPerMillion?: number | null
+    minOutputEurPerMillion?: number | null
     eurPerMillionTokens: number | null
     eurPerThousandTokens: number | null
     estimatedGrossMarginPercent: number
@@ -145,7 +147,11 @@ export function StatusPage() {
 
   const topModels = useMemo(() => (status?.models || []).slice(0, 8), [status])
   const liveWorkers = useMemo(() => (status?.workers || []).filter((worker) => worker.live).slice(0, 10), [status])
-  const pricingLabel = status?.pricing.published === false ? 'Sur devis' : fmtEur(status?.pricing.eurPerMillionTokens)
+  const pricingLabel = status?.pricing.published === false
+    ? 'Sur devis'
+    : status?.pricing.minInputEurPerMillion != null && status?.pricing.minOutputEurPerMillion != null
+      ? `${status.pricing.minInputEurPerMillion.toFixed(2)} / ${status.pricing.minOutputEurPerMillion.toFixed(2)} €/M`
+      : fmtEur(status?.pricing.eurPerMillionTokens)
 
   return (
     <main className="min-h-screen overflow-hidden bg-[#050713] text-white">
@@ -215,7 +221,7 @@ export function StatusPage() {
             <MetricCard label="Workers online" value={fmtInt(status?.network.workersOnline)} hint={`${fmtInt(status?.network.workersRegistered)} enregistrés`} accent="#7dd3fc" />
             <MetricCard label="TPS actif" value={fmtTps(status?.network.tpsActiveAvg)} hint={`p95 ${fmtTps(status?.network.tpsActiveP95)} TPS`} accent="#a7f3d0" />
             <MetricCard label="TTFT p50" value={fmtMs(status?.network.ttftP50Ms)} hint={`latence p95 ${fmtMs(status?.network.latencyP95Ms)}`} accent="#f0abfc" />
-            <MetricCard label="Prix public" value={pricingLabel} hint={status?.pricing.published === false ? 'non publié' : 'par million de tokens'} accent="#67e8f9" />
+            <MetricCard label="Prix public" value={pricingLabel} hint={status?.pricing.published === false ? 'non publié' : 'input / output €/M'} accent="#67e8f9" />
           </div>
 
           <div className="mt-8 grid gap-5 xl:grid-cols-[1.1fr_.9fr]">
