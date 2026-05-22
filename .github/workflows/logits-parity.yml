@@ -1,11 +1,23 @@
 name: logits-parity
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
+  push-noop:
+    name: Manual-only logits parity
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Logits parity requires a self-hosted macOS ARM64 runner and runs manually only."
+
   qwen-logits-parity:
     name: Qwen logits parity (Transformers vs mlx-lm)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 180
     env:
