@@ -712,6 +712,7 @@ async fn call_local_inference_stream(
 // ============================================================
 
 /// Lecture `sysctl -n <key>` (une ligne, sans unité).
+#[cfg(target_os = "macos")]
 fn sysctl_n_trimmed(key: &str) -> Option<String> {
     let out = std::process::Command::new("sysctl")
         .args(["-n", key])
@@ -729,6 +730,7 @@ fn sysctl_n_trimmed(key: &str) -> Option<String> {
 }
 
 /// Mémoire physique (MiB) — utile comme repli VRAM sur Apple Silicon (mémoire unifiée).
+#[cfg(target_os = "macos")]
 fn sysctl_hw_memsize_mib() -> Option<u64> {
     sysctl_n_trimmed("hw.memsize")
         .and_then(|s| s.parse::<u64>().ok())
@@ -736,6 +738,7 @@ fn sysctl_hw_memsize_mib() -> Option<u64> {
 }
 
 /// Interprète `spdisplays_vram` ou équivalent (« 16 Go », « 16384 Mo », « 8192 », …) → MiB.
+#[cfg(target_os = "macos")]
 fn parse_vram_human(s: &str) -> Option<u64> {
     let lower = s.to_lowercase();
     let mut buf = String::new();
