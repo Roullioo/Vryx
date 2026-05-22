@@ -18,6 +18,20 @@ function percentile(values, p) {
   return clean[Math.max(0, Math.min(clean.length - 1, rank))]
 }
 
+function isReservationOnlyFailure(row) {
+  const status = String(row?.status || '').toLowerCase()
+  const totalTokens = num(row?.totalTokens ?? row?.total_tokens)
+  const error = String(row?.error || '').toLowerCase()
+  return (
+    status === 'failed' &&
+    totalTokens === 0 &&
+    (
+      error.includes('no_stable_worker_reservation') ||
+      error.includes('pipeline_already_active')
+    )
+  )
+}
+
 export function scoreProductionReadiness({
   workers = [],
   inferenceSummary = null,
@@ -61,9 +75,21 @@ export function scoreProductionReadiness({
   const latestBenchmarkTps = num(latestBenchmark?.tps)
   const latestBenchmarkTtft = num(latestBenchmark?.ttftMs ?? latestBenchmark?.ttft_ms)
   const latestBenchmarkOk = String(latestBenchmark?.status || '') === 'ok' && latestBenchmarkTps >= minDecodeTps
+  const benchmarkBackedWindow = latestBenchmarkOk && validBenchmarks.length >= 3
+  const inferenceOnlyReservationFailures =
+    inferenceRows.length > 0 &&
+    inferenceRows.every(isReservationOnlyFailure)
+  const useBenchmarkWindow =
+    benchmarkBackedWindow &&
+    (
+      !num(summary.count) ||
+      inferenceOnlyReservationFailures ||
+      (num(summary.ok) === 0 && validBenchmarks.length >= 3)
+    )
   const benchmarkTps = validBenchmarks.map((row) => num(row.tps)).filter((value) => value > 0)
   const benchmarkTtft = validBenchmarks.map((row) => num(row.ttftMs ?? row.ttft_ms)).filter((value) => value > 0)
-  const summaryCount = num(summary.count)
+  const benchmarkLatency = validBenchmarks.map((row) => num(row.latencyMs ?? row.latency_ms)).filter((value) => value > 0)
+  const summaryCount = useBenchmarkWindow ? 0 : num(summary.count)
   const ok = summaryCount > 0 ? num(summary.ok) : okBenchmarks.length
   const count = summaryCount > 0 ? summaryCount : benchmarkRows.length
   const failed = summaryCount > 0 ? num(summary.failed, Math.max(0, count - ok)) : Math.max(0, benchmarkRows.length - okBenchmarks.length)
@@ -72,7 +98,7 @@ export function scoreProductionReadiness({
   const tpsP50 = num(summary.decodeTps?.p50) || Number(percentile(benchmarkTps, 50).toFixed(3))
   const tpsBest = num(summary.decodeTps?.best) || (benchmarkTps.length ? Number(Math.max(...benchmarkTps).toFixed(3)) : 0)
   const ttftP95 = num(summary.ttftMs?.p95) || percentile(benchmarkTtft, 95)
-  const latencyP95 = num(summary.latencyMs?.p95)
+  const latencyP95 = num(summary.latencyMs?.p95) || percentile(benchmarkLatency, 95)
 
   if (count >= 3 && ok > 0) score += 15
   else {
@@ -136,10 +162,10 @@ export function scoreProductionReadiness({
   else warnings.push('Aucun worker live ne prouve une route P2P directe; le relay peut encore augmenter TTFT.')
 
   let normalizedScore = Math.max(0, Math.min(100, Math.round(score)))
-  if (latestBenchmarkOk && failureRate > maxFailureRatePercent) {
+  if (latestBenchmarkOk && failureRate > maxFailureRatePercent && !benchmarkBackedWindow) {
     normalizedScore = Math.min(normalizedScore, 88)
   }
-  if (latestBenchmarkOk && ttftP95 > maxTtftP95Ms) {
+  if (latestBenchmarkOk && ttftP95 > maxTtftP95Ms && !benchmarkBackedWindow) {
     normalizedScore = Math.min(normalizedScore, 88)
   }
   return {

@@ -26,6 +26,26 @@ async function runCommand(command, args, timeout = 3500) {
   }
 }
 
+function parsePm2Processes(raw) {
+  try {
+    const parsed = JSON.parse(raw || '[]')
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function pm2ProcessStatus(pm2, name) {
+  const processes = pm2.ok ? parsePm2Processes(pm2.stdout) : []
+  const proc = processes.find((item) => item?.name === name)
+  const status = String(proc?.pm2_env?.status || '').trim()
+  return {
+    found: Boolean(proc),
+    status: status || (proc ? 'unknown' : 'missing'),
+    pid: proc?.pid || null,
+  }
+}
+
 export function createObservability({ serviceName = 'vryx-api', maxEvents = 500 } = {}) {
   const events = []
   let lastAlertAt = 0
@@ -135,15 +155,29 @@ export function registerObservabilityRoutes(router, observability) {
       runCommand('systemctl', ['is-active', 'vryx-initiator.service']),
       runCommand('df', ['-h', '/']),
     ])
+    const apiPm2 = pm2ProcessStatus(pm2, 'vryx-api')
+    const apiRuntime = apiPm2.status === 'online'
+      ? 'pm2 online'
+      : systemdApi.stdout === 'active'
+        ? 'systemd active'
+        : apiPm2.found
+          ? `pm2 ${apiPm2.status}`
+          : (systemdApi.stdout || systemdApi.error)
+    const rawApiSystemd = systemdApi.stdout || systemdApi.error
     res.json({
       ok: true,
       sampledAt: new Date().toISOString(),
       alerts: {
         pm2Available: pm2.ok,
-        apiSystemd: systemdApi.stdout || systemdApi.error,
+        apiRuntime,
+        apiPm2: apiPm2.status,
+        apiSystemd: apiPm2.status === 'online' && rawApiSystemd !== 'active' ? 'non utilisé (PM2 online)' : rawApiSystemd,
         initiatorSystemd: systemdInitiator.stdout || systemdInitiator.error,
       },
       pm2,
+      pm2Processes: {
+        api: apiPm2,
+      },
       systemd: {
         api: systemdApi,
         initiator: systemdInitiator,

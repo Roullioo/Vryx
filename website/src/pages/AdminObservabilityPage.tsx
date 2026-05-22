@@ -28,6 +28,8 @@ type ObservabilityHealth = {
   sampledAt: string
   alerts: {
     pm2Available: boolean
+    apiRuntime?: string
+    apiPm2?: string
     apiSystemd: string
     initiatorSystemd: string
   }
@@ -82,7 +84,7 @@ export function AdminObservabilityPage() {
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <SmallCard label="Erreurs 1h" value={String(events?.summary.errorsLastHour ?? 0)} hint="HTTP 5xx, process, fatal" />
         <SmallCard label="Warnings 1h" value={String(events?.summary.warningsLastHour ?? 0)} hint="Requêtes API lentes" />
-        <SmallCard label="PM2" value={health?.alerts.pm2Available ? 'OK' : 'À vérifier'} hint="pm2 jlist côté VPS" />
+        <SmallCard label="API runtime" value={health?.alerts.apiRuntime || '—'} hint="PM2 prioritaire, systemd en fallback" />
         <SmallCard label="Systemd initiateur" value={health?.alerts.initiatorSystemd || '—'} hint="vryx-initiator.service" />
       </div>
 
@@ -91,6 +93,7 @@ export function AdminObservabilityPage() {
           <h2 className="font-display text-xl font-bold text-fg">Alertes système</h2>
           <div className="mt-4 space-y-3">
             {[
+              ['API PM2', health?.alerts.apiPm2 || (health?.alerts.pm2Available ? 'OK' : 'À vérifier')],
               ['API systemd', health?.alerts.apiSystemd || '—'],
               ['Initiateur systemd', health?.alerts.initiatorSystemd || '—'],
               ['Dernier check', health?.sampledAt ? new Date(health.sampledAt).toLocaleString('fr-FR') : 'chargement'],

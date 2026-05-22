@@ -19,7 +19,7 @@ import { createObservability, registerObservabilityMiddleware, registerObservabi
 import { registerPublicStatusRoutes } from './public-status.js'
 import { buildInferenceLog } from './inference-metrics.js'
 import { registerAdminInferenceRoutes } from './admin-inference-routes.js'
-import { computeRequestCost, computeBlendedPrice } from './pricing-engine.js'
+import { computeRequestCost, computeBlendedPrice, resolveWorkerPayout } from './pricing-engine.js'
 import {
   ensurePricingAndModelCatalogTables,
   getPricingConfig,
@@ -826,7 +826,7 @@ function toUserSessionSummary(row) {
   }
 }
 
-async function computeBillingCost({ model, promptTokens = 0, completionTokens = 0, billingMode = 'public' }) {
+async function computeBillingCost({ model, promptTokens = 0, completionTokens = 0, billingMode = 'public', userId = null }) {
   const prompt = Math.max(0, Math.floor(Number(promptTokens) || 0))
   const completion = Math.max(0, Math.floor(Number(completionTokens) || 0))
   const globalConfig = await getPricingConfig(pool, PRICING_FALLBACK)
@@ -845,7 +845,37 @@ async function computeBillingCost({ model, promptTokens = 0, completionTokens = 
         outputEurPerMillion: globalConfig.headline?.minOutputEurPerMillion ?? 0.06,
         blendedInputRatioPercent: globalConfig.blendedInputRatioPercent ?? 75,
       }
-  return computeRequestCost({ modelPricing, promptTokens: prompt, completionTokens: completion, billingMode })
+  const volumeDiscountPercent = await resolveVolumeDiscountPercent({ userId, estimatedTokens: prompt + completion })
+  const cost = computeRequestCost({ modelPricing, promptTokens: prompt, completionTokens: completion, billingMode, volumeDiscountPercent })
+  return {
+    ...cost,
+    workerSharePercent: resolved?.pricing?.workerSharePercent ?? globalConfig.defaultWorkerSharePercent ?? globalConfig.workerRewardSharePercent,
+  }
+}
+
+async function resolveVolumeDiscountPercent({ userId = null, estimatedTokens = 0 } = {}) {
+  const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+  const discounts = Array.isArray(pricing.volumeDiscounts) ? pricing.volumeDiscounts : []
+  if (!discounts.length) return 0
+
+  let monthTokens = Math.max(0, Math.floor(Number(estimatedTokens) || 0))
+  if (Number.isFinite(Number(userId)) && Number(userId) > 0) {
+    const [[row]] = await pool.query(
+      `SELECT COALESCE(SUM(total_tokens), 0) AS tokens
+       FROM api_key_usage
+       WHERE user_id = :userId
+         AND created_at >= DATE_FORMAT(CURRENT_DATE, '%Y-%m-01')`,
+      { userId: Number(userId) },
+    )
+    monthTokens += Number(row?.tokens || 0)
+  }
+
+  const monthMillions = monthTokens / 1_000_000
+  return discounts.reduce((best, row) => {
+    const min = Number(row.minMonthlyMillions) || 0
+    const pct = Number(row.discountPercent) || 0
+    return monthMillions >= min ? Math.max(best, pct) : best
+  }, 0)
 }
 
 async function getBillingCreditPackages() {
@@ -2080,6 +2110,32 @@ async function ensureWorkerTokenLedgerTable() {
   `)
 }
 
+async function ensureWorkerPayoutLedgerTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS worker_payout_ledger (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      peer_id VARCHAR(100) NOT NULL,
+      api_key_usage_id BIGINT UNSIGNED NULL,
+      user_id BIGINT UNSIGNED NULL,
+      model VARCHAR(120) NULL,
+      prompt_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      completion_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      total_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      customer_cost_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+      worker_share_percent DECIMAL(6,3) NOT NULL DEFAULT 0,
+      payout_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+      currency CHAR(3) NOT NULL DEFAULT 'EUR',
+      pricing_snapshot_json LONGTEXT NULL,
+      status ENUM('pending','payable','paid','void') NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_worker_payout_peer_time (peer_id, created_at),
+      KEY idx_worker_payout_usage (api_key_usage_id),
+      KEY idx_worker_payout_status (status, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+}
+
 async function ensureP2pChatSessionsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS p2p_chat_sessions (
@@ -2401,7 +2457,7 @@ async function ensureApiCreditForRequest(req, { prompt, maxTokens, model = null 
   if (!Number.isFinite(userId) || userId <= 0) return { ok: true, estimatedCostEur: 0, balanceEur: 0 }
   const promptTokens = estimatePromptTokens(prompt)
   const completionTokens = Math.max(1, Math.floor(Number(maxTokens) || 0))
-  const costBreakdown = await computeBillingCost({ model, promptTokens, completionTokens })
+  const costBreakdown = await computeBillingCost({ model, promptTokens, completionTokens, userId })
   const estimatedCostEur = costBreakdown.totalCostEur
   if (!VRYX_BILLING_ENFORCE_CREDITS) return { ok: true, estimatedCostEur, balanceEur: null }
   const balanceEur = await getUserCreditBalance(userId)
@@ -2411,6 +2467,92 @@ async function ensureApiCreditForRequest(req, { prompt, maxTokens, model = null 
   return { ok: true, estimatedCostEur, balanceEur }
 }
 
+async function recordWorkerPayoutForUsage(conn, {
+  usageId,
+  userId,
+  model,
+  promptTokens,
+  completionTokens,
+  totalTokens,
+  costEur,
+  costBreakdown,
+}) {
+  const cost = Number(costEur) || 0
+  const total = Math.max(0, Math.floor(Number(totalTokens) || 0))
+  if (!usageId || cost <= 0 || total <= 0) return
+
+  const [workers] = await conn.query(
+    `SELECT peer_id, model
+     FROM workers
+     WHERE mode = 'worker'
+       AND desired_state = 'active'
+       AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :offline
+     ORDER BY last_heartbeat_at DESC
+     LIMIT 16`,
+    { offline: WORKER_OFFLINE_SEC },
+  )
+  const compatible = workers.filter((worker) => modelKeyMatches(worker.model, model))
+  const selectedWorkers = compatible.length ? compatible : workers.slice(0, 1)
+  if (!selectedWorkers.length) return
+
+  const defaultShare = costBreakdown?.workerSharePercent
+  const splitCost = cost / selectedWorkers.length
+  const splitPrompt = Math.floor(Number(promptTokens || 0) / selectedWorkers.length)
+  const splitCompletion = Math.floor(Number(completionTokens || 0) / selectedWorkers.length)
+  const splitTotal = Math.floor(total / selectedWorkers.length)
+  const pricingSnapshot = JSON.stringify({
+    usageId: String(usageId),
+    model,
+    billingMode: costBreakdown?.billingMode || 'public',
+    rates: costBreakdown?.rates || null,
+    inputCostEur: costBreakdown?.inputCostEur ?? null,
+    outputCostEur: costBreakdown?.outputCostEur ?? null,
+    volumeDiscountPercent: costBreakdown?.volumeDiscountPercent ?? 0,
+    allocation: 'equal_live_model_workers',
+  })
+
+  for (const [index, worker] of selectedWorkers.entries()) {
+    const isLast = index === selectedWorkers.length - 1
+    const allocatedCost = isLast
+      ? toEuroAmount(cost - splitCost * (selectedWorkers.length - 1), 6)
+      : toEuroAmount(splitCost, 6)
+    const allocatedPrompt = isLast
+      ? Math.max(0, Number(promptTokens || 0) - splitPrompt * (selectedWorkers.length - 1))
+      : splitPrompt
+    const allocatedCompletion = isLast
+      ? Math.max(0, Number(completionTokens || 0) - splitCompletion * (selectedWorkers.length - 1))
+      : splitCompletion
+    const allocatedTotal = isLast
+      ? Math.max(0, total - splitTotal * (selectedWorkers.length - 1))
+      : splitTotal
+    const payout = resolveWorkerPayout({
+      costEur: allocatedCost,
+      workerSharePercent: defaultShare ?? PRICING_FALLBACK.workerRewardSharePercent,
+    })
+    await conn.query(
+      `INSERT INTO worker_payout_ledger
+         (peer_id, api_key_usage_id, user_id, model, prompt_tokens, completion_tokens, total_tokens,
+          customer_cost_eur, worker_share_percent, payout_eur, pricing_snapshot_json)
+       VALUES
+         (:peerId, :usageId, :userId, :model, :promptTokens, :completionTokens, :totalTokens,
+          :customerCostEur, :workerSharePercent, :payoutEur, :pricingSnapshot)`,
+      {
+        peerId: worker.peer_id,
+        usageId,
+        userId,
+        model: typeof model === 'string' ? model.slice(0, 120) : null,
+        promptTokens: allocatedPrompt,
+        completionTokens: allocatedCompletion,
+        totalTokens: allocatedTotal,
+        customerCostEur: allocatedCost,
+        workerSharePercent: payout.workerSharePercent,
+        payoutEur: payout.workerPayoutEur,
+        pricingSnapshot,
+      },
+    )
+  }
+}
+
 async function recordApiKeyUsage(req, { model, promptTokens = 0, completionTokens = 0, totalTokens = 0, latencyMs = 0, billingMode = 'public' } = {}) {
   const keyId = Number(req.apiUser?.keyId)
   const userId = Number(req.apiUser?.id)
@@ -2418,11 +2560,12 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
   const prompt = Math.max(0, Math.floor(Number(promptTokens) || 0))
   const completion = Math.max(0, Math.floor(Number(completionTokens) || 0))
   const total = Math.max(prompt + completion, Math.floor(Number(totalTokens) || 0))
-  const costBreakdown = await computeBillingCost({ model, promptTokens: prompt, completionTokens: completion, billingMode })
+  const costBreakdown = await computeBillingCost({ model, promptTokens: prompt, completionTokens: completion, billingMode, userId })
   const cost = costBreakdown.totalCostEur
   const pricingSnapshot = JSON.stringify({
     rates: costBreakdown.rates,
     billingMode: costBreakdown.billingMode,
+    workerSharePercent: costBreakdown.workerSharePercent,
     inputCostEur: costBreakdown.inputCostEur,
     outputCostEur: costBreakdown.outputCostEur,
   })
@@ -2466,7 +2609,25 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
           completionTokens: completion,
           totalTokens: total,
           latencyMs: Math.max(0, Math.floor(Number(latencyMs) || 0)),
+          pricing: {
+            billingMode: costBreakdown.billingMode,
+            rates: costBreakdown.rates,
+            inputCostEur: costBreakdown.inputCostEur,
+            outputCostEur: costBreakdown.outputCostEur,
+            volumeDiscountPercent: costBreakdown.volumeDiscountPercent,
+            workerSharePercent: costBreakdown.workerSharePercent,
+          },
         },
+      })
+      await recordWorkerPayoutForUsage(conn, {
+        usageId: result.insertId,
+        userId,
+        model,
+        promptTokens: prompt,
+        completionTokens: completion,
+        totalTokens: total,
+        costEur: cost,
+        costBreakdown,
       })
     }
     await conn.commit()
@@ -3372,7 +3533,7 @@ openAiRouter.post('/chat/completions', async (req, res) => {
     }
     return res.json(openAiToolCallResponse({ id, created, model, toolCall: directToolCall }))
   }
-  const creditCheck = await ensureApiCreditForRequest(req, { prompt, maxTokens })
+  const creditCheck = await ensureApiCreditForRequest(req, { prompt, maxTokens, model })
   if (!creditCheck.ok) {
     return res.status(402).json({
       error: {
@@ -3976,9 +4137,11 @@ accountRouter.get('/overview', async (req, res) => {
 accountRouter.get('/billing', async (req, res) => {
   try {
     const userId = req.user.id
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
     const [ledgerRows] = await pool.query(
       `SELECT id, type, amount_eur AS amountEur, currency, description,
-              reference_type AS referenceType, reference_id AS referenceId, created_at AS createdAt
+              reference_type AS referenceType, reference_id AS referenceId, metadata_json AS metadataJson,
+              created_at AS createdAt
        FROM billing_credit_ledger
        WHERE user_id = :userId
        ORDER BY created_at DESC, id DESC
@@ -3994,17 +4157,30 @@ accountRouter.get('/billing', async (req, res) => {
          AND created_at >= DATE_FORMAT(CURRENT_DATE, '%Y-%m-01')`,
       { userId },
     )
+    const [invoiceRows] = await pool.query(
+      `SELECT provider, provider_session_id AS providerSessionId, amount_eur AS amountEur,
+              currency, status, checkout_url AS checkoutUrl, created_at AS createdAt, updated_at AS updatedAt
+       FROM billing_checkout_sessions
+       WHERE user_id = :userId
+       ORDER BY created_at DESC, id DESC
+       LIMIT 30`,
+      { userId },
+    )
     res.json({
       ok: true,
       currency: 'EUR',
       balanceEur: await getUserCreditBalance(userId),
       enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
       checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
-      packages: await getBillingCreditPackages(),
+      packages: pricing.recharge?.packagesEur || await getBillingCreditPackages(),
+      pricing: publicPricingDto(pricing),
       monthUsage: {
         requestCount: Number(usageMonth?.requestCount || 0),
         totalTokens: Number(usageMonth?.totalTokens || 0),
         costEur: Number(usageMonth?.costEur || 0),
+        averageEurPerMillion: Number(usageMonth?.totalTokens || 0) > 0
+          ? toEuroAmount((Number(usageMonth?.costEur || 0) / Number(usageMonth?.totalTokens || 1)) * 1_000_000, 6)
+          : null,
       },
       ledger: ledgerRows.map((row) => ({
         id: String(row.id),
@@ -4014,7 +4190,25 @@ accountRouter.get('/billing', async (req, res) => {
         description: row.description || '',
         referenceType: row.referenceType || null,
         referenceId: row.referenceId || null,
+        pricing: (() => {
+          try {
+            const meta = row.metadataJson ? JSON.parse(row.metadataJson) : null
+            return meta?.pricing || null
+          } catch {
+            return null
+          }
+        })(),
         createdAt: toIsoDate(row.createdAt),
+      })),
+      invoices: invoiceRows.map((row) => ({
+        provider: row.provider,
+        providerSessionId: row.providerSessionId,
+        amountEur: Number(row.amountEur || 0),
+        currency: row.currency || 'EUR',
+        status: row.status,
+        checkoutUrl: row.checkoutUrl || null,
+        createdAt: toIsoDate(row.createdAt),
+        updatedAt: toIsoDate(row.updatedAt),
       })),
     })
   } catch (e) {
@@ -4053,6 +4247,8 @@ accountRouter.post('/billing/checkout', async (req, res) => {
     params.set('line_items[0][price_data][currency]', 'eur')
     params.set('line_items[0][price_data][unit_amount]', String(Math.round(amountEur * 100)))
     params.set('line_items[0][price_data][product_data][name]', `Crédits API Vryx ${amountEur} EUR`)
+    params.set('invoice_creation[enabled]', 'true')
+    params.set('invoice_creation[invoice_data][description]', `Crédits API Vryx ${amountEur} EUR`)
     params.set('metadata[user_id]', userId)
     params.set('metadata[vryx_credit_amount_eur]', String(amountEur))
     const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
@@ -5791,6 +5987,12 @@ app.get('/api/workers/network-stats', async (_req, res) => {
           COUNT(DISTINCT CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) THEN peer_id END) AS activeWorkers30d
        FROM worker_token_ledger`,
     )
+    const [[payoutLedger]] = await pool.query(
+      `SELECT
+          COALESCE(SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN payout_eur ELSE 0 END), 0) AS payout24hEur,
+          COALESCE(SUM(CASE WHEN status IN ('pending','payable') THEN payout_eur ELSE 0 END), 0) AS payoutPendingEur
+       FROM worker_payout_ledger`,
+    ).catch(() => [[{}]])
     const totalTokens30d = Number(ledger.totalTokens30d || 0)
     const activeWorkers30d = Number(ledger.activeWorkers30d || 0)
     return res.json({
@@ -5803,6 +6005,8 @@ app.get('/api/workers/network-stats', async (_req, res) => {
       totalTokens1h: Number(ledger.totalTokens1h || 0),
       totalTokens24h: Number(ledger.totalTokens24h || 0),
       totalTokens30d,
+      workerPayout24hEur: Number(payoutLedger.payout24hEur || 0),
+      workerPayoutPendingEur: Number(payoutLedger.payoutPendingEur || 0),
       avgTokensPerActiveWorker30d: activeWorkers30d > 0 ? Math.round(totalTokens30d / activeWorkers30d) : 0,
     })
   } catch (e) {
@@ -5917,6 +6121,59 @@ const adminRouter = express.Router()
 adminRouter.use(requireAdmin)
 registerObservabilityRoutes(adminRouter, observability)
 registerAdminInferenceRoutes(adminRouter, { pool })
+
+function withSnakeCaseAliases(body) {
+  const src = body && typeof body === 'object' ? body : {}
+  const out = { ...src }
+
+  // Pricing config
+  if (out.privatePoolTokenDiscountPercent === undefined && out.private_pool_token_discount_percent !== undefined) {
+    out.privatePoolTokenDiscountPercent = out.private_pool_token_discount_percent
+  }
+  if (out.defaultEurPerMillion === undefined && out.default_eur_per_million !== undefined) out.defaultEurPerMillion = out.default_eur_per_million
+  if (out.pricingPublished === undefined && out.pricing_published !== undefined) out.pricingPublished = out.pricing_published
+  if (out.vatPercent === undefined && out.vat_percent !== undefined) out.vatPercent = out.vat_percent
+  if (out.workerRewardSharePercent === undefined && out.worker_reward_share_percent !== undefined) out.workerRewardSharePercent = out.worker_reward_share_percent
+  if (out.defaultWorkerSharePercent === undefined && out.default_worker_share_percent !== undefined) out.defaultWorkerSharePercent = out.default_worker_share_percent
+  if (out.blendedInputRatioPercent === undefined && out.blended_input_ratio_percent !== undefined) out.blendedInputRatioPercent = out.blended_input_ratio_percent
+  if (out.minVryxNetMarginPercent === undefined && out.min_vryx_net_margin_percent !== undefined) out.minVryxNetMarginPercent = out.min_vryx_net_margin_percent
+
+  // Model catalog pricing overrides (Private Pool + others)
+  if (out.privatePoolInputEurPerMillion === undefined && out.private_pool_input_eur_per_million !== undefined) {
+    out.privatePoolInputEurPerMillion = out.private_pool_input_eur_per_million
+  }
+  if (out.privatePoolOutputEurPerMillion === undefined && out.private_pool_output_eur_per_million !== undefined) {
+    out.privatePoolOutputEurPerMillion = out.private_pool_output_eur_per_million
+  }
+  if (out.eurPerMillionInput === undefined && out.eur_per_million_input !== undefined) out.eurPerMillionInput = out.eur_per_million_input
+  if (out.eurPerMillionOutput === undefined && out.eur_per_million_output !== undefined) out.eurPerMillionOutput = out.eur_per_million_output
+  if (out.eurPerMillionCachedInput === undefined && out.eur_per_million_cached_input !== undefined) out.eurPerMillionCachedInput = out.eur_per_million_cached_input
+  if (out.eurPerMillionBatchInput === undefined && out.eur_per_million_batch_input !== undefined) out.eurPerMillionBatchInput = out.eur_per_million_batch_input
+  if (out.eurPerMillionBatchOutput === undefined && out.eur_per_million_batch_output !== undefined) out.eurPerMillionBatchOutput = out.eur_per_million_batch_output
+  if (out.workerSharePercent === undefined && out.worker_share_percent !== undefined) out.workerSharePercent = out.worker_share_percent
+  if (out.minVryxMarginPercent === undefined && out.min_vryx_margin_percent !== undefined) out.minVryxMarginPercent = out.min_vryx_margin_percent
+  if (out.availabilityStatus === undefined && out.availability_status !== undefined) out.availabilityStatus = out.availability_status
+  if (out.isActive === undefined && out.is_active !== undefined) out.isActive = out.is_active
+  if (out.isPublic === undefined && out.is_public !== undefined) out.isPublic = out.is_public
+  if (out.sortOrder === undefined && out.sort_order !== undefined) out.sortOrder = out.sort_order
+  if (out.pricingTier === undefined && out.pricing_tier !== undefined) out.pricingTier = out.pricing_tier
+  if (out.apiAlias === undefined && out.api_alias !== undefined) out.apiAlias = out.api_alias
+  if (out.hfId === undefined && out.hf_id !== undefined) out.hfId = out.hf_id
+  if (out.openWeights === undefined && out.open_weights !== undefined) out.openWeights = out.open_weights
+  if (out.weightGb === undefined && out.weight_gb !== undefined) out.weightGb = out.weight_gb
+  if (out.contextTokens === undefined && out.context_tokens !== undefined) out.contextTokens = out.context_tokens
+  if (out.paramsNote === undefined && out.params_note !== undefined) out.paramsNote = out.params_note
+  if (out.minVramMb === undefined && out.min_vram_mb !== undefined) out.minVramMb = out.min_vram_mb
+  if (out.requiredWorkers === undefined && out.required_workers !== undefined) out.requiredWorkers = out.required_workers
+
+  // Private pool plan aliases
+  if (out.monthlyEur === undefined && out.monthly_eur !== undefined) out.monthlyEur = out.monthly_eur
+  if (out.workerCountMin === undefined && out.worker_count_min !== undefined) out.workerCountMin = out.worker_count_min
+  if (out.workerCountMax === undefined && out.worker_count_max !== undefined) out.workerCountMax = out.worker_count_max
+  if (out.tokenDiscountPercent === undefined && out.token_discount_percent !== undefined) out.tokenDiscountPercent = out.token_discount_percent
+
+  return out
+}
 
 const pricingConfigBodySchema = z.object({
   defaultEurPerMillion: z.number().positive().max(1000).optional(),
@@ -6039,7 +6296,7 @@ adminRouter.get('/pricing', async (_req, res) => {
 })
 
 adminRouter.patch('/pricing', async (req, res) => {
-  const parsed = pricingConfigBodySchema.safeParse(req.body)
+  const parsed = pricingConfigBodySchema.safeParse(withSnakeCaseAliases(req.body))
   if (!parsed.success) {
     const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
     return res.status(400).json({ error: first })
@@ -6065,7 +6322,7 @@ adminRouter.get('/models/catalog', async (_req, res) => {
 })
 
 adminRouter.post('/models/catalog', async (req, res) => {
-  const parsed = modelCatalogBodySchema.safeParse(req.body)
+  const parsed = modelCatalogBodySchema.safeParse(withSnakeCaseAliases(req.body))
   if (!parsed.success) {
     const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
     return res.status(400).json({ error: first })
@@ -6082,7 +6339,7 @@ adminRouter.post('/models/catalog', async (req, res) => {
 })
 
 adminRouter.patch('/models/catalog/:slug', async (req, res) => {
-  const parsed = modelCatalogBodySchema.partial().safeParse(req.body)
+  const parsed = modelCatalogBodySchema.partial().safeParse(withSnakeCaseAliases(req.body))
   if (!parsed.success) {
     const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
     return res.status(400).json({ error: first })
@@ -6170,7 +6427,7 @@ adminRouter.patch('/plans/subscriptions/:slug', async (req, res) => {
   const parsed = subscriptionPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
   if (!parsed.success) return res.status(400).json({ error: 'Plan invalide.' })
   try {
-    await upsertSubscriptionPlan(pool, parsed.data)
+    await upsertSubscriptionPlan(pool, parsed.data, req.user?.id || null)
     res.json({ ok: true, plans: await getAllSubscriptionPlans(pool) })
   } catch (e) {
     res.status(500).json({ error: 'Erreur plan abonnement.' })
@@ -6182,7 +6439,7 @@ adminRouter.get('/plans/private-pool', async (_req, res) => {
 })
 
 adminRouter.patch('/plans/private-pool/:slug', async (req, res) => {
-  const parsed = privatePoolPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
+  const parsed = privatePoolPlanBodySchema.partial().safeParse({ ...withSnakeCaseAliases(req.body), slug: req.params.slug })
   if (!parsed.success) return res.status(400).json({ error: 'Plan pool invalide.' })
   try {
     await upsertPrivatePoolPlan(pool, parsed.data, req.user?.id || null)
@@ -6200,7 +6457,7 @@ adminRouter.patch('/plans/fine-tuning/:slug', async (req, res) => {
   const parsed = fineTuningPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
   if (!parsed.success) return res.status(400).json({ error: 'Plan fine-tuning invalide.' })
   try {
-    await upsertFineTuningPlan(pool, parsed.data)
+    await upsertFineTuningPlan(pool, parsed.data, req.user?.id || null)
     res.json({ ok: true, plans: await getAllFineTuningPlans(pool) })
   } catch (e) {
     res.status(500).json({ error: 'Erreur plan fine-tuning.' })
@@ -6209,6 +6466,7 @@ adminRouter.patch('/plans/fine-tuning/:slug', async (req, res) => {
 
 adminRouter.get('/billing/summary', async (_req, res) => {
   try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
     const [[totals]] = await pool.query(`
       SELECT
         COALESCE(SUM(CASE WHEN amount_eur > 0 THEN amount_eur ELSE 0 END), 0) AS credits,
@@ -6217,6 +6475,14 @@ adminRouter.get('/billing/summary', async (_req, res) => {
         COUNT(DISTINCT user_id) AS usersWithLedger
       FROM billing_credit_ledger
     `)
+    const [[payoutTotals]] = await pool.query(`
+      SELECT
+        COALESCE(SUM(payout_eur), 0) AS pendingPayouts,
+        COUNT(*) AS payoutRows,
+        COUNT(DISTINCT peer_id) AS payoutWorkers
+      FROM worker_payout_ledger
+      WHERE status IN ('pending','payable')
+    `).catch(() => [[{}]])
     const [recent] = await pool.query(
       `SELECT l.id, l.user_id AS userId, u.email, l.type, l.amount_eur AS amountEur,
               l.description, l.created_at AS createdAt
@@ -6230,12 +6496,16 @@ adminRouter.get('/billing/summary', async (_req, res) => {
       currency: 'EUR',
       enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
       checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
-      packages: VRYX_BILLING_CREDIT_PACKAGES,
+      packages: pricing.recharge?.packagesEur || VRYX_BILLING_CREDIT_PACKAGES,
+      pricing: publicPricingDto(pricing),
       totals: {
         creditsEur: Number(totals?.credits || 0),
         debitsEur: Number(totals?.debits || 0),
         balanceEur: Number(totals?.balance || 0),
         usersWithLedger: Number(totals?.usersWithLedger || 0),
+        workerPayoutPendingEur: Number(payoutTotals?.pendingPayouts || 0),
+        workerPayoutRows: Number(payoutTotals?.payoutRows || 0),
+        workerPayoutWorkers: Number(payoutTotals?.payoutWorkers || 0),
       },
       recent: recent.map((row) => ({
         id: String(row.id),
@@ -6256,15 +6526,15 @@ adminRouter.get('/billing/summary', async (_req, res) => {
 adminRouter.get('/enterprise/quotes', async (req, res) => {
   try {
     const status = String(req.query.status || '').trim()
-    const where = status ? 'WHERE status = :status' : ''
+    const where = status ? 'WHERE q.status = :status' : ''
     const [rows] = await pool.query(
-      `SELECT id, company, email, offer, monthly_tokens AS monthlyTokens,
-              latency_target_ms AS latencyTargetMs, privacy_level AS privacyLevel,
-              fine_tuning AS fineTuning, dedicated_workers AS dedicatedWorkers,
-              monthly_estimate_eur AS monthlyEstimateEur, setup_estimate_eur AS setupEstimateEur,
-              status, commercial_stage AS commercialStage, pilot_amount_eur AS pilotAmountEur,
-              expected_close_date AS expectedCloseDate, next_step AS nextStep,
-              signed_document_url AS signedDocumentUrl, notes,
+      `SELECT q.id, q.company, q.email, q.offer, q.monthly_tokens AS monthlyTokens,
+              q.latency_target_ms AS latencyTargetMs, q.privacy_level AS privacyLevel,
+              q.fine_tuning AS fineTuning, q.dedicated_workers AS dedicatedWorkers,
+              q.monthly_estimate_eur AS monthlyEstimateEur, q.setup_estimate_eur AS setupEstimateEur,
+              q.status, q.commercial_stage AS commercialStage, q.pilot_amount_eur AS pilotAmountEur,
+              q.expected_close_date AS expectedCloseDate, q.next_step AS nextStep,
+              q.signed_document_url AS signedDocumentUrl, q.notes,
               q.created_at AS createdAt, q.updated_at AS updatedAt,
               q.updated_by_user_id AS updatedByUserId, u.email AS updatedByEmail
        FROM enterprise_quote_requests q
@@ -6748,7 +7018,11 @@ adminRouter.get('/workers/registered', async (req, res) => {
               (SELECT COALESCE(SUM(l.delta_tokens), 0) FROM worker_token_ledger l
                  WHERE l.peer_id = w.peer_id AND l.created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR)) AS tokensGenerated1h,
               (SELECT COALESCE(SUM(l.delta_tokens), 0) FROM worker_token_ledger l
-                 WHERE l.peer_id = w.peer_id AND l.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS tokensGenerated24h
+                 WHERE l.peer_id = w.peer_id AND l.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS tokensGenerated24h,
+              (SELECT COALESCE(SUM(p.payout_eur), 0) FROM worker_payout_ledger p
+                 WHERE p.peer_id = w.peer_id AND p.status IN ('pending','payable')) AS payoutPendingEur,
+              (SELECT COALESCE(SUM(p.payout_eur), 0) FROM worker_payout_ledger p
+                 WHERE p.peer_id = w.peer_id AND p.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS payout24hEur
        FROM workers w
        LEFT JOIN users u ON u.id = w.user_id
        ORDER BY w.last_heartbeat_at DESC LIMIT :limit`,
@@ -6770,6 +7044,8 @@ adminRouter.get('/workers/registered', async (req, res) => {
         tokensGenerated: Number(r.tokens_generated || 0),
         tokensGenerated1h: Number(r.tokensGenerated1h || 0),
         tokensGenerated24h: Number(r.tokensGenerated24h || 0),
+        payoutPendingEur: Number(r.payoutPendingEur || 0),
+        payout24hEur: Number(r.payout24hEur || 0),
         tokensIn: Number(r.tokens_in ?? 0),
         tokensOut: Number(r.tokens_out ?? 0),
         model: r.model ?? null,
@@ -8731,6 +9007,7 @@ async function start() {
   await ensureWorkerBenchmarkRunsTable()
   await ensureInferenceRequestLogsTable()
   await ensureWorkerTokenLedgerTable()
+  await ensureWorkerPayoutLedgerTable()
   await ensureP2pChatSessionsTable()
   await ensureApiKeysTable()
   await ensureApiKeyUsageTable()

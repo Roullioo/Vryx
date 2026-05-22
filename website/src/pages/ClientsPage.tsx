@@ -29,6 +29,7 @@ export function ClientsPage() {
   const { user } = useAuth()
   const [minInput, setMinInput] = useState<number | null>(0.02)
   const [minOutput, setMinOutput] = useState<number | null>(0.06)
+  const [rechargeMin, setRechargeMin] = useState<number | null>(20)
   const [pricingPublished, setPricingPublished] = useState(false)
   const [subscriptionPlans, setSubscriptionPlans] = useState<{ name: string; monthlyEur: number }[]>([])
   const [models, setModels] = useState<CatalogModel[]>([])
@@ -41,6 +42,7 @@ export function ClientsPage() {
       if (r.ok) {
         setMinInput(r.data.pricing.minInputEurPerMillion ?? r.data.pricing.headline?.minInputEurPerMillion ?? null)
         setMinOutput(r.data.pricing.minOutputEurPerMillion ?? r.data.pricing.headline?.minOutputEurPerMillion ?? null)
+        setRechargeMin(r.data.pricing.recharge?.minEur ?? null)
         setPricingPublished(r.data.pricing.published)
         setSubscriptionPlans(
           (r.data.pricing.subscriptionPlans || [])
@@ -154,7 +156,7 @@ export function ClientsPage() {
                 <div className="rounded-xl border border-border bg-card px-4 py-3">
                   <p className="font-mono text-[0.68rem] uppercase tracking-wide text-muted">Facturation</p>
                   <p className="mt-1 text-sm text-fg">
-                    Recharge minimum 20
+                    Recharge minimum {rechargeMin?.toLocaleString('fr-FR') ?? 'sur devis'}
                     <EurSign className="inline text-fg" />, usage décrémenté au fil des requêtes.
                   </p>
                 </div>
@@ -211,7 +213,7 @@ export function ClientsPage() {
                   <p className="font-display text-2xl font-bold text-white sm:text-3xl">
                     {minOutput.toFixed(2)} €<span className="text-lg font-medium text-white/65"> / M output</span>
                   </p>
-                  <p className="text-sm text-white/70">Exemple : Qwen3.5 9B — 0,06 €/M input, 0,12 €/M output.</p>
+                  <p className="text-sm text-white/70">Chaque appel API est débité avec le prix du modèle au moment de la requête.</p>
                 </div>
               ) : (
                 <p className="mt-8 rounded-2xl border border-white/15 bg-black/35 px-5 py-4 text-sm leading-relaxed text-white/80">
