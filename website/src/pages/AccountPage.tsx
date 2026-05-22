@@ -3,13 +3,15 @@ import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { apiJson, apiUrl } from '../lib/api'
 import {
+  createBillingCheckout,
   createAccountApiKey,
   fetchAccountApiKeys,
+  fetchAccountBilling,
   fetchAccountOverview,
   fetchAccountSessions,
   revokeAccountApiKey,
 } from '../lib/account'
-import type { AccountApiKey, AccountOverview, AccountSessionSummary } from '../lib/account'
+import type { AccountApiKey, AccountBilling, AccountOverview, AccountSessionSummary } from '../lib/account'
 import {
   IconBolt,
   IconCode,
@@ -300,6 +302,7 @@ export function AccountPage() {
   const [googleStatus, setGoogleStatus] = useState<'idle' | 'processing' | 'error'>(hasGoogleCode ? 'processing' : 'idle')
   const [googleError, setGoogleError] = useState('')
   const [overview, setOverview] = useState<AccountOverview | null>(null)
+  const [billing, setBilling] = useState<AccountBilling | null>(null)
   const [apiKeys, setApiKeys] = useState<AccountApiKey[]>([])
   const [sessions, setSessions] = useState<AccountSessionSummary[]>([])
   const [workers, setWorkers] = useState<AccountWorker[]>([])
@@ -315,6 +318,7 @@ export function AccountPage() {
   const [generatedKey, setGeneratedKey] = useState('')
   const [copiedKey, setCopiedKey] = useState('')
   const [actionError, setActionError] = useState('')
+  const [checkoutLoadingAmount, setCheckoutLoadingAmount] = useState<number | null>(null)
   const [reloading, setReloading] = useState(false)
   const [chatInput, setChatInput] = useState('')
   const [chatAttachments, setChatAttachments] = useState<ChatAttachment[]>([])
@@ -379,8 +383,9 @@ export function AccountPage() {
     if (!user) return
     if (!accountLoadedRef.current) setAccountLoading(true)
     setAccountError('')
-    const [overviewResult, keysResult, sessionsResult, workersResult, modelsResult] = await Promise.all([
+    const [overviewResult, billingResult, keysResult, sessionsResult, workersResult, modelsResult] = await Promise.all([
       fetchAccountOverview(),
+      fetchAccountBilling(),
       fetchAccountApiKeys(),
       fetchAccountSessions(120),
       apiJson<{ workers: AccountWorker[] }>('/api/account/workers'),
@@ -389,6 +394,8 @@ export function AccountPage() {
     const errors: string[] = []
     if (overviewResult.ok) setOverview(overviewResult.data)
     else errors.push(`Résumé: ${overviewResult.error}`)
+    if (billingResult.ok) setBilling(billingResult.billing)
+    else errors.push(`Facturation: ${billingResult.error}`)
     if (keysResult.ok) setApiKeys(keysResult.keys)
     else errors.push(`Clés API: ${keysResult.error}`)
     if (sessionsResult.ok) setSessions(sessionsResult.sessions)
@@ -534,6 +541,19 @@ export function AccountPage() {
     }
     setApiKeys((prev) => prev.filter((k) => k.id !== id))
   }, [])
+
+  const startCheckout = useCallback(async (amountEur: number) => {
+    if (checkoutLoadingAmount != null) return
+    setActionError('')
+    setCheckoutLoadingAmount(amountEur)
+    const r = await createBillingCheckout(amountEur)
+    setCheckoutLoadingAmount(null)
+    if (!r.ok) {
+      setActionError(r.error)
+      return
+    }
+    window.location.href = r.url
+  }, [checkoutLoadingAmount])
 
   const clearSessions = useCallback(async () => {
     const r = await apiJson<{ ok: true }>('/api/account/sessions', { method: 'DELETE' })
@@ -1462,27 +1482,66 @@ export function AccountPage() {
 
           {activePage.id === 'billing' ? (
             <section>
-              <PageHeader eyebrow="Facturation" title="Coûts et projection mensuelle." subtitle="Les montants sont calculés depuis les sessions réelles enregistrées sur ton compte." />
+              <PageHeader eyebrow="Facturation" title="Crédits API et débit usage." subtitle="Le solde est tenu dans un ledger monétaire. Chaque appel API débite le coût réel calculé aux tokens." />
               <div className="grid gap-5 lg:grid-cols-3">
+                <Kpi title="Solde crédits" value={`${money(billing?.balanceEur ?? overview?.balanceCredits ?? 0)} €`} detail={billing?.enforceCredits ? 'Blocage actif si solde insuffisant' : 'Débit actif, blocage désactivé'} tone="emerald" />
+                <Kpi title="Usage API mois" value={`${money(billing?.monthUsage.costEur ?? 0, 6)} €`} detail={`${compact(billing?.monthUsage.totalTokens ?? 0)} tokens API`} tone="violet" />
                 <Kpi title="Coût moyen" value={`${money(eurPerMillion, 4)} €`} detail="Par million de tokens" />
-                <Kpi title="Projection" value={`${money(estimatedMonthly)} €`} detail="Rythme mensuel actuel" tone="violet" />
-                <Kpi title="Prochaine facture" value={`${money(overview?.nextInvoiceEstimate ?? 0)} €`} detail="Estimation disponible" tone="emerald" />
               </div>
-              <div className="mt-5 grid gap-5 lg:grid-cols-3">
+              <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,26rem)]">
                 <Panel className="p-5">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-muted">Marge nette estimée</p>
-                  <p className="mt-3 font-display text-3xl font-bold text-fg">{money(investor?.estimatedGrossMarginEur ?? 0, 6)} €</p>
-                  <p className="mt-2 text-sm text-muted">Hypothèse serveur: {money(investor?.estimatedGrossMarginPercent ?? 0, 0)}% de marge brute.</p>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="font-display text-2xl font-bold text-fg">Recharger des crédits</p>
+                      <p className="mt-1 text-sm text-muted">Packs prépayés utilisables par les clés API. Les factures Stripe apparaissent après paiement.</p>
+                    </div>
+                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${billing?.checkoutEnabled ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300' : 'bg-amber-500/10 text-amber-600 dark:text-amber-300'}`}>
+                      {billing?.checkoutEnabled ? 'Checkout actif' : 'Stripe à configurer'}
+                    </span>
+                  </div>
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    {(billing?.packages?.length ? billing.packages : [50, 100, 500, 2000]).map((amount) => (
+                      <button
+                        key={amount}
+                        type="button"
+                        onClick={() => void startCheckout(amount)}
+                        disabled={checkoutLoadingAmount != null}
+                        className="rounded-2xl border border-border bg-surface p-4 text-left transition hover:border-accent/40 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        <span className="block text-xs font-semibold uppercase tracking-wide text-muted">Pack crédits</span>
+                        <span className="mt-2 block font-display text-3xl font-bold text-fg">{money(amount, 0)} €</span>
+                        <span className="mt-2 block text-xs text-muted">{checkoutLoadingAmount === amount ? 'Ouverture...' : 'Paiement carte'}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Projection</p><p className="mt-1 font-mono font-semibold">{money(estimatedMonthly)} € / mois</p></div>
+                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Rewards workers</p><p className="mt-1 font-mono font-semibold">{money(investor?.estimatedWorkerRewardsEur ?? 0, 6)} €</p></div>
+                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Marge estimée</p><p className="mt-1 font-mono font-semibold">{money(investor?.estimatedGrossMarginPercent ?? 0, 0)}%</p></div>
+                  </div>
                 </Panel>
                 <Panel className="p-5">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-muted">Rewards workers</p>
-                  <p className="mt-3 font-display text-3xl font-bold text-fg">{money(investor?.estimatedWorkerRewardsEur ?? 0, 6)} €</p>
-                  <p className="mt-2 text-sm text-muted">Part redistribuable estimée sur l'usage réel.</p>
-                </Panel>
-                <Panel className="p-5">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-muted">Ping p50 / p95</p>
-                  <p className="mt-3 font-display text-3xl font-bold text-fg">{integer(investor?.pingP50Ms ?? 0)} / {integer(investor?.pingP95Ms ?? 0)} ms</p>
-                  <p className="mt-2 text-sm text-muted">Échantillons extraits des traces P2P.</p>
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-semibold text-fg">Ledger crédits</p>
+                    <span className="rounded-full bg-surface px-2.5 py-1 text-xs font-semibold text-muted">{billing?.ledger.length ?? 0}</span>
+                  </div>
+                  <div className="mt-4 space-y-3">
+                    {billing?.ledger.length ? (
+                      billing.ledger.slice(0, 8).map((entry) => (
+                        <div key={entry.id} className="rounded-2xl bg-black/5 p-3 dark:bg-white/6">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="truncate text-sm font-semibold text-fg">{entry.description || entry.type}</p>
+                            <span className={`font-mono text-sm font-semibold ${entry.amountEur >= 0 ? 'text-emerald-600 dark:text-emerald-300' : 'text-fg'}`}>
+                              {entry.amountEur >= 0 ? '+' : ''}{money(entry.amountEur, 6)} €
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs text-muted">{dateTime(entry.createdAt)} · {entry.type}</p>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="rounded-2xl bg-black/5 p-4 text-sm text-muted dark:bg-white/6">Aucun mouvement de crédits pour le moment.</p>
+                    )}
+                  </div>
                 </Panel>
               </div>
             </section>

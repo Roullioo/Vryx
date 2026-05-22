@@ -1,0 +1,127 @@
+name: Investor CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  web:
+    name: Frontend build and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=moderate
+      - run: npm run build
+
+  api:
+    name: Backend checks and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: website/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: website/server/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=moderate
+      - run: npm run test:production-readiness
+      - name: Syntax check scripts and server
+        run: |
+          node --check src/index.js
+          node --check scripts/golden-path-benchmark-cron.mjs
+          node --check scripts/worker-command-e2e.mjs
+
+  rust:
+    name: Rust daemon fmt, clippy and release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy -p rust-daemon -- -D warnings
+      - run: cargo build --release -p rust-daemon
+
+  python-runtime:
+    name: Python runtime syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile Python runtime
+        run: python -m compileall -q nodeAndWorker/python-inference nodeAndWorker/scripts
+
+  electron-smoke:
+    name: Electron worker smoke build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: AppMacos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: AppMacos/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Build daemon used by packaged runtime
+        working-directory: .
+        run: cargo build --release -p rust-daemon
+      - run: npm ci
+      - run: npm audit --audit-level=moderate
+      - run: npm run prepare:runtime
+      - run: npm run build
+
+  dependency-security:
+    name: Dependency security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: Python requirements audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r nodeAndWorker/python-inference/requirements.txt

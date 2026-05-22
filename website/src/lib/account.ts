@@ -61,6 +61,32 @@ export type AccountApiKeyCreateResult = {
   plainKey: string
 }
 
+export type BillingLedgerEntry = {
+  id: string
+  type: 'credit_purchase' | 'usage_debit' | 'admin_adjustment' | 'refund' | string
+  amountEur: number
+  currency: string
+  description: string
+  referenceType: string | null
+  referenceId: string | null
+  createdAt: string | null
+}
+
+export type AccountBilling = {
+  ok: boolean
+  currency: string
+  balanceEur: number
+  enforceCredits: boolean
+  checkoutEnabled: boolean
+  packages: number[]
+  monthUsage: {
+    requestCount: number
+    totalTokens: number
+    costEur: number
+  }
+  ledger: BillingLedgerEntry[]
+}
+
 export type AccountSessionSummary = {
   id: string
   conversationId: string
@@ -153,6 +179,25 @@ export async function revokeAccountApiKey(id: string): Promise<
   const r = await apiJson(`/api/account/api-keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
   if (!r.ok) return { ok: false, error: r.error, status: r.status }
   return { ok: true }
+}
+
+export async function fetchAccountBilling(): Promise<
+  { ok: true; billing: AccountBilling } | { ok: false; error: string; status: number }
+> {
+  const r = await apiJson<AccountBilling>('/api/account/billing')
+  if (!r.ok) return { ok: false, error: r.error, status: r.status }
+  return { ok: true, billing: r.data }
+}
+
+export async function createBillingCheckout(amountEur: number): Promise<
+  { ok: true; url: string; sessionId: string } | { ok: false; error: string; status: number }
+> {
+  const r = await apiJson<{ url: string; sessionId: string }>('/api/account/billing/checkout', {
+    method: 'POST',
+    body: JSON.stringify({ amountEur }),
+  })
+  if (!r.ok) return { ok: false, error: r.error, status: r.status }
+  return { ok: true, url: r.data.url, sessionId: r.data.sessionId }
 }
 
 export async function fetchAccountSessions(limit = 75): Promise<

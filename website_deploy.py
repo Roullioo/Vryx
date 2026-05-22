@@ -86,7 +86,7 @@ def make_tarball(path: Path) -> None:
 
     with tarfile.open(path, "w:gz") as tar:
         tar.add(WEBSITE / "dist", arcname="dist", filter=tar_filter)
-        for rel in ("package.json", "package-lock.json", "src"):
+        for rel in ("package.json", "package-lock.json", "src", "scripts"):
             p = srv / rel
             if not p.exists():
                 print(f"[!] Fichier requis manquant : {p}", file=sys.stderr)

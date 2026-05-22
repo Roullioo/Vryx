@@ -1,0 +1,76 @@
+name: Worker Release Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'worker-v*'
+      - 'v*'
+
+jobs:
+  macos-worker:
+    name: macOS worker artifact
+    runs-on: macos-14
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: AppMacos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: AppMacos/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Rust daemon
+        working-directory: .
+        run: cargo build --release -p rust-daemon
+      - run: npm ci
+      - name: Build unsigned macOS app directory
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run build:mac:unsigned
+      - name: Upload macOS worker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vryx-worker-macos-unsigned
+          path: |
+            AppMacos/release/mac*/**
+            nodeAndWorker/runtime-release-manifest.json
+
+  windows-worker:
+    name: Windows worker artifact
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: AppMacos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: AppMacos/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: choco install protoc -y
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Rust daemon
+        working-directory: .
+        run: cargo build --release -p rust-daemon
+      - run: npm ci
+      - name: Build Windows installer
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run build:win:installer
+      - name: Upload Windows worker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vryx-worker-windows-unsigned
+          path: |
+            AppMacos/release/*.exe
+            AppMacos/release/*.blockmap
+            nodeAndWorker/runtime-release-manifest.json

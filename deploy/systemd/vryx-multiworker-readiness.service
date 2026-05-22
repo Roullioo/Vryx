@@ -10,7 +10,7 @@ EnvironmentFile=/var/www/vryx/server/.env
 Environment=VRYX_ROOT_DIR=/var/www/vryx
 Environment=VRYX_MULTIWORKER_REPORT=/var/log/vryx/multiworker-readiness.json
 Environment=VRYX_MULTIWORKER_STATE=/var/lib/vryx/multiworker-readiness-state.json
-Environment=VRYX_MULTIWORKER_MODEL=gemma4:31b
+Environment=VRYX_MULTIWORKER_MODEL=Qwen/Qwen3.6-35B-A3B
 Environment=VRYX_MULTIWORKER_TARGET_TPS=10
 Environment=VRYX_MULTIWORKER_STALE_SEC=90
 Environment=VRYX_MULTIWORKER_COOLDOWN_SEC=1800

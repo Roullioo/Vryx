@@ -169,9 +169,10 @@ Les textes marketing et légaux légers sont centralisés dans `website/src/data
 
 - `GET /api/health` — Santé API.
 - `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/me`.
-- `POST /api/workers/heartbeat` — Enregistrement / mise à jour des workers (limiteur dédié).
+- `POST /api/workers/heartbeat` — Enregistrement / mise à jour des workers (secret worker obligatoire hors dev explicitement non sécurisé).
 - `POST /api/workers/inference-delegate` — **Délégation d’inférence** : le worker distant authentifie la requête (secret partagé côté serveur `WORKER_INFERENCE_DELEGATE_SECRET` et en-tête côté client) ; l’**exécution LLM** a lieu sur le VPS via Ollama.
-- `GET /api/workers/status` — Statut agrégé pour le front.
+- `GET /api/workers/status` — Registre workers interne authentifié, utilisé par l’initiateur/runtime pour la découverte.
+- `GET /api/public/network-status` — Statut public redacted pour le front et la page Live Network.
 - `POST /api/chat/stream`, `GET /api/chat/health` — Chat streaming branché sur **Ollama** (`chat.js`).
 
 ### 7.4 Espace `/api/admin`

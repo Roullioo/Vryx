@@ -742,10 +742,18 @@ def _public_api_base() -> str:
     return (os.environ.get("VRYX_API_URL") or "https://vryx.eu").strip().rstrip("/")
 
 
+def _worker_registry_headers(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    headers = dict(extra or {})
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    if secret_token:
+        headers["Authorization"] = f"Bearer {secret_token}"
+    return headers
+
+
 def _fetch_workers_public_status_payload() -> list[dict]:
     try:
         url = f"{_public_api_base()}/api/workers/status"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        req = urllib.request.Request(url, headers=_worker_registry_headers({"Accept": "application/json"}), method="GET")
         with urllib.request.urlopen(req, timeout=10.0) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except Exception:
@@ -1779,7 +1787,7 @@ def _fetch_worker_catalog() -> dict[str, dict]:
     """Infos heartbeat utiles au placement pondéré (VRAM, GPU, modèle)."""
     for url in ("http://127.0.0.1:48953/api/workers/status", "http://127.0.0.1:4000/api/workers/status"):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=5.0) as resp:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=_worker_registry_headers(), method="GET"), timeout=5.0) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
             workers = body.get("workers") if isinstance(body, dict) else []
             if isinstance(workers, list):

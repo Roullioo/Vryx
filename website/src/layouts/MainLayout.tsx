@@ -24,6 +24,7 @@ export function MainLayout() {
     pathname === '/simulateur' ||
     pathname === '/comparatif' ||
     pathname === '/workers' ||
+    pathname === '/network' ||
     pathname === '/panel/modeles'
 
   return (

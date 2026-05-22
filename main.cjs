@@ -202,6 +202,13 @@ function writeConfig(config) {
   return next;
 }
 
+function workerAuthHeaders(config = readConfig()) {
+  const secret = String(
+    config?.workerSecret || process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET || ''
+  ).trim();
+  return secret ? { Authorization: `Bearer ${secret}` } : {};
+}
+
 function handleProtocolUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
@@ -384,7 +391,8 @@ async function readWorkerMetrics() {
   const local = await fetchJson(statusUrl(config), {}, 1200);
   const localData = local.ok ? (local.data || {}) : {};
   const peerId = String(localData.peer_id || '');
-  const remote = await fetchJson(`${config.apiUrl || DEFAULT_API_URL}/api/workers/status`, {}, 1800);
+  const remoteStatusUrl = `${config.apiUrl || DEFAULT_API_URL}/api/workers/status${peerId ? `?peer_id=${encodeURIComponent(peerId)}` : ''}`;
+  const remote = await fetchJson(remoteStatusUrl, workerAuthHeaders(config), 1800);
   const workers = Array.isArray(remote.data?.workers) ? remote.data.workers : [];
   const remoteWorker = peerId
     ? workers.find((w) => w.peerId === peerId)

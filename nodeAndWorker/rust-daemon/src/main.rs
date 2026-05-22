@@ -1,10 +1,17 @@
 use anyhow::Result;
+use axum::body::{Body, Bytes};
+use axum::extract::DefaultBodyLimit;
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
 use base64::Engine as _;
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, identify, kad, mdns, noise,
-    relay,
+    autonat, dcutr, identify, kad, mdns, noise, relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol,
@@ -21,12 +28,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::time;
-use axum::body::{Body, Bytes};
-use axum::http::StatusCode;
-use axum::response::Response;
-use axum::{routing::{get, post}, Json, Router};
 use tower_http::cors::CorsLayer;
-use axum::extract::DefaultBodyLimit;
 
 // ============================================================
 //  Codec P2P personnalisé (512 MB pour les poids de modèle)
@@ -47,11 +49,17 @@ mod vryx_codec {
     }
 
     impl<Req, Resp> Default for Codec<Req, Resp> {
-        fn default() -> Self { Codec { phantom: PhantomData } }
+        fn default() -> Self {
+            Codec {
+                phantom: PhantomData,
+            }
+        }
     }
 
     impl<Req, Resp> Clone for Codec<Req, Resp> {
-        fn clone(&self) -> Self { Self::default() }
+        fn clone(&self) -> Self {
+            Self::default()
+        }
     }
 
     #[async_trait]
@@ -69,11 +77,12 @@ mod vryx_codec {
             _protocol: &Self::Protocol,
             io: &mut T,
         ) -> io::Result<Self::Request>
-        where T: AsyncRead + Unpin + Send {
+        where
+            T: AsyncRead + Unpin + Send,
+        {
             let mut buf = Vec::new();
             io.take(MAX_SIZE).read_to_end(&mut buf).await?;
-            serde_json::from_slice(&buf)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
 
         async fn read_response<T>(
@@ -81,11 +90,12 @@ mod vryx_codec {
             _protocol: &Self::Protocol,
             io: &mut T,
         ) -> io::Result<Self::Response>
-        where T: AsyncRead + Unpin + Send {
+        where
+            T: AsyncRead + Unpin + Send,
+        {
             let mut buf = Vec::new();
             io.take(MAX_SIZE).read_to_end(&mut buf).await?;
-            serde_json::from_slice(&buf)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
 
         async fn write_request<T>(
@@ -94,7 +104,9 @@ mod vryx_codec {
             io: &mut T,
             req: Self::Request,
         ) -> io::Result<()>
-        where T: AsyncWrite + Unpin + Send {
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
             let data = serde_json::to_vec(&req)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             io.write_all(&data).await?;
@@ -108,7 +120,9 @@ mod vryx_codec {
             io: &mut T,
             resp: Self::Response,
         ) -> io::Result<()>
-        where T: AsyncWrite + Unpin + Send {
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
             let data = serde_json::to_vec(&resp)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             io.write_all(&data).await?;
@@ -193,7 +207,7 @@ struct TensorRequest {
     session_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct TensorResponse {
     #[serde(with = "base64_vec")]
     data: Vec<u8>,
@@ -221,27 +235,6 @@ struct TensorResponse {
     shard_warmup_sent: u32,
     #[serde(default)]
     compute_time_ms: u64,
-}
-
-impl Default for TensorResponse {
-    fn default() -> Self {
-        Self {
-            data: vec![],
-            compute_time_ns: 0,
-            serialization_time_ns: 0,
-            prompt_tokens_llm: 0,
-            completion_tokens_llm: 0,
-            total_tokens_llm: 0,
-            vps_delegate_ms: 0,
-            worker_compute_ms: 0,
-            p2p_messages_in: 0,
-            p2p_messages_out: 0,
-            shard_session_id: String::new(),
-            scheduler_workers_used: 0,
-            shard_warmup_sent: 0,
-            compute_time_ms: 0,
-        }
-    }
 }
 
 /// Tableau `routing_path` pour les réponses HTTP/SSE (aligné sur `pipeline_trace_json`).
@@ -274,6 +267,83 @@ fn env_f64_positive(name: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+fn env_bool_flag(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn heartbeat_machine_info_with_network(
+    machine_info: Option<serde_json::Value>,
+    p2p_port: u16,
+) -> Option<serde_json::Value> {
+    let direct_ready = env_bool_flag("VRYX_DIRECT_READY");
+    let route_mode = std::env::var("VRYX_ROUTE_MODE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    let public_ip = std::env::var("VRYX_PUBLIC_IP")
+        .or_else(|_| std::env::var("VRYX_DIRECT_PUBLIC_IP"))
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let public_port = std::env::var("VRYX_DIRECT_PUBLIC_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0);
+    let proof_at = std::env::var("VRYX_DIRECT_PROOF_AT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    if direct_ready.is_none()
+        && route_mode.is_none()
+        && public_ip.is_none()
+        && public_port.is_none()
+        && proof_at.is_none()
+    {
+        return machine_info;
+    }
+
+    let mut root = machine_info
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(root_obj) = root.as_object_mut() else {
+        return Some(root);
+    };
+    let network_entry = root_obj
+        .entry("network".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !network_entry.is_object() {
+        *network_entry = serde_json::json!({});
+    }
+    if let Some(network) = network_entry.as_object_mut() {
+        if let Some(value) = direct_ready {
+            network.insert("directReady".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = route_mode {
+            network.insert("routeMode".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = public_ip {
+            network.insert("publicIp".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = public_port {
+            network.insert("publicP2pPort".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = proof_at {
+            network.insert("directProofAt".to_string(), serde_json::json!(value));
+        }
+        if p2p_port > 0 {
+            network.insert("p2pPort".to_string(), serde_json::json!(p2p_port));
+        }
+    }
+    Some(root)
+}
+
 fn tensor_yamux_config() -> yamux::Config {
     let mut config = yamux::Config::default();
     #[allow(deprecated)]
@@ -288,7 +358,9 @@ fn heartbeat_allocated_vram_mb(gpu_vram_mb: Option<u64>) -> (Option<u64>, Option
     let percent = env_f64_positive("VRYX_WORKER_MEMORY_LIMIT_PERCENT")
         .map(|p| p.round().clamp(1.0, 100.0) as u8);
     let limit_from_percent = match (gpu_vram_mb, percent) {
-        (Some(vram), Some(pct)) if vram > 0 => Some(((vram as f64) * (pct as f64 / 100.0)).round() as u64),
+        (Some(vram), Some(pct)) if vram > 0 => {
+            Some(((vram as f64) * (pct as f64 / 100.0)).round() as u64)
+        }
         _ => None,
     };
 
@@ -305,14 +377,16 @@ fn heartbeat_allocated_vram_mb(gpu_vram_mb: Option<u64>) -> (Option<u64>, Option
 }
 
 mod base64_vec {
+    use base64::{engine::general_purpose, Engine as _};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use base64::{Engine as _, engine::general_purpose};
 
     pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        general_purpose::STANDARD.encode(bytes).serialize(serializer)
+        general_purpose::STANDARD
+            .encode(bytes)
+            .serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -346,10 +420,12 @@ pub mod vryx {
     tonic::include_proto!("vryx");
 }
 
-use vryx::inference_service_client::InferenceServiceClient;
 use tonic::transport::Channel;
+use vryx::inference_service_client::InferenceServiceClient;
 
-async fn connect_local_inference_channel(port: u16) -> Result<Channel, Box<dyn Error + Send + Sync>> {
+async fn connect_local_inference_channel(
+    port: u16,
+) -> Result<Channel, Box<dyn Error + Send + Sync>> {
     // Le serveur Python peut redémarrer pendant le chargement du modèle. Un canal tonic réutilisé
     // garde parfois une socket morte et se traduit par un "transport error" côté P2P.
     let endpoint = Channel::from_shared(format!("http://127.0.0.1:{}", port))?
@@ -382,7 +458,10 @@ fn load_or_create_keypair(path: &PathBuf) -> Result<libp2p::identity::Keypair, B
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, &b64)?;
-        println!("[*] Nouveau keypair généré et sauvegardé dans {}", path.display());
+        println!(
+            "[*] Nouveau keypair généré et sauvegardé dans {}",
+            path.display()
+        );
         Ok(kp)
     }
 }
@@ -413,7 +492,10 @@ fn estimate_chat_token_deltas(data: &[u8]) -> (u64, u64) {
         digits.parse::<u64>().unwrap_or(0)
     };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
-        return (0, find_number("max_new_tokens").max(find_number("maxNewTokens")));
+        return (
+            0,
+            find_number("max_new_tokens").max(find_number("maxNewTokens")),
+        );
     };
     let prompt_tokens = v
         .get("prompt")
@@ -509,7 +591,10 @@ async fn call_local_inference_once(
         if let Ok(trace) = serde_json::from_str::<serde_json::Value>(&m.pipeline_trace_json) {
             let metrics = trace.get("metrics").unwrap_or(&trace);
             if m.prompt_tokens == 0 {
-                m.prompt_tokens = metrics.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                m.prompt_tokens = metrics
+                    .get("prompt_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
             }
             if m.completion_tokens == 0 {
                 m.completion_tokens = metrics
@@ -519,7 +604,10 @@ async fn call_local_inference_once(
                     .unwrap_or(0);
             }
             if m.total_tokens == 0 {
-                m.total_tokens = metrics.get("total_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                m.total_tokens = metrics
+                    .get("total_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
             }
         }
     }
@@ -548,7 +636,10 @@ async fn call_local_inference(
     let mut last_msg = String::new();
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(200 + u64::from(attempt) * 400)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                200 + u64::from(attempt) * 400,
+            ))
+            .await;
         }
         match call_local_inference_once(
             port,
@@ -581,18 +672,15 @@ async fn call_local_inference(
                     );
                     continue;
                 }
-                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg)));
+                return Err(Box::new(std::io::Error::other(msg)));
             }
         }
     }
-    Err(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        if last_msg.is_empty() {
-            "gRPC local : échec inattendu.".to_string()
-        } else {
-            last_msg
-        },
-    )))
+    Err(Box::new(std::io::Error::other(if last_msg.is_empty() {
+        "gRPC local : échec inattendu.".to_string()
+    } else {
+        last_msg
+    })))
 }
 
 async fn call_local_inference_stream(
@@ -672,7 +760,7 @@ fn parse_vram_human(s: &str) -> Option<u64> {
     if n >= 512.0 {
         return Some(n.round() as u64);
     }
-    if n >= 4.0 && n <= 256.0 {
+    if (4.0..=256.0).contains(&n) {
         return Some((n * 1024.0).round() as u64);
     }
     None
@@ -778,7 +866,11 @@ fn linux_nvidia_smi_gpu() -> (Option<String>, Option<u64>) {
     let Some(name) = parts.next().map(str::to_string).filter(|s| !s.is_empty()) else {
         return (None, None);
     };
-    let Some(mib) = parts.next().and_then(|s| s.parse::<u64>().ok()).filter(|&n| n > 0) else {
+    let Some(mib) = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+    else {
         return (None, None);
     };
     (Some(name), Some(mib))
@@ -806,7 +898,9 @@ fn detect_heartbeat_gpu_hardware() -> (Option<String>, Option<u64>) {
 static HEARTBEAT_GPU_HW: OnceLock<(Option<String>, Option<u64>)> = OnceLock::new();
 
 fn heartbeat_gpu_hints_cached() -> (Option<String>, Option<u64>) {
-    HEARTBEAT_GPU_HW.get_or_init(detect_heartbeat_gpu_hardware).clone()
+    HEARTBEAT_GPU_HW
+        .get_or_init(detect_heartbeat_gpu_hardware)
+        .clone()
 }
 
 #[derive(Debug, Serialize)]
@@ -840,16 +934,12 @@ struct HeartbeatPayload {
     machine_info: Option<serde_json::Value>,
 }
 
-async fn send_heartbeat(
-    client: &reqwest::Client,
-    api_url: &str,
-    payload: &HeartbeatPayload,
-) {
+async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &HeartbeatPayload) {
     let url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
     let token = std::env::var("VRYX_WORKER_SECRET")
         .or_else(|_| std::env::var("WORKER_INFERENCE_DELEGATE_SECRET"))
         .unwrap_or_default();
-    
+
     let mut req = client.post(&url).json(payload);
     if !token.is_empty() {
         req = req.header("Authorization", format!("Bearer {}", token));
@@ -885,7 +975,10 @@ async fn send_heartbeat(
                                     cmd_id
                                 );
                                 // Envoyer un ACK avant de quitter pour que la BDD enregistre la livraison
-                                let ack_url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
+                                let ack_url = format!(
+                                    "{}/api/workers/heartbeat",
+                                    api_url.trim_end_matches('/')
+                                );
                                 let ack_payload = serde_json::json!({
                                     "peer_id": payload.peer_id,
                                     "mode": payload.mode,
@@ -893,10 +986,32 @@ async fn send_heartbeat(
                                 });
                                 let mut ack_req = client.post(&ack_url).json(&ack_payload);
                                 if !token.is_empty() {
-                                    ack_req = ack_req.header("Authorization", format!("Bearer {}", token));
+                                    ack_req = ack_req
+                                        .header("Authorization", format!("Bearer {}", token));
                                 }
                                 let _ = ack_req.send().await;
                                 std::process::exit(0);
+                            }
+                            "set_memory" => {
+                                println!(
+                                    "[VRYX_REMOTE_COMMAND] Action=set_memory (cmd={}) → acknowledged.",
+                                    cmd_id
+                                );
+                                let ack_url = format!(
+                                    "{}/api/workers/heartbeat",
+                                    api_url.trim_end_matches('/')
+                                );
+                                let ack_payload = serde_json::json!({
+                                    "peer_id": payload.peer_id,
+                                    "mode": payload.mode,
+                                    "command_ack": { "id": cmd_id, "status": "acknowledged" }
+                                });
+                                let mut ack_req = client.post(&ack_url).json(&ack_payload);
+                                if !token.is_empty() {
+                                    ack_req = ack_req
+                                        .header("Authorization", format!("Bearer {}", token));
+                                }
+                                let _ = ack_req.send().await;
                             }
                             "hot_reload_python" => {
                                 // Le payload peut contenir { files: ["shard_runtime", "distributed_llm_orchestrator"] }
@@ -917,7 +1032,10 @@ async fn send_heartbeat(
                                     .and_then(|v| v.parse::<u16>().ok())
                                     .unwrap_or(50052);
                                 let admin_port = grpc_port_env + 1;
-                                let reload_url = format!("http://127.0.0.1:{}/internal/hot-reload-python", admin_port);
+                                let reload_url = format!(
+                                    "http://127.0.0.1:{}/internal/hot-reload-python",
+                                    admin_port
+                                );
                                 let reload_body = serde_json::json!({
                                     "files": files,
                                     "command_id": cmd_id,
@@ -928,9 +1046,13 @@ async fn send_heartbeat(
                                 );
                                 let mut ack_status = "failed";
                                 let mut ack_error: Option<String> = None;
-                                match client.post(&reload_url).json(&reload_body).timeout(
-                                    std::time::Duration::from_secs(15)
-                                ).send().await {
+                                match client
+                                    .post(&reload_url)
+                                    .json(&reload_body)
+                                    .timeout(std::time::Duration::from_secs(15))
+                                    .send()
+                                    .await
+                                {
                                     Ok(resp) => {
                                         let status = resp.status();
                                         let body_text = resp.text().await.unwrap_or_default();
@@ -938,15 +1060,22 @@ async fn send_heartbeat(
                                         if status.is_success() {
                                             ack_status = "acknowledged";
                                         } else {
-                                            ack_error = Some(format!("hot_reload_python HTTP {}: {}", status, body_text));
+                                            ack_error = Some(format!(
+                                                "hot_reload_python HTTP {}: {}",
+                                                status, body_text
+                                            ));
                                         }
                                     }
                                     Err(e) => {
                                         eprintln!("[VRYX_REMOTE_COMMAND] hot_reload_python POST échec : {}", e);
-                                        ack_error = Some(format!("hot_reload_python POST échec : {}", e));
+                                        ack_error =
+                                            Some(format!("hot_reload_python POST échec : {}", e));
                                     }
                                 }
-                                let ack_url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
+                                let ack_url = format!(
+                                    "{}/api/workers/heartbeat",
+                                    api_url.trim_end_matches('/')
+                                );
                                 let ack_payload = serde_json::json!({
                                     "peer_id": payload.peer_id,
                                     "mode": payload.mode,
@@ -958,7 +1087,8 @@ async fn send_heartbeat(
                                 });
                                 let mut ack_req = client.post(&ack_url).json(&ack_payload);
                                 if !token.is_empty() {
-                                    ack_req = ack_req.header("Authorization", format!("Bearer {}", token));
+                                    ack_req = ack_req
+                                        .header("Authorization", format!("Bearer {}", token));
                                 }
                                 let _ = ack_req.send().await;
                             }
@@ -982,9 +1112,9 @@ async fn send_heartbeat(
     }
 }
 
-
 /// Initiateur : lit `/api/workers/status`, enregistre les workers et relance un dial relay.
 /// Évite la course avec le ticker heartbeat (~30 s) quand `/api/chat` arrive juste après le démarrage.
+#[allow(clippy::too_many_arguments)]
 async fn initiator_pull_workers_from_api_now(
     swarm: &mut Swarm<VryxBehaviour>,
     http_client: &reqwest::Client,
@@ -1004,9 +1134,20 @@ async fn initiator_pull_workers_from_api_now(
     if boot_addr_str.trim().is_empty() {
         return;
     }
-    let url = format!("{}/api/workers/status", api_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/workers/status?peer_id={}",
+        api_url.trim_end_matches('/'),
+        my_peer_id
+    );
+    let token = std::env::var("VRYX_WORKER_SECRET")
+        .or_else(|_| std::env::var("WORKER_INFERENCE_DELEGATE_SECRET"))
+        .unwrap_or_default();
     let fetch = async {
-        let resp = http_client.get(&url).send().await.ok()?;
+        let mut req = http_client.get(&url);
+        if !token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+        let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -1016,10 +1157,7 @@ async fn initiator_pull_workers_from_api_now(
         Ok(Some(json)) => json,
         Ok(None) => {
             if log_origin == "chat" {
-                eprintln!(
-                    "[P2P] Pré-chat : HTTP invalide ou JSON pour {}",
-                    url
-                );
+                eprintln!("[P2P] Pré-chat : HTTP invalide ou JSON pour {}", url);
             }
             return;
         }
@@ -1058,7 +1196,10 @@ async fn initiator_pull_workers_from_api_now(
         let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() else {
             continue;
         };
-        swarm.behaviour_mut().kad.add_address(&peer_id, relay_addr.clone());
+        swarm
+            .behaviour_mut()
+            .kad
+            .add_address(&peer_id, relay_addr.clone());
         swarm.add_peer_address(peer_id, relay_addr.clone());
         let newly_discovered = discovered_peers.insert(peer_id);
         if newly_discovered {
@@ -1069,10 +1210,7 @@ async fn initiator_pull_workers_from_api_now(
         }
         if !active_peers.lock().unwrap().contains(&peer_id) {
             if let Err(e) = swarm.dial(relay_addr) {
-                eprintln!(
-                    "[!] Dial worker {} échoué ({:?})",
-                    peer_id, e
-                );
+                eprintln!("[!] Dial worker {} échoué ({:?})", peer_id, e);
             } else {
                 match log_origin {
                     "heartbeat" => println!("[P2P] Dial worker heartbeat : {}", peer_id),
@@ -1128,20 +1266,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )?
         .with_quic()
         .with_dns()?
-        .with_relay_client(
-            noise::Config::new,
-            tensor_yamux_config,
-        )?
+        .with_relay_client(noise::Config::new, tensor_yamux_config)?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = key.public().to_peer_id();
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
-            let p2p_request_timeout_s = env_u64_clamped("VRYX_P2P_REQUEST_TIMEOUT_S", 3600, 30, 7200);
+            let p2p_request_timeout_s =
+                env_u64_clamped("VRYX_P2P_REQUEST_TIMEOUT_S", 3600, 30, 7200);
             let rr_config = request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(p2p_request_timeout_s));
             // Codec personnalisé 512 MB pour le transfert de tranches de poids LLM.
             let request_response = request_response::Behaviour::with_codec(
                 vryx_codec::Codec::<TensorRequest, TensorResponse>::default(),
-                [(StreamProtocol::new("/vryx/tensor/1.0.0"), ProtocolSupport::Full)],
+                [(
+                    StreamProtocol::new("/vryx/tensor/1.0.0"),
+                    ProtocolSupport::Full,
+                )],
                 rr_config,
             );
             let store = kad::store::MemoryStore::new(peer_id);
@@ -1149,24 +1288,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if args.mode == "bootstrap" {
                 kad.set_mode(Some(kad::Mode::Server));
             }
-            let identify = identify::Behaviour::new(
-                identify::Config::new("/vryx/1.0.0".into(), key.public()),
-            );
+            let identify =
+                identify::Behaviour::new(identify::Config::new("/vryx/1.0.0".into(), key.public()));
             let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
             let dcutr = dcutr::Behaviour::new(peer_id);
             let relay_server = if args.mode == "bootstrap" {
-                let mut config = libp2p::relay::Config::default();
-                config.reservation_duration = Duration::from_secs(3600);
-                config.max_reservations = 1000;
-                config.max_circuits = 1000;
-                config.max_circuit_duration = Duration::from_secs(3600);
-                config.max_circuit_bytes = 1024 * 1024 * 1024; // 1 GB
-                config.reservation_rate_limiters = vec![];
-                config.circuit_src_rate_limiters = vec![];
+                let config = libp2p::relay::Config {
+                    reservation_duration: Duration::from_secs(3600),
+                    max_reservations: 1000,
+                    max_circuits: 1000,
+                    max_circuit_duration: Duration::from_secs(3600),
+                    max_circuit_bytes: 1024 * 1024 * 1024, // 1 GB
+                    reservation_rate_limiters: vec![],
+                    circuit_src_rate_limiters: vec![],
+                    ..Default::default()
+                };
                 Some(libp2p::relay::Behaviour::new(peer_id, config))
             } else {
                 None
-            }.into();
+            }
+            .into();
 
             Ok(VryxBehaviour {
                 mdns,
@@ -1189,18 +1330,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", args.p2p_port).parse()?)?;
     if args.mode == "bootstrap" {
         swarm.add_external_address(format!("/ip4/51.222.26.225/tcp/{}", args.p2p_port).parse()?);
-        swarm.add_external_address(format!("/ip4/51.222.26.225/udp/{}/quic-v1", args.p2p_port).parse()?);
+        swarm.add_external_address(
+            format!("/ip4/51.222.26.225/udp/{}/quic-v1", args.p2p_port).parse()?,
+        );
     }
 
     let my_peer_id = *swarm.local_peer_id();
-    println!(
-        "\n╔══════════════════════════════════════════════╗"
-    );
+    println!("\n╔══════════════════════════════════════════════╗");
     println!("║  Vryx Node  │  mode = {}  ", args.mode);
     println!("║  PeerId : {}", my_peer_id);
-    println!(
-        "╚══════════════════════════════════════════════╝\n"
-    );
+    println!("╚══════════════════════════════════════════════╝\n");
 
     // ── Bootstrap node ────────────────────────────────────────────────────
     let mut bootstrap_peer_id: Option<PeerId> = None;
@@ -1240,7 +1379,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             persistent_relay: bool,
             connection_reuse: bool,
         },
-        Forwarded { original_channel: request_response::ResponseChannel<TensorResponse> },
+        Forwarded {
+            original_channel: request_response::ResponseChannel<TensorResponse>,
+        },
     }
 
     let mut pending_requests: HashMap<
@@ -1248,14 +1389,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         (TensorRequest, PendingMeta),
     > = HashMap::new();
     // Requêtes POST /api/p2p/relay avant qu'une première connexion libp2p existe : send_request trop tôt → DialFailure libp2p.
-    let mut pending_relay_until_connected: HashMap<
-        PeerId,
-        VecDeque<(
-            TensorRequest,
-            tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>,
-            Instant,
-        )>,
-    > = HashMap::new();
+    type RelayPendingTx = tokio::sync::oneshot::Sender<std::result::Result<TensorResponse, String>>;
+    type RelayPendingQueue = HashMap<PeerId, VecDeque<(TensorRequest, RelayPendingTx, Instant)>>;
+    let mut pending_relay_until_connected: RelayPendingQueue = HashMap::new();
 
     type ChatApiTx = tokio::sync::oneshot::Sender<serde_json::Value>;
 
@@ -1295,7 +1431,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Channel pour envoyer des commandes chat via l'API (initiator seulement)
     // (Prompt, Response Sender)
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Option<ChatApiTx>)>();
+    let (cmd_tx, mut cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Option<ChatApiTx>)>();
     let (p2p_relay_tx, mut p2p_relay_rx) = tokio::sync::mpsc::unbounded_channel::<(
         PeerId,
         TensorRequest,
@@ -1509,7 +1646,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     })
                                 })
                             })
-                            .filter(|&mt| mt >= 1 && mt <= 32768)
+                            .filter(|&mt| (1..=32768).contains(&mt))
                     {
                         request_obj["max_new_tokens"] = serde_json::json!(mt);
                     }
@@ -1570,7 +1707,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let request_payload = request_obj.to_string();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let _ = cmd_tx_axum.send((request_payload, Some(tx)));
-                    
+
                     match tokio::time::timeout(std::time::Duration::from_secs(3600), rx).await {
                         Ok(Ok(response)) => {
                             if response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
@@ -1627,7 +1764,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(mt) = payload
                     .get("max_new_tokens")
                     .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 1 { Some(i as u64) } else { None })))
-                    .filter(|&mt| mt >= 1 && mt <= 32768)
+                    .filter(|&mt| (1..=32768).contains(&mt))
                 {
                     request_obj["max_new_tokens"] = serde_json::json!(mt);
                 }
@@ -1769,7 +1906,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let routing_path = payload.get("routing_path").and_then(|v| v.as_array()).map(|arr| {
                     arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
                 }).unwrap_or_default();
-                
+
                 let req = TensorRequest {
                     kind: String::new(),
                     data,
@@ -1898,9 +2035,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             request: TensorRequest,
             original_channel: request_response::ResponseChannel<TensorResponse>,
         },
-        Error { 
-            context: String, 
-            message: String 
+        Error {
+            context: String,
+            message: String,
         },
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<InferenceResult>();
@@ -2031,9 +2168,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|p| !boot_cancel.is_some_and(|b| *p == b));
-            has_non_boot_connected
-                || registry_for_cancel.load(Ordering::Relaxed) > 0
+                .any(|p| boot_cancel.is_none_or(|b| *p != b));
+            has_non_boot_connected || registry_for_cancel.load(Ordering::Relaxed) > 0
         }
     };
 
@@ -2566,6 +2702,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .ok()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
                         .filter(|v| v.is_object());
+                    let machine_info =
+                        heartbeat_machine_info_with_network(machine_info, args.p2p_port);
                     let payload = HeartbeatPayload {
                         peer_id: my_peer_id.to_string(),
                         mode: args.mode.clone(),
@@ -2734,7 +2872,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     identify::Event::Received { peer_id, info },
                 )) => {
                     println!("[P2P] Identify reçu de {} : addrs={:?} (observed={:?})", peer_id, info.listen_addrs, info.observed_addr);
-                    let is_bootstrap = bootstrap_peer_id.map_or(false, |id| id == peer_id);
+                    let is_bootstrap = bootstrap_peer_id == Some(peer_id);
                     for addr in info.listen_addrs {
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                         swarm.add_peer_address(peer_id, addr.clone());

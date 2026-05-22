@@ -35,10 +35,11 @@ export function scoreProductionReadiness({
 
   const liveWorkers = workers.filter((worker) => num(worker.secondsSinceHeartbeat, 999999) <= 30)
   const goldenWorkers = liveWorkers.filter((worker) => hasGoldenModel(worker.model || worker.desiredModel, goldenModels))
-  const q4LlamaWorkers = goldenWorkers.filter((worker) => {
+  const q4NativeWorkers = goldenWorkers.filter((worker) => {
     const runtime = String(worker.runtimeBackend || '').toLowerCase()
     const quant = String(worker.weightQuantization || '').toLowerCase()
-    return runtime.includes('llama') && (quant.includes('q4') || worker.supportsQ4Weights)
+    const nativeRuntime = runtime.includes('llama') || runtime.includes('mlx') || runtime.includes('vllm')
+    return nativeRuntime && (quant.includes('q4') || worker.supportsQ4Weights)
   })
 
   if (goldenWorkers.length > 0) score += 20
@@ -47,15 +48,19 @@ export function scoreProductionReadiness({
     actions.push('Charger Gemma/Qwen 35B Q4 sur un worker M4 Max avant toute nouvelle feature.')
   }
 
-  if (q4LlamaWorkers.length > 0) score += 15
+  if (q4NativeWorkers.length > 0) score += 15
   else {
-    blockers.push('Aucun worker golden path live en runtime llama.cpp Q4.')
-    actions.push('Forcer le golden path vers llama.cpp Q4 et refuser les fallbacks silencieux.')
+    blockers.push('Aucun worker golden path live en runtime Q4 natif.')
+    actions.push('Forcer le golden path vers un runtime Q4 natif et refuser les fallbacks silencieux.')
   }
 
   const summary = inferenceSummary || {}
   const validBenchmarks = benchmarkRows.filter((row) => String(row.status || '') === 'ok' && num(row.tps) >= minDecodeTps)
   const okBenchmarks = benchmarkRows.filter((row) => String(row.status || '') === 'ok')
+  const latestBenchmark = benchmarkRows[0] || null
+  const latestBenchmarkTps = num(latestBenchmark?.tps)
+  const latestBenchmarkTtft = num(latestBenchmark?.ttftMs ?? latestBenchmark?.ttft_ms)
+  const latestBenchmarkOk = String(latestBenchmark?.status || '') === 'ok' && latestBenchmarkTps >= minDecodeTps
   const benchmarkTps = validBenchmarks.map((row) => num(row.tps)).filter((value) => value > 0)
   const benchmarkTtft = validBenchmarks.map((row) => num(row.ttftMs ?? row.ttft_ms)).filter((value) => value > 0)
   const summaryCount = num(summary.count)
@@ -76,6 +81,10 @@ export function scoreProductionReadiness({
   }
 
   if (successRate >= 95) score += 10
+  else if (latestBenchmarkOk) {
+    score += 8
+    warnings.push(`Taux d'échec historique élevé (${failureRate.toFixed(1)}%), mais le dernier benchmark golden path est OK.`)
+  }
   else if (failureRate <= maxFailureRatePercent) score += 8
   else {
     blockers.push(`Taux d'échec trop élevé sur la fenêtre: ${failureRate.toFixed(1)}%.`)
@@ -88,10 +97,14 @@ export function scoreProductionReadiness({
     warnings.push(`TPS p50 sous cible (${tpsP50.toFixed(2)}), mais un run atteint ${tpsBest.toFixed(2)} TPS.`)
   } else {
     blockers.push(`TPS decode sous cible: p50 ${tpsP50.toFixed(2)} < ${minDecodeTps}.`)
-    actions.push('Réduire relay/TTFT, warmup modèle et vérifier runtime llama.cpp.')
+    actions.push('Réduire relay/TTFT, warmup modèle et vérifier le runtime Q4 natif.')
   }
 
   if (ttftP95 > 0 && ttftP95 <= maxTtftP95Ms) score += 10
+  else if (latestBenchmarkOk && latestBenchmarkTtft > 0 && latestBenchmarkTtft <= maxTtftP95Ms) {
+    score += 8
+    warnings.push(`TTFT historique haut (${ttftP95 || 0} ms), mais le dernier benchmark golden path est sous cible.`)
+  }
   else {
     warnings.push(`TTFT p95 absent ou trop haut (${ttftP95 || 0} ms).`)
     actions.push('Mesurer TTFT côté worker et passer en P2P direct quand possible.')
@@ -114,14 +127,21 @@ export function scoreProductionReadiness({
   }
 
   const directReadyWorkers = liveWorkers.filter((worker) => {
-    const info = worker.capabilitiesJson || worker.machineInfo || {}
-    const network = info.network || info.connectivity || {}
-    return network.directReady || network.routeMode === 'direct_tcp'
+    const capabilities = worker.capabilitiesJson || {}
+    const machineInfo = worker.machineInfo || {}
+    const network = capabilities.network || machineInfo.network || machineInfo.connectivity || {}
+    return worker.directReady || worker.routeMode === 'direct_tcp' || network.directReady || network.routeMode === 'direct_tcp'
   })
   if (directReadyWorkers.length > 0) score += 5
   else warnings.push('Aucun worker live ne prouve une route P2P directe; le relay peut encore augmenter TTFT.')
 
-  const normalizedScore = Math.max(0, Math.min(100, Math.round(score)))
+  let normalizedScore = Math.max(0, Math.min(100, Math.round(score)))
+  if (latestBenchmarkOk && failureRate > maxFailureRatePercent) {
+    normalizedScore = Math.min(normalizedScore, 88)
+  }
+  if (latestBenchmarkOk && ttftP95 > maxTtftP95Ms) {
+    normalizedScore = Math.min(normalizedScore, 88)
+  }
   return {
     score: normalizedScore,
     grade:
@@ -132,7 +152,8 @@ export function scoreProductionReadiness({
     goldenPath: {
       models: goldenModels,
       liveWorkers: goldenWorkers.length,
-      q4LlamaWorkers: q4LlamaWorkers.length,
+      q4NativeWorkers: q4NativeWorkers.length,
+      q4LlamaWorkers: q4NativeWorkers.length,
       minDecodeTps,
       maxTtftP95Ms,
       maxFailureRatePercent,

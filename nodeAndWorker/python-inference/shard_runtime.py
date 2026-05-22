@@ -33,6 +33,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
 
+import urllib.parse
 import urllib.request
 import numpy as np
 import torch
@@ -317,7 +318,7 @@ SPECULATIVE_HEADS = os.environ.get("VRYX_SPECULATIVE_HEADS", "off").lower()
 CONTINUOUS_BATCHING = os.environ.get("VRYX_CONTINUOUS_BATCHING", "0").lower() in ("1", "true", "yes")
 CHUNKED_PREFILL = os.environ.get("VRYX_CHUNKED_PREFILL", "0").lower() in ("1", "true", "yes")
 RING_ATTENTION = os.environ.get("VRYX_RING_ATTENTION", "0").lower() in ("1", "true", "yes")
-MLX_LM_BUSY_TIMEOUT_SEC = max(0.05, float(os.environ.get("VRYX_MLX_LM_BUSY_TIMEOUT_SEC", "0.25")))
+MLX_LM_BUSY_TIMEOUT_SEC = max(0.05, float(os.environ.get("VRYX_MLX_LM_BUSY_TIMEOUT_SEC", "30")))
 def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
     try:
         value = int(os.environ.get(name, str(default)))
@@ -346,6 +347,22 @@ MLX_LM_MAX_KV_SIZE = _env_int("VRYX_MLX_LM_MAX_KV_SIZE", 4096, minimum=256, maxi
 MLX_LM_PREFILL_STEP_SIZE = _env_int("VRYX_MLX_LM_PREFILL_STEP_SIZE", 1024, minimum=128, maximum=8192)
 MLX_LM_STREAM_CHUNK_TOKENS = _env_int("VRYX_MLX_LM_STREAM_CHUNK_TOKENS", 12, minimum=1, maximum=128)
 MLX_LM_STREAM_CHUNK_MS = _env_int("VRYX_MLX_LM_STREAM_CHUNK_MS", 45, minimum=0, maximum=500)
+
+
+def _redact_url_secret(url: str) -> str:
+    try:
+        parts = urllib.parse.urlsplit(str(url))
+        if not parts.query:
+            return str(url)
+        redacted_query = urllib.parse.urlencode(
+            [
+                (key, "<redacted>" if key.lower() in {"token", "secret", "stream_secret"} else value)
+                for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+            ],
+        )
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, redacted_query, parts.fragment))
+    except Exception:
+        return str(url).replace("token=", "token=<redacted>&")
 LLAMA_CPP_URL = os.environ.get("VRYX_LLAMA_CPP_URL", os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")).rstrip("/")
 LLAMA_CPP_MODEL = os.environ.get("VRYX_LLAMA_CPP_MODEL", os.environ.get("OLLAMA_MODEL", "vryx-llama2-70b-q4")).strip()
 LLAMA_CPP_TIMEOUT_SEC = _env_float("VRYX_LLAMA_CPP_TIMEOUT_SEC", 900.0, minimum=5.0, maximum=3600.0)
@@ -1904,7 +1921,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
             _ctx = _ssl.create_default_context()
             _ctx.check_hostname = False
             _ctx.verify_mode = _ssl.CERT_NONE
-            print(f"[shard] Téléchargement manifeste depuis {download_url}")
+            print(f"[shard] Téléchargement manifeste depuis {_redact_url_secret(download_url)}")
             t0 = time.perf_counter()
             req = urllib.request.Request(download_url, method="GET")
             with urllib.request.urlopen(req, timeout=MANIFEST_FETCH_TIMEOUT_SEC, context=_ctx) as resp:
@@ -2176,7 +2193,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                 setattr(shard_ref, "load_error", str(e)[:500])
             except Exception:
                 pass
-            print(f"[shard] Échec téléchargement {download_url} : {e}")
+            print(f"[shard] Échec téléchargement {_redact_url_secret(download_url)} : {e}")
             return json.dumps({"ok": False, "session_id": sid, "error": f"Téléchargement échoué : {e}"})
 
     return json.dumps({"ok": True, "session_id": sid, "num_layers": n_layers})

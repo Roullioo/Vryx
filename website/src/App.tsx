@@ -11,6 +11,7 @@ import { RacePoolPage } from './pages/RacePoolPage'
 import { ClientsPage } from './pages/ClientsPage'
 import { WorkersPage } from './pages/WorkersPage'
 import { StatusPage } from './pages/StatusPage'
+import { EnterprisePage } from './pages/EnterprisePage'
 import { AdminOverviewPage } from './pages/AdminOverviewPage'
 import { AdminUserDetailPage, AdminUsersPage } from './pages/AdminUsersPage'
 import { AdminNodePage } from './pages/AdminNodePage'
@@ -18,6 +19,8 @@ import { AdminP2PChatPage } from './pages/AdminP2PChatPage'
 import { AdminWorkersPage, AdminWorkerDetailPage } from './pages/AdminWorkersPage'
 import { AdminSessionsPage, AdminSessionDetailPage } from './pages/AdminSessionsPage'
 import { AdminObservabilityPage } from './pages/AdminObservabilityPage'
+import { AdminProductionReadinessPage } from './pages/AdminProductionReadinessPage'
+import { AdminEnterpriseQuotesPage } from './pages/AdminEnterpriseQuotesPage'
 
 export default function App() {
   return (
@@ -30,6 +33,8 @@ export default function App() {
         <Route path="simulateur" element={<SimulatorPage />} />
         <Route path="comparatif" element={<ComparePage />} />
         <Route path="status" element={<StatusPage />} />
+        <Route path="network" element={<StatusPage />} />
+        <Route path="enterprise" element={<EnterprisePage />} />
         <Route path="compte/*" element={<AccountPage />} />
         <Route path="panel/modeles" element={<ModelsPanelPage />} />
         <Route path="admin" element={<AdminOverviewPage />} />
@@ -42,6 +47,8 @@ export default function App() {
         <Route path="admin/sessions" element={<AdminSessionsPage />} />
         <Route path="admin/sessions/:sessionId" element={<AdminSessionDetailPage />} />
         <Route path="admin/observabilite" element={<AdminObservabilityPage />} />
+        <Route path="admin/production-readiness" element={<AdminProductionReadinessPage />} />
+        <Route path="admin/enterprise" element={<AdminEnterpriseQuotesPage />} />
         <Route path="connexion" element={<LoginPage />} />
         <Route path="inscription" element={<RegisterPage />} />
       </Route>

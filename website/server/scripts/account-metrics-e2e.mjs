@@ -37,6 +37,14 @@ for (const key of ['workersHealthy', 'uptimePercent', 'costPerTokenEur', 'netMar
 }
 assert.ok(Array.isArray(publicStatus.data?.models), 'publicStatus.models[] missing')
 assert.ok(Array.isArray(publicStatus.data?.workers), 'publicStatus.workers[] missing')
+if (publicStatus.data?.publicExposure === 'redacted') {
+  for (const worker of publicStatus.data.workers) {
+    assert.match(String(worker.peerId || ''), /^wrk_[a-f0-9]{10}$/, 'public worker id must be redacted')
+    assert.equal(worker.publicIp, undefined, 'public worker IP must not be exposed')
+    assert.equal(worker.p2pPort, undefined, 'public worker P2P port must not be exposed')
+    assert.equal(worker.secondsSinceHeartbeat, undefined, 'public worker heartbeat age must not be exposed')
+  }
+}
 
 const schedulerPreview = await readJson('/api/public/scheduler-preview?model=Qwen/Qwen3.6-35B-A3B&mode=auto')
 assert.equal(schedulerPreview.res.status, 200, `public scheduler preview failed: ${schedulerPreview.text}`)

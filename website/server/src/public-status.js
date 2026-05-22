@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import { summarizeInferenceRows } from './inference-metrics.js'
 import { scoreProductionReadiness } from './production-readiness.js'
 
@@ -34,6 +35,36 @@ function shortPeer(peerId) {
   const value = String(peerId || '')
   if (value.length <= 14) return value
   return `${value.slice(0, 10)}...${value.slice(-4)}`
+}
+
+function publicWorkerId(peerId, index = 0) {
+  const raw = String(peerId || `anonymous-${index}`)
+  const hash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 10)
+  return `wrk_${hash}`
+}
+
+function publicBenchmarkError(error) {
+  if (!error) return null
+  return 'Benchmark golden path échoué. Détails complets réservés à l’admin.'
+}
+
+function gpuClass(gpuName, runtimeBackend) {
+  const value = `${gpuName || ''} ${runtimeBackend || ''}`.toLowerCase()
+  if (value.includes('apple') || value.includes('mlx')) return 'Apple Silicon'
+  if (value.includes('nvidia') || value.includes('rtx') || value.includes('geforce') || value.includes('cuda')) return 'NVIDIA GPU'
+  if (value.includes('amd') || value.includes('radeon')) return 'AMD GPU'
+  if (gpuName) return 'GPU worker'
+  return 'Hardware non declare'
+}
+
+function memoryTier(gb) {
+  const value = Number(gb || 0)
+  if (!Number.isFinite(value) || value <= 0) return 'unknown'
+  if (value < 16) return '<16GB'
+  if (value < 32) return '16-32GB'
+  if (value < 64) return '32-64GB'
+  if (value < 96) return '64-96GB'
+  return '96GB+'
 }
 
 function sessionMetrics(row) {
@@ -107,6 +138,7 @@ export function registerPublicStatusRoutes(app, options) {
                   first_seen_at AS firstSeenAt,
                   TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
            FROM workers
+           WHERE mode = 'worker'
            ORDER BY last_heartbeat_at DESC
            LIMIT 120`,
         ),
@@ -136,35 +168,44 @@ export function registerPublicStatusRoutes(app, options) {
         discoverAvailableModels(),
       ])
 
-      const workers = (workerRows[0] || []).map((row) => {
+      const exposeWorkerDetails = process.env.VRYX_PUBLIC_EXPOSE_WORKER_DETAILS === '1'
+      const workers = (workerRows[0] || []).map((row, index) => {
         const secondsSinceHeartbeat = toNumber(row.secondsSinceHeartbeat, 999999)
         const online = secondsSinceHeartbeat <= workerOfflineSec
         const live = secondsSinceHeartbeat <= workerLiveSec
         const uptimeSec = row.firstSeenAt ? Math.max(0, Math.floor((Date.now() - new Date(row.firstSeenAt).getTime()) / 1000)) : 0
+        const gpuVramGb = row.gpuVramMb ? Number((Number(row.gpuVramMb) / 1024).toFixed(1)) : null
+        const allocatedVramGb = row.allocatedVramMb ? Number((Number(row.allocatedVramMb) / 1024).toFixed(1)) : null
+        const redactedId = publicWorkerId(row.peerId, index)
         return {
-          peerId: row.peerId,
-          peerLabel: shortPeer(row.peerId),
+          peerId: exposeWorkerDetails ? row.peerId : redactedId,
+          peerLabel: exposeWorkerDetails ? shortPeer(row.peerId) : redactedId,
+          publicId: redactedId,
           mode: row.mode || 'worker',
           online,
           live,
           model: row.model || null,
-          gpuName: row.gpuName || null,
-          gpuVramGb: row.gpuVramMb ? Number((Number(row.gpuVramMb) / 1024).toFixed(1)) : null,
-          allocatedVramGb: row.allocatedVramMb ? Number((Number(row.allocatedVramMb) / 1024).toFixed(1)) : null,
-          memoryLimitPercent: row.memoryLimitPercent != null ? Number(row.memoryLimitPercent) : null,
+          gpuName: exposeWorkerDetails ? row.gpuName || null : null,
+          gpuClass: gpuClass(row.gpuName, row.runtimeBackend),
+          gpuVramGb: exposeWorkerDetails ? gpuVramGb : null,
+          allocatedVramGb: exposeWorkerDetails ? allocatedVramGb : null,
+          memoryTier: memoryTier(allocatedVramGb || gpuVramGb),
+          memoryLimitPercent: exposeWorkerDetails && row.memoryLimitPercent != null ? Number(row.memoryLimitPercent) : undefined,
           runtimeBackend: row.runtimeBackend || 'unknown',
           weightQuantization: row.weightQuantization || 'fp16',
-          supportsQ4Weights: Boolean(row.supportsQ4Weights),
-          supportsMlx: Boolean(row.supportsMlx),
-          supportsVllm: Boolean(row.supportsVllm),
-          tokensGenerated: Number(row.tokensGenerated || 0),
-          tokensIn: Number(row.tokensIn || 0),
-          tokensOut: Number(row.tokensOut || 0),
-          p2pPeers: Number(row.p2pPeers || 0),
-          lastHeartbeatAt: toIsoDate(row.lastHeartbeatAt),
-          firstSeenAt: toIsoDate(row.firstSeenAt),
+          supportsQ4Weights: exposeWorkerDetails ? Boolean(row.supportsQ4Weights) : undefined,
+          supportsMlx: exposeWorkerDetails ? Boolean(row.supportsMlx) : undefined,
+          supportsVllm: exposeWorkerDetails ? Boolean(row.supportsVllm) : undefined,
+          tokensGenerated: exposeWorkerDetails ? Number(row.tokensGenerated || 0) : undefined,
+          tokensIn: exposeWorkerDetails ? Number(row.tokensIn || 0) : undefined,
+          tokensOut: exposeWorkerDetails ? Number(row.tokensOut || 0) : undefined,
+          p2pPeers: exposeWorkerDetails ? Number(row.p2pPeers || 0) : undefined,
+          lastHeartbeatAt: exposeWorkerDetails ? toIsoDate(row.lastHeartbeatAt) : null,
+          firstSeenAt: exposeWorkerDetails ? toIsoDate(row.firstSeenAt) : null,
           secondsSinceHeartbeat,
+          presence: live ? 'live' : online ? 'online' : 'offline',
           uptimeSec,
+          uptimeBucket: uptimeSec >= 24 * 3600 ? '24h+' : uptimeSec >= 3600 ? '1h+' : uptimeSec >= 60 ? '1m+' : '<1m',
         }
       })
 
@@ -224,6 +265,7 @@ export function registerPublicStatusRoutes(app, options) {
       return res.json({
         ok: true,
         sampledAt: new Date().toISOString(),
+        publicExposure: exposeWorkerDetails ? 'worker_details_enabled' : 'redacted',
         pricing: {
           eurPerMillionTokens: eurPerMillion,
           eurPerThousandTokens: Number((eurPerMillion / 1000).toFixed(6)),
@@ -278,7 +320,14 @@ export function registerPublicStatusRoutes(app, options) {
               : 'En attente de sessions publiques récentes pour figer le benchmark Qwen 9B.',
         },
         models: publicModels,
-        workers,
+        workers: workers.map((worker) => {
+          const out = Object.fromEntries(Object.entries(worker).filter(([, value]) => value !== undefined))
+          if (!exposeWorkerDetails) {
+            delete out.secondsSinceHeartbeat
+            delete out.uptimeSec
+          }
+          return out
+        }),
       })
     } catch (error) {
       console.error('public/network-status', error)
@@ -320,7 +369,7 @@ export function registerPublicStatusRoutes(app, options) {
           `SELECT model, mode, status, worker_count AS workerCount, latency_ms AS latencyMs,
                   ttft_ms AS ttftMs, tps, prompt_tokens AS promptTokens,
                   completion_tokens AS completionTokens, total_tokens AS totalTokens,
-                  error, created_at AS createdAt
+                  plan_json AS planJson, error, created_at AS createdAt
            FROM worker_benchmark_runs
            WHERE created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
            ORDER BY created_at DESC
@@ -361,6 +410,33 @@ export function registerPublicStatusRoutes(app, options) {
       })
       const benchmarkOk = benchmarks.filter((row) => row.status === 'ok' && Number(row.tps || 0) > 0)
       const latestBenchmark = benchmarks[0] || null
+      const benchmarkEvidence = benchmarks.map((row) => {
+        const plan = parseJsonSafe(row.planJson) || {}
+        const verdict = plan.verdict && typeof plan.verdict === 'object' ? plan.verdict : {}
+        const metrics = verdict.metrics && typeof verdict.metrics === 'object' ? verdict.metrics : {}
+        const thresholds = verdict.thresholds && typeof verdict.thresholds === 'object' ? verdict.thresholds : {}
+        const requestCount = toNumber(metrics.requestCount ?? plan.requestedRuns, 0)
+        const successRate = toNumber(metrics.successRate, row.status === 'ok' ? 100 : 0)
+        const emptyResponses = toNumber(metrics.emptyResponses, 0)
+        return {
+          model: row.model,
+          status: row.status,
+          requestCount,
+          successRate,
+          emptyResponses,
+          tpsP50: toNumber(metrics.tpsP50 ?? row.tps, 0),
+          tpsP95: toNumber(metrics.tpsP95, 0),
+          ttftP95Ms: toNumber(metrics.ttftP95Ms ?? row.ttftMs, 0),
+          minRequests: toNumber(thresholds.minRequests, 0),
+          createdAt: toIsoDate(row.createdAt),
+          ok:
+            row.status === 'ok' &&
+            requestCount >= 100 &&
+            successRate >= 99 &&
+            emptyResponses === 0,
+        }
+      })
+      const proof100 = benchmarkEvidence.find((item) => item.ok) || null
       return res.json({
         ok: true,
         sampledAt: new Date().toISOString(),
@@ -368,7 +444,8 @@ export function registerPublicStatusRoutes(app, options) {
         readiness,
         goldenPath: {
           models: goldenModels,
-          stable99Proven: readiness.score >= 90 && readiness.metrics.successRate >= 99,
+          stable99Proven: Boolean(proof100),
+          proof100,
           directWorkers: workers.filter((worker) => worker.directReady).length,
           relayWorkers: workers.filter((worker) => worker.secondsSinceHeartbeat <= workerLiveSec && !worker.directReady).length,
           benchmarkRuns: benchmarks.length,
@@ -382,19 +459,19 @@ export function registerPublicStatusRoutes(app, options) {
                 latencyMs: Number(latestBenchmark.latencyMs || 0),
                 workerCount: Number(latestBenchmark.workerCount || 0),
                 createdAt: toIsoDate(latestBenchmark.createdAt),
-                error: latestBenchmark.error || null,
+                error: publicBenchmarkError(latestBenchmark.error),
               }
             : null,
         },
-        workers: workers.map((worker) => ({
-          peerId: worker.peerId,
+        workers: workers.map((worker, index) => ({
+          peerId: publicWorkerId(worker.peerId, index),
+          peerLabel: publicWorkerId(worker.peerId, index),
           model: worker.model,
           runtimeBackend: worker.runtimeBackend,
           weightQuantization: worker.weightQuantization,
-          secondsSinceHeartbeat: worker.secondsSinceHeartbeat,
+          presence: worker.secondsSinceHeartbeat <= workerLiveSec ? 'live' : 'offline',
           routeMode: worker.routeMode,
           directReady: worker.directReady,
-          p2pPort: worker.p2pPort,
         })),
       })
     } catch (error) {

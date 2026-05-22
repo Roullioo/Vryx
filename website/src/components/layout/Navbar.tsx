@@ -9,11 +9,12 @@ import { fetchAccountOverview, type AccountOverview } from '../../lib/account'
 
 const routeLinks = [
   { to: '/clients', label: 'Clients' },
+  { to: '/enterprise', label: 'Enterprise' },
   { to: '/race-pool', label: 'Race-Pool' },
   { to: '/simulateur', label: 'Simulateur' },
   { to: '/comparatif', label: 'Gains solo / pool' },
   { to: '/workers', label: 'Workers' },
-  { to: '/status', label: 'Status' },
+  { to: '/network', label: 'Network' },
 ]
 
 export function Navbar() {
@@ -34,6 +35,7 @@ export function Navbar() {
     pathname === '/comparatif' ||
     pathname === '/workers' ||
     pathname === '/status' ||
+    pathname === '/network' ||
     pathname === '/panel/modeles'
 
   /** Pastilles blanches sur hero uniquement en thème clair résolu. */

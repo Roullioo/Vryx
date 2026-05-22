@@ -379,20 +379,51 @@ export function AdminUserDetailPage() {
   const [detail, setDetail] = useState<AdminUserDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [creditAmount, setCreditAmount] = useState('50')
+  const [creditDescription, setCreditDescription] = useState('Crédit pilote')
+  const [creditLoading, setCreditLoading] = useState(false)
+  const [creditHint, setCreditHint] = useState<string | null>(null)
 
-  useEffect(() => {
+  const loadDetail = useCallback(async () => {
     if (!id) return
     setLoading(true)
-    apiJson<AdminUserDetail>(`/api/admin/users/${encodeURIComponent(id)}`).then((r) => {
-      setLoading(false)
-      if (r.ok) {
-        setDetail(r.data)
-        setError(null)
-      } else {
-        setError(r.error)
-      }
-    })
+    const r = await apiJson<AdminUserDetail>(`/api/admin/users/${encodeURIComponent(id)}`)
+    setLoading(false)
+    if (r.ok) {
+      setDetail(r.data)
+      setError(null)
+    } else {
+      setError(r.error)
+    }
   }, [id])
+
+  useEffect(() => {
+    void loadDetail()
+  }, [loadDetail])
+
+  const addCredit = useCallback(async (event: React.FormEvent) => {
+    event.preventDefault()
+    if (!id || creditLoading) return
+    const amountEur = Number(creditAmount.replace(',', '.'))
+    if (!Number.isFinite(amountEur) || Math.abs(amountEur) <= 0) {
+      setError('Montant de crédit invalide.')
+      return
+    }
+    setCreditLoading(true)
+    setError(null)
+    const r = await apiJson<{ ok: true; balanceEur: number }>(`/api/admin/billing/users/${encodeURIComponent(id)}/credit`, {
+      method: 'POST',
+      body: JSON.stringify({ amountEur, description: creditDescription.trim() || 'Ajustement admin' }),
+    })
+    setCreditLoading(false)
+    if (!r.ok) {
+      setError(r.error)
+      return
+    }
+    setCreditHint(`Solde mis à jour: ${Number(r.data.balanceEur || 0).toFixed(2)} €`)
+    window.setTimeout(() => setCreditHint(null), 4000)
+    await loadDetail()
+  }, [creditAmount, creditDescription, creditLoading, id, loadDetail])
 
   if (loading) {
     return (
@@ -429,8 +460,14 @@ export function AdminUserDetailPage() {
       }
     >
       <div className="space-y-6">
+        {creditHint ? (
+          <div className="rounded-lg border border-success/40 bg-success/10 px-4 py-3 text-sm text-success" role="status">
+            {creditHint}
+          </div>
+        ) : null}
         <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
           {[
+            ['Solde crédits', `${Number(user.balanceEuro || 0).toFixed(2)} €`],
             ['Requêtes API', fmt(usage.apiRequests)],
             ['Tokens API', fmt(usage.totalTokens)],
             ['Coût API', `${Number(usage.costEur || 0).toFixed(4)} €`],
@@ -452,6 +489,7 @@ export function AdminUserDetailPage() {
               {[
                 ['Email', user.email],
                 ['ID', user.id],
+                ['Solde crédits', `${Number(user.balanceEuro || 0).toFixed(2)} €`],
                 ['Rôle', user.isAdmin ? 'Administrateur' : 'Utilisateur'],
                 ['Google OAuth', user.googleLinked ? 'Oui' : 'Non'],
                 ['Créé le', formatDate(user.createdAt)],
@@ -464,6 +502,31 @@ export function AdminUserDetailPage() {
                 </div>
               ))}
             </dl>
+            <form onSubmit={addCredit} className="mt-5 rounded-2xl border border-border bg-surface/70 p-4">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Ajuster les crédits</p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-[8rem_1fr]">
+                <input
+                  value={creditAmount}
+                  onChange={(event) => setCreditAmount(event.target.value)}
+                  className="rounded-lg border border-border bg-card px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+                  inputMode="decimal"
+                  aria-label="Montant en euros"
+                />
+                <input
+                  value={creditDescription}
+                  onChange={(event) => setCreditDescription(event.target.value)}
+                  className="rounded-lg border border-border bg-card px-3 py-2 text-sm text-fg outline-none focus:border-accent"
+                  placeholder="Description"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={creditLoading}
+                className="mt-3 rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {creditLoading ? 'Enregistrement...' : 'Ajouter / retirer'}
+              </button>
+            </form>
           </div>
 
           <div className="rounded-3xl border border-border bg-card p-5 shadow-sm">

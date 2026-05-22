@@ -90,7 +90,13 @@ const JWT_EXPIRES_DAYS = Math.min(30, Math.max(1, Number(process.env.JWT_EXPIRES
 const COOKIE_NAME = 'velocity_token'
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 const NODE_ENV = process.env.NODE_ENV || 'development'
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173'
+const IS_PRODUCTION = NODE_ENV === 'production'
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim().replace(/\/$/, ''))
+  .filter(Boolean)
+const CORS_ORIGIN = CORS_ORIGINS[0] || 'http://localhost:5173'
+const JSON_BODY_LIMIT = process.env.VRYX_JSON_BODY_LIMIT || (IS_PRODUCTION ? '1mb' : '8mb')
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || ''
 const GOOGLE_OAUTH_REDIRECT_URI = process.env.GOOGLE_OAUTH_REDIRECT_URI || ''
@@ -106,6 +112,10 @@ const VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET = (() => {
   if (!Number.isFinite(n) || n <= 0) return 10_000_000
   return Math.max(1_000_000, Math.min(5_000_000_000, Math.floor(n)))
 })()
+const VRYX_BILLING_ENFORCE_CREDITS = process.env.VRYX_BILLING_ENFORCE_CREDITS === '1'
+const VRYX_BILLING_CREDIT_PACKAGES = parseCreditPackages(process.env.VRYX_BILLING_CREDIT_PACKAGES_EUR || '50,100,500,2000')
+const VRYX_APP_BASE_URL = (process.env.VRYX_APP_BASE_URL || CORS_ORIGIN || 'https://vryx.eu').replace(/\/$/, '')
+const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 
 /** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
 let pipelineChatSessions = 0
@@ -130,7 +140,16 @@ function isUserPipelineChatActive(userId) {
   return userId ? activeUserChatSessions.has(String(userId)) : false
 }
 
-const WORKER_SECRET = process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET;
+const WORKER_SECRET = String(process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET || '').trim()
+const RAW_ALLOW_UNSECURE_WORKERS = process.env.ALLOW_UNSECURE_WORKERS === '1'
+const ALLOW_UNSECURE_WORKERS = RAW_ALLOW_UNSECURE_WORKERS && !IS_PRODUCTION
+
+function tokenMatchesSecret(token, secret) {
+  const tokenBuf = Buffer.from(String(token || ''))
+  const secretBuf = Buffer.from(String(secret || ''))
+  if (tokenBuf.length === 0 || tokenBuf.length !== secretBuf.length) return false
+  return crypto.timingSafeEqual(tokenBuf, secretBuf)
+}
 
 async function requireWorkerSecret(req, res, next) {
   const authHeader = req.headers['authorization'] || ''
@@ -140,8 +159,8 @@ async function requireWorkerSecret(req, res, next) {
   } else {
     token = req.query.token || req.headers['x-worker-token'] || ''
   }
-  if (process.env.ALLOW_UNSECURE_WORKERS === '1') return next()
-  if (WORKER_SECRET && token === WORKER_SECRET) return next()
+  if (ALLOW_UNSECURE_WORKERS) return next()
+  if (WORKER_SECRET && tokenMatchesSecret(token, WORKER_SECRET)) return next()
   const peerId = String(req.body?.peer_id || req.query.peer_id || '').trim()
   if (peerId && token) {
     try {
@@ -164,10 +183,16 @@ async function requireWorkerSecret(req, res, next) {
       console.warn('worker secret lookup failed', e?.code || e?.message || e)
     }
   }
-  if (!WORKER_SECRET && !peerId) {
-    return next()
-  }
   return res.status(401).json({ error: 'Unauthorized: Invalid worker secret token.' })
+}
+
+function normalizedOrigin(value) {
+  if (!value) return ''
+  try {
+    return new URL(String(value)).origin.toLowerCase()
+  } catch {
+    return ''
+  }
 }
 
 function csrfProtection(req, res, next) {
@@ -179,19 +204,19 @@ function csrfProtection(req, res, next) {
   const host = req.get('host') || ''
   const protocol = req.protocol || 'http'
   const localUrl = `${protocol}://${host}`
-  const allowedOrigins = [
-    localUrl.toLowerCase(),
-    CORS_ORIGIN.toLowerCase(),
+  const allowedOrigins = new Set([
+    normalizedOrigin(localUrl),
+    ...CORS_ORIGINS.map(normalizedOrigin),
     'https://vryx.eu',
     'https://www.vryx.eu'
-  ].filter(Boolean)
+  ].filter(Boolean))
 
   if (origin) {
-    if (!allowedOrigins.some(allowed => origin.toLowerCase().startsWith(allowed))) {
+    if (!allowedOrigins.has(normalizedOrigin(origin))) {
       return res.status(403).json({ error: 'CSRF Protection: Invalid request origin.' })
     }
   } else if (referer) {
-    if (!allowedOrigins.some(allowed => referer.toLowerCase().startsWith(allowed))) {
+    if (!allowedOrigins.has(normalizedOrigin(referer))) {
       return res.status(403).json({ error: 'CSRF Protection: Invalid request referer.' })
     }
   } else {
@@ -416,6 +441,15 @@ function clampPercent(value) {
   return Math.min(100, Math.max(0, value))
 }
 
+function parseCreditPackages(raw) {
+  const values = String(raw || '')
+    .split(',')
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value) && value >= 5 && value <= 100_000)
+  const unique = [...new Set(values.map((value) => Number(value.toFixed(2))))]
+  return unique.length ? unique : [50, 100, 500, 2000]
+}
+
 function toNumber(value, fallback = 0) {
   const n = Number(value)
   return Number.isFinite(n) ? n : fallback
@@ -627,6 +661,57 @@ function toMoneyAmount(tokens) {
   return Number(((tokens / 1_000_000) * VRYX_EUR_PER_MILLION).toFixed(4))
 }
 
+function toEuroAmount(value, precision = 6) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 0
+  return Number(n.toFixed(precision))
+}
+
+function euroFromTokens(tokens) {
+  if (!Number.isFinite(tokens) || tokens <= 0) return 0
+  return toEuroAmount((tokens / 1_000_000) * VRYX_EUR_PER_MILLION)
+}
+
+function estimatePromptTokens(prompt) {
+  return Math.max(1, Math.ceil(String(prompt || '').length / 4))
+}
+
+function estimateEnterpriseQuote(input) {
+  const monthlyTokens = Math.max(1_000_000, Number(input.monthlyTokens || 0))
+  const usageBase = euroFromTokens(monthlyTokens)
+  const offerMultiplier =
+    input.offer === 'private_pool' ? 5
+      : input.offer === 'knowledge_ai' ? 3.5
+        : input.offer === 'custom_ai' ? 7
+          : 1.8
+  const privacyMultiplier =
+    input.privacyLevel === 'no_retention' ? 1.45
+      : input.privacyLevel === 'private_pool' ? 1.65
+        : input.privacyLevel === 'eu_only' ? 1.2
+          : 1
+  const dedicatedWorkerBase = Math.max(0, Number(input.dedicatedWorkers || 0)) * 950
+  const fineTuningSetup = input.fineTuning ? 4500 : 0
+  const monthlyMin =
+    input.offer === 'api' ? 250
+      : input.offer === 'knowledge_ai' ? 1500
+        : input.offer === 'private_pool' ? 3500
+          : 6000
+  const monthlyEstimate = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier + dedicatedWorkerBase)
+  const setupEstimate = input.offer === 'api' ? 0 : 2500 + fineTuningSetup
+  return {
+    monthlyEstimateEur: toEuroAmount(monthlyEstimate, 2),
+    setupEstimateEur: toEuroAmount(setupEstimate, 2),
+    unitTokenCostEurPerMillion: VRYX_EUR_PER_MILLION,
+    assumptions: {
+      monthlyTokens,
+      offerMultiplier,
+      privacyMultiplier,
+      dedicatedWorkers: Math.max(0, Number(input.dedicatedWorkers || 0)),
+      fineTuning: Boolean(input.fineTuning),
+    },
+  }
+}
+
 function newApiKeyPrefix() {
   return `vel_sk_live_${crypto.randomBytes(24).toString('hex')}`
 }
@@ -639,10 +724,32 @@ function sha256Hex(raw) {
   return crypto.createHash('sha256').update(String(raw || '')).digest('hex')
 }
 
-if (!JWT_SECRET || JWT_SECRET.length < 32) {
-  console.error('FATAL: JWT_SECRET manquant ou trop court (minimum 32 caractères). Copiez server/env.example vers server/.env.')
-  process.exit(1)
+function validateSecurityConfig() {
+  const fatal = []
+  if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    fatal.push('JWT_SECRET manquant ou trop court (minimum 32 caractères). Copiez server/env.example vers server/.env.')
+  }
+  if (IS_PRODUCTION) {
+    if (!WORKER_SECRET || WORKER_SECRET.length < 32) {
+      fatal.push('VRYX_WORKER_SECRET ou WORKER_INFERENCE_DELEGATE_SECRET est obligatoire en production.')
+    }
+    if (!COOKIE_SECURE) {
+      fatal.push('COOKIE_SECURE=true est obligatoire en production.')
+    }
+    if (CORS_ORIGINS.length === 0 || CORS_ORIGINS.some((origin) => origin === '*' || /localhost|127\.0\.0\.1|\[::1\]/i.test(origin))) {
+      fatal.push('CORS_ORIGIN doit contenir uniquement les origines HTTPS publiques autorisées en production.')
+    }
+    if (RAW_ALLOW_UNSECURE_WORKERS) {
+      console.warn('WARN: ALLOW_UNSECURE_WORKERS=1 est ignoré en production; les routes workers restent fail-closed.')
+    }
+  }
+  if (fatal.length > 0) {
+    for (const message of fatal) console.error(`FATAL: ${message}`)
+    process.exit(1)
+  }
 }
+
+validateSecurityConfig()
 
 const emailSchema = z
   .string()
@@ -680,6 +787,27 @@ const googleFinishSchema = z.object({
 
 const accountApiKeySchema = z.object({
   name: z.string().trim().min(1, 'Le libellé de la clé est requis.').max(80, 'Libellé trop long.'),
+})
+
+const accountCheckoutSchema = z.object({
+  amountEur: z.number().min(5).max(100_000),
+})
+
+const adminCreditSchema = z.object({
+  amountEur: z.number().min(-100_000).max(100_000).refine((value) => Math.abs(value) >= 0.000001, 'Montant nul.'),
+  description: z.string().trim().max(240).optional().default('Ajustement admin'),
+})
+
+const enterpriseQuoteSchema = z.object({
+  company: z.string().trim().min(2).max(160),
+  email: emailSchema,
+  offer: z.enum(['api', 'private_pool', 'knowledge_ai', 'custom_ai']),
+  monthlyTokens: z.number().min(1_000_000).max(50_000_000_000),
+  latencyTargetMs: z.number().min(250).max(60_000),
+  privacyLevel: z.enum(['standard', 'eu_only', 'private_pool', 'no_retention']),
+  fineTuning: z.boolean().optional().default(false),
+  dedicatedWorkers: z.number().int().min(0).max(128).optional().default(0),
+  notes: z.string().trim().max(2000).optional().default(''),
 })
 
 const pool = mysql.createPool({
@@ -1778,6 +1906,72 @@ async function ensureApiKeyUsageTable() {
   `)
 }
 
+async function ensureBillingTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_credit_ledger (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      type ENUM('credit_purchase','usage_debit','admin_adjustment','refund') NOT NULL,
+      amount_eur DECIMAL(12,6) NOT NULL,
+      currency CHAR(3) NOT NULL DEFAULT 'EUR',
+      description VARCHAR(240) NULL,
+      reference_type VARCHAR(80) NULL,
+      reference_id VARCHAR(120) NULL,
+      metadata_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_billing_ledger_user_time (user_id, created_at),
+      KEY idx_billing_ledger_reference (reference_type, reference_id),
+      CONSTRAINT fk_billing_ledger_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS billing_checkout_sessions (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      provider VARCHAR(40) NOT NULL DEFAULT 'stripe',
+      provider_session_id VARCHAR(120) NULL,
+      amount_eur DECIMAL(12,6) NOT NULL,
+      currency CHAR(3) NOT NULL DEFAULT 'EUR',
+      status VARCHAR(40) NOT NULL DEFAULT 'created',
+      checkout_url TEXT NULL,
+      metadata_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_billing_checkout_provider_session (provider, provider_session_id),
+      KEY idx_billing_checkout_user_time (user_id, created_at),
+      CONSTRAINT fk_billing_checkout_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+}
+
+async function ensureEnterpriseQuoteRequestsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS enterprise_quote_requests (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      company VARCHAR(160) NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      offer VARCHAR(40) NOT NULL,
+      monthly_tokens BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      latency_target_ms INT UNSIGNED NOT NULL DEFAULT 0,
+      privacy_level VARCHAR(40) NOT NULL,
+      fine_tuning TINYINT(1) NOT NULL DEFAULT 0,
+      dedicated_workers INT UNSIGNED NOT NULL DEFAULT 0,
+      monthly_estimate_eur DECIMAL(12,2) NOT NULL DEFAULT 0,
+      setup_estimate_eur DECIMAL(12,2) NOT NULL DEFAULT 0,
+      status VARCHAR(40) NOT NULL DEFAULT 'new',
+      notes TEXT NULL,
+      quote_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_enterprise_quotes_status_created (status, created_at),
+      KEY idx_enterprise_quotes_email (email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+}
+
 async function ensureForcedAdmins() {
   if (FORCED_ADMIN_EMAILS.length === 0) return
   for (const email of FORCED_ADMIN_EMAILS) {
@@ -1900,6 +2094,57 @@ async function requireApiKey(req, res, next) {
   }
 }
 
+async function getUserCreditBalance(userId, conn = pool) {
+  const [[row]] = await conn.query(
+    `SELECT COALESCE(SUM(amount_eur), 0) AS balance
+     FROM billing_credit_ledger
+     WHERE user_id = :userId`,
+    { userId },
+  )
+  return toEuroAmount(row?.balance || 0)
+}
+
+async function insertBillingLedgerEntry(conn, {
+  userId,
+  type,
+  amountEur,
+  description = null,
+  referenceType = null,
+  referenceId = null,
+  metadata = null,
+}) {
+  const amount = toEuroAmount(amountEur)
+  await conn.query(
+    `INSERT INTO billing_credit_ledger
+       (user_id, type, amount_eur, currency, description, reference_type, reference_id, metadata_json)
+     VALUES
+       (:userId, :type, :amountEur, 'EUR', :description, :referenceType, :referenceId, :metadataJson)`,
+    {
+      userId,
+      type,
+      amountEur: amount,
+      description: description ? String(description).slice(0, 240) : null,
+      referenceType: referenceType ? String(referenceType).slice(0, 80) : null,
+      referenceId: referenceId ? String(referenceId).slice(0, 120) : null,
+      metadataJson: metadata ? JSON.stringify(metadata) : null,
+    },
+  )
+  return amount
+}
+
+async function ensureApiCreditForRequest(req, { prompt, maxTokens }) {
+  const userId = Number(req.apiUser?.id)
+  if (!Number.isFinite(userId) || userId <= 0) return { ok: true, estimatedCostEur: 0, balanceEur: 0 }
+  const estimatedTokens = estimatePromptTokens(prompt) + Math.max(1, Math.floor(Number(maxTokens) || 0))
+  const estimatedCostEur = euroFromTokens(estimatedTokens)
+  if (!VRYX_BILLING_ENFORCE_CREDITS) return { ok: true, estimatedCostEur, balanceEur: null }
+  const balanceEur = await getUserCreditBalance(userId)
+  if (balanceEur + 0.000001 < estimatedCostEur) {
+    return { ok: false, estimatedCostEur, balanceEur }
+  }
+  return { ok: true, estimatedCostEur, balanceEur }
+}
+
 async function recordApiKeyUsage(req, { model, promptTokens = 0, completionTokens = 0, totalTokens = 0, latencyMs = 0 } = {}) {
   const keyId = Number(req.apiUser?.keyId)
   const userId = Number(req.apiUser?.id)
@@ -1907,9 +2152,11 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
   const prompt = Math.max(0, Math.floor(Number(promptTokens) || 0))
   const completion = Math.max(0, Math.floor(Number(completionTokens) || 0))
   const total = Math.max(prompt + completion, Math.floor(Number(totalTokens) || 0))
-  const cost = Number(((total / 1_000_000) * VRYX_EUR_PER_MILLION).toFixed(6))
-  await pool
-    .query(
+  const cost = euroFromTokens(total)
+  const conn = await pool.getConnection()
+  try {
+    await conn.beginTransaction()
+    const [result] = await conn.query(
       `INSERT INTO api_key_usage
          (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, cost_eur, latency_ms)
        VALUES
@@ -1925,7 +2172,33 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
         latencyMs: Math.max(0, Math.floor(Number(latencyMs) || 0)),
       },
     )
-    .catch((e) => console.error('api key usage insert', e))
+    if (cost > 0) {
+      await insertBillingLedgerEntry(conn, {
+        userId,
+        type: 'usage_debit',
+        amountEur: -cost,
+        description: `Usage API ${typeof model === 'string' ? model.slice(0, 80) : 'Vryx'}`,
+        referenceType: 'api_key_usage',
+        referenceId: String(result.insertId || ''),
+        metadata: {
+          apiKeyId: keyId,
+          model: typeof model === 'string' ? model.slice(0, 120) : null,
+          promptTokens: prompt,
+          completionTokens: completion,
+          totalTokens: total,
+          latencyMs: Math.max(0, Math.floor(Number(latencyMs) || 0)),
+        },
+      })
+    }
+    await conn.commit()
+    return { usageId: String(result.insertId || ''), costEur: cost }
+  } catch (e) {
+    await conn.rollback().catch(() => {})
+    console.error('api key usage insert', e)
+    return null
+  } finally {
+    conn.release()
+  }
 }
 
 /** Vérifie en base que l'utilisateur courant est administrateur. */
@@ -1959,11 +2232,14 @@ app.use(
 )
 app.use(
   cors({
-    origin: CORS_ORIGIN,
+    origin(origin, callback) {
+      if (!origin) return callback(null, true)
+      return callback(null, CORS_ORIGINS.includes(origin.replace(/\/$/, '')))
+    },
     credentials: true,
   }),
 )
-app.use(express.json({ limit: '8mb' }))
+app.use(express.json({ limit: JSON_BODY_LIMIT }))
 app.use(cookieParser())
 app.use(csrfProtection)
 app.use(authMiddleware)
@@ -2005,8 +2281,61 @@ const loginLimiter = rateLimit({
   message: { error: 'Trop de tentatives de connexion. Réessayez plus tard.' },
 })
 
+const enterpriseQuoteLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de demandes Enterprise. Réessayez plus tard.' },
+})
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
+})
+
+app.post('/api/enterprise/quote', enterpriseQuoteLimiter, async (req, res) => {
+  const parsed = enterpriseQuoteSchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Demande Enterprise invalide.'
+    return res.status(400).json({ ok: false, error: first })
+  }
+  const data = parsed.data
+  const estimate = estimateEnterpriseQuote(data)
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO enterprise_quote_requests
+         (company, email, offer, monthly_tokens, latency_target_ms, privacy_level,
+          fine_tuning, dedicated_workers, monthly_estimate_eur, setup_estimate_eur,
+          notes, quote_json)
+       VALUES
+         (:company, :email, :offer, :monthlyTokens, :latencyTargetMs, :privacyLevel,
+          :fineTuning, :dedicatedWorkers, :monthlyEstimateEur, :setupEstimateEur,
+          :notes, :quoteJson)`,
+      {
+        company: data.company,
+        email: data.email.toLowerCase(),
+        offer: data.offer,
+        monthlyTokens: Math.floor(data.monthlyTokens),
+        latencyTargetMs: Math.floor(data.latencyTargetMs),
+        privacyLevel: data.privacyLevel,
+        fineTuning: data.fineTuning ? 1 : 0,
+        dedicatedWorkers: Math.floor(data.dedicatedWorkers || 0),
+        monthlyEstimateEur: estimate.monthlyEstimateEur,
+        setupEstimateEur: estimate.setupEstimateEur,
+        notes: data.notes || null,
+        quoteJson: JSON.stringify({ input: data, estimate }),
+      },
+    )
+    res.json({
+      ok: true,
+      id: String(result.insertId || ''),
+      status: 'new',
+      estimate,
+    })
+  } catch (e) {
+    console.error('enterprise/quote', e)
+    res.status(500).json({ ok: false, error: 'Impossible d’enregistrer la demande Enterprise.' })
+  }
 })
 
 const openAiRouter = express.Router()
@@ -2750,6 +3079,16 @@ openAiRouter.post('/chat/completions', async (req, res) => {
     }
     return res.json(openAiToolCallResponse({ id, created, model, toolCall: directToolCall }))
   }
+  const creditCheck = await ensureApiCreditForRequest(req, { prompt, maxTokens })
+  if (!creditCheck.ok) {
+    return res.status(402).json({
+      error: {
+        message: `Crédits API insuffisants. Solde ${toEuroAmount(creditCheck.balanceEur, 4)} €, coût estimé ${toEuroAmount(creditCheck.estimatedCostEur, 4)} €.`,
+        type: 'insufficient_quota',
+        code: 'insufficient_vryx_credits',
+      },
+    })
+  }
   const requestedQuantization = ['q4', 'int8', 'fp16'].includes(req.body?.quantization) ? req.body.quantization : 'q4'
   const chatBody = {
     prompt,
@@ -3268,13 +3607,26 @@ accountRouter.get('/overview', async (req, res) => {
       'SELECT COUNT(*) AS activeApiKeys FROM api_keys WHERE user_id = :userId AND revoked_at IS NULL',
       { userId },
     )
+    const [[apiUsageMonth]] = await pool.query(
+      `SELECT COUNT(*) AS apiRequests,
+              COALESCE(SUM(total_tokens), 0) AS apiTokens,
+              COALESCE(SUM(cost_eur), 0) AS apiCostEur
+       FROM api_key_usage
+       WHERE user_id = :userId
+         AND created_at >= :monthStart`,
+      { userId, monthStart },
+    )
 
-    const requestsThisMonth = Number(sessionRows.length)
+    const apiTokensMonth = Number(apiUsageMonth?.apiTokens || 0)
+    const apiCostMonth = Number(apiUsageMonth?.apiCostEur || 0)
+    monthTokens += apiTokensMonth
+    const requestsThisMonth = Number(sessionRows.length) + Number(apiUsageMonth?.apiRequests || 0)
     const usagePercent = clampPercent((monthTokens / VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET) * 100)
-    const spendThisMonth = toMoneyAmount(monthTokens)
+    const spendThisMonth = toEuroAmount(toMoneyAmount(monthTokens - apiTokensMonth) + apiCostMonth, 4)
     const costPerMillionTokens = monthTokens > 0 ? spendThisMonth / (monthTokens / 1_000_000) : toMoneyAmount(1_000_000)
     const estimatedGrossMarginEur = spendThisMonth * (VRYX_ESTIMATED_GROSS_MARGIN / 100)
     const estimatedWorkerRewardsEur = spendThisMonth * (VRYX_WORKER_REWARD_SHARE / 100)
+    const creditBalance = await getUserCreditBalance(userId)
     const [workerRows] = await pool.query(
       `SELECT
          COUNT(*) AS totalWorkers,
@@ -3294,7 +3646,7 @@ accountRouter.get('/overview', async (req, res) => {
       plan: ACCOUNT_PLAN_NAME,
       monthlyTokenBudget: VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET,
       balanceCurrency: 'EUR',
-      balanceCredits: toMoneyAmount(Math.max(0, VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET - monthTokens)),
+      balanceCredits: creditBalance,
       usagePercent,
       tokensUsed: monthTokens,
       tokensQuota: VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET,
@@ -3324,6 +3676,120 @@ accountRouter.get('/overview', async (req, res) => {
   } catch (e) {
     console.error('account/overview', e)
     res.status(500).json({ error: 'Impossible de charger le résumé de compte.' })
+  }
+})
+
+accountRouter.get('/billing', async (req, res) => {
+  try {
+    const userId = req.user.id
+    const [ledgerRows] = await pool.query(
+      `SELECT id, type, amount_eur AS amountEur, currency, description,
+              reference_type AS referenceType, reference_id AS referenceId, created_at AS createdAt
+       FROM billing_credit_ledger
+       WHERE user_id = :userId
+       ORDER BY created_at DESC, id DESC
+       LIMIT 100`,
+      { userId },
+    )
+    const [[usageMonth]] = await pool.query(
+      `SELECT COUNT(*) AS requestCount,
+              COALESCE(SUM(total_tokens), 0) AS totalTokens,
+              COALESCE(SUM(cost_eur), 0) AS costEur
+       FROM api_key_usage
+       WHERE user_id = :userId
+         AND created_at >= DATE_FORMAT(CURRENT_DATE, '%Y-%m-01')`,
+      { userId },
+    )
+    res.json({
+      ok: true,
+      currency: 'EUR',
+      balanceEur: await getUserCreditBalance(userId),
+      enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
+      checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
+      packages: VRYX_BILLING_CREDIT_PACKAGES,
+      monthUsage: {
+        requestCount: Number(usageMonth?.requestCount || 0),
+        totalTokens: Number(usageMonth?.totalTokens || 0),
+        costEur: Number(usageMonth?.costEur || 0),
+      },
+      ledger: ledgerRows.map((row) => ({
+        id: String(row.id),
+        type: row.type,
+        amountEur: Number(row.amountEur || 0),
+        currency: row.currency || 'EUR',
+        description: row.description || '',
+        referenceType: row.referenceType || null,
+        referenceId: row.referenceId || null,
+        createdAt: toIsoDate(row.createdAt),
+      })),
+    })
+  } catch (e) {
+    console.error('account/billing', e)
+    res.status(500).json({ error: 'Impossible de charger la facturation.' })
+  }
+})
+
+accountRouter.post('/billing/checkout', async (req, res) => {
+  const parsed = accountCheckoutSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Montant invalide.' })
+  const amountEur = toEuroAmount(parsed.data.amountEur, 2)
+  if (!VRYX_BILLING_CREDIT_PACKAGES.includes(amountEur)) {
+    return res.status(400).json({ error: 'Pack de crédits indisponible.' })
+  }
+  if (!STRIPE_SECRET_KEY) {
+    return res.status(501).json({ error: 'Checkout Stripe non configuré côté serveur.' })
+  }
+  try {
+    const userId = String(req.user.id)
+    const successUrl = `${VRYX_APP_BASE_URL}/compte/facturation?checkout=success`
+    const cancelUrl = `${VRYX_APP_BASE_URL}/compte/facturation?checkout=cancelled`
+    const params = new URLSearchParams()
+    params.set('mode', 'payment')
+    params.set('success_url', successUrl)
+    params.set('cancel_url', cancelUrl)
+    params.set('client_reference_id', userId)
+    params.set('customer_email', req.user.email || '')
+    params.set('line_items[0][quantity]', '1')
+    params.set('line_items[0][price_data][currency]', 'eur')
+    params.set('line_items[0][price_data][unit_amount]', String(Math.round(amountEur * 100)))
+    params.set('line_items[0][price_data][product_data][name]', `Crédits API Vryx ${amountEur} EUR`)
+    params.set('metadata[user_id]', userId)
+    params.set('metadata[vryx_credit_amount_eur]', String(amountEur))
+    const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params,
+    })
+    const stripeData = await stripeRes.json().catch(() => null)
+    if (!stripeRes.ok || !stripeData?.id || !stripeData?.url) {
+      return res.status(502).json({ error: String(stripeData?.error?.message || 'Stripe a refusé la session checkout.') })
+    }
+    await pool.query(
+      `INSERT INTO billing_checkout_sessions
+         (user_id, provider, provider_session_id, amount_eur, currency, status, checkout_url, metadata_json)
+       VALUES
+         (:userId, 'stripe', :providerSessionId, :amountEur, 'EUR', :status, :checkoutUrl, :metadataJson)
+       ON DUPLICATE KEY UPDATE
+         status = VALUES(status),
+         checkout_url = VALUES(checkout_url),
+         metadata_json = VALUES(metadata_json),
+         updated_at = CURRENT_TIMESTAMP`,
+      {
+        userId,
+        providerSessionId: stripeData.id,
+        amountEur,
+        status: String(stripeData.status || 'created').slice(0, 40),
+        checkoutUrl: stripeData.url,
+        metadataJson: JSON.stringify({ stripe: { id: stripeData.id }, amountEur }),
+      },
+    )
+    res.json({ ok: true, provider: 'stripe', sessionId: stripeData.id, url: stripeData.url })
+  } catch (e) {
+    console.error('account/billing/checkout', e)
+    res.status(500).json({ error: 'Impossible de créer le paiement.' })
   }
 })
 
@@ -3913,6 +4379,86 @@ accountRouter.delete('/sessions', async (req, res) => {
 })
 
 app.use('/api/account', accountRouter)
+
+app.post('/api/billing/stripe/webhook', async (req, res) => {
+  if (!STRIPE_SECRET_KEY) return res.status(501).json({ ok: false, error: 'Stripe non configuré.' })
+  try {
+    const eventId = typeof req.body?.id === 'string' ? req.body.id : ''
+    let event = req.body
+    if (eventId) {
+      const stripeRes = await fetch(`https://api.stripe.com/v1/events/${encodeURIComponent(eventId)}`, {
+        headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}` },
+      })
+      const stripeEvent = await stripeRes.json().catch(() => null)
+      if (stripeRes.ok && stripeEvent?.id) event = stripeEvent
+    }
+    const type = String(event?.type || '')
+    if (type !== 'checkout.session.completed') return res.json({ ok: true, ignored: type || 'unknown' })
+    const session = event?.data?.object || {}
+    if (session.payment_status && session.payment_status !== 'paid') {
+      return res.json({ ok: true, ignored: `payment_status=${session.payment_status}` })
+    }
+    const providerSessionId = String(session.id || '')
+    const userId = Number(session.metadata?.user_id || session.client_reference_id || 0)
+    const amountEur = toEuroAmount(
+      Number(session.metadata?.vryx_credit_amount_eur || 0) || Number(session.amount_total || 0) / 100,
+    )
+    if (!providerSessionId || !Number.isFinite(userId) || userId <= 0 || amountEur <= 0) {
+      return res.status(400).json({ ok: false, error: 'Webhook Stripe incomplet.' })
+    }
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+      await conn.query(
+        `INSERT INTO billing_checkout_sessions
+           (user_id, provider, provider_session_id, amount_eur, currency, status, checkout_url, metadata_json)
+         VALUES
+           (:userId, 'stripe', :providerSessionId, :amountEur, 'EUR', 'paid', :checkoutUrl, :metadataJson)
+         ON DUPLICATE KEY UPDATE
+           status = 'paid',
+           amount_eur = VALUES(amount_eur),
+           metadata_json = VALUES(metadata_json),
+           updated_at = CURRENT_TIMESTAMP`,
+        {
+          userId,
+          providerSessionId,
+          amountEur,
+          checkoutUrl: session.url || null,
+          metadataJson: JSON.stringify({ eventId: event.id || null, providerSessionId, amountEur }),
+        },
+      )
+      const [existing] = await conn.query(
+        `SELECT id FROM billing_credit_ledger
+         WHERE user_id = :userId
+           AND reference_type = 'stripe_checkout_session'
+           AND reference_id = :providerSessionId
+         LIMIT 1`,
+        { userId, providerSessionId },
+      )
+      if (!existing[0]) {
+        await insertBillingLedgerEntry(conn, {
+          userId,
+          type: 'credit_purchase',
+          amountEur,
+          description: `Achat crédits Stripe ${amountEur} EUR`,
+          referenceType: 'stripe_checkout_session',
+          referenceId: providerSessionId,
+          metadata: { eventId: event.id || null, paymentIntent: session.payment_intent || null },
+        })
+      }
+      await conn.commit()
+      res.json({ ok: true, credited: !existing[0], amountEur, userId: String(userId) })
+    } catch (e) {
+      await conn.rollback().catch(() => {})
+      throw e
+    } finally {
+      conn.release()
+    }
+  } catch (e) {
+    console.error('billing/stripe/webhook', e)
+    res.status(500).json({ ok: false, error: 'Webhook billing impossible.' })
+  }
+})
 
 app.get('/compte', async (req, res) => {
   const code = typeof req.query.code === 'string' ? req.query.code : ''
@@ -4568,7 +5114,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
       release?.version &&
       (release.macSha256 || release.winX64Sha256 || release.winArm64Sha256 || release.runtimeSha256) &&
       version &&
-      process.env.ALLOW_UNSECURE_WORKERS !== '1' &&
+      !ALLOW_UNSECURE_WORKERS &&
       compareVersionLike(version, release.version) < 0
     ) {
       const [existingUpdate] = await pool.query(
@@ -4677,7 +5223,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
 // Limiteur partagé par le chat P2P admin (rate-limit côté initiateur).
 const chatLimiter = rateLimit({ windowMs: 60_000, max: 20, message: { error: 'Trop de requêtes.' } })
 
-app.get('/api/workers/status', async (_req, res) => {
+app.get('/api/workers/status', requireWorkerSecret, async (_req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT peer_id, mode, grpc_port, p2p_port, public_ip, version,
@@ -4695,6 +5241,7 @@ app.get('/api/workers/status', async (_req, res) => {
               TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
        FROM workers
        WHERE TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :offline
+         AND mode = 'worker'
          AND desired_state = 'active'
        ORDER BY last_heartbeat_at DESC`,
       { offline: WORKER_OFFLINE_SEC },
@@ -4747,7 +5294,8 @@ app.get('/api/workers/network-stats', async (_req, res) => {
           COUNT(*) AS registeredWorkers,
           SUM(tokens_generated) AS totalTokensGenerated,
           SUM(TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :offline) AS onlineCount
-       FROM workers`,
+       FROM workers
+       WHERE mode = 'worker'`,
       { offline: WORKER_OFFLINE_SEC },
     )
     const [[ledger]] = await pool.query(
@@ -4807,6 +5355,11 @@ app.get('/api/public/scheduler-preview', async (req, res) => {
   }
 })
 
+function publicBenchmarkError(error) {
+  if (!error) return null
+  return 'Benchmark échoué. Détails complets réservés à l’admin.'
+}
+
 app.get('/api/public/benchmarks', async (req, res) => {
   try {
     const model = normalizeP2pModelId(String(req.query.model || '')) || null
@@ -4861,7 +5414,7 @@ app.get('/api/public/benchmarks', async (req, res) => {
         completionTokens: Number(row.completionTokens || 0),
         totalTokens: Number(row.totalTokens || 0),
         costPerMillionEur: Number(row.costPerMillionEur || 0),
-        error: row.error || null,
+        error: publicBenchmarkError(row.error),
         createdAt: row.createdAt,
       })),
     })
@@ -4879,6 +5432,129 @@ const adminRouter = express.Router()
 adminRouter.use(requireAdmin)
 registerObservabilityRoutes(adminRouter, observability)
 registerAdminInferenceRoutes(adminRouter, { pool })
+
+adminRouter.get('/billing/summary', async (_req, res) => {
+  try {
+    const [[totals]] = await pool.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN amount_eur > 0 THEN amount_eur ELSE 0 END), 0) AS credits,
+        COALESCE(SUM(CASE WHEN amount_eur < 0 THEN -amount_eur ELSE 0 END), 0) AS debits,
+        COALESCE(SUM(amount_eur), 0) AS balance,
+        COUNT(DISTINCT user_id) AS usersWithLedger
+      FROM billing_credit_ledger
+    `)
+    const [recent] = await pool.query(
+      `SELECT l.id, l.user_id AS userId, u.email, l.type, l.amount_eur AS amountEur,
+              l.description, l.created_at AS createdAt
+       FROM billing_credit_ledger l
+       JOIN users u ON u.id = l.user_id
+       ORDER BY l.created_at DESC, l.id DESC
+       LIMIT 50`,
+    )
+    res.json({
+      ok: true,
+      currency: 'EUR',
+      enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
+      checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
+      packages: VRYX_BILLING_CREDIT_PACKAGES,
+      totals: {
+        creditsEur: Number(totals?.credits || 0),
+        debitsEur: Number(totals?.debits || 0),
+        balanceEur: Number(totals?.balance || 0),
+        usersWithLedger: Number(totals?.usersWithLedger || 0),
+      },
+      recent: recent.map((row) => ({
+        id: String(row.id),
+        userId: String(row.userId),
+        email: row.email,
+        type: row.type,
+        amountEur: Number(row.amountEur || 0),
+        description: row.description || '',
+        createdAt: toIsoDate(row.createdAt),
+      })),
+    })
+  } catch (e) {
+    console.error('admin/billing/summary', e)
+    res.status(500).json({ ok: false, error: 'Erreur synthèse billing.' })
+  }
+})
+
+adminRouter.get('/enterprise/quotes', async (req, res) => {
+  try {
+    const status = String(req.query.status || '').trim()
+    const where = status ? 'WHERE status = :status' : ''
+    const [rows] = await pool.query(
+      `SELECT id, company, email, offer, monthly_tokens AS monthlyTokens,
+              latency_target_ms AS latencyTargetMs, privacy_level AS privacyLevel,
+              fine_tuning AS fineTuning, dedicated_workers AS dedicatedWorkers,
+              monthly_estimate_eur AS monthlyEstimateEur, setup_estimate_eur AS setupEstimateEur,
+              status, notes, created_at AS createdAt, updated_at AS updatedAt
+       FROM enterprise_quote_requests
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT 200`,
+      { status },
+    )
+    res.json({
+      ok: true,
+      quotes: rows.map((row) => ({
+        id: String(row.id),
+        company: row.company,
+        email: row.email,
+        offer: row.offer,
+        monthlyTokens: Number(row.monthlyTokens || 0),
+        latencyTargetMs: Number(row.latencyTargetMs || 0),
+        privacyLevel: row.privacyLevel,
+        fineTuning: Boolean(row.fineTuning),
+        dedicatedWorkers: Number(row.dedicatedWorkers || 0),
+        monthlyEstimateEur: Number(row.monthlyEstimateEur || 0),
+        setupEstimateEur: Number(row.setupEstimateEur || 0),
+        status: row.status,
+        notes: row.notes || '',
+        createdAt: toIsoDate(row.createdAt),
+        updatedAt: toIsoDate(row.updatedAt),
+      })),
+    })
+  } catch (e) {
+    console.error('admin/enterprise/quotes', e)
+    res.status(500).json({ ok: false, error: 'Erreur lecture demandes Enterprise.' })
+  }
+})
+
+adminRouter.post('/billing/users/:id/credit', async (req, res) => {
+  const parsed = adminCreditSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Montant ou description invalide.' })
+  const userId = Number(req.params.id)
+  if (!Number.isFinite(userId) || userId <= 0) return res.status(400).json({ error: 'Utilisateur invalide.' })
+  try {
+    const [users] = await pool.query('SELECT id FROM users WHERE id = :userId LIMIT 1', { userId })
+    if (!users[0]) return res.status(404).json({ error: 'Utilisateur introuvable.' })
+    const conn = await pool.getConnection()
+    try {
+      await conn.beginTransaction()
+      await insertBillingLedgerEntry(conn, {
+        userId,
+        type: parsed.data.amountEur >= 0 ? 'admin_adjustment' : 'refund',
+        amountEur: parsed.data.amountEur,
+        description: parsed.data.description,
+        referenceType: 'admin_adjustment',
+        referenceId: `admin-${Date.now().toString(36)}`,
+        metadata: { adminUserId: String(req.user.id) },
+      })
+      const balanceEur = await getUserCreditBalance(userId, conn)
+      await conn.commit()
+      res.json({ ok: true, userId: String(userId), balanceEur })
+    } catch (e) {
+      await conn.rollback().catch(() => {})
+      throw e
+    } finally {
+      conn.release()
+    }
+  } catch (e) {
+    console.error('admin/billing/users credit', e)
+    res.status(500).json({ error: 'Impossible d’ajuster les crédits.' })
+  }
+})
 
 adminRouter.get('/site/stats', async (_req, res) => {
   try {
@@ -4925,14 +5601,29 @@ adminRouter.get('/users', async (req, res) => {
     let rows
     if (search) {
       ;[rows] = await pool.query(
-        `SELECT id, email, is_admin AS isAdmin, created_at AS createdAt, last_login_at AS lastLoginAt
-         FROM users WHERE LOWER(email) LIKE :q ORDER BY created_at DESC LIMIT 500`,
+        `SELECT u.id, u.email, u.is_admin AS isAdmin, u.created_at AS createdAt, u.last_login_at AS lastLoginAt,
+                COALESCE(b.balanceEuro, 0) AS balanceEuro
+         FROM users u
+         LEFT JOIN (
+           SELECT user_id, SUM(amount_eur) AS balanceEuro
+           FROM billing_credit_ledger
+           GROUP BY user_id
+         ) b ON b.user_id = u.id
+         WHERE LOWER(u.email) LIKE :q
+         ORDER BY u.created_at DESC LIMIT 500`,
         { q: `%${search}%` },
       )
     } else {
       ;[rows] = await pool.query(
-        `SELECT id, email, is_admin AS isAdmin, created_at AS createdAt, last_login_at AS lastLoginAt
-         FROM users ORDER BY created_at DESC LIMIT 500`,
+        `SELECT u.id, u.email, u.is_admin AS isAdmin, u.created_at AS createdAt, u.last_login_at AS lastLoginAt,
+                COALESCE(b.balanceEuro, 0) AS balanceEuro
+         FROM users u
+         LEFT JOIN (
+           SELECT user_id, SUM(amount_eur) AS balanceEuro
+           FROM billing_credit_ledger
+           GROUP BY user_id
+         ) b ON b.user_id = u.id
+         ORDER BY u.created_at DESC LIMIT 500`,
       )
     }
     res.json({
@@ -4940,6 +5631,7 @@ adminRouter.get('/users', async (req, res) => {
         id: String(r.id),
         email: r.email,
         isAdmin: !!r.isAdmin,
+        balanceEuro: Number(r.balanceEuro || 0),
         createdAt: r.createdAt,
         lastLoginAt: r.lastLoginAt,
       })),
@@ -4954,9 +5646,18 @@ adminRouter.get('/users/:id', async (req, res) => {
   const id = String(req.params.id)
   try {
     const [userRows] = await pool.query(
-      `SELECT id, email, is_admin AS isAdmin, google_id AS googleId,
-              created_at AS createdAt, updated_at AS updatedAt, last_login_at AS lastLoginAt
-       FROM users WHERE id = :id LIMIT 1`,
+      `SELECT u.id, u.email, u.is_admin AS isAdmin, u.google_id AS googleId,
+              u.created_at AS createdAt, u.updated_at AS updatedAt, u.last_login_at AS lastLoginAt,
+              COALESCE(b.balanceEuro, 0) AS balanceEuro
+       FROM users u
+       LEFT JOIN (
+         SELECT user_id, SUM(amount_eur) AS balanceEuro
+         FROM billing_credit_ledger
+         WHERE user_id = :id
+         GROUP BY user_id
+       ) b ON b.user_id = u.id
+       WHERE u.id = :id
+       LIMIT 1`,
       { id },
     )
     const user = userRows[0]
@@ -5030,6 +5731,7 @@ adminRouter.get('/users/:id', async (req, res) => {
         email: user.email,
         isAdmin: Boolean(user.isAdmin),
         googleLinked: Boolean(user.googleId),
+        balanceEuro: Number(user.balanceEuro || 0),
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
         lastLoginAt: user.lastLoginAt,
@@ -6659,7 +7361,12 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       if (isWorkerError) {
         try {
           const [stRes, initRes] = await Promise.allSettled([
-            fetch(`http://127.0.0.1:${PORT}/api/workers/status`, { headers: { Accept: 'application/json' } }),
+            fetch(`http://127.0.0.1:${PORT}/api/workers/status`, {
+              headers: {
+                Accept: 'application/json',
+                ...(WORKER_SECRET ? { Authorization: `Bearer ${WORKER_SECRET}` } : {}),
+              },
+            }),
             fetch('http://127.0.0.1:3031/api/status', { headers: { Accept: 'application/json' } }),
           ])
           const stBody = stRes.status === 'fulfilled' ? await stRes.value.json().catch(() => null) : null
@@ -7189,6 +7896,8 @@ async function start() {
   await ensureP2pChatSessionsTable()
   await ensureApiKeysTable()
   await ensureApiKeyUsageTable()
+  await ensureBillingTables()
+  await ensureEnterpriseQuoteRequestsTable()
   await ensureForcedAdmins()
   nodeMonitor.startSampling()
   app.listen(PORT, '127.0.0.1', () => {

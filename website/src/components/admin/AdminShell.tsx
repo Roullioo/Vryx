@@ -92,6 +92,8 @@ const navItems: NavItem[] = [
   { to: '/admin/workers', label: 'Workers', icon: <IconWorkers /> },
   { to: '/admin/sessions', label: 'Sessions', icon: <IconSessions /> },
   { to: '/admin/observabilite', label: 'Observabilité', icon: <IconPulse /> },
+  { to: '/admin/production-readiness', label: 'Readiness', icon: <IconPulse /> },
+  { to: '/admin/enterprise', label: 'Enterprise', icon: <IconGrid /> },
   { to: '/admin/utilisateurs', label: 'Utilisateurs', icon: <IconUsers /> },
 ]
 

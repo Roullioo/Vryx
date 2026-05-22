@@ -179,8 +179,9 @@ Schéma **créé et migré automatiquement** au démarrage de `website/server/sr
 | `POST` | `/api/auth/login` | Connexion (cookie JWT) |
 | `POST` | `/api/auth/logout` | Déconnexion |
 | `GET` | `/api/auth/me` | Session courante |
-| `POST` | `/api/workers/heartbeat` | Enregistrement / mise à jour worker en DB |
-| `GET` | `/api/workers/status` | Workers actifs (seuil `WORKER_OFFLINE_SEC`) |
+| `POST` | `/api/workers/heartbeat` | Enregistrement / mise à jour worker en DB, secret worker requis |
+| `GET` | `/api/workers/status` | Registre workers actif authentifié (seuil `WORKER_OFFLINE_SEC`) |
+| `GET` | `/api/public/network-status` | Statut public redacted pour la page Live Network |
 
 #### Routes internes (accès restreint)
 

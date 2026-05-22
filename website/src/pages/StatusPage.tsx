@@ -9,12 +9,15 @@ type PublicWorker = {
   live: boolean
   model: string | null
   gpuName: string | null
+  gpuClass?: string
   gpuVramGb: number | null
   allocatedVramGb: number | null
+  memoryTier?: string
   runtimeBackend: string
   weightQuantization: string
-  tokensGenerated: number
-  secondsSinceHeartbeat: number
+  tokensGenerated?: number
+  presence?: string
+  uptimeBucket?: string
 }
 
 type PublicModel = {
@@ -273,7 +276,7 @@ export function StatusPage() {
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0">
                           <p className="font-mono text-sm font-bold text-cyan-100">{worker.peerLabel}</p>
-                          <p className="mt-1 truncate text-sm text-white/55">{worker.gpuName || 'GPU non déclaré'}</p>
+                          <p className="mt-1 truncate text-sm text-white/55">{worker.gpuName || worker.gpuClass || 'Hardware masqué'}</p>
                         </div>
                         <span className="rounded-full bg-cyan-300/15 px-3 py-1 text-xs font-bold text-cyan-100">
                           {worker.runtimeBackend}
@@ -281,9 +284,9 @@ export function StatusPage() {
                       </div>
                       <p className="mt-3 truncate text-xs text-white/45">{worker.model || 'Modèle non déclaré'}</p>
                       <div className="mt-3 flex flex-wrap gap-2 text-xs text-white/50">
-                        <span>{worker.allocatedVramGb || 0} Go alloués</span>
+                        <span>{worker.allocatedVramGb ? `${worker.allocatedVramGb} Go alloués` : worker.memoryTier || 'VRAM masquée'}</span>
                         <span>{worker.weightQuantization}</span>
-                        <span>{fmtInt(worker.tokensGenerated)} tokens</span>
+                        <span>{worker.uptimeBucket || worker.presence || 'live'}</span>
                       </div>
                     </div>
                   ))

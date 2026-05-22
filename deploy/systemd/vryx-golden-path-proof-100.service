@@ -1,5 +1,5 @@
 [Unit]
-Description=VRYX golden path benchmark recorder
+Description=VRYX investor golden path proof - 100 requests
 After=network-online.target mysql.service vryx-api.service vryx-initiator.service
 Wants=network-online.target
 
@@ -8,17 +8,20 @@ Type=oneshot
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/var/www/vryx/server
+TimeoutStartSec=3600
 EnvironmentFile=/var/www/vryx/server/.env
 Environment=VRYX_ROOT_DIR=/var/www/vryx
 Environment=VRYX_GOLDEN_BENCH_MODEL=Qwen/Qwen3.6-35B-A3B
 Environment=VRYX_GOLDEN_BENCH_QUANT=q4
 Environment=VRYX_GOLDEN_BENCH_POOL=auto
 Environment=VRYX_GOLDEN_BENCH_TARGET_TPS=10
-Environment=VRYX_GOLDEN_BENCH_TOKENS=128,256
-Environment=VRYX_GOLDEN_BENCH_ARTIFACT_DIR=/var/www/vryx/var/golden-path
-Environment=VRYX_GOLDEN_BENCH_MIN_REQUESTS=2
+Environment=VRYX_GOLDEN_BENCH_TOKENS=64,128
+Environment=VRYX_GOLDEN_BENCH_REPEAT=50
+Environment=VRYX_GOLDEN_BENCH_ARTIFACT_DIR=/var/www/vryx/var/golden-path-proof-100
+Environment=VRYX_GOLDEN_BENCH_MIN_REQUESTS=100
 Environment=VRYX_GOLDEN_BENCH_MIN_SUCCESS_RATE=99
 Environment=VRYX_GOLDEN_BENCH_MAX_EMPTY_RESPONSES=0
 Environment=VRYX_GOLDEN_BENCH_MIN_TPS_P50=10
 Environment=VRYX_GOLDEN_BENCH_MAX_TTFT_P95_MS=10000
+Environment=VRYX_BENCH_HTTP_TIMEOUT=600
 ExecStart=/usr/bin/node scripts/golden-path-benchmark-cron.mjs

@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 
 const baseUrl = (process.env.VRYX_E2E_BASE_URL || 'https://vryx.eu').replace(/\/$/, '')
+const csrfHeaders = { Origin: baseUrl, Referer: `${baseUrl}/admin/workers` }
 const bearer = process.env.VRYX_ADMIN_BEARER || ''
 const email = process.env.VRYX_ADMIN_EMAIL || process.env.VRYX_TEST_EMAIL || ''
 const password = process.env.VRYX_ADMIN_PASSWORD || process.env.VRYX_TEST_PASSWORD || ''
@@ -41,7 +42,7 @@ async function authHeaders() {
 }
 
 const headers = await authHeaders()
-const status = await readJson('/api/workers/status')
+const status = await readJson('/api/admin/workers/registered?limit=500', { headers })
 assert.equal(status.res.status, 200, `workers status failed: ${status.text}`)
 const workers = Array.isArray(status.data?.workers) ? status.data.workers : []
 const worker = peerId
@@ -58,7 +59,7 @@ assert.ok(action.allocatedVramMb || action.memoryPercent, 'worker memory target 
 
 const created = await readJson(`/api/admin/workers/${encodeURIComponent(worker.peerId)}/actions`, {
   method: 'POST',
-  headers: { ...headers, 'Content-Type': 'application/json' },
+  headers: { ...headers, ...csrfHeaders, 'Content-Type': 'application/json' },
   body: JSON.stringify(action),
 })
 assert.equal(created.res.status, 200, `create command failed: ${created.text}`)

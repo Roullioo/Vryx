@@ -20,8 +20,8 @@ jobs:
       VRYX_BENCH_MIN_COMPUTE_WORKERS: '2'
       VRYX_BENCH_QUANT: q4
       VRYX_BENCH_POOL: velocity_mlx
-      VRYX_BENCH_TOKENS: '64'
-      VRYX_BENCH_TARGET_TPS: '0'
+      VRYX_BENCH_TOKENS: '64,128'
+      VRYX_BENCH_TARGET_TPS: '10'
       VRYX_BENCH_HTTP_TIMEOUT: '2400'
     steps:
       - uses: actions/checkout@v4
@@ -38,4 +38,11 @@ jobs:
           fi
 
       - name: Run forced P2P shard bench
-        run: python3 nodeAndWorker/scripts/bench_vps_chat_tps.py
+        run: python3 nodeAndWorker/scripts/bench_vps_chat_tps.py | tee p2p-staging-bench.jsonl
+
+      - name: Upload bench artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p2p-staging-bench
+          path: p2p-staging-bench.jsonl

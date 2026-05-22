@@ -810,7 +810,8 @@ async function readWorkerMetrics() {
   const localData = local.ok ? (local.data || {}) : {};
   const shardSummary = summarizeShardStatus(shardStatus.ok ? shardStatus.data : null);
   const peerId = String(localData.peer_id || '');
-  const remote = await fetchJson(`${config.apiUrl || DEFAULT_API_URL}/api/workers/status`, {}, 1800);
+  const remoteStatusUrl = `${config.apiUrl || DEFAULT_API_URL}/api/workers/status${peerId ? `?peer_id=${encodeURIComponent(peerId)}` : ''}`;
+  const remote = await fetchJson(remoteStatusUrl, workerAuthHeaders(config), 1800);
   const workers = Array.isArray(remote.data?.workers) ? remote.data.workers : [];
   const remoteWorker = peerId
     ? workers.find((w) => w.peerId === peerId)
