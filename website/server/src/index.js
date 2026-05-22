@@ -2566,6 +2566,7 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
     rates: costBreakdown.rates,
     billingMode: costBreakdown.billingMode,
     workerSharePercent: costBreakdown.workerSharePercent,
+    volumeDiscountPercent: costBreakdown.volumeDiscountPercent,
     inputCostEur: costBreakdown.inputCostEur,
     outputCostEur: costBreakdown.outputCostEur,
   })
