@@ -38,6 +38,7 @@ Application/
 Application/**
 
 # Artefacts divers
+artifacts/investor-demo/
 *.local
 *.tar.gz
 *.tgz
