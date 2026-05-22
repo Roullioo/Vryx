@@ -23,9 +23,13 @@ jobs:
           cache: npm
           cache-dependency-path: AppMacos/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: brew install protobuf
       - uses: Swatinem/rust-cache@v2
       - name: Build Rust daemon
         working-directory: .
+        env:
+          CARGO_TARGET_DIR: nodeAndWorker/target
         run: cargo build --release -p rust-daemon
       - run: npm ci
       - name: Build unsigned macOS app directory
@@ -60,6 +64,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Rust daemon
         working-directory: .
+        env:
+          CARGO_TARGET_DIR: nodeAndWorker/target
         run: cargo build --release -p rust-daemon
       - run: npm ci
       - name: Build Windows installer
