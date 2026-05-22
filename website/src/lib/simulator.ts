@@ -1,7 +1,7 @@
 import type { GpuCatalogEntry } from '../data/gpuCatalog'
 
-/** Tarif public Vryx (pool), en euros par million de tokens facturés. */
-export const VELOCITY_EUR_PER_MILLION = 0.3
+/** Fallback local si l’API pricing n’est pas encore disponible. */
+export const VRYX_EUR_PER_MILLION_FALLBACK = 0.3
 
 /** Débit séquentiel de référence (solo), tokens/s ; ordre de grandeur serveur dédié mid-range. */
 const SOLO_THROUGHPUT_TOKENS_PER_S = 42
@@ -18,6 +18,8 @@ export type SimulatorInput = {
   poolCandidateCount: number
   /** Tokens de sortie moyens par requête (pour le modèle de latence) */
   avgOutputTokensPerRequest: number
+  /** Tarif public Vryx actuel (€ / million), fourni par l’API pricing. */
+  vryxEurPerMillion?: number | null
 }
 
 export type SimulatorResult = {
@@ -45,11 +47,12 @@ function clamp(n: number, min: number, max: number) {
 export function runSimulator(input: SimulatorInput): SimulatorResult {
   const M = clamp(input.millionsTokensPerMonth, 0, 1_000_000)
   const ref = clamp(input.referenceEurPerMillion, 0.05, 80)
+  const vryx = clamp(Number(input.vryxEurPerMillion ?? VRYX_EUR_PER_MILLION_FALLBACK), 0.0001, 80)
   const n = Math.round(clamp(input.poolCandidateCount, 2, 256))
   const outTok = Math.round(clamp(input.avgOutputTokensPerRequest, 16, 128_000))
 
   const monthlySoloEuro = M * ref
-  const monthlyPoolEuro = M * VELOCITY_EUR_PER_MILLION
+  const monthlyPoolEuro = M * vryx
   const yearlySoloEuro = monthlySoloEuro * 12
   const yearlyPoolEuro = monthlyPoolEuro * 12
   const savingsMonthlyEuro = monthlySoloEuro - monthlyPoolEuro

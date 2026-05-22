@@ -40,14 +40,14 @@ const SLUG_BY_PROVIDER: Record<string, string> = {
 
 /** Logos externes quand l’éditeur n’existe pas dans Simple Icons. */
 const CUSTOM_LOGO_BY_PROVIDER: Record<string, string> = {
-  Alibaba: '/qwen.png',
-  DeepSeek: '/Deepseek.png',
-  Meta: '/llama.png',
-  'Zhipu AI': '/zai.png',
-  Microsoft: '/microsoft.png',
-  Google: '/google.png',
-  'Mistral AI': '/Mistral.png',
-  NVIDIA: '/Nvidia.png',
+  Alibaba: '/qwen.webp',
+  DeepSeek: '/Deepseek.webp',
+  Meta: '/llama.webp',
+  'Zhipu AI': '/zai.webp',
+  Microsoft: '/microsoft.webp',
+  Google: '/google.webp',
+  'Mistral AI': '/Mistral.webp',
+  NVIDIA: '/Nvidia.webp',
 }
 
 export function providerLogoSrc(provider: string): string | null {

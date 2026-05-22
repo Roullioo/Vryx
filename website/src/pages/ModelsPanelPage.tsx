@@ -1,24 +1,32 @@
-import { useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { Navigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { useAuth } from '../context/AuthContext'
-import {
-  LARGE_AI_MODELS,
-  PROVIDERS,
-  formatContext,
-  type LargeAiModel
-} from '../data/largeAiModels'
 import { IconSearch } from '../components/icons/Icons'
 import { ModelFamilyLogo } from '../components/ModelFamilyLogo'
 import { ProviderLogo } from '../components/ProviderLogo'
-import { formatVramGbLabel, modelVramIndicativeGb } from '../lib/modelVramEstimate'
+import { fetchPublicModels, formatInputOutputLabel, formatPricingLabel, type CatalogModel } from '../lib/pricingModels'
+
+function formatContext(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const m = tokens / 1_000_000
+    return m >= 10 ? `${Math.round(m)}M` : `${m % 1 === 0 ? m : m.toFixed(1)}M`
+  }
+  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k`
+  return String(tokens || 0)
+}
+
+function formatVramGbLabel(value: number | null | undefined) {
+  if (value == null || value <= 0) return '—'
+  return `${Number(value).toLocaleString('fr-FR', { maximumFractionDigits: 1 })} Go`
+}
 
 function ModelCard({
   m
 }: {
-  m: LargeAiModel
+  m: CatalogModel
 }) {
-  const vramGb = modelVramIndicativeGb(m)
+  const vramGb = m.weightGb
 
   return (
     <article className="panel p-4 sm:p-5">
@@ -33,7 +41,10 @@ function ModelCard({
                 m.openWeights ? 'bg-accent/15 text-accent' : 'bg-border/80 text-muted',
               ].join(' ')}
             >
-              {m.openWeights ? 'Open weights' : 'Propriétaire'}
+              {m.openWeights ? 'Poids ouverts' : 'Propriétaire'}
+            </span>
+            <span className={`rounded-md px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide ${m.runnable || m.ready ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
+              {m.runnable || m.ready ? 'Disponible' : 'Bientôt'}
             </span>
           </div>
           <p className="mt-1 flex items-center gap-2 text-sm text-muted">
@@ -70,6 +81,16 @@ function ModelCard({
           <dt className="text-muted">Poids (VRAM indicative)</dt>
           <dd className="mt-0.5 font-mono text-sm text-fg">{formatVramGbLabel(vramGb)}</dd>
         </div>
+        <div className="col-span-2">
+          <dt className="text-muted">Prix input / output</dt>
+          <dd className="mt-0.5 font-mono text-sm text-fg">
+            {formatInputOutputLabel(m.pricing?.inputEurPerMillion ?? m.eurPerMillionInput, m.pricing?.outputEurPerMillion ?? m.eurPerMillionOutput)}
+          </dd>
+        </div>
+        <div className="col-span-2">
+          <dt className="text-muted">Prix blended (chat moyen)</dt>
+          <dd className="mt-0.5 font-mono text-sm text-fg">{formatPricingLabel(m.pricing?.blendedEurPerMillion ?? m.effectiveEurPerMillion)} / M</dd>
+        </div>
       </dl>
     </article>
   )
@@ -79,16 +100,32 @@ export function ModelsPanelPage() {
   const { user, loading } = useAuth()
   const [query, setQuery] = useState('')
   const [provider, setProvider] = useState<string>('')
+  const [models, setModels] = useState<CatalogModel[]>([])
+  const [modelsLoading, setModelsLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    fetchPublicModels().then((r) => {
+      if (cancelled) return
+      if (r.ok) setModels(r.data.models)
+      setModelsLoading(false)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const providers = useMemo(() => [...new Set(models.map((m) => m.provider))].sort((a, b) => a.localeCompare(b, 'fr')), [models])
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase()
-    return LARGE_AI_MODELS.filter((m) => {
+    return models.filter((m) => {
       if (provider && m.provider !== provider) return false
       if (!q) return true
-      const blob = `${m.name} ${m.provider} ${m.family} ${m.paramsNote} ${m.modalities.join(' ')} ${formatVramGbLabel(modelVramIndicativeGb(m))}`.toLowerCase()
+      const blob = `${m.name} ${m.provider} ${m.family} ${m.paramsNote} ${m.modalities.join(' ')} ${formatVramGbLabel(m.weightGb)}`.toLowerCase()
       return blob.includes(q)
     })
-  }, [query, provider])
+  }, [models, query, provider])
 
   const stats = useMemo(() => {
     const openW = filtered.filter((m) => m.openWeights).length
@@ -104,7 +141,7 @@ export function ModelsPanelPage() {
     return <Navigate to="/connexion" replace state={{ from: '/panel/modeles' }} />
   }
 
-  if (loading) {
+  if (loading || modelsLoading) {
     return (
       <div className="bg-bg min-h-[calc(100svh-4.25rem)] px-4 py-16">
         <div className="mx-auto max-w-4xl animate-pulse space-y-4">
@@ -119,22 +156,16 @@ export function ModelsPanelPage() {
   return (
     <div className="bg-bg min-h-[calc(100svh-4.25rem)] pb-8 sm:pb-10 lg:pb-12">
       <section
-        className="relative isolate -mt-[4.25rem] flex min-h-[min(86vh,38rem)] flex-col overflow-hidden border-b border-border pt-[4.25rem] sm:min-h-[min(88vh,42rem)]"
+        className="page-hero"
         aria-labelledby="models-hero-heading"
       >
-        <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-          aria-hidden
-        >
+        <div className="page-hero-media-shell" aria-hidden>
           <div
-            className="absolute inset-0 scale-105 bg-cover bg-center bg-no-repeat blur-[3px]"
-            style={{ backgroundImage: "url('/brain.png')" }}
+            className="page-hero-media blur-[3px]"
+            style={{ backgroundImage: "url('/heroes/home-hero.webp')" }}
           />
         </div>
-        <div
-          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
-          aria-hidden
-        />
+        <div className="page-hero-overlay" aria-hidden />
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-8 text-center sm:pb-16 sm:pt-10">
           <motion.div
             initial={{ opacity: 0, y: 14 }}
@@ -200,7 +231,7 @@ export function ModelsPanelPage() {
                 className="rounded-xl border border-border bg-bg px-3 py-2.5 text-sm text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent/30"
               >
                 <option value="">Tous</option>
-                {PROVIDERS.map((p) => (
+              {providers.map((p) => (
                   <option key={p} value={p}>
                     {p}
                   </option>
@@ -248,6 +279,12 @@ export function ModelsPanelPage() {
                   VRAM (Go)
                 </th>
                 <th scope="col" className="px-4 py-3">
+                  Prix
+                </th>
+                <th scope="col" className="px-4 py-3">
+                  Disponibilité
+                </th>
+                <th scope="col" className="px-4 py-3">
                   Modalités
                 </th>
               </tr>
@@ -273,7 +310,13 @@ export function ModelsPanelPage() {
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-fg">{m.paramsNote}</td>
                   <td className="px-4 py-3 font-mono text-electric">{formatContext(m.contextTokens)}</td>
-                  <td className="px-4 py-3 font-mono text-xs text-fg">{formatVramGbLabel(modelVramIndicativeGb(m))}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-fg">{formatVramGbLabel(m.weightGb)}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-fg">{formatPricingLabel(m.effectiveEurPerMillion)}</td>
+                  <td className="px-4 py-3">
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${m.runnable || m.ready ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
+                      {m.runnable || m.ready ? 'Disponible' : 'Bientôt'}
+                    </span>
+                  </td>
                   <td className="px-4 py-3">
                     <span className="line-clamp-2 text-xs text-muted">{m.modalities.join(', ')}</span>
                   </td>

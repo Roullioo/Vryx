@@ -32,7 +32,7 @@ export function VryxLogo({
 
   const mark = (
     <img
-      src="/logo-withoutbg.png"
+      src="/logo-withoutbg.webp"
       alt=""
       width={180}
       height={180}

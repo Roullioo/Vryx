@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
 import { ConfirmDialog } from '../components/admin/ConfirmDialog'
 import { apiJson } from '../lib/api'
+import { displayLabel } from '../lib/displayLabels'
 import { useAuth } from '../context/AuthContext'
 
 type AdminUser = {
@@ -569,11 +570,11 @@ export function AdminUserDetailPage() {
                     <p className="mt-1 text-[11px] text-muted">{w.model || 'Modèle non déclaré'}</p>
                   </div>
                   <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${w.online ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
-                    {w.online ? 'online' : 'offline'}
+                    {w.online ? 'En ligne' : 'Hors ligne'}
                   </span>
                 </div>
                 <p className="mt-3 text-[11px] text-muted">
-                  {fmt(w.tokensGenerated)} tokens · état {w.desiredState || 'active'} · commande {w.lastCommandStatus || '—'}
+                  {fmt(w.tokensGenerated)} tokens · état {displayLabel(w.desiredState || 'active')} · commande {displayLabel(w.lastCommandStatus)}
                 </p>
               </Link>
             ))}

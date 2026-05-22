@@ -69,6 +69,8 @@ Dans `server/.env` :
 - `JWT_SECRET` : au moins 32 caractères aléatoires (`openssl rand -base64 48`).
 - En production HTTPS : `COOKIE_SECURE=true`, `NODE_ENV=production`, `CORS_ORIGIN` = URL exacte du site (ex. `https://www.votredomaine.com`).
 
+Depuis la refonte branding, l’API émet le cookie `vryx_token`. L’ancien cookie `velocity_token` reste accepté pendant la période de migration afin d’éviter de déconnecter les sessions existantes.
+
 ## 4. Front (optionnel)
 
 ```bash

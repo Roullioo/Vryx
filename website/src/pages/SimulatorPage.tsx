@@ -1,11 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
+import { useTranslation } from 'react-i18next'
 import { EurSign } from '../components/icons/Icons'
 import { GPU_CATALOG, type GpuTier } from '../data/gpuCatalog'
 import { STORYTELLING } from '../data/storytelling'
 import {
-  VELOCITY_EUR_PER_MILLION,
+  VRYX_EUR_PER_MILLION_FALLBACK,
   WORKER_EUR_PER_TFLOP_HOUR,
   computeFleetWorkerProfit,
   computeWorkerGpuProfit,
@@ -15,14 +16,42 @@ import {
   type FleetLine,
   type WorkerSimMode,
 } from '../lib/simulator'
+import { fetchPublicPricing, fetchPublicModels, computeBlendedPrice, type CatalogModel } from '../lib/pricingModels'
 
 const PRESETS = [
-  { label: 'Démarrage', millions: 5, ref: 4.2 },
-  { label: 'Croissance', millions: 80, ref: 4.8 },
-  { label: 'Entreprise', millions: 400, ref: 3.9 },
+  { label: 'Démarrage', millions: 5 },
+  { label: 'Croissance', millions: 80 },
+  { label: 'Entreprise', millions: 400 },
 ]
 
 const VOLUME_CHART_POINTS = [5, 15, 40, 80, 160]
+
+const MARKET_PRICE_PROFILES = [
+  {
+    id: 'openai-gpt-4.1-mini',
+    label: 'OpenAI GPT-4.1 mini',
+    inputEurPerMillion: 0.4,
+    outputEurPerMillion: 1.6,
+    sourceLabel: 'OpenAI API Pricing',
+    sourceUrl: 'https://platform.openai.com/docs/pricing/',
+  },
+  {
+    id: 'google-gemini-2-flash',
+    label: 'Google Gemini 2.0 Flash',
+    inputEurPerMillion: 0.15,
+    outputEurPerMillion: 0.6,
+    sourceLabel: 'Google Vertex AI Pricing',
+    sourceUrl: 'https://cloud.google.com/vertex-ai/generative-ai/pricing',
+  },
+  {
+    id: 'anthropic-claude-haiku-4.5',
+    label: 'Anthropic Claude Haiku 4.5',
+    inputEurPerMillion: 1,
+    outputEurPerMillion: 5,
+    sourceLabel: 'Anthropic Claude Pricing',
+    sourceUrl: 'https://platform.claude.com/docs/en/about-claude/pricing',
+  },
+] as const
 
 type TabId = 'inference' | 'worker'
 
@@ -54,12 +83,49 @@ function Sparkline({ values }: { values: number[] }) {
 }
 
 export function SimulatorPage() {
+  const { t } = useTranslation('public')
   const [tab, setTab] = useState<TabId>('inference')
+  const [vryxEurPerMillion, setVryxEurPerMillion] = useState<number | null>(VRYX_EUR_PER_MILLION_FALLBACK)
+  const [minInputEur, setMinInputEur] = useState<number | null>(0.02)
+  const [minOutputEur, setMinOutputEur] = useState<number | null>(0.06)
+  const [pricingPublished, setPricingPublished] = useState(true)
+  const [models, setModels] = useState<CatalogModel[]>([])
+  const [selectedModelSlug, setSelectedModelSlug] = useState('')
+  const [inputRatioPercent, setInputRatioPercent] = useState(75)
+  const [selectedMarketProfileId, setSelectedMarketProfileId] = useState<string>(MARKET_PRICE_PROFILES[0].id)
 
   const [millions, setMillions] = useState(25)
-  const [refEur, setRefEur] = useState(4.5)
+  const [referenceOverrideEur, setReferenceOverrideEur] = useState<number | null>(null)
   const [poolN, setPoolN] = useState(16)
   const [outTok, setOutTok] = useState(512)
+
+  const selectedMarketProfile =
+    MARKET_PRICE_PROFILES.find((profile) => profile.id === selectedMarketProfileId) ?? MARKET_PRICE_PROFILES[0]
+
+  const selectedModel = useMemo(
+    () => models.find((m) => m.slug === selectedModelSlug) ?? models[0] ?? null,
+    [models, selectedModelSlug],
+  )
+
+  const modelInputEur = selectedModel?.pricing?.inputEurPerMillion ?? selectedModel?.eurPerMillionInput ?? minInputEur
+  const modelOutputEur = selectedModel?.pricing?.outputEurPerMillion ?? selectedModel?.eurPerMillionOutput ?? minOutputEur
+
+  const effectiveVryxEurPerMillion = useMemo(() => {
+    if (modelInputEur != null && modelOutputEur != null) {
+      return computeBlendedPrice(modelInputEur, modelOutputEur, inputRatioPercent)
+    }
+    return vryxEurPerMillion
+  }, [modelInputEur, modelOutputEur, inputRatioPercent, vryxEurPerMillion])
+
+  const effectiveReferenceEurPerMillion = useMemo(() => {
+    return computeBlendedPrice(
+      selectedMarketProfile.inputEurPerMillion,
+      selectedMarketProfile.outputEurPerMillion,
+      inputRatioPercent,
+    )
+  }, [inputRatioPercent, selectedMarketProfile.inputEurPerMillion, selectedMarketProfile.outputEurPerMillion])
+
+  const refEur = referenceOverrideEur ?? effectiveReferenceEurPerMillion
 
   const result = useMemo(
     () =>
@@ -68,9 +134,33 @@ export function SimulatorPage() {
         referenceEurPerMillion: refEur,
         poolCandidateCount: poolN,
         avgOutputTokensPerRequest: outTok,
+        vryxEurPerMillion: effectiveVryxEurPerMillion,
       }),
-    [millions, refEur, poolN, outTok],
+    [millions, refEur, poolN, outTok, effectiveVryxEurPerMillion],
   )
+
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([fetchPublicPricing(), fetchPublicModels()]).then(([pricingR, modelsR]) => {
+      if (cancelled) return
+      if (pricingR.ok) {
+        setPricingPublished(pricingR.data.pricing.published)
+        setMinInputEur(pricingR.data.pricing.minInputEurPerMillion ?? pricingR.data.pricing.headline?.minInputEurPerMillion ?? null)
+        setMinOutputEur(pricingR.data.pricing.minOutputEurPerMillion ?? pricingR.data.pricing.headline?.minOutputEurPerMillion ?? null)
+        setVryxEurPerMillion(pricingR.data.pricing.eurPerMillionTokens ?? null)
+        setInputRatioPercent(pricingR.data.pricing.blendedInputRatioPercent ?? 75)
+      }
+      if (modelsR.ok) {
+        const list = modelsR.data.models.filter((m) => m.isPublic && m.isActive)
+        setModels(list)
+        const preferred = list.find((m) => m.slug === 'qwen3-5-9b') ?? list[0]
+        if (preferred) setSelectedModelSlug(preferred.slug)
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const latGainPct =
     result.estimatedSoloP50Ms > 0
@@ -85,10 +175,11 @@ export function SimulatorPage() {
           referenceEurPerMillion: refEur,
           poolCandidateCount: poolN,
           avgOutputTokensPerRequest: outTok,
+          vryxEurPerMillion: effectiveVryxEurPerMillion,
         })
         return { millions: m, solo: r.monthlySoloEuro, pool: r.monthlyPoolEuro }
       }),
-    [refEur, poolN, outTok],
+    [refEur, poolN, outTok, effectiveVryxEurPerMillion],
   )
   const chartMax = Math.max(...chartRows.flatMap((r) => [r.solo, r.pool]), 1)
   const chartAreaPx = 160
@@ -173,22 +264,16 @@ export function SimulatorPage() {
   return (
     <div className="border-b border-border bg-bg pb-20 sm:pb-28">
       <section
-        className="relative isolate -mt-[4.25rem] flex min-h-[min(82vh,34rem)] flex-col overflow-hidden border-b border-border pt-[4.25rem] sm:min-h-[min(84vh,38rem)]"
+        className="page-hero page-hero--compact"
         aria-labelledby="simulator-hero-heading"
       >
-        <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-          aria-hidden
-        >
+        <div className="page-hero-media-shell" aria-hidden>
           <div
-            className="absolute inset-0 scale-105 bg-cover bg-center bg-no-repeat blur-[3px]"
-            style={{ backgroundImage: "url('/inference.png')" }}
+            className="page-hero-media blur-[3px]"
+            style={{ backgroundImage: "url('/heroes/inference-hero.webp')" }}
           />
         </div>
-        <div
-          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
-          aria-hidden
-        />
+        <div className="page-hero-overlay" aria-hidden />
 
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-12 pt-8 text-center sm:pb-14 sm:pt-10">
           <motion.div
@@ -241,7 +326,7 @@ export function SimulatorPage() {
               }`}
               onClick={() => setTab('inference')}
             >
-              Coût inférence
+              Coût {t('simulator.inference').toLowerCase()}
             </button>
             <button
               type="button"
@@ -252,7 +337,7 @@ export function SimulatorPage() {
               }`}
               onClick={() => setTab('worker')}
             >
-              Rentabilité worker
+              {t('simulator.worker')}
             </button>
           </div>
         </div>
@@ -266,6 +351,53 @@ export function SimulatorPage() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.35 }}
           >
+            <div className="panel p-5 sm:p-6">
+              <label className="block font-mono text-xs uppercase tracking-wider text-muted">Modèle Vryx</label>
+              <select
+                value={selectedModel?.slug ?? ''}
+                onChange={(e) => setSelectedModelSlug(e.target.value)}
+                className="mt-3 w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-sm text-fg outline-none focus:border-accent"
+              >
+                {models.length === 0 ? (
+                  <option value="">Tarif headline (API)</option>
+                ) : (
+                  models.map((m) => (
+                    <option key={m.slug} value={m.slug}>
+                      {m.name}
+                      {m.pricing?.inputEurPerMillion != null
+                        ? ` — ${m.pricing.inputEurPerMillion.toFixed(4)}/${m.pricing.outputEurPerMillion.toFixed(4)} €/M`
+                        : ''}
+                    </option>
+                  ))
+                )}
+              </select>
+              {selectedModel && modelInputEur != null && modelOutputEur != null ? (
+                <p className="mt-2 text-xs text-muted">
+                  {modelInputEur.toFixed(4)} €/M input · {modelOutputEur.toFixed(4)} €/M output · blended{' '}
+                  {effectiveVryxEurPerMillion?.toFixed(4)} €/M
+                </p>
+              ) : null}
+            </div>
+
+            <div className="panel p-5 sm:p-6">
+              <label className="block font-mono text-xs uppercase tracking-wider text-muted">
+                Ratio input / output ({inputRatioPercent} % input)
+              </label>
+              <div className="mt-3 flex items-center gap-4">
+                <input
+                  type="range"
+                  min={10}
+                  max={90}
+                  step={5}
+                  value={inputRatioPercent}
+                  onChange={(e) => setInputRatioPercent(Number(e.target.value))}
+                  className="h-2 w-full flex-1 cursor-pointer accent-accent"
+                />
+                <span className="w-12 text-right font-mono text-sm text-fg">{inputRatioPercent}%</span>
+              </div>
+              <p className="mt-2 text-xs text-muted">75/25 par défaut — profil chat moyen.</p>
+            </div>
+
             <div className="panel p-5 sm:p-6">
               <label className="block font-mono text-xs uppercase tracking-wider text-muted">
                 Volume (M tokens / mois)
@@ -294,18 +426,49 @@ export function SimulatorPage() {
             </div>
 
             <div className="panel p-5 sm:p-6">
+              <label className="block font-mono text-xs uppercase tracking-wider text-muted">Prix marché</label>
+              <select
+                value={selectedMarketProfileId}
+                onChange={(e) => setSelectedMarketProfileId(e.target.value)}
+                className="mt-3 w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-sm text-fg outline-none focus:border-accent"
+              >
+                {MARKET_PRICE_PROFILES.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.label}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-2 text-xs text-muted">
+                {selectedMarketProfile.inputEurPerMillion.toFixed(2)} €/M input ·{' '}
+                {selectedMarketProfile.outputEurPerMillion.toFixed(2)} €/M output · blended{' '}
+                {effectiveReferenceEurPerMillion.toFixed(4)} €/M
+              </p>
+              <p className="mt-1 text-xs text-muted">
+                Source publique :{' '}
+                <a
+                  href={selectedMarketProfile.sourceUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent underline underline-offset-2"
+                >
+                  {selectedMarketProfile.sourceLabel}
+                </a>
+              </p>
+            </div>
+
+            <div className="panel p-5 sm:p-6">
               <label className="block font-mono text-xs uppercase tracking-wider text-muted">
-                Prix ailleurs (
+                Prix marché blended (
                 <EurSign className="font-mono font-semibold text-muted" /> / million de tokens)
               </label>
               <div className="mt-3 flex items-center gap-4">
                 <input
                   type="range"
-                  min={1}
+                  min={0.05}
                   max={18}
                   step={0.1}
                   value={refEur}
-                  onChange={(e) => setRefEur(Number(e.target.value))}
+                  onChange={(e) => setReferenceOverrideEur(Number(e.target.value))}
                   className="h-2 w-full flex-1 cursor-pointer accent-electric"
                 />
                 <input
@@ -314,15 +477,28 @@ export function SimulatorPage() {
                   max={80}
                   step={0.05}
                   value={refEur}
-                  onChange={(e) => setRefEur(Number(e.target.value) || 0)}
+                  onChange={(e) => setReferenceOverrideEur(Number(e.target.value) || 0)}
                   className="w-24 rounded-lg border border-border bg-bg px-2 py-1.5 text-right font-mono text-sm text-fg"
                 />
               </div>
-              <p className="mt-2 text-xs text-muted">Référence fournisseur « classique ».</p>
+              <p className="mt-2 text-xs text-muted">
+                Calculé depuis le profil public sélectionné. Vous pouvez encore l’ajuster manuellement si besoin.
+              </p>
+              {referenceOverrideEur != null ? (
+                <button
+                  type="button"
+                  onClick={() => setReferenceOverrideEur(null)}
+                  className="mt-3 rounded-lg border border-border bg-card px-3 py-1.5 font-mono text-xs text-muted transition-colors hover:border-accent/40 hover:text-accent"
+                >
+                  Revenir au prix public calculé
+                </button>
+              ) : null}
             </div>
 
             <div className="panel p-5 sm:p-6">
-              <label className="block font-mono text-xs uppercase tracking-wider text-muted">GPU en course (N)</label>
+              <label className="block font-mono text-xs uppercase tracking-wider text-muted">
+                Workers candidats (N)
+              </label>
               <div className="mt-3 flex items-center gap-4">
                 <input
                   type="range"
@@ -335,7 +511,10 @@ export function SimulatorPage() {
                 />
                 <span className="w-12 text-right font-mono text-sm text-fg">{poolN}</span>
               </div>
-              <p className="mt-2 text-xs text-muted">Sert à estimer la latence Race-Pool, pas le prix Vryx.</p>
+              <p className="mt-2 text-xs text-muted">
+                Sert uniquement à l’heuristique de latence. L’infra réelle réserve et sélectionne des workers via
+                scheduler, ce n’est pas un pricing knob.
+              </p>
             </div>
 
             <div className="panel p-5 sm:p-6">
@@ -371,7 +550,6 @@ export function SimulatorPage() {
                   type="button"
                   onClick={() => {
                     setMillions(p.millions)
-                    setRefEur(p.ref)
                   }}
                   className="rounded-lg border border-border bg-card px-3 py-1.5 font-mono text-xs text-muted transition-colors hover:border-accent/40 hover:text-accent"
                 >
@@ -399,7 +577,7 @@ export function SimulatorPage() {
               </div>
               <div className="grid gap-0 sm:grid-cols-2">
                 <div className="border-b border-border p-5 sm:border-r sm:border-b-0 sm:p-6">
-                  <p className="font-mono text-xs uppercase tracking-wider text-muted">Ailleurs</p>
+                  <p className="font-mono text-xs uppercase tracking-wider text-muted">Marché</p>
                   <p className="font-display mt-2 text-3xl font-bold text-warning tabular-nums">
                     {formatEur(result.monthlySoloEuro)}
                     <EurSign className="text-warning" />
@@ -416,8 +594,14 @@ export function SimulatorPage() {
                     <EurSign className="text-accent" />
                   </p>
                   <p className="mt-1 text-xs text-muted">
-                    / mois · {VELOCITY_EUR_PER_MILLION.toFixed(2)}
-                    <EurSign /> / M tokens
+                    / mois · {pricingPublished && modelInputEur != null && modelOutputEur != null ? (
+                      <>
+                        {modelInputEur.toFixed(4)} € in / {modelOutputEur.toFixed(4)} € out
+                        {selectedModel ? ` · ${selectedModel.name}` : ''}
+                      </>
+                    ) : (
+                      t('pricing.onQuote').toLowerCase()
+                    )}
                   </p>
                 </div>
               </div>
@@ -440,7 +624,7 @@ export function SimulatorPage() {
             <div className="panel p-5 sm:p-6">
               <h3 className="font-display text-base font-semibold text-fg">Coût mensuel selon le volume</h3>
               <p className="mt-1 text-xs text-muted">
-                Barres : référence « ailleurs » (orange) vs Vryx (bleu), pour les volumes indiqués avec vos
+                Barres : référence marché (orange) vs Vryx (bleu), pour les volumes indiqués avec vos
                 paramètres actuels.
               </p>
               <div className="mt-6 flex justify-between gap-2 border-b border-border pb-2">
@@ -477,7 +661,7 @@ export function SimulatorPage() {
             <div className="panel p-5 sm:p-6">
               <h3 className="font-display text-base font-semibold text-fg">Latence (ordre de grandeur)</h3>
               <p className="mt-2 text-xs text-muted">
-                Plus il y a de GPU en compétition, plus la réponse peut arriver vite. Chiffre indicatif.
+                Plus il y a de workers candidats pour une réservation, plus la réponse peut arriver vite. Chiffre indicatif.
               </p>
               <div className="mt-4 grid gap-4 sm:grid-cols-2">
                 <div className="panel-inset p-4">
@@ -775,7 +959,7 @@ export function SimulatorPage() {
       >
         <div
           className="absolute inset-0 bg-cover bg-center bg-no-repeat"
-          style={{ backgroundImage: "url('/mid.png')" }}
+          style={{ backgroundImage: "url('/heroes/mid-section.webp')" }}
           aria-hidden
         />
         <div className="hero-overlay absolute inset-0" aria-hidden />

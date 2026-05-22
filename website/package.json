@@ -1,5 +1,5 @@
 {
-  "name": "velocity",
+  "name": "vryx-web",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -11,17 +11,20 @@
     "docker:db": "docker compose --env-file server/.env up -d",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "lint:refonte": "eslint src/pages/AdminPricingPage.tsx src/pages/AdminModelsCatalogPage.tsx src/components/ui/VryxPrimitives.tsx src/lib/pricingModels.ts src/i18n/index.ts src/pages/SimulatorPage.tsx src/pages/ClientsPage.tsx src/pages/StatusPage.tsx src/pages/ModelsPanelPage.tsx src/components/layout/Navbar.tsx src/components/layout/Footer.tsx src/layouts/MainLayout.tsx",
     "preview": "vite preview"
   },
   "dependencies": {
     "d3-timer": "^3.0.1",
     "force-graph": "^1.51.4",
     "framer-motion": "^12.38.0",
+    "i18next": "^26.2.0",
     "lodash-es": "^4.18.1",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-force-graph-2d": "^1.29.1",
     "react-force-graph-3d": "^1.29.1",
+    "react-i18next": "^17.0.8",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.14.2",
     "remark-gfm": "^4.0.1",

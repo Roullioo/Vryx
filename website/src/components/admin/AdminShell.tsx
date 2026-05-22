@@ -84,8 +84,9 @@ function IconLogout() {
 
 /* ─── Navigation ──────────────────────────────────────────────────────────── */
 type NavItem = { to: string; label: string; icon: ReactNode; end?: boolean }
+type NavSection = { label: string; items: NavItem[] }
 
-const navItems: NavItem[] = [
+const mainNavItems: NavItem[] = [
   { to: '/admin', label: "Vue d'ensemble", icon: <IconGrid />, end: true },
   { to: '/admin/noeud', label: 'Nœud Vryx', icon: <IconServer /> },
   { to: '/admin/chat-p2p', label: 'Chat P2P', icon: <IconChat /> },
@@ -95,6 +96,16 @@ const navItems: NavItem[] = [
   { to: '/admin/production-readiness', label: 'Readiness', icon: <IconPulse /> },
   { to: '/admin/enterprise', label: 'Enterprise', icon: <IconGrid /> },
   { to: '/admin/utilisateurs', label: 'Utilisateurs', icon: <IconUsers /> },
+]
+
+const pricingNavItems: NavItem[] = [
+  { to: '/admin/parametres/pricing', label: 'Paramètres', icon: <IconPulse /> },
+  { to: '/admin/modeles', label: 'Modèles', icon: <IconServer /> },
+]
+
+const navSections: NavSection[] = [
+  { label: 'Navigation', items: mainNavItems },
+  { label: 'Pricing', items: pricingNavItems },
 ]
 
 const SIDEBAR_W = 220 // px
@@ -144,29 +155,33 @@ function Sidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
 
         {/* Nav */}
         <nav className="flex-1 overflow-y-auto px-3 py-4">
-          <p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-widest text-white/25">
-            Navigation
-          </p>
-          <ul className="space-y-0.5">
-            {navItems.map((item) => (
-              <li key={`${item.to}-${item.label}`}>
-                <NavLink
-                  to={item.to}
-                  end={item.end}
-                  className={({ isActive }) =>
-                    `flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors ${
-                      isActive
-                        ? 'bg-white/10 text-white'
-                        : 'text-white/50 hover:bg-white/5 hover:text-white/80'
-                    }`
-                  }
-                >
-                  {item.icon}
-                  {item.label}
-                </NavLink>
-              </li>
-            ))}
-          </ul>
+          {navSections.map((section) => (
+            <div key={section.label} className={section.label === 'Pricing' ? 'mt-5' : ''}>
+              <p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-widest text-white/25">
+                {section.label}
+              </p>
+              <ul className="space-y-0.5">
+                {section.items.map((item) => (
+                  <li key={`${item.to}-${item.label}`}>
+                    <NavLink
+                      to={item.to}
+                      end={item.end}
+                      className={({ isActive }) =>
+                        `flex items-center gap-3 rounded-lg px-3 py-2 text-[13px] font-medium transition-colors ${
+                          isActive
+                            ? 'bg-white/10 text-white'
+                            : 'text-white/50 hover:bg-white/5 hover:text-white/80'
+                        }`
+                      }
+                    >
+                      {item.icon}
+                      {item.label}
+                    </NavLink>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
         </nav>
 
         {/* User footer */}

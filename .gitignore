@@ -50,3 +50,4 @@ Application/**
 # Clés libp2p générées en local (start-3-workers-mac.sh)
 **/.vryx-keys-mac/
 nodeAndWorker/.vryx-keys/
+nodeAndWorker/.vryx-keys-manual/

@@ -1,5 +1,58 @@
 # Rapport : réduction du « mur » perçu (admin chat P2P)
 
+## Mise à jour : Pricing V2 input/output, pool, B2B et garde-fous (22 mai 2026)
+
+### Ce qu’il se passait avant
+
+- Tarif unique **0,30 €/M tokens** (blended) côté site et billing : pas de distinction prompt/completion.
+- `recordApiKeyUsage` facturait `total_tokens × rate` sans tenir compte du modèle ni de la direction.
+- Pas de tiers pricing, plans B2B, Private Pool ni fine-tuning en base ; pas de garde-fous de marge admin.
+- Le simulateur et les pages publiques ne proposaient qu’un prix headline unique.
+
+### Ce qu’il se passe maintenant
+
+- **Schéma MariaDB V2** : `pricing_config` (headline min in/out, recharge Stripe, remise pool, marge min), `model_catalog` (input/output, tier, worker share, availability, pool), tables `pricing_tiers`, `subscription_plans`, `private_pool_plans`, `fine_tuning_plans`, `pricing_config_audit`.
+- **Moteur** `pricing-engine.js` : `computeRequestCost`, `computeBlendedPrice`, `validatePricingFloor`, `resolveModelRates`.
+- **Billing** : facturation `prompt × rate_in + completion × rate_out` ; colonnes `cost_input_eur`, `cost_output_eur`, `billing_mode`, `pricing_snapshot_json` sur `api_key_usage`.
+- **API publique** : `/api/public/pricing` expose headline 0,02/0,06 €, plans B2B/pool/finetune, recharge min 20 € ; `/api/public/models` retourne pricing in/out/blended par modèle.
+- **Admin** : `/admin/parametres/pricing` en onglets (Général, Volume, B2B, Pool, Fine-tuning) ; `/admin/modeles` avec prix in/out, tier, worker share, preview marge ; nav regroupée sous section « Pricing ».
+- **Site public** : `/clients`, `/panel/modeles`, `/status`, `/simulateur` affichent tarifs in/out ; simulateur avec sélecteur modèle et ratio input/output.
+- **Seed** : grille tiers nano→code, modèles clés (Qwen 0.5B, 9B, 35B, etc.), plans Developer→Scale et Private Pool S→XL ; `pricing_published=1`.
+
+### Vérifications
+
+- `npm run build`, `npm run lint:refonte`, `npm run test:pricing-models` : OK.
+- Déploiement VPS (`website_deploy.py`) : OK après correction doublon `pricingConfig` dans `public-status.js` ; PM2 `vryx-api` online, `/api/health` OK.
+
+## Mise à jour : refonte Vryx unifiée pricing, modèles, DA et admin (22 mai 2026)
+
+### Ce qu’il se passait avant
+
+- Le pricing était fragmenté : `0,30 €/M tokens` côté front et `VRYX_EUR_PER_MILLION` côté API, sans écran admin pour publier ou masquer la grille.
+- Le catalogue marketing des modèles et le catalogue runtime P2P étaient séparés, ce qui empêchait d’afficher un prix par modèle et une disponibilité cohérente.
+- L’admin ne proposait pas d’écrans dédiés pour modifier le tarif global, les remises volume ou le catalogue modèles.
+- Le branding gardait des traces visibles de « Velocity » et le cookie d’auth principal portait encore l’ancien nom.
+- Le design system alternait entre sections blanches, hero galactique et admin gris isolé ; la navbar n’était pas fixe.
+- Aucune base i18n FR/EN n’était branchée.
+
+### Ce qu’il se passe maintenant
+
+- MariaDB crée et seed automatiquement `pricing_config` et `model_catalog`; l’API expose `/api/public/pricing`, `/api/public/models`, `/api/admin/pricing` et `/api/admin/models/catalog`.
+- Le site public consomme ces APIs sur `/panel/modeles`, `/simulateur`, `/clients` et `/status`; si le prix n’est pas publié, l’interface affiche « Sur devis » au lieu d’un faux prix.
+- L’admin dispose de `/admin/parametres/pricing` et `/admin/modeles` pour publier le prix, gérer TVA, commission workers, remises volume, statuts actif/public et prix override.
+- Le branding émet désormais le cookie `vryx_token` et accepte encore `velocity_token` pendant la migration; les labels UI affichent Vryx, tout en gardant les valeurs API `velocity_mlx` / `velocity_vllm` compatibles.
+- Les tokens CSS sont alignés sur une DA bleu nuit / cyan, la navbar est fixe, des primitives `VryxCard`, `VryxButton`, `VryxBadge` et `VryxInput` sont disponibles.
+- `react-i18next` est initialisé en FR par défaut avec EN optionnel et un sélecteur de langue dans le footer.
+- La CI ajoute le test pricing/models et la documentation `INFRASTRUCTURE_A_Z.md` décrit les nouvelles tables et routes.
+
+### Vérifications locales et production
+
+- `npm run build` dans `website/` : OK.
+- `npm run lint:refonte` dans `website/` : OK (fichiers refonte uniquement).
+- `npm run test:pricing-models` dans `website/server/` : OK (`computeEffectiveModelPrice`, slugify).
+- Déploiement VPS (`website_deploy.py`) : OK — PM2 `vryx-api` online, `/api/public/pricing` et `/api/public/models` répondent (prix masqué tant que `pricing_published=false` en BDD).
+- Billing interne (API keys, devis enterprise, benchmarks, chat P2P) lit désormais le tarif via `getPricingConfig()` / cache 30 s au lieu de l’env seul.
+
 ## Mise à jour critique : TPS et latence pipeline P2P (15 mai 2026)
 
 ### Ce qu'il se passait avant

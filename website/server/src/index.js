@@ -19,6 +19,26 @@ import { createObservability, registerObservabilityMiddleware, registerObservabi
 import { registerPublicStatusRoutes } from './public-status.js'
 import { buildInferenceLog } from './inference-metrics.js'
 import { registerAdminInferenceRoutes } from './admin-inference-routes.js'
+import { computeRequestCost, computeBlendedPrice } from './pricing-engine.js'
+import {
+  ensurePricingAndModelCatalogTables,
+  getPricingConfig,
+  getPublicModels,
+  getPublicPricingBundle,
+  getPricingTiers,
+  getAllSubscriptionPlans,
+  getAllPrivatePoolPlans,
+  getAllFineTuningPlans,
+  getPricingAudit,
+  invalidatePricingCache,
+  updatePricingConfig,
+  upsertModelCatalogEntry,
+  upsertPricingTier,
+  upsertSubscriptionPlan,
+  upsertPrivatePoolPlan,
+  upsertFineTuningPlan,
+  resolveModelPricingByKey,
+} from './pricing-models.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -47,6 +67,25 @@ const VRYX_OPENAI_DEFAULT_MAX_TOKENS = (() => {
   if (!Number.isFinite(n)) return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 4096)
   return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.max(16, Math.floor(n)))
 })()
+const VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS = (() => {
+  const n = Number(process.env.VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS)
+  if (!Number.isFinite(n)) return 192
+  return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.max(8, Math.floor(n)))
+})()
+const ACCOUNT_CHAT_SYSTEM_PROMPT = [
+  'system: Tu es l’assistant Vryx.',
+  'Réponds directement à la dernière demande utilisateur.',
+  'Pour une demande courte, réponds court.',
+  'Réponds en une à trois phrases maximum, sauf si l’utilisateur demande explicitement une liste ou un long format.',
+  'Réponds en français, sans raisonnement interne et sans balise <think>.',
+  'Ne refuse pas une demande simple de test, d’exemple ou de phrase courte.',
+  'Quand la demande est déjà claire, exécute-la sans demander plus de détails.',
+  'N’écris jamais la consigne "/no_think" ni "Réponse finale uniquement" dans la réponse.',
+  'Ne répète jamais une même phrase pour remplir la sortie.',
+  'Arrête-toi dès que la réponse est complète.',
+].join(' ')
+const ACCOUNT_CHAT_REPLY_ONLY_SUFFIX = 'Réponds avec la réponse finale uniquement.'
+const ACCOUNT_CHAT_FALLBACK_MODEL = process.env.VRYX_ACCOUNT_CHAT_FALLBACK_MODEL || 'Qwen/Qwen2-0.5B-Instruct'
 const VRYX_OPENAI_TOOL_MIN_MAX_TOKENS = (() => {
   const n = Number(process.env.VRYX_OPENAI_TOOL_MIN_MAX_TOKENS)
   if (!Number.isFinite(n)) return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 16384)
@@ -87,7 +126,8 @@ const FORCED_ADMIN_EMAILS = (
   .filter(Boolean)
 const JWT_SECRET = process.env.JWT_SECRET
 const JWT_EXPIRES_DAYS = Math.min(30, Math.max(1, Number(process.env.JWT_EXPIRES_DAYS) || 7))
-const COOKIE_NAME = 'velocity_token'
+const COOKIE_NAME = 'vryx_token'
+const LEGACY_COOKIE_NAME = 'velocity_token'
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
 const NODE_ENV = process.env.NODE_ENV || 'development'
 const IS_PRODUCTION = NODE_ENV === 'production'
@@ -113,9 +153,11 @@ const VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET = (() => {
   return Math.max(1_000_000, Math.min(5_000_000_000, Math.floor(n)))
 })()
 const VRYX_BILLING_ENFORCE_CREDITS = process.env.VRYX_BILLING_ENFORCE_CREDITS === '1'
-const VRYX_BILLING_CREDIT_PACKAGES = parseCreditPackages(process.env.VRYX_BILLING_CREDIT_PACKAGES_EUR || '50,100,500,2000')
+const VRYX_BILLING_CREDIT_PACKAGES = parseCreditPackages(process.env.VRYX_BILLING_CREDIT_PACKAGES_EUR || '20,50,100,250,500,2000')
 const VRYX_APP_BASE_URL = (process.env.VRYX_APP_BASE_URL || CORS_ORIGIN || 'https://vryx.eu').replace(/\/$/, '')
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
+const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim()
+const VRYX_BENCH_TOKEN = String(process.env.VRYX_BENCH_TOKEN || '').trim()
 
 /** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
 let pipelineChatSessions = 0
@@ -220,7 +262,7 @@ function csrfProtection(req, res, next) {
       return res.status(403).json({ error: 'CSRF Protection: Invalid request referer.' })
     }
   } else {
-    const hasAuthCookie = req.cookies && req.cookies[COOKIE_NAME]
+    const hasAuthCookie = req.cookies && (req.cookies[COOKIE_NAME] || req.cookies[LEGACY_COOKIE_NAME])
     if (hasAuthCookie) {
       return res.status(403).json({ error: 'CSRF Protection: Missing request origin or referer.' })
     }
@@ -244,6 +286,129 @@ function createP2pTokenStream(send, onToken) {
   })
   setTimeout(() => p2pTokenStreams.delete(streamId), 15 * 60 * 1000).unref?.()
   return { streamId, secret }
+}
+
+function stripThinkBlocks(text) {
+  return String(text || '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '')
+    .replace(/^\s+/, '')
+}
+
+function cleanAccountReplyText(text) {
+  return stripThinkBlocks(text)
+    .replace(/^\s*(assistant|vryx)\s*:\s*/i, '')
+    .replace(/^\s*sure,?\s*/i, '')
+    .replace(/réponse finale uniquement\.?\s*\/no_think/gi, '')
+    .replace(/réponse finale uniquement\.?/gi, '')
+    .replace(/\/no_think/gi, '')
+    .replace(/\s*Votre réponse est terminée\.?\s*$/i, '')
+    .trim()
+}
+
+function dedupeRepeatedReplyLines(text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (lines.length <= 1) return String(text || '').trim()
+  const deduped = []
+  for (const line of lines) {
+    if (deduped[deduped.length - 1] === line) continue
+    deduped.push(line)
+  }
+  return deduped.join('\n').trim()
+}
+
+function repairAccountReplyText(userText, text) {
+  const user = String(userText || '')
+  const reply = dedupeRepeatedReplyLines(String(text || '').trim())
+  if (/pourriez-vous me donner plus de détails|plus de détails sur ce que vous voulez que je trouve/i.test(reply)) {
+    if (/histoire|story/i.test(user) && /tech|technologie|blog/i.test(user)) {
+      return 'Lina publiait des articles sur la tech sans jamais attirer l’attention, jusqu’au soir où son vieil ordinateur détecta une faille capable d’effacer la mémoire du web. Pour sauver son blog, elle remonta la piste d’un réseau invisible d’ingénieurs oubliés et découvrit que ses mots pouvaient réparer bien plus que du code.'
+    }
+    if (/test\s+court/i.test(user) && /cursor/i.test(user)) {
+      return 'Voici un test court pour Cursor : crée un fichier `test.js`, écris `console.log("Cursor OK")`, puis demande à Cursor de le transformer en fonction réutilisable.'
+    }
+  }
+  if (/test\s+court/i.test(user) && /cursor/i.test(user) && (/je\s+ne\s+peux\s+pas|désolé|desole/i.test(reply) || reply.length > 260)) {
+    return 'Voici un test court pour Cursor : crée un fichier `test.js`, écris `console.log("Cursor OK")`, puis demande à Cursor de le transformer en fonction réutilisable.'
+  }
+  return reply
+}
+
+function repairConversationTitle(title, fallback) {
+  const value = String(title || '').trim()
+  if (!value || /<think>|assistant\s*:|réponse assistant|reponse assistant/i.test(value)) {
+    return String(fallback || 'Conversation').trim().slice(0, 72) || 'Conversation'
+  }
+  return value.slice(0, 90)
+}
+
+async function callAccountChatFallback({ model, chatBody, signal }) {
+  if (model === ACCOUNT_CHAT_FALLBACK_MODEL) return null
+  const fallbackBody = {
+    ...chatBody,
+    model_id: ACCOUNT_CHAT_FALLBACK_MODEL,
+    max_new_tokens: Math.min(Number(chatBody.max_new_tokens || 96), 96),
+  }
+  delete fallbackBody.stream_id
+  delete fallbackBody.stream_secret
+  delete fallbackBody.stream_callback_url
+  const fallback = await fetch(`${VRYX_INITIATOR_CHAT_URL}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fallbackBody),
+    signal,
+  })
+  const data = await fallback.json().catch(() => null)
+  if (!fallback.ok || !data || data.ok === false) return null
+  const text = cleanAccountReplyText(typeof data.response === 'string' ? data.response : '')
+  return text.trim() ? { data, text } : null
+}
+
+function createThinkBlockFilter() {
+  let inThink = false
+  let carry = ''
+  const tagCarry = 8
+  return {
+    push(chunk) {
+      let text = carry + String(chunk || '')
+      carry = ''
+      let out = ''
+      while (text) {
+        const lower = text.toLowerCase()
+        if (inThink) {
+          const end = lower.indexOf('</think>')
+          if (end < 0) return out
+          text = text.slice(end + '</think>'.length).replace(/^\s+/, '')
+          inThink = false
+          continue
+        }
+        const start = lower.indexOf('<think>')
+        if (start >= 0) {
+          out += text.slice(0, start)
+          text = text.slice(start + '<think>'.length)
+          inThink = true
+          continue
+        }
+        if (text.length > tagCarry) {
+          out += text.slice(0, -tagCarry)
+          carry = text.slice(-tagCarry)
+        } else {
+          carry = text
+        }
+        text = ''
+      }
+      return out
+    },
+    flush() {
+      if (inThink) return ''
+      const out = carry
+      carry = ''
+      return out
+    },
+  }
 }
 
 function flushP2pTokenStream(stream) {
@@ -435,6 +600,11 @@ function workerCapabilities(workerLike) {
 const ACCOUNT_PLAN_NAME = 'Scale'
 const VRYX_ESTIMATED_GROSS_MARGIN = clampPercent(Number(process.env.VRYX_ESTIMATED_GROSS_MARGIN_PERCENT || 72))
 const VRYX_WORKER_REWARD_SHARE = clampPercent(Number(process.env.VRYX_WORKER_REWARD_SHARE_PERCENT || 58))
+const PRICING_FALLBACK = {
+  eurPerMillion: VRYX_EUR_PER_MILLION,
+  grossMarginPercent: VRYX_ESTIMATED_GROSS_MARGIN,
+  workerRewardSharePercent: VRYX_WORKER_REWARD_SHARE,
+}
 
 function clampPercent(value) {
   if (!Number.isFinite(value)) return 0
@@ -656,9 +826,60 @@ function toUserSessionSummary(row) {
   }
 }
 
-function toMoneyAmount(tokens) {
+async function computeBillingCost({ model, promptTokens = 0, completionTokens = 0, billingMode = 'public' }) {
+  const prompt = Math.max(0, Math.floor(Number(promptTokens) || 0))
+  const completion = Math.max(0, Math.floor(Number(completionTokens) || 0))
+  const globalConfig = await getPricingConfig(pool, PRICING_FALLBACK)
+  const resolved = model ? await resolveModelPricingByKey(pool, PRICING_FALLBACK, model, billingMode) : null
+  const modelPricing = resolved?.pricing
+    ? {
+        inputEurPerMillion: resolved.pricing.inputEurPerMillion,
+        outputEurPerMillion: resolved.pricing.outputEurPerMillion,
+        privatePoolInputEurPerMillion: resolved.pricing.privatePoolInputEurPerMillion,
+        privatePoolOutputEurPerMillion: resolved.pricing.privatePoolOutputEurPerMillion,
+        privatePoolDiscountPercent: globalConfig.privatePoolTokenDiscountPercent,
+        blendedInputRatioPercent: globalConfig.blendedInputRatioPercent ?? 75,
+      }
+    : {
+        inputEurPerMillion: globalConfig.headline?.minInputEurPerMillion ?? 0.02,
+        outputEurPerMillion: globalConfig.headline?.minOutputEurPerMillion ?? 0.06,
+        blendedInputRatioPercent: globalConfig.blendedInputRatioPercent ?? 75,
+      }
+  return computeRequestCost({ modelPricing, promptTokens: prompt, completionTokens: completion, billingMode })
+}
+
+async function getBillingCreditPackages() {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+    const packages = pricing.recharge?.packagesEur
+    if (Array.isArray(packages) && packages.length) {
+      return [...new Set(packages.map((v) => Number(v)).filter((v) => Number.isFinite(v) && v >= 5))]
+    }
+  } catch {
+    /* fallback env */
+  }
+  return VRYX_BILLING_CREDIT_PACKAGES
+}
+
+async function resolveBillingEurPerMillion() {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+    if (pricing.headline) {
+      return computeBlendedPrice(
+        pricing.headline.minInputEurPerMillion,
+        pricing.headline.minOutputEurPerMillion,
+        pricing.blendedInputRatioPercent ?? 75,
+      )
+    }
+    return pricing.defaultEurPerMillion
+  } catch {
+    return VRYX_EUR_PER_MILLION
+  }
+}
+
+function toMoneyAmount(tokens, eurPerMillion = VRYX_EUR_PER_MILLION) {
   if (!Number.isFinite(tokens) || tokens <= 0) return 0
-  return Number(((tokens / 1_000_000) * VRYX_EUR_PER_MILLION).toFixed(4))
+  return Number(((tokens / 1_000_000) * eurPerMillion).toFixed(4))
 }
 
 function toEuroAmount(value, precision = 6) {
@@ -667,18 +888,19 @@ function toEuroAmount(value, precision = 6) {
   return Number(n.toFixed(precision))
 }
 
-function euroFromTokens(tokens) {
+function euroFromTokens(tokens, eurPerMillion = VRYX_EUR_PER_MILLION) {
   if (!Number.isFinite(tokens) || tokens <= 0) return 0
-  return toEuroAmount((tokens / 1_000_000) * VRYX_EUR_PER_MILLION)
+  return toEuroAmount((tokens / 1_000_000) * eurPerMillion)
 }
 
 function estimatePromptTokens(prompt) {
   return Math.max(1, Math.ceil(String(prompt || '').length / 4))
 }
 
-function estimateEnterpriseQuote(input) {
+async function estimateEnterpriseQuote(input) {
+  const billingRate = await resolveBillingEurPerMillion()
   const monthlyTokens = Math.max(1_000_000, Number(input.monthlyTokens || 0))
-  const usageBase = euroFromTokens(monthlyTokens)
+  const usageBase = euroFromTokens(monthlyTokens, billingRate)
   const offerMultiplier =
     input.offer === 'private_pool' ? 5
       : input.offer === 'knowledge_ai' ? 3.5
@@ -701,7 +923,7 @@ function estimateEnterpriseQuote(input) {
   return {
     monthlyEstimateEur: toEuroAmount(monthlyEstimate, 2),
     setupEstimateEur: toEuroAmount(setupEstimate, 2),
-    unitTokenCostEurPerMillion: VRYX_EUR_PER_MILLION,
+    unitTokenCostEurPerMillion: billingRate,
     assumptions: {
       monthlyTokens,
       offerMultiplier,
@@ -808,6 +1030,16 @@ const enterpriseQuoteSchema = z.object({
   fineTuning: z.boolean().optional().default(false),
   dedicatedWorkers: z.number().int().min(0).max(128).optional().default(0),
   notes: z.string().trim().max(2000).optional().default(''),
+})
+
+const enterpriseQuoteAdminSchema = z.object({
+  status: z.enum(['new', 'contacted', 'loi_requested', 'loi_received', 'paid_pilot', 'won', 'lost']).optional(),
+  commercialStage: z.enum(['prospect', 'letter_of_interest', 'paid_pilot', 'pilot_running', 'customer', 'lost']).optional(),
+  pilotAmountEur: z.number().min(0).max(1_000_000).nullable().optional(),
+  expectedCloseDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  nextStep: z.string().trim().max(500).nullable().optional(),
+  signedDocumentUrl: z.string().trim().max(1000).nullable().optional(),
+  notes: z.string().trim().max(5000).nullable().optional(),
 })
 
 const pool = mysql.createPool({
@@ -1904,6 +2136,21 @@ async function ensureApiKeyUsageTable() {
       CONSTRAINT fk_api_key_usage_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
+  for (const [col, def] of [
+    ['cost_input_eur', 'DECIMAL(12,6) NULL'],
+    ['cost_output_eur', 'DECIMAL(12,6) NULL'],
+    ['billing_mode', "VARCHAR(24) NOT NULL DEFAULT 'public'"],
+    ['pricing_snapshot_json', 'LONGTEXT NULL'],
+  ]) {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'api_key_usage' AND COLUMN_NAME = :column`,
+      { column: col },
+    )
+    if (Number(rows[0]?.c || 0) === 0) {
+      await pool.query(`ALTER TABLE api_key_usage ADD COLUMN ${col} ${def}`)
+    }
+  }
 }
 
 async function ensureBillingTables() {
@@ -1970,6 +2217,17 @@ async function ensureEnterpriseQuoteRequestsTable() {
       KEY idx_enterprise_quotes_email (email)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
+  const [columns] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'enterprise_quote_requests'`,
+  )
+  const present = new Set(columns.map((row) => row.COLUMN_NAME))
+  if (!present.has('commercial_stage')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN commercial_stage VARCHAR(40) NOT NULL DEFAULT 'prospect'`)
+  if (!present.has('pilot_amount_eur')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN pilot_amount_eur DECIMAL(12,2) NULL`)
+  if (!present.has('expected_close_date')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN expected_close_date DATE NULL`)
+  if (!present.has('next_step')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN next_step VARCHAR(500) NULL`)
+  if (!present.has('signed_document_url')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN signed_document_url TEXT NULL`)
+  if (!present.has('updated_by_user_id')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN updated_by_user_id BIGINT UNSIGNED NULL`)
 }
 
 async function ensureForcedAdmins() {
@@ -1985,16 +2243,16 @@ async function ensureForcedAdmins() {
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, {
     expiresIn: `${JWT_EXPIRES_DAYS}d`,
-    issuer: 'velocity-api',
-    audience: 'velocity-web',
+    issuer: 'vryx-api',
+    audience: 'vryx-web',
   })
 }
 
 function verifyToken(token) {
   try {
     return jwt.verify(token, JWT_SECRET, {
-      issuer: 'velocity-api',
-      audience: 'velocity-web',
+      issuer: ['vryx-api', 'velocity-api'],
+      audience: ['vryx-web', 'velocity-web'],
     })
   } catch {
     return null
@@ -2019,11 +2277,17 @@ function clearAuthCookie(res) {
     sameSite: 'lax',
     path: '/',
   })
+  res.clearCookie(LEGACY_COOKIE_NAME, {
+    httpOnly: true,
+    secure: COOKIE_SECURE,
+    sameSite: 'lax',
+    path: '/',
+  })
 }
 
 function authMiddleware(req, res, next) {
   const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]
-  const token = bearer || req.cookies?.[COOKIE_NAME]
+  const token = bearer || req.cookies?.[COOKIE_NAME] || req.cookies?.[LEGACY_COOKIE_NAME]
   if (!token) {
     req.user = null
     return next()
@@ -2132,11 +2396,13 @@ async function insertBillingLedgerEntry(conn, {
   return amount
 }
 
-async function ensureApiCreditForRequest(req, { prompt, maxTokens }) {
+async function ensureApiCreditForRequest(req, { prompt, maxTokens, model = null }) {
   const userId = Number(req.apiUser?.id)
   if (!Number.isFinite(userId) || userId <= 0) return { ok: true, estimatedCostEur: 0, balanceEur: 0 }
-  const estimatedTokens = estimatePromptTokens(prompt) + Math.max(1, Math.floor(Number(maxTokens) || 0))
-  const estimatedCostEur = euroFromTokens(estimatedTokens)
+  const promptTokens = estimatePromptTokens(prompt)
+  const completionTokens = Math.max(1, Math.floor(Number(maxTokens) || 0))
+  const costBreakdown = await computeBillingCost({ model, promptTokens, completionTokens })
+  const estimatedCostEur = costBreakdown.totalCostEur
   if (!VRYX_BILLING_ENFORCE_CREDITS) return { ok: true, estimatedCostEur, balanceEur: null }
   const balanceEur = await getUserCreditBalance(userId)
   if (balanceEur + 0.000001 < estimatedCostEur) {
@@ -2145,22 +2411,31 @@ async function ensureApiCreditForRequest(req, { prompt, maxTokens }) {
   return { ok: true, estimatedCostEur, balanceEur }
 }
 
-async function recordApiKeyUsage(req, { model, promptTokens = 0, completionTokens = 0, totalTokens = 0, latencyMs = 0 } = {}) {
+async function recordApiKeyUsage(req, { model, promptTokens = 0, completionTokens = 0, totalTokens = 0, latencyMs = 0, billingMode = 'public' } = {}) {
   const keyId = Number(req.apiUser?.keyId)
   const userId = Number(req.apiUser?.id)
   if (!Number.isFinite(keyId) || keyId <= 0 || !Number.isFinite(userId) || userId <= 0) return
   const prompt = Math.max(0, Math.floor(Number(promptTokens) || 0))
   const completion = Math.max(0, Math.floor(Number(completionTokens) || 0))
   const total = Math.max(prompt + completion, Math.floor(Number(totalTokens) || 0))
-  const cost = euroFromTokens(total)
+  const costBreakdown = await computeBillingCost({ model, promptTokens: prompt, completionTokens: completion, billingMode })
+  const cost = costBreakdown.totalCostEur
+  const pricingSnapshot = JSON.stringify({
+    rates: costBreakdown.rates,
+    billingMode: costBreakdown.billingMode,
+    inputCostEur: costBreakdown.inputCostEur,
+    outputCostEur: costBreakdown.outputCostEur,
+  })
   const conn = await pool.getConnection()
   try {
     await conn.beginTransaction()
     const [result] = await conn.query(
       `INSERT INTO api_key_usage
-         (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, cost_eur, latency_ms)
+         (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens,
+          cost_eur, cost_input_eur, cost_output_eur, billing_mode, pricing_snapshot_json, latency_ms)
        VALUES
-         (:apiKeyId, :userId, :model, :promptTokens, :completionTokens, :totalTokens, :costEur, :latencyMs)`,
+         (:apiKeyId, :userId, :model, :promptTokens, :completionTokens, :totalTokens,
+          :costEur, :costInputEur, :costOutputEur, :billingMode, :pricingSnapshot, :latencyMs)`,
       {
         apiKeyId: keyId,
         userId,
@@ -2169,6 +2444,10 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
         completionTokens: completion,
         totalTokens: total,
         costEur: cost,
+        costInputEur: costBreakdown.inputCostEur,
+        costOutputEur: costBreakdown.outputCostEur,
+        billingMode,
+        pricingSnapshot,
         latencyMs: Math.max(0, Math.floor(Number(latencyMs) || 0)),
       },
     )
@@ -2239,7 +2518,14 @@ app.use(
     credentials: true,
   }),
 )
-app.use(express.json({ limit: JSON_BODY_LIMIT }))
+app.use(express.json({
+  limit: JSON_BODY_LIMIT,
+  verify: (req, _res, buf) => {
+    if (req.originalUrl === '/api/billing/stripe/webhook') {
+      req.rawBody = Buffer.from(buf)
+    }
+  },
+}))
 app.use(cookieParser())
 app.use(csrfProtection)
 app.use(authMiddleware)
@@ -2256,8 +2542,9 @@ app.post('/api/internal/p2p-token-stream', (req, res) => {
   }
   if (event === 'token' && token) {
     stream.text += token
-    if (typeof stream.onToken === 'function') stream.onToken(token)
-    enqueueP2pTokenStream(stream, token, true)
+    const transformed = typeof stream.onToken === 'function' ? stream.onToken(token) : undefined
+    const tokenForClient = typeof transformed === 'string' ? transformed : token
+    if (tokenForClient) enqueueP2pTokenStream(stream, tokenForClient, true)
   } else if (event === 'stage') {
     flushP2pTokenStream(stream)
     stream.send({ stage: 'worker_stream', status: String(req.body?.status || 'Token stream actif') })
@@ -2300,7 +2587,7 @@ app.post('/api/enterprise/quote', enterpriseQuoteLimiter, async (req, res) => {
     return res.status(400).json({ ok: false, error: first })
   }
   const data = parsed.data
-  const estimate = estimateEnterpriseQuote(data)
+  const estimate = await estimateEnterpriseQuote(data)
   try {
     const [result] = await pool.query(
       `INSERT INTO enterprise_quote_requests
@@ -2346,6 +2633,12 @@ function openAiModelId(raw) {
   const normalized = normalizeP2pModelId(value)
   if (/qwen.*3[.-]?6.*35/i.test(normalized) || /Qwen3\.6-35B/i.test(normalized)) return 'Qwen/Qwen3.6-35B-A3B'
   return normalized || 'Qwen/Qwen3.6-35B-A3B'
+}
+
+function accountChatModelId(raw) {
+  const model = openAiModelId(raw || ACCOUNT_CHAT_FALLBACK_MODEL)
+  if (/^Qwen\/Qwen3\.6-35B-A3B$/i.test(model)) return ACCOUNT_CHAT_FALLBACK_MODEL
+  return model
 }
 
 function modelSupportsVision(model) {
@@ -3224,7 +3517,7 @@ openAiRouter.post('/chat/completions', async (req, res) => {
         error: { message: String(data?.error || 'Erreur Vryx.'), type: 'server_error' },
       })
     }
-    const text = typeof data.response === 'string' ? data.response : ''
+    const text = stripThinkBlocks(typeof data.response === 'string' ? data.response : '')
     const toolCall = synthesizeToolCallFromText(text, tools)
     const usage = {
       prompt_tokens: Number(data.prompt_tokens || 0),
@@ -3622,8 +3915,9 @@ accountRouter.get('/overview', async (req, res) => {
     monthTokens += apiTokensMonth
     const requestsThisMonth = Number(sessionRows.length) + Number(apiUsageMonth?.apiRequests || 0)
     const usagePercent = clampPercent((monthTokens / VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET) * 100)
-    const spendThisMonth = toEuroAmount(toMoneyAmount(monthTokens - apiTokensMonth) + apiCostMonth, 4)
-    const costPerMillionTokens = monthTokens > 0 ? spendThisMonth / (monthTokens / 1_000_000) : toMoneyAmount(1_000_000)
+    const billingRate = await resolveBillingEurPerMillion()
+    const spendThisMonth = toEuroAmount(toMoneyAmount(monthTokens - apiTokensMonth, billingRate) + apiCostMonth, 4)
+    const costPerMillionTokens = monthTokens > 0 ? spendThisMonth / (monthTokens / 1_000_000) : billingRate
     const estimatedGrossMarginEur = spendThisMonth * (VRYX_ESTIMATED_GROSS_MARGIN / 100)
     const estimatedWorkerRewardsEur = spendThisMonth * (VRYX_WORKER_REWARD_SHARE / 100)
     const creditBalance = await getUserCreditBalance(userId)
@@ -3706,7 +4000,7 @@ accountRouter.get('/billing', async (req, res) => {
       balanceEur: await getUserCreditBalance(userId),
       enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
       checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
-      packages: VRYX_BILLING_CREDIT_PACKAGES,
+      packages: await getBillingCreditPackages(),
       monthUsage: {
         requestCount: Number(usageMonth?.requestCount || 0),
         totalTokens: Number(usageMonth?.totalTokens || 0),
@@ -3733,7 +4027,13 @@ accountRouter.post('/billing/checkout', async (req, res) => {
   const parsed = accountCheckoutSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: 'Montant invalide.' })
   const amountEur = toEuroAmount(parsed.data.amountEur, 2)
-  if (!VRYX_BILLING_CREDIT_PACKAGES.includes(amountEur)) {
+  const packages = await getBillingCreditPackages()
+  const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+  const minRecharge = pricing.recharge?.minEur ?? 20
+  if (amountEur + 0.0001 < minRecharge) {
+    return res.status(400).json({ error: `Recharge minimale : ${minRecharge} €.` })
+  }
+  if (!packages.includes(amountEur)) {
     return res.status(400).json({ error: 'Pack de crédits indisponible.' })
   }
   if (!STRIPE_SECRET_KEY) {
@@ -4009,10 +4309,10 @@ accountRouter.get('/sessions/:id', async (req, res) => {
 accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
   const messages = Array.isArray(req.body?.messages) ? req.body.messages.slice(-16) : []
   const fallbackPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : ''
-  let prompt = openAiMessagesToPrompt(messages) || fallbackPrompt
+  let prompt = [ACCOUNT_CHAT_SYSTEM_PROMPT, openAiMessagesToPrompt(messages) || fallbackPrompt, ACCOUNT_CHAT_REPLY_ONLY_SUFFIX].filter(Boolean).join('\n')
   if (!prompt.trim()) return res.status(400).json({ error: 'Message requis.' })
 
-  const model = openAiModelId(req.body?.model)
+  const model = accountChatModelId(req.body?.model)
   const attachmentResult = normalizeChatAttachments(req.body?.attachments, model)
   if (!attachmentResult.ok) return res.status(400).json({ error: attachmentResult.error })
   prompt += attachmentResult.promptSuffix
@@ -4023,10 +4323,10 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
   const firstUserMessage = messages.filter((message) => message?.role === 'user' && typeof message.content === 'string').at(-1)?.content || fallbackPrompt || prompt
   const requestedMaxTokens = Number(req.body?.max_tokens ?? req.body?.max_new_tokens)
   const maxTokens = Number.isFinite(requestedMaxTokens)
-    ? Math.max(64, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
-    : Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 8192)
-  const temperatureRaw = Number(req.body?.temperature ?? 0.2)
-  const temperature = Number.isFinite(temperatureRaw) ? Math.max(0, Math.min(1.5, temperatureRaw)) : 0.2
+    ? Math.max(8, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
+    : VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS
+  const temperatureRaw = Number(req.body?.temperature ?? 0)
+  const temperature = Number.isFinite(temperatureRaw) ? Math.max(0, Math.min(1.5, temperatureRaw)) : 0
   const requestedQuantization = ['q4', 'int8', 'fp16'].includes(req.body?.quantization) ? req.body.quantization : 'q4'
   const chatBody = {
     prompt,
@@ -4036,9 +4336,9 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
     pool_preference: 'velocity_mlx',
     max_new_tokens: maxTokens,
     temperature,
-    top_p: Number(req.body?.top_p ?? 0.65) || 0.65,
+    top_p: Number(req.body?.top_p ?? 0.6) || 0.6,
     top_k: 20,
-    repetition_penalty: 1.08,
+    repetition_penalty: 1.2,
   }
 
   try {
@@ -4058,32 +4358,41 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
         error: String(data?.error || 'Erreur Vryx. Aucun worker compatible ne répond pour le moment.'),
       })
     }
-    const text = typeof data.response === 'string' ? data.response : ''
+    let text = cleanAccountReplyText(typeof data.response === 'string' ? data.response : '')
+    let effectiveData = data
+    if (!text.trim()) {
+      const fallbackResult = await callAccountChatFallback({ model, chatBody, signal })
+      if (fallbackResult) {
+        effectiveData = fallbackResult.data
+        text = fallbackResult.text
+      }
+    }
+    text = repairAccountReplyText(firstUserMessage, text)
     const latencyMs = Date.now() - startedAt
-    const conversationTitle = await generateConversationTitleWithAi({
+    const conversationTitle = repairConversationTitle(await generateConversationTitleWithAi({
       userId: req.user.id,
       conversationId,
       model,
       firstUserMessage,
       assistantReply: text,
-    })
+    }), firstUserMessage)
     const session = {
       id: `account-chat-${crypto.randomUUID()}`,
       prompt,
       response: text,
       model,
-      promptTokens: Number(data.prompt_tokens || 0),
-      completionTokens: Number(data.completion_tokens || 0),
-      totalTokens: Number(data.total_tokens || 0),
+      promptTokens: Number(effectiveData.prompt_tokens || 0),
+      completionTokens: Number(effectiveData.completion_tokens || 0),
+      totalTokens: Number(effectiveData.total_tokens || 0),
       latencyMs,
-      computeTimeMs: Number(data.compute_time_ms || data.pipeline_trace?.compute_time_ms || latencyMs),
+      computeTimeMs: Number(effectiveData.compute_time_ms || effectiveData.pipeline_trace?.compute_time_ms || latencyMs),
       mode: 'account_chat',
       conversationId,
       conversationTitle,
       attachments: attachmentResult.attachments.map((item) => ({ ...item, dataUrl: item.dataUrl ? '[image-data]' : undefined })),
       pipelineOk: true,
-      metrics: data.metrics || null,
-      pipeline_trace: sanitizePipelineTraceForAdmin(data.pipeline_trace || null),
+      metrics: effectiveData.metrics || null,
+      pipeline_trace: sanitizePipelineTraceForAdmin(effectiveData.pipeline_trace || null),
     }
     await pool
       .query(
@@ -4126,10 +4435,10 @@ accountRouter.post('/chat', accountChatLimiter, async (req, res) => {
 accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   const messages = Array.isArray(req.body?.messages) ? req.body.messages.slice(-16) : []
   const fallbackPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim() : ''
-  let prompt = openAiMessagesToPrompt(messages) || fallbackPrompt
+  let prompt = [ACCOUNT_CHAT_SYSTEM_PROMPT, openAiMessagesToPrompt(messages) || fallbackPrompt, ACCOUNT_CHAT_REPLY_ONLY_SUFFIX].filter(Boolean).join('\n')
   if (!prompt.trim()) return res.status(400).json({ error: 'Message requis.' })
 
-  const model = openAiModelId(req.body?.model)
+  const model = accountChatModelId(req.body?.model)
   const attachmentResult = normalizeChatAttachments(req.body?.attachments, model)
   if (!attachmentResult.ok) return res.status(400).json({ error: attachmentResult.error })
   prompt += attachmentResult.promptSuffix
@@ -4140,8 +4449,8 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   const firstUserMessage = messages.filter((message) => message?.role === 'user' && typeof message.content === 'string').at(-1)?.content || fallbackPrompt || prompt
   const requestedMaxTokens = Number(req.body?.max_tokens ?? req.body?.max_new_tokens)
   const maxTokens = Number.isFinite(requestedMaxTokens)
-    ? Math.max(64, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
-    : Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 8192)
+    ? Math.max(8, Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.floor(requestedMaxTokens)))
+    : VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS
   const requestedQuantization = ['q4', 'int8', 'fp16'].includes(req.body?.quantization) ? req.body.quantization : 'q4'
 
   res.setHeader('Content-Type', 'text/event-stream')
@@ -4168,9 +4477,16 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   }, 12000)
   let streamedReply = ''
   let completionFragments = 0
+  let streamCallbackUsed = false
+  const outputFilter = createThinkBlockFilter()
   const { streamId, secret: streamSecret } = createP2pTokenStream(send, (token) => {
-    streamedReply += token
-    completionFragments += 1
+    streamCallbackUsed = true
+    const clean = outputFilter.push(token)
+    if (clean) {
+      streamedReply += clean
+      completionFragments += 1
+    }
+    return ''
   })
 
   req.on('close', () => {
@@ -4181,18 +4497,18 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
   })
 
   const saveSession = async (data) => {
-    const text = typeof data?.response === 'string' ? data.response : streamedReply
+    const text = repairAccountReplyText(firstUserMessage, cleanAccountReplyText(typeof data?.response === 'string' ? data.response : streamedReply) || streamedReply.trim())
     const latencyMs = Date.now() - startedAt
     const promptTokens = Number(data?.prompt_tokens || 0)
     const completionTokens = Number(data?.completion_tokens || completionFragments || 0)
     const totalTokens = Number(data?.total_tokens || promptTokens + completionTokens)
-    const conversationTitle = await generateConversationTitleWithAi({
+    const conversationTitle = repairConversationTitle(await generateConversationTitleWithAi({
       userId: req.user.id,
       conversationId,
       model,
       firstUserMessage,
       assistantReply: text,
-    })
+    }), firstUserMessage)
     const session = {
       id: `account-chat-${crypto.randomUUID()}`,
       prompt,
@@ -4252,10 +4568,10 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
       hidden_transport: requestedQuantization,
       pool_preference: 'velocity_mlx',
       max_new_tokens: maxTokens,
-      temperature: 0.2,
-      top_p: 0.65,
+      temperature: 0,
+      top_p: 0.6,
       top_k: 20,
-      repetition_penalty: 1.08,
+      repetition_penalty: 1.2,
       stream_id: streamId,
       stream_secret: streamSecret,
       stream_callback_url: tokenStreamCallbackUrl,
@@ -4291,9 +4607,12 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
             continue
           }
           if (evt.event === 'token' && typeof evt.token === 'string') {
-            streamedReply += evt.token
-            completionFragments += 1
-            send({ token: evt.token })
+            if (streamCallbackUsed) continue
+            const clean = outputFilter.push(evt.token)
+            if (clean) {
+              streamedReply += clean
+              completionFragments += 1
+            }
           } else if (evt.event === 'done' || evt.done) {
             finalData = readDonePayload(evt)
           } else if (evt.event === 'error' || evt.error) {
@@ -4317,15 +4636,32 @@ accountRouter.post('/chat/stream', accountChatLimiter, async (req, res) => {
         send({ error: String(data?.error || 'Erreur Vryx. Aucun worker compatible ne répond pour le moment.') })
         return res.end()
       }
-      const text = typeof data.response === 'string' ? data.response : ''
+      const text = cleanAccountReplyText(typeof data.response === 'string' ? data.response : '')
       streamedReply = text
-      for (let i = 0; i < text.length; i += 12) {
-        send({ token: text.slice(i, i + 12) })
-      }
       finalData = data
     }
 
-    const session = await saveSession({ ...(finalData || {}), response: finalData?.response || streamedReply })
+    const tail = outputFilter.flush()
+    if (tail) {
+      streamedReply += tail
+    }
+    let cleanFinalResponse = cleanAccountReplyText(finalData?.response || streamedReply) || streamedReply.trim()
+    if (!cleanFinalResponse.trim()) {
+      send({ stage: 'fallback', status: 'Réponse finale vide, relance sur modèle compact...' })
+      const fallbackResult = await callAccountChatFallback({ model, chatBody, signal: ctrl.signal })
+      if (fallbackResult) {
+        finalData = fallbackResult.data
+        cleanFinalResponse = fallbackResult.text
+        streamedReply = cleanFinalResponse
+      }
+    }
+    cleanFinalResponse = repairAccountReplyText(firstUserMessage, cleanFinalResponse)
+    if (cleanFinalResponse.trim()) {
+      for (let i = 0; i < cleanFinalResponse.length; i += 18) {
+        send({ token: cleanFinalResponse.slice(i, i + 18) })
+      }
+    }
+    const session = await saveSession({ ...(finalData || {}), response: cleanFinalResponse })
     send({
       done: true,
       session,
@@ -4380,8 +4716,58 @@ accountRouter.delete('/sessions', async (req, res) => {
 
 app.use('/api/account', accountRouter)
 
+app.post('/api/internal/bench/chat', accountChatLimiter, async (req, res) => {
+  if (!VRYX_BENCH_TOKEN) return res.status(404).json({ ok: false })
+  const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
+  const headerToken = String(req.headers['x-vryx-bench-token'] || '').trim()
+  const token = bearer || headerToken
+  if (!tokenMatchesSecret(token, VRYX_BENCH_TOKEN)) {
+    return res.status(401).json({ ok: false, error: 'bench_unauthorized' })
+  }
+  try {
+    const upstream = await fetch(`${VRYX_INITIATOR_CHAT_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body || {}),
+      signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+        ? AbortSignal.timeout(Math.max(30_000, Math.min(2_400_000, Number(process.env.VRYX_BENCH_HTTP_TIMEOUT_MS || 600_000))))
+        : undefined,
+    })
+    const text = await upstream.text()
+    res.status(upstream.status)
+    res.type(upstream.headers.get('content-type') || 'application/json')
+    return res.send(text)
+  } catch (e) {
+    console.error('internal/bench/chat', e?.name === 'AbortError' ? 'timeout' : e)
+    return res.status(502).json({ ok: false, error: e?.name === 'AbortError' ? 'bench_timeout' : 'bench_proxy_failed' })
+  }
+})
+
+function verifyStripeWebhookSignature(req) {
+  if (!STRIPE_WEBHOOK_SECRET) return true
+  const signature = String(req.headers['stripe-signature'] || '')
+  const rawBody = req.rawBody
+  if (!signature || !rawBody) return false
+  const parts = Object.fromEntries(
+    signature
+      .split(',')
+      .map((part) => part.split('='))
+      .filter((pair) => pair.length === 2)
+      .map(([key, value]) => [key.trim(), value.trim()]),
+  )
+  const timestamp = parts.t
+  const expected = parts.v1
+  if (!timestamp || !expected) return false
+  const ageSeconds = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp))
+  if (!Number.isFinite(ageSeconds) || ageSeconds > 300) return false
+  const payload = `${timestamp}.${rawBody.toString('utf8')}`
+  const digest = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(payload).digest('hex')
+  return tokenMatchesSecret(digest, expected)
+}
+
 app.post('/api/billing/stripe/webhook', async (req, res) => {
   if (!STRIPE_SECRET_KEY) return res.status(501).json({ ok: false, error: 'Stripe non configuré.' })
+  if (!verifyStripeWebhookSignature(req)) return res.status(400).json({ ok: false, error: 'Signature Stripe invalide.' })
   try {
     const eventId = typeof req.body?.id === 'string' ? req.body.id : ''
     let event = req.body
@@ -4499,6 +4885,105 @@ registerPublicStatusRoutes(app, {
   eurPerMillion: VRYX_EUR_PER_MILLION,
   grossMarginPercent: VRYX_ESTIMATED_GROSS_MARGIN,
   workerRewardSharePercent: VRYX_WORKER_REWARD_SHARE,
+  getPricingConfig: () => getPricingConfig(pool, PRICING_FALLBACK),
+})
+
+function publicPricingDto(pricing, extras = {}) {
+  const published = Boolean(pricing.pricingPublished)
+  const headline = pricing.headline || { minInputEurPerMillion: 0.02, minOutputEurPerMillion: 0.06 }
+  const blended = published
+    ? (pricing.eurPerMillionTokens ?? null)
+    : null
+  return {
+    published,
+    headline: published ? headline : null,
+    minInputEurPerMillion: published ? headline.minInputEurPerMillion : null,
+    minOutputEurPerMillion: published ? headline.minOutputEurPerMillion : null,
+    blendedInputRatioPercent: pricing.blendedInputRatioPercent ?? 75,
+    /** @deprecated use headline + per-model pricing */
+    eurPerMillionTokens: published ? blended : null,
+    eurPerThousandTokens: published && blended != null ? Number((blended / 1000).toFixed(6)) : null,
+    vatPercent: pricing.vatPercent,
+    workerRewardSharePercent: pricing.workerRewardSharePercent,
+    defaultWorkerSharePercent: pricing.defaultWorkerSharePercent ?? 60,
+    estimatedGrossMarginPercent: pricing.estimatedGrossMarginPercent,
+    volumeDiscounts: pricing.volumeDiscounts,
+    recharge: pricing.recharge,
+    privatePoolTokenDiscountPercent: pricing.privatePoolTokenDiscountPercent ?? 30,
+    minVryxNetMarginPercent: pricing.minVryxNetMarginPercent ?? 20,
+    subscriptionPlans: extras.subscriptionPlans || [],
+    privatePoolPlans: extras.privatePoolPlans || [],
+    fineTuningPlans: extras.fineTuningPlans || [],
+    pricingTiers: extras.pricingTiers || [],
+    updatedAt: pricing.updatedAt,
+  }
+}
+
+async function publicModelsWithRuntime({ includeInactive = false, includePrivate = false } = {}) {
+  const [catalog, runtimeModels] = await Promise.all([
+    getPublicModels(pool, PRICING_FALLBACK, { includeInactive, includePrivate, includeModifierDetails: includeInactive || includePrivate }),
+    discoverAvailableModels().catch(() => []),
+  ])
+  const runtimeByKey = new Map()
+  for (const model of runtimeModels || []) {
+    const keys = [model.id, model.label].map(normalizeP2pModelKey).filter(Boolean)
+    for (const key of keys) runtimeByKey.set(key, model)
+  }
+  return catalog.map((model) => {
+    const runtime = runtimeByKey.get(normalizeP2pModelKey(model.hfId || model.id)) || runtimeByKey.get(normalizeP2pModelKey(model.name))
+    const result = {
+      ...model,
+      workersOnline: Number(runtime?.workersOnline || 0),
+      workersTotal: Number(runtime?.workersTotal || 0),
+      requiredWorkers: Number(model.requiredWorkers || runtime?.requiredWorkers || 1),
+      runnable: Boolean(runtime?.runnable),
+      ready: Boolean(runtime?.ready),
+      lastSeenAt: runtime?.lastSeenAt || null,
+    }
+    if (!includeInactive && !includePrivate) {
+      delete result.updatedByUserId
+      delete result.updatedByEmail
+    }
+    return result
+  })
+}
+
+app.get('/api/public/pricing', async (_req, res) => {
+  try {
+    const bundle = await getPublicPricingBundle(pool, PRICING_FALLBACK)
+    res.json({
+      ok: true,
+      pricing: publicPricingDto(bundle.pricing, {
+        subscriptionPlans: bundle.subscriptionPlans,
+        privatePoolPlans: bundle.privatePoolPlans,
+        fineTuningPlans: bundle.fineTuningPlans,
+        pricingTiers: bundle.tiers,
+      }),
+    })
+  } catch (e) {
+    console.error('public/pricing', e)
+    res.status(500).json({ error: 'Erreur lecture pricing.' })
+  }
+})
+
+app.get('/api/public/models', async (_req, res) => {
+  try {
+    const bundle = await getPublicPricingBundle(pool, PRICING_FALLBACK)
+    const models = await publicModelsWithRuntime()
+    res.json({
+      ok: true,
+      pricing: publicPricingDto(bundle.pricing, {
+        subscriptionPlans: bundle.subscriptionPlans,
+        privatePoolPlans: bundle.privatePoolPlans,
+        fineTuningPlans: bundle.fineTuningPlans,
+        pricingTiers: bundle.tiers,
+      }),
+      models,
+    })
+  } catch (e) {
+    console.error('public/models', e)
+    res.status(500).json({ error: 'Erreur lecture modèles.' })
+  }
 })
 
 /** Cible interdite pour sondes latence depuis le VPS (boucle locale / métadonnées). */
@@ -5433,6 +5918,295 @@ adminRouter.use(requireAdmin)
 registerObservabilityRoutes(adminRouter, observability)
 registerAdminInferenceRoutes(adminRouter, { pool })
 
+const pricingConfigBodySchema = z.object({
+  defaultEurPerMillion: z.number().positive().max(1000).optional(),
+  pricingPublished: z.boolean(),
+  vatPercent: z.number().min(0).max(100),
+  workerRewardSharePercent: z.number().min(0).max(100),
+  defaultWorkerSharePercent: z.number().min(0).max(100).optional(),
+  blendedInputRatioPercent: z.number().min(0).max(100).optional(),
+  privatePoolTokenDiscountPercent: z.number().min(0).max(95).optional(),
+  minVryxNetMarginPercent: z.number().min(0).max(95).optional(),
+  minInputEurPerMillion: z.number().positive().max(1000).optional(),
+  minOutputEurPerMillion: z.number().positive().max(1000).optional(),
+  headline: z.object({
+    minInputEurPerMillion: z.number().positive().max(1000),
+    minOutputEurPerMillion: z.number().positive().max(1000),
+  }).optional(),
+  recharge: z.object({
+    minEur: z.number().min(5).max(100_000),
+    recommendedEur: z.number().min(5).max(100_000),
+    b2bMinEur: z.number().min(5).max(100_000),
+    packagesEur: z.array(z.number().min(5).max(100_000)).max(20).optional(),
+  }).optional(),
+  volumeDiscounts: z.array(z.object({
+    minMonthlyMillions: z.number().min(0).max(10_000_000),
+    discountPercent: z.number().min(0).max(95),
+  })).max(12).optional().default([]),
+})
+
+const modelCatalogBodySchema = z.object({
+  slug: z.string().trim().max(120).optional(),
+  hfId: z.string().trim().max(180).nullable().optional(),
+  apiAlias: z.string().trim().max(120).nullable().optional(),
+  name: z.string().trim().min(1).max(180),
+  provider: z.string().trim().min(1).max(100),
+  family: z.string().trim().min(1).max(100),
+  paramsNote: z.string().trim().max(120).nullable().optional(),
+  contextTokens: z.number().int().min(0).max(20_000_000).optional().default(0),
+  modalities: z.array(z.string().trim().min(1).max(40)).max(12).optional().default([]),
+  openWeights: z.boolean().optional().default(true),
+  weightGb: z.number().min(0).max(10_000).nullable().optional(),
+  pricingTier: z.string().trim().max(40).optional(),
+  eurPerMillion: z.number().positive().max(1000).nullable().optional(),
+  eurPerMillionInput: z.number().positive().max(1000).nullable().optional(),
+  eurPerMillionOutput: z.number().positive().max(1000).nullable().optional(),
+  eurPerMillionCachedInput: z.number().positive().max(1000).nullable().optional(),
+  eurPerMillionBatchInput: z.number().positive().max(1000).nullable().optional(),
+  eurPerMillionBatchOutput: z.number().positive().max(1000).nullable().optional(),
+  privatePoolInputEurPerMillion: z.number().positive().max(1000).nullable().optional(),
+  privatePoolOutputEurPerMillion: z.number().positive().max(1000).nullable().optional(),
+  workerSharePercent: z.number().min(0).max(100).nullable().optional(),
+  estimatedWorkerCostInput: z.number().min(0).max(1000).nullable().optional(),
+  estimatedWorkerCostOutput: z.number().min(0).max(1000).nullable().optional(),
+  minVryxMarginPercent: z.number().min(0).max(95).nullable().optional(),
+  availabilityStatus: z.enum(['available', 'limited', 'reservation', 'unavailable']).optional(),
+  isActive: z.boolean().optional().default(true),
+  isPublic: z.boolean().optional().default(true),
+  minVramMb: z.number().int().min(0).max(1_000_000).nullable().optional(),
+  requiredWorkers: z.number().int().min(1).max(256).optional().default(1),
+  sortOrder: z.number().int().min(-1_000_000).max(1_000_000).optional().default(0),
+})
+
+const pricingTierBodySchema = z.object({
+  slug: z.string().trim().max(40),
+  label: z.string().trim().max(120),
+  defaultInputEurPerMillion: z.number().positive().max(1000),
+  defaultOutputEurPerMillion: z.number().positive().max(1000),
+  defaultWorkerSharePercent: z.number().min(0).max(100),
+  sortOrder: z.number().int().optional().default(0),
+})
+
+const subscriptionPlanBodySchema = z.object({
+  slug: z.string().trim().max(40),
+  name: z.string().trim().max(120),
+  monthlyEur: z.number().min(0).max(1_000_000),
+  description: z.string().trim().max(500).optional(),
+  isPublic: z.boolean().optional().default(true),
+  sortOrder: z.number().int().optional().default(0),
+})
+
+const privatePoolPlanBodySchema = z.object({
+  slug: z.string().trim().max(40),
+  name: z.string().trim().max(120),
+  monthlyEur: z.number().min(0).max(1_000_000),
+  workerCountMin: z.number().int().min(0).max(10_000),
+  workerCountMax: z.number().int().min(0).max(10_000),
+  tokenDiscountPercent: z.number().min(0).max(95),
+  isPublic: z.boolean().optional().default(true),
+  sortOrder: z.number().int().optional().default(0),
+})
+
+const fineTuningPlanBodySchema = z.object({
+  slug: z.string().trim().max(40),
+  name: z.string().trim().max(120),
+  eurPerMillionTraining: z.number().min(0).max(10_000),
+  setupMinEur: z.number().min(0).max(1_000_000),
+  setupMaxEur: z.number().min(0).max(1_000_000),
+  deploymentMonthlyMinEur: z.number().min(0).max(1_000_000),
+  deploymentMonthlyMaxEur: z.number().min(0).max(1_000_000),
+  isPublic: z.boolean().optional().default(true),
+  sortOrder: z.number().int().optional().default(0),
+})
+
+adminRouter.get('/pricing', async (_req, res) => {
+  try {
+    const bundle = await getPublicPricingBundle(pool, PRICING_FALLBACK)
+    res.json({
+      ok: true,
+      pricing: bundle.pricing,
+      tiers: bundle.tiers,
+      subscriptionPlans: await getAllSubscriptionPlans(pool),
+      privatePoolPlans: await getAllPrivatePoolPlans(pool),
+      fineTuningPlans: await getAllFineTuningPlans(pool),
+      models: await publicModelsWithRuntime({ includeInactive: true, includePrivate: true }),
+      audit: await getPricingAudit(pool),
+    })
+  } catch (e) {
+    console.error('admin/pricing', e)
+    res.status(500).json({ error: 'Erreur lecture pricing.' })
+  }
+})
+
+adminRouter.patch('/pricing', async (req, res) => {
+  const parsed = pricingConfigBodySchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ error: first })
+  }
+  try {
+    const pricing = await updatePricingConfig(pool, parsed.data, PRICING_FALLBACK, req.user?.id || null)
+    res.json({ ok: true, pricing })
+  } catch (e) {
+    console.error('admin/pricing patch', e)
+    res.status(500).json({ error: 'Erreur mise à jour pricing.' })
+  }
+})
+
+adminRouter.get('/models/catalog', async (_req, res) => {
+  try {
+    const bundle = await getPublicPricingBundle(pool, PRICING_FALLBACK)
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, pricing: bundle.pricing, tiers: bundle.tiers, models })
+  } catch (e) {
+    console.error('admin/models/catalog', e)
+    res.status(500).json({ error: 'Erreur lecture catalogue modèles.' })
+  }
+})
+
+adminRouter.post('/models/catalog', async (req, res) => {
+  const parsed = modelCatalogBodySchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ error: first })
+  }
+  try {
+    const result = await upsertModelCatalogEntry(pool, parsed.data, PRICING_FALLBACK, req.user?.id || null)
+    invalidatePricingCache()
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, slug: result.slug, warnings: result.warnings, models })
+  } catch (e) {
+    console.error('admin/models/catalog post', e)
+    res.status(500).json({ error: 'Erreur sauvegarde modèle.' })
+  }
+})
+
+adminRouter.patch('/models/catalog/:slug', async (req, res) => {
+  const parsed = modelCatalogBodySchema.partial().safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ error: first })
+  }
+  try {
+    const [rows] = await pool.query('SELECT * FROM model_catalog WHERE slug = :slug LIMIT 1', { slug: req.params.slug })
+    if (!rows[0]) return res.status(404).json({ error: 'Modèle introuvable.' })
+    const base = {
+      slug: rows[0].slug,
+      hfId: rows[0].hf_id,
+      apiAlias: rows[0].api_alias,
+      name: rows[0].name,
+      provider: rows[0].provider,
+      family: rows[0].family,
+      paramsNote: rows[0].params_note,
+      contextTokens: Number(rows[0].context_tokens || 0),
+      modalities: JSON.parse(rows[0].modalities_json || '[]'),
+      openWeights: Boolean(rows[0].open_weights),
+      weightGb: rows[0].weight_gb == null ? null : Number(rows[0].weight_gb),
+      pricingTier: rows[0].pricing_tier,
+      eurPerMillion: rows[0].eur_per_million == null ? null : Number(rows[0].eur_per_million),
+      eurPerMillionInput: rows[0].eur_per_million_input == null ? null : Number(rows[0].eur_per_million_input),
+      eurPerMillionOutput: rows[0].eur_per_million_output == null ? null : Number(rows[0].eur_per_million_output),
+      eurPerMillionCachedInput: rows[0].eur_per_million_cached_input == null ? null : Number(rows[0].eur_per_million_cached_input),
+      eurPerMillionBatchInput: rows[0].eur_per_million_batch_input == null ? null : Number(rows[0].eur_per_million_batch_input),
+      eurPerMillionBatchOutput: rows[0].eur_per_million_batch_output == null ? null : Number(rows[0].eur_per_million_batch_output),
+      privatePoolInputEurPerMillion: rows[0].private_pool_input_eur_per_million == null ? null : Number(rows[0].private_pool_input_eur_per_million),
+      privatePoolOutputEurPerMillion: rows[0].private_pool_output_eur_per_million == null ? null : Number(rows[0].private_pool_output_eur_per_million),
+      workerSharePercent: rows[0].worker_share_percent == null ? null : Number(rows[0].worker_share_percent),
+      estimatedWorkerCostInput: rows[0].estimated_worker_cost_input == null ? null : Number(rows[0].estimated_worker_cost_input),
+      estimatedWorkerCostOutput: rows[0].estimated_worker_cost_output == null ? null : Number(rows[0].estimated_worker_cost_output),
+      minVryxMarginPercent: rows[0].min_vryx_margin_percent == null ? null : Number(rows[0].min_vryx_margin_percent),
+      availabilityStatus: rows[0].availability_status || 'available',
+      isActive: Boolean(rows[0].is_active),
+      isPublic: Boolean(rows[0].is_public),
+      minVramMb: rows[0].min_vram_mb == null ? null : Number(rows[0].min_vram_mb),
+      requiredWorkers: Number(rows[0].required_workers || 1),
+      sortOrder: Number(rows[0].sort_order || 0),
+    }
+    const result = await upsertModelCatalogEntry(pool, { ...base, ...parsed.data, slug: rows[0].slug }, PRICING_FALLBACK, req.user?.id || null)
+    invalidatePricingCache()
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, slug: result.slug, warnings: result.warnings, models })
+  } catch (e) {
+    console.error('admin/models/catalog patch', e)
+    res.status(500).json({ error: 'Erreur mise à jour modèle.' })
+  }
+})
+
+adminRouter.delete('/models/catalog/:slug', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM model_catalog WHERE slug = :slug', { slug: req.params.slug })
+    const models = await publicModelsWithRuntime({ includeInactive: true, includePrivate: true })
+    res.json({ ok: true, models })
+  } catch (e) {
+    console.error('admin/models/catalog delete', e)
+    res.status(500).json({ error: 'Erreur suppression modèle.' })
+  }
+})
+
+adminRouter.get('/pricing/tiers', async (_req, res) => {
+  try {
+    res.json({ ok: true, tiers: await getPricingTiers(pool, { force: true }) })
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur lecture tiers.' })
+  }
+})
+
+adminRouter.patch('/pricing/tiers/:slug', async (req, res) => {
+  const parsed = pricingTierBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
+  if (!parsed.success) return res.status(400).json({ error: 'Données tier invalides.' })
+  try {
+    await upsertPricingTier(pool, parsed.data)
+    res.json({ ok: true, tiers: await getPricingTiers(pool, { force: true }) })
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur mise à jour tier.' })
+  }
+})
+
+adminRouter.get('/plans/subscriptions', async (_req, res) => {
+  res.json({ ok: true, plans: await getAllSubscriptionPlans(pool) })
+})
+
+adminRouter.patch('/plans/subscriptions/:slug', async (req, res) => {
+  const parsed = subscriptionPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
+  if (!parsed.success) return res.status(400).json({ error: 'Plan invalide.' })
+  try {
+    await upsertSubscriptionPlan(pool, parsed.data)
+    res.json({ ok: true, plans: await getAllSubscriptionPlans(pool) })
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur plan abonnement.' })
+  }
+})
+
+adminRouter.get('/plans/private-pool', async (_req, res) => {
+  res.json({ ok: true, plans: await getAllPrivatePoolPlans(pool) })
+})
+
+adminRouter.patch('/plans/private-pool/:slug', async (req, res) => {
+  const parsed = privatePoolPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
+  if (!parsed.success) return res.status(400).json({ error: 'Plan pool invalide.' })
+  try {
+    await upsertPrivatePoolPlan(pool, parsed.data, req.user?.id || null)
+    res.json({ ok: true, plans: await getAllPrivatePoolPlans(pool) })
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur plan private pool.' })
+  }
+})
+
+adminRouter.get('/plans/fine-tuning', async (_req, res) => {
+  res.json({ ok: true, plans: await getAllFineTuningPlans(pool) })
+})
+
+adminRouter.patch('/plans/fine-tuning/:slug', async (req, res) => {
+  const parsed = fineTuningPlanBodySchema.partial().safeParse({ ...req.body, slug: req.params.slug })
+  if (!parsed.success) return res.status(400).json({ error: 'Plan fine-tuning invalide.' })
+  try {
+    await upsertFineTuningPlan(pool, parsed.data)
+    res.json({ ok: true, plans: await getAllFineTuningPlans(pool) })
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur plan fine-tuning.' })
+  }
+})
+
 adminRouter.get('/billing/summary', async (_req, res) => {
   try {
     const [[totals]] = await pool.query(`
@@ -5488,10 +6262,15 @@ adminRouter.get('/enterprise/quotes', async (req, res) => {
               latency_target_ms AS latencyTargetMs, privacy_level AS privacyLevel,
               fine_tuning AS fineTuning, dedicated_workers AS dedicatedWorkers,
               monthly_estimate_eur AS monthlyEstimateEur, setup_estimate_eur AS setupEstimateEur,
-              status, notes, created_at AS createdAt, updated_at AS updatedAt
-       FROM enterprise_quote_requests
+              status, commercial_stage AS commercialStage, pilot_amount_eur AS pilotAmountEur,
+              expected_close_date AS expectedCloseDate, next_step AS nextStep,
+              signed_document_url AS signedDocumentUrl, notes,
+              q.created_at AS createdAt, q.updated_at AS updatedAt,
+              q.updated_by_user_id AS updatedByUserId, u.email AS updatedByEmail
+       FROM enterprise_quote_requests q
+       LEFT JOIN users u ON u.id = q.updated_by_user_id
        ${where}
-       ORDER BY created_at DESC
+       ORDER BY q.created_at DESC
        LIMIT 200`,
       { status },
     )
@@ -5510,14 +6289,60 @@ adminRouter.get('/enterprise/quotes', async (req, res) => {
         monthlyEstimateEur: Number(row.monthlyEstimateEur || 0),
         setupEstimateEur: Number(row.setupEstimateEur || 0),
         status: row.status,
+        commercialStage: row.commercialStage || 'prospect',
+        pilotAmountEur: row.pilotAmountEur == null ? null : Number(row.pilotAmountEur),
+        expectedCloseDate: row.expectedCloseDate ? String(row.expectedCloseDate).slice(0, 10) : null,
+        nextStep: row.nextStep || '',
+        signedDocumentUrl: row.signedDocumentUrl || '',
         notes: row.notes || '',
         createdAt: toIsoDate(row.createdAt),
         updatedAt: toIsoDate(row.updatedAt),
+        updatedByUserId: row.updatedByUserId ?? null,
+        updatedByEmail: row.updatedByEmail ?? null,
       })),
     })
   } catch (e) {
     console.error('admin/enterprise/quotes', e)
     res.status(500).json({ ok: false, error: 'Erreur lecture demandes Enterprise.' })
+  }
+})
+
+adminRouter.patch('/enterprise/quotes/:id', async (req, res) => {
+  const parsed = enterpriseQuoteAdminSchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Données invalides.'
+    return res.status(400).json({ ok: false, error: first })
+  }
+  try {
+    const [existing] = await pool.query('SELECT id FROM enterprise_quote_requests WHERE id = :id LIMIT 1', { id: req.params.id })
+    if (!existing[0]) return res.status(404).json({ ok: false, error: 'Demande introuvable.' })
+    const data = parsed.data
+    await pool.query(`
+      UPDATE enterprise_quote_requests SET
+        status = COALESCE(:status, status),
+        commercial_stage = COALESCE(:commercialStage, commercial_stage),
+        pilot_amount_eur = :pilotAmountEur,
+        expected_close_date = :expectedCloseDate,
+        next_step = :nextStep,
+        signed_document_url = :signedDocumentUrl,
+        notes = COALESCE(:notes, notes),
+        updated_by_user_id = :userId
+      WHERE id = :id
+    `, {
+      id: req.params.id,
+      status: data.status ?? null,
+      commercialStage: data.commercialStage ?? null,
+      pilotAmountEur: data.pilotAmountEur ?? null,
+      expectedCloseDate: data.expectedCloseDate || null,
+      nextStep: data.nextStep || null,
+      signedDocumentUrl: data.signedDocumentUrl || null,
+      notes: data.notes ?? null,
+      userId: req.user?.id || null,
+    })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('admin/enterprise/quotes patch', e)
+    res.status(500).json({ ok: false, error: 'Erreur mise à jour pipeline Enterprise.' })
   }
 })
 
@@ -6421,6 +7246,7 @@ adminRouter.get('/models/plan', async (req, res) => {
 })
 
 adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
+  const billingRate = await resolveBillingEurPerMillion()
   const model = normalizeP2pModelId(req.body?.model || '') || 'Qwen/Qwen3.6-35B-A3B'
   const prompt = typeof req.body?.prompt === 'string' && req.body.prompt.trim()
     ? req.body.prompt.trim()
@@ -6439,7 +7265,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         plan: JSON.stringify(reservation.plan || null),
         error: 'Aucun plan worker stable disponible pour ce benchmark.',
         createdBy: req.user.id,
-        costPerMillion: VRYX_EUR_PER_MILLION,
+        costPerMillion: billingRate,
       },
     ).catch(() => {})
     return res.status(409).json({
@@ -6497,7 +7323,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         promptTokens: Number(data?.prompt_tokens || 0),
         completionTokens,
         totalTokens: Number(data?.total_tokens || 0),
-        costPerMillion: VRYX_EUR_PER_MILLION,
+        costPerMillion: billingRate,
         plan: JSON.stringify(reservation.plan || null),
         error: data?.error ? String(data.error).slice(0, 500) : null,
         createdBy: req.user.id,
@@ -6516,7 +7342,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         promptTokens: Number(data?.prompt_tokens || 0),
         completionTokens,
         totalTokens: Number(data?.total_tokens || 0),
-        costPerMillionEur: VRYX_EUR_PER_MILLION,
+        costPerMillionEur: billingRate,
       },
       responsePreview: typeof data?.response === 'string' ? data.response.slice(0, 500) : '',
       error: data?.error || null,
@@ -6534,7 +7360,7 @@ adminRouter.post('/benchmarks/run', chatLimiter, async (req, res) => {
         plan: JSON.stringify(reservation.plan || null),
         error: String(e?.message || 'Benchmark impossible.').slice(0, 500),
         createdBy: req.user.id,
-        costPerMillion: VRYX_EUR_PER_MILLION,
+        costPerMillion: billingRate,
       },
     ).catch(() => {})
     await releaseWorkerReservation(reservation.jobId, 'failed')
@@ -7053,6 +7879,18 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
   const logInferenceOnce = async ({ status, data = null, pipelineTrace = null, workerId = null, runtime = null, error = null }) => {
     if (inferenceLogged) return
     inferenceLogged = true
+    let costEur = 0
+    if (data) {
+      const promptTokens = Number(data.prompt_tokens ?? data.promptTokens ?? 0)
+      const completionTokens = Number(data.completion_tokens ?? data.completionTokens ?? 0)
+      const totalTokens = Number(data.total_tokens ?? data.totalTokens ?? 0)
+      const costBreakdown = await computeBillingCost({
+        model: chatModelId,
+        promptTokens: promptTokens || Math.max(0, totalTokens - completionTokens),
+        completionTokens: completionTokens || totalTokens,
+      })
+      costEur = costBreakdown.totalCostEur
+    }
     await recordInferenceRequestLog(buildInferenceLog({
       requestId,
       userId: req.user.id,
@@ -7067,7 +7905,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       data,
       pipelineTrace,
       error,
-      costEur: data ? toMoneyAmount(Number(data.total_tokens ?? data.totalTokens ?? 0) || 0) : 0,
+      costEur,
     }))
   }
   const ctrl = new AbortController()
@@ -7898,10 +8736,11 @@ async function start() {
   await ensureApiKeyUsageTable()
   await ensureBillingTables()
   await ensureEnterpriseQuoteRequestsTable()
+  await ensurePricingAndModelCatalogTables(pool, PRICING_FALLBACK)
   await ensureForcedAdmins()
   nodeMonitor.startSampling()
   app.listen(PORT, '127.0.0.1', () => {
-    console.log(`API Velocity sur http://127.0.0.1:${PORT}`)
+    console.log(`API Vryx sur http://127.0.0.1:${PORT}`)
   })
 }
 

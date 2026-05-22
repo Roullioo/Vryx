@@ -34,22 +34,16 @@ export function ComparePage() {
   return (
     <div className="border-b border-border bg-bg pb-16 sm:pb-24">
       <section
-        className="relative isolate -mt-[4.25rem] flex min-h-[min(78vh,30rem)] flex-col overflow-hidden border-b border-border pt-[4.25rem] sm:min-h-[min(80vh,34rem)]"
+        className="page-hero page-hero--compact"
         aria-labelledby="compare-hero-heading"
       >
-        <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-          aria-hidden
-        >
+        <div className="page-hero-media-shell" aria-hidden>
           <div
-            className="absolute inset-0 scale-[1.03] bg-cover bg-center bg-no-repeat"
-            style={{ backgroundImage: "url('/speed.png')" }}
+            className="page-hero-media"
+            style={{ backgroundImage: "url('/heroes/compare-hero.webp')" }}
           />
         </div>
-        <div
-          className="hero-overlay pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
-          aria-hidden
-        />
+        <div className="page-hero-overlay" aria-hidden />
 
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-12 pt-8 text-center sm:pb-14 sm:pt-10">
           <motion.div

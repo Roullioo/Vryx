@@ -259,10 +259,10 @@ export function HomeWorkerPreviewSection() {
 
           <figure className="order-3 mt-8 flex select-none justify-center sm:mt-10 lg:order-none lg:col-start-2 lg:row-span-2 lg:row-start-1 lg:mt-14 lg:justify-end lg:self-start">
             <img
-              src="/section1.png"
+              src="/section1.webp"
               alt="Illustration : postes de calcul reliés au rack serveur."
-              width={1200}
-              height={675}
+              width={800}
+              height={437}
               decoding="async"
               draggable={false}
               onContextMenu={(e) => e.preventDefault()}

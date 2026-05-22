@@ -103,7 +103,7 @@ export function LoginPage() {
               className="btn-secondary relative flex w-full items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold"
               onClick={startGoogle}
             >
-              <img src="/google.png" alt="" className="h-5 w-5" />
+              <img src="/google.webp" alt="" className="h-5 w-5" />
               Continuer avec Google
             </button>
           </div>

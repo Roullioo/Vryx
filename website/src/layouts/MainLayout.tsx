@@ -20,10 +20,12 @@ export function MainLayout() {
   const topDarkHero =
     pathname === '/' ||
     pathname === '/clients' ||
+    pathname === '/enterprise' ||
     pathname === '/race-pool' ||
     pathname === '/simulateur' ||
     pathname === '/comparatif' ||
     pathname === '/workers' ||
+    pathname === '/status' ||
     pathname === '/network' ||
     pathname === '/panel/modeles'
 
@@ -35,7 +37,7 @@ export function MainLayout() {
     >
       <ScrollToTopOnPathname />
       {!hideMarketingChrome && <Navbar />}
-      <main className={`relative z-0 ${hideMarketingChrome ? 'min-h-dvh' : ''}`}>
+      <main className={`relative z-0 ${hideMarketingChrome ? 'min-h-dvh' : 'pt-[calc(4.25rem+env(safe-area-inset-top))]'}`}>
         <Outlet />
       </main>
       {!hideMarketingChrome && <Footer />}

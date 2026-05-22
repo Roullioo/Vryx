@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, NavLink, useLocation } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { IconChevronDown } from '../icons/Icons'
 import { VryxLogo } from '../brand/VryxLogo'
 import { useAuth } from '../../context/AuthContext'
@@ -8,21 +9,23 @@ import { ThemeToggle } from './ThemeToggle'
 import { fetchAccountOverview, type AccountOverview } from '../../lib/account'
 
 const routeLinks = [
-  { to: '/clients', label: 'Clients' },
-  { to: '/enterprise', label: 'Enterprise' },
-  { to: '/race-pool', label: 'Race-Pool' },
-  { to: '/simulateur', label: 'Simulateur' },
-  { to: '/comparatif', label: 'Gains solo / pool' },
-  { to: '/workers', label: 'Workers' },
-  { to: '/network', label: 'Network' },
+  { to: '/clients', labelKey: 'nav.clients' },
+  { to: '/enterprise', labelKey: 'nav.enterprise' },
+  { to: '/race-pool', labelKey: 'nav.racePool' },
+  { to: '/simulateur', labelKey: 'nav.simulator' },
+  { to: '/comparatif', labelKey: 'nav.comparison' },
+  { to: '/workers', labelKey: 'nav.workers' },
+  { to: '/network', labelKey: 'nav.network' },
 ]
 
 export function Navbar() {
   const [menuOpen, setMenuOpen] = useState(false)
+  const [scrolled, setScrolled] = useState(false)
   const [accountOverview, setAccountOverview] = useState<AccountOverview | null>(null)
   const [accountOverviewLoading, setAccountOverviewLoading] = useState(false)
   const [accountOverviewError, setAccountOverviewError] = useState('')
   const { pathname } = useLocation()
+  const { t } = useTranslation()
   const { user, loading, logout } = useAuth()
   const { resolvedTheme } = useTheme()
   const accountDetailsRef = useRef<HTMLDetailsElement>(null)
@@ -30,6 +33,7 @@ export function Navbar() {
   const lightNav =
     pathname === '/' ||
     pathname === '/clients' ||
+    pathname === '/enterprise' ||
     pathname === '/race-pool' ||
     pathname === '/simulateur' ||
     pathname === '/comparatif' ||
@@ -38,88 +42,131 @@ export function Navbar() {
     pathname === '/network' ||
     pathname === '/panel/modeles'
 
-  /** Pastilles blanches sur hero uniquement en thème clair résolu. */
   const heroLightChrome = lightNav && resolvedTheme === 'light'
+  const heroDarkChrome = lightNav && resolvedTheme !== 'light'
+
+  useEffect(() => {
+    function onScroll() {
+      setScrolled(window.scrollY > 12)
+    }
+    onScroll()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
 
   const navRouteClass = ({ isActive }: { isActive: boolean }) =>
     [
       'text-sm font-medium transition-colors',
       lightNav
-        ? isActive
-          ? 'text-white'
-          : 'text-white/75 hover:text-white'
+        ? heroLightChrome
+          ? isActive
+            ? 'text-slate-950'
+            : 'text-slate-700 hover:text-slate-950'
+          : isActive
+            ? 'text-white'
+            : 'text-white/75 hover:text-white'
         : isActive
           ? 'text-accent'
           : 'text-muted hover:text-fg',
     ].join(' ')
+
+  const navShellClass = lightNav
+    ? `site-nav-shell ${heroLightChrome ? 'site-nav-shell--hero-light' : 'site-nav-shell--hero-dark'} ${scrolled ? 'is-scrolled' : ''}`
+    : ''
+
+  const chromePrimaryClass = heroLightChrome
+    ? 'bg-slate-950 text-white hover:bg-slate-900'
+    : heroDarkChrome
+      ? 'bg-white text-slate-950 hover:bg-white/90'
+      : 'btn-primary'
+
+  const chromeSecondaryClass = heroLightChrome
+    ? 'border border-slate-300/90 bg-white/68 text-slate-900 hover:bg-white/92'
+    : heroDarkChrome
+      ? 'border border-white/30 bg-white/10 text-white hover:bg-white/18'
+      : 'btn-secondary'
+
+  const mobileToneClass = heroLightChrome
+    ? 'border-slate-300/90 text-slate-900 hover:bg-slate-950/5'
+    : lightNav
+      ? 'border-white/30 text-white hover:bg-white/10'
+      : 'border-border text-muted hover:bg-surface'
 
   const handleLogout = useCallback(async () => {
     await logout()
     setMenuOpen(false)
   }, [logout])
 
-  const loadAccountOverview = useCallback(async () => {
+  /* eslint-disable react-hooks/set-state-in-effect -- reset compte au logout */
+  useEffect(() => {
+    let cancelled = false
     if (!user) {
       setAccountOverview(null)
-      return
+      setAccountOverviewError('')
+      setAccountOverviewLoading(false)
+      return () => {
+        cancelled = true
+      }
     }
     setAccountOverviewLoading(true)
     setAccountOverviewError('')
-    const result = await fetchAccountOverview()
-    if (!result.ok) {
-      setAccountOverviewError(result.error)
-      setAccountOverview(null)
+    fetchAccountOverview().then((result) => {
+      if (cancelled) return
+      if (!result.ok) {
+        setAccountOverviewError(result.error)
+        setAccountOverview(null)
+        setAccountOverviewLoading(false)
+        return
+      }
+      setAccountOverview(result.data)
       setAccountOverviewLoading(false)
-      return
+    })
+    return () => {
+      cancelled = true
     }
-    setAccountOverview(result.data)
-    setAccountOverviewLoading(false)
   }, [user])
-
-  useEffect(() => {
-    void loadAccountOverview()
-  }, [loadAccountOverview])
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   return (
-    <header className="relative z-30 w-full bg-transparent">
-      <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3.5 sm:px-6 lg:px-8">
-        <div onClick={() => setMenuOpen(false)}>
-          <VryxLogo to="/" tone={lightNav ? 'light' : 'dark'} markSize="sm" className="py-0.5" />
-        </div>
+    <header className="fixed inset-x-0 top-0 z-40 w-full bg-transparent pt-[env(safe-area-inset-top)]">
+      <div className="mx-auto max-w-6xl px-4 py-3.5 sm:px-6 lg:px-8">
+        <div className={`flex items-center justify-between gap-4 px-4 py-3 sm:px-5 ${navShellClass}`}>
+          <div onClick={() => setMenuOpen(false)}>
+            <VryxLogo
+              to="/"
+              tone={heroLightChrome ? 'dark' : lightNav ? 'light' : 'dark'}
+              markSize="sm"
+              className="py-0.5"
+            />
+          </div>
 
         <nav className="hidden items-center gap-4 xl:gap-5 lg:flex" aria-label="Navigation principale">
           {routeLinks.map((l) => (
             <NavLink key={l.to} to={l.to} className={navRouteClass}>
-              {l.label}
+              {t(l.labelKey)}
             </NavLink>
           ))}
           {!loading && user && (
             <NavLink to="/panel/modeles" className={navRouteClass}>
-              Modèles IA
+              {t('nav.models')}
             </NavLink>
           )}
           {!loading && user?.isAdmin && (
             <NavLink to="/admin" className={navRouteClass}>
-              Admin
+              {t('nav.admin')}
             </NavLink>
           )}
         </nav>
 
         <div className="flex shrink-0 items-center gap-2 sm:gap-3">
-          <ThemeToggle navOnDarkHero={lightNav} />
+          <ThemeToggle navOnDarkHero={heroDarkChrome} />
           {!loading && user ? (
             <>
               <details ref={accountDetailsRef} className="relative hidden lg:block">
                 <summary
-                  className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold [&::-webkit-details-marker]:hidden ${
-                    heroLightChrome
-                      ? 'bg-white text-slate-950 hover:bg-white/90'
-                      : lightNav
-                        ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md hover:bg-card'
-                        : 'btn-primary'
-                  }`}
+                  className={`flex cursor-pointer list-none items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold [&::-webkit-details-marker]:hidden ${chromePrimaryClass}`}
                 >
-                  Mon compte
+                  {t('nav.account')}
                   <IconChevronDown className="h-4 w-4 opacity-90" aria-hidden />
                 </summary>
                 <div className="absolute right-0 z-50 mt-2 w-[min(calc(100vw-2rem),22rem)] rounded-xl border border-border bg-card p-5 shadow-lg">
@@ -169,11 +216,7 @@ export function Navbar() {
               </details>
               <button
                 type="button"
-                className={`hidden rounded-lg px-4 py-2 text-sm lg:inline-flex ${
-                  lightNav
-                    ? 'border border-white/35 bg-white/10 text-white hover:bg-white/20'
-                    : 'btn-secondary'
-                }`}
+                className={`hidden rounded-lg px-4 py-2 text-sm lg:inline-flex ${chromeSecondaryClass}`}
                 onClick={() => void handleLogout()}
               >
                 Déconnexion
@@ -184,24 +227,14 @@ export function Navbar() {
               <Link
                 to="/connexion"
                 state={{ from: '/compte' }}
-                className={`hidden rounded-lg px-4 py-2 text-sm font-semibold lg:inline-flex ${
-                  heroLightChrome
-                    ? 'bg-white text-slate-950 hover:bg-white/90'
-                    : lightNav
-                      ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md hover:bg-card'
-                      : 'btn-primary'
-                }`}
+                className={`hidden rounded-lg px-4 py-2 text-sm font-semibold lg:inline-flex ${chromePrimaryClass}`}
                 onClick={() => setMenuOpen(false)}
               >
-                Mon compte
+                  {t('nav.account')}
               </Link>
               <Link
                 to="/inscription"
-                className={`hidden rounded-lg px-4 py-2 text-sm lg:inline-flex ${
-                  lightNav
-                    ? 'border border-white/35 bg-white/10 text-white hover:bg-white/20'
-                    : 'btn-secondary'
-                }`}
+                className={`hidden rounded-lg px-4 py-2 text-sm lg:inline-flex ${chromeSecondaryClass}`}
                 onClick={() => setMenuOpen(false)}
               >
                 Inscription
@@ -211,31 +244,19 @@ export function Navbar() {
           {!loading && user ? (
             <Link
               to="/compte"
-              className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${
-                heroLightChrome
-                  ? 'bg-white text-slate-950'
-                  : lightNav
-                    ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md'
-                    : 'btn-primary'
-              }`}
+              className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${chromePrimaryClass}`}
               onClick={() => setMenuOpen(false)}
             >
-              Mon compte
+              {t('nav.account')}
             </Link>
           ) : !loading ? (
             <Link
               to="/connexion"
               state={{ from: '/compte' }}
-              className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${
-                heroLightChrome
-                  ? 'bg-white text-slate-950'
-                  : lightNav
-                    ? 'border border-white/25 bg-card/90 text-fg backdrop-blur-md'
-                    : 'btn-primary'
-              }`}
+              className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${chromePrimaryClass}`}
               onClick={() => setMenuOpen(false)}
             >
-              Mon compte
+              {t('nav.account')}
             </Link>
           ) : (
             <span
@@ -246,9 +267,7 @@ export function Navbar() {
 
           <button
             type="button"
-            className={`flex h-10 w-10 items-center justify-center rounded-lg lg:hidden ${
-              lightNav ? 'border border-white/30 text-white' : 'border border-border text-muted'
-            }`}
+            className={`flex h-10 w-10 items-center justify-center rounded-lg border lg:hidden ${mobileToneClass}`}
             aria-expanded={menuOpen}
             aria-controls="mobile-nav"
             onClick={() => setMenuOpen((o) => !o)}
@@ -265,14 +284,17 @@ export function Navbar() {
             <span className="sr-only">Menu</span>
           </button>
         </div>
+        </div>
       </div>
 
       {menuOpen && (
         <div
           id="mobile-nav"
-          className={`border-t px-4 py-4 backdrop-blur-md lg:hidden ${
+          className={`mx-4 rounded-2xl border px-4 py-4 backdrop-blur-md sm:mx-6 lg:hidden lg:mx-8 ${
             lightNav
-              ? 'border-white/10 bg-page-hero/95 text-white'
+              ? heroLightChrome
+                ? 'border-slate-900/10 bg-white/92 text-slate-950'
+                : 'border-white/10 bg-page-hero/95 text-white'
               : 'border-border bg-bg/95'
           }`}
           role="dialog"
@@ -287,9 +309,13 @@ export function Navbar() {
                 className={({ isActive }) =>
                   `rounded-lg px-3 py-2.5 text-base font-medium ${
                     lightNav
-                      ? isActive
-                        ? 'bg-white/15 text-white'
-                        : 'text-white/80'
+                      ? heroLightChrome
+                        ? isActive
+                          ? 'bg-slate-950/8 text-slate-950'
+                          : 'text-slate-700'
+                        : isActive
+                          ? 'bg-white/15 text-white'
+                          : 'text-white/80'
                       : isActive
                         ? 'bg-accent/15 text-accent'
                         : 'text-muted'
@@ -297,18 +323,22 @@ export function Navbar() {
                 }
                 onClick={() => setMenuOpen(false)}
               >
-                {l.label}
+                {t(l.labelKey)}
               </NavLink>
             ))}
             {!loading && user && (
               <Link
                 to="/compte"
                 className={`rounded-lg px-3 py-2.5 text-base font-semibold ${
-                  lightNav ? 'bg-white/15 text-white' : 'bg-accent/10 text-accent'
+                  lightNav
+                    ? heroLightChrome
+                      ? 'bg-slate-950/8 text-slate-950'
+                      : 'bg-white/15 text-white'
+                    : 'bg-accent/10 text-accent'
                 }`}
                 onClick={() => setMenuOpen(false)}
               >
-                Mon compte, tableau de bord
+                {t('nav.account')}, tableau de bord
               </Link>
             )}
             {!loading && user?.isAdmin && (
@@ -317,9 +347,13 @@ export function Navbar() {
                 className={({ isActive }) =>
                   `rounded-lg px-3 py-2.5 text-base font-semibold ${
                     lightNav
-                      ? isActive
-                        ? 'bg-white/15 text-white'
-                        : 'text-white/80'
+                      ? heroLightChrome
+                        ? isActive
+                          ? 'bg-slate-950/8 text-slate-950'
+                          : 'text-slate-700'
+                        : isActive
+                          ? 'bg-white/15 text-white'
+                          : 'text-white/80'
                       : isActive
                         ? 'bg-accent/15 text-accent'
                         : 'text-muted'
@@ -336,9 +370,13 @@ export function Navbar() {
                 className={({ isActive }) =>
                   `rounded-lg px-3 py-2.5 text-base font-medium ${
                     lightNav
-                      ? isActive
-                        ? 'bg-white/15 text-white'
-                        : 'text-white/80'
+                      ? heroLightChrome
+                        ? isActive
+                          ? 'bg-slate-950/8 text-slate-950'
+                          : 'text-slate-700'
+                        : isActive
+                          ? 'bg-white/15 text-white'
+                          : 'text-white/80'
                       : isActive
                         ? 'bg-accent/15 text-accent'
                         : 'text-muted'
@@ -346,18 +384,27 @@ export function Navbar() {
                 }
                 onClick={() => setMenuOpen(false)}
               >
-                Modèles IA
+                {t('nav.models')}
               </NavLink>
             )}
             {!loading && user ? (
               <>
-                <p className={`mt-2 truncate px-3 text-sm ${lightNav ? 'text-white/70' : 'text-muted'}`} title={user.email}>
+                <p
+                  className={`mt-2 truncate px-3 text-sm ${
+                    heroLightChrome ? 'text-slate-600' : lightNav ? 'text-white/70' : 'text-muted'
+                  }`}
+                  title={user.email}
+                >
                   {user.email}
                 </p>
                 <button
                   type="button"
                   className={`mt-2 w-full rounded-lg px-3 py-2.5 text-center text-sm ${
-                    lightNav ? 'border border-white/25 text-white' : 'border border-border text-fg'
+                    heroLightChrome
+                      ? 'border border-slate-300/90 text-slate-900'
+                      : lightNav
+                        ? 'border border-white/25 text-white'
+                        : 'border border-border text-fg'
                   }`}
                   onClick={() => void handleLogout()}
                 >
@@ -369,7 +416,11 @@ export function Navbar() {
                 <Link
                   to="/connexion"
                   className={`mt-2 rounded-lg px-3 py-2.5 text-center text-sm ${
-                    lightNav ? 'border border-white/25 text-white' : 'border border-border text-fg'
+                    heroLightChrome
+                      ? 'border border-slate-300/90 text-slate-900'
+                      : lightNav
+                        ? 'border border-white/25 text-white'
+                        : 'border border-border text-fg'
                   }`}
                   onClick={() => setMenuOpen(false)}
                 >
@@ -378,7 +429,11 @@ export function Navbar() {
                 <Link
                   to="/inscription"
                   className={`mt-1 rounded-lg px-3 py-2.5 text-center text-sm font-medium ${
-                    lightNav ? 'bg-white/15 text-white' : 'bg-accent/10 text-accent'
+                    heroLightChrome
+                      ? 'bg-slate-950/8 text-slate-950'
+                      : lightNav
+                        ? 'bg-white/15 text-white'
+                        : 'bg-accent/10 text-accent'
                   }`}
                   onClick={() => setMenuOpen(false)}
                 >

@@ -1,10 +1,14 @@
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import { ClientPythonSnippet } from '../components/clients/ClientPythonSnippet'
 import { EurSign } from '../components/icons/Icons'
 import { CLIENT_ENDPOINTS, CLIENT_FAQ } from '../data/clientsContent'
-import { VELOCITY_EUR_PER_MILLION } from '../lib/simulator'
 import { useAuth } from '../context/AuthContext'
+import { fetchPublicModels, fetchPublicPricing, type CatalogModel } from '../lib/pricingModels'
+
+const API_DOC_HOST = 'https://vryx.eu'
+const API_BASE_URL = `${API_DOC_HOST}/v1`
 
 const highlights = [
   {
@@ -23,30 +27,78 @@ const highlights = [
 
 export function ClientsPage() {
   const { user } = useAuth()
-  const priceLabel = VELOCITY_EUR_PER_MILLION.toLocaleString('fr-FR', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+  const [minInput, setMinInput] = useState<number | null>(0.02)
+  const [minOutput, setMinOutput] = useState<number | null>(0.06)
+  const [pricingPublished, setPricingPublished] = useState(false)
+  const [subscriptionPlans, setSubscriptionPlans] = useState<{ name: string; monthlyEur: number }[]>([])
+  const [models, setModels] = useState<CatalogModel[]>([])
+  const [modelsLoading, setModelsLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    fetchPublicPricing().then((r) => {
+      if (cancelled) return
+      if (r.ok) {
+        setMinInput(r.data.pricing.minInputEurPerMillion ?? r.data.pricing.headline?.minInputEurPerMillion ?? null)
+        setMinOutput(r.data.pricing.minOutputEurPerMillion ?? r.data.pricing.headline?.minOutputEurPerMillion ?? null)
+        setPricingPublished(r.data.pricing.published)
+        setSubscriptionPlans(
+          (r.data.pricing.subscriptionPlans || [])
+            .filter((p) => p.isPublic && p.monthlyEur > 0)
+            .map((p) => ({ name: p.name, monthlyEur: p.monthlyEur })),
+        )
+      }
+    })
+    fetchPublicModels().then((r) => {
+      if (cancelled) return
+      if (r.ok) {
+        const publicModels = (r.data.models || [])
+          .filter((m) => m.isPublic && m.isActive)
+          .sort((a, b) => {
+            const scoreA = Number(b.requiredWorkers || 0) - Number(a.requiredWorkers || 0)
+            if (scoreA !== 0) return scoreA
+            return (a.sortOrder || 0) - (b.sortOrder || 0)
+          })
+        setModels(publicModels)
+      }
+      setModelsLoading(false)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const modelRows = models.slice(0, 12).map((model) => {
+    const requiredWorkers = Math.max(1, Number(model.requiredWorkers || 1))
+    const workersOnline = Number(model.workersOnline || 0)
+    const runnable = Boolean(model.runnable) || Boolean(model.ready) || workersOnline >= requiredWorkers
+    return {
+      id: model.id,
+      provider: model.provider,
+      family: model.family,
+      workers: `${workersOnline}/${requiredWorkers}`,
+      pricing:
+        typeof model.eurPerMillionInput === 'number' && typeof model.eurPerMillionOutput === 'number'
+          ? `${model.eurPerMillionInput.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} € in / ${model.eurPerMillionOutput.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} € out`
+          : 'Sur devis',
+      status: runnable ? 'Disponible' : 'En attente de capacité',
+    }
   })
+  const defaultModel = modelRows[0]?.id || 'vryx-qwen3.6-35b'
 
   return (
     <div className="border-b border-border bg-bg">
       <section
-        className="relative isolate -mt-[4.25rem] flex min-h-[min(88vh,40rem)] flex-col overflow-hidden border-b border-border pt-[4.25rem] sm:min-h-[min(90vh,44rem)]"
+        className="page-hero"
         aria-labelledby="clients-hero-heading"
       >
-        <div
-          className="pointer-events-none absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))] overflow-hidden"
-          aria-hidden
-        >
+        <div className="page-hero-media-shell" aria-hidden>
           <div
-            className="absolute inset-0 scale-105 bg-cover bg-center bg-no-repeat blur-[3px]"
-            style={{ backgroundImage: "url('/ClientsHero.png')" }}
+            className="page-hero-media blur-[3px]"
+            style={{ backgroundImage: "url('/heroes/clients-hero.webp')" }}
           />
         </div>
-        <div
-          className="hero-overlay absolute inset-x-0 bottom-0 -top-[max(0.75rem,env(safe-area-inset-top,0px))]"
-          aria-hidden
-        />
+        <div className="page-hero-overlay" aria-hidden />
 
         <div className="relative z-10 flex min-h-[inherit] flex-1 flex-col items-center justify-center px-4 pb-14 pt-6 text-center sm:pb-16 sm:pt-8">
           <motion.div
@@ -89,7 +141,7 @@ export function ClientsPage() {
               <div className="panel-inset rounded-2xl p-4 sm:p-5">
                 <p className="text-sm leading-relaxed text-muted sm:text-base">
                   Créez une organisation, générez une clé API dans votre espace compte, puis pointez votre SDK
-                  vers <span className="font-mono text-fg">https://api.vryx-ai.eu/v1</span>.
+                  vers <span className="font-mono text-fg">{API_BASE_URL}</span>.
                 </p>
                 <p className="mt-3 text-sm leading-relaxed text-muted sm:text-base">
                   Les modèles exposés suivent la convention Vryx (préfixe{' '}
@@ -112,7 +164,7 @@ export function ClientsPage() {
                 </div>
               </div>
             </motion.div>
-            <ClientPythonSnippet />
+            <ClientPythonSnippet apiBaseUrl={API_BASE_URL} model={defaultModel} />
           </div>
 
           <motion.ul
@@ -137,7 +189,7 @@ export function ClientsPage() {
       >
         <div
           className="absolute inset-0 bg-cover bg-center bg-no-repeat"
-          style={{ backgroundImage: "url('/mid.png')" }}
+          style={{ backgroundImage: "url('/heroes/mid-section.webp')" }}
           aria-hidden
         />
         <div className="hero-overlay absolute inset-0" aria-hidden />
@@ -145,23 +197,46 @@ export function ClientsPage() {
           <div className="grid gap-10 lg:grid-cols-2 lg:items-center">
             <div>
               <h2 id="tarifs-clients" className="font-display text-2xl font-bold text-white sm:text-3xl">
-                Tarif public
+                {pricingPublished ? 'Tarif public' : 'Tarifs sur devis'}
               </h2>
               <p className="mt-3 text-sm text-white/75 sm:text-base">
-                Un prix unique par million de tokens pour simplifier vos prévisions. Ajustements volume
-                possibles sur devis entreprise.
+                Tarifs à partir de {minInput?.toFixed(2) ?? '0,02'} €/M input et {minOutput?.toFixed(2) ?? '0,06'} €/M output.
+                Prix par modèle, selon disponibilité réseau.
               </p>
-              <p className="font-display mt-8 text-4xl font-bold text-white sm:text-5xl">
-                {priceLabel}
-                <EurSign className="text-white" />{' '}
-                <span className="text-lg font-medium text-white/65 sm:text-xl">/ million de tokens</span>
-              </p>
+              {pricingPublished && minInput != null && minOutput != null ? (
+                <div className="mt-8 space-y-2">
+                  <p className="font-display text-3xl font-bold text-white sm:text-4xl">
+                    {minInput.toFixed(2)} €<span className="text-lg font-medium text-white/65"> / M input</span>
+                  </p>
+                  <p className="font-display text-2xl font-bold text-white sm:text-3xl">
+                    {minOutput.toFixed(2)} €<span className="text-lg font-medium text-white/65"> / M output</span>
+                  </p>
+                  <p className="text-sm text-white/70">Exemple : Qwen3.5 9B — 0,06 €/M input, 0,12 €/M output.</p>
+                </div>
+              ) : (
+                <p className="mt-8 rounded-2xl border border-white/15 bg-black/35 px-5 py-4 text-sm leading-relaxed text-white/80">
+                  Les prix publics sont en cours de calibration. L’admin Vryx peut les publier dès que la grille est validée.
+                </p>
+              )}
               <Link
                 to="/simulateur"
                 className="mt-8 inline-flex text-sm font-semibold text-sky-300 underline-offset-2 transition-colors hover:text-sky-200 hover:underline"
               >
                 Projeter vos millions de tokens dans le simulateur
               </Link>
+              {subscriptionPlans.length > 0 ? (
+                <div className="mt-8 rounded-2xl border border-white/15 bg-black/35 p-4 sm:p-5">
+                  <p className="font-mono text-[0.68rem] uppercase tracking-wide text-white/55">Plans B2B</p>
+                  <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {subscriptionPlans.map((plan) => (
+                      <li key={plan.name} className="flex items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/85">
+                        <span>{plan.name}</span>
+                        <span className="font-mono font-semibold">{plan.monthlyEur.toLocaleString('fr-FR')} €/mois</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
             <div className="overflow-x-auto rounded-xl border border-white/15 bg-black/40 backdrop-blur-md shadow-lg">
               <table className="w-full min-w-[20rem] text-left text-sm">
@@ -179,10 +254,53 @@ export function ClientsPage() {
                   {CLIENT_ENDPOINTS.map((row) => (
                     <tr key={row.path} className="border-b border-white/10 last:border-0">
                       <td className="px-4 py-3 pl-5 font-mono text-xs text-sky-300">{row.method}</td>
-                      <td className="px-4 py-3 font-mono text-xs text-white">{row.path}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-white">{`${API_DOC_HOST}${row.path}`}</td>
                       <td className="px-4 py-3 pr-5 text-white/65">{row.desc}</td>
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-white/15 bg-black/40 backdrop-blur-md shadow-lg">
+              <table className="w-full min-w-[20rem] text-left text-sm">
+                <caption className="border-b border-white/10 px-4 py-3 text-left text-xs font-medium text-white/55">
+                  Catalogue public des modèles
+                </caption>
+                <thead>
+                  <tr className="border-b border-white/10 bg-white/[0.06] text-xs font-semibold uppercase tracking-wide text-white/55">
+                    <th className="px-4 py-3 pl-5">Modèle</th>
+                    <th className="px-4 py-3">Provider</th>
+                    <th className="px-4 py-3">Famille</th>
+                    <th className="px-4 py-3">Prix (M tokens)</th>
+                    <th className="px-4 py-3">Workers</th>
+                    <th className="px-4 py-3 pr-5">Statut</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {modelsLoading ? (
+                    <tr>
+                      <td className="px-4 py-3 pl-5 text-white/55" colSpan={6}>
+                        Chargement du catalogue public...
+                      </td>
+                    </tr>
+                  ) : modelRows.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-3 pl-5 text-white/55" colSpan={6}>
+                        Aucun modèle public disponible pour l’instant.
+                      </td>
+                    </tr>
+                  ) : (
+                    modelRows.map((model) => (
+                      <tr key={model.id} className="border-b border-white/10 last:border-0">
+                        <td className="px-4 py-3 pl-5 font-mono text-xs text-white">{model.id}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-white/75">{model.provider}</td>
+                        <td className="px-4 py-3 text-xs text-white/75">{model.family}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-white/75">{model.pricing}</td>
+                        <td className="px-4 py-3 text-xs text-white/75">{model.workers}</td>
+                        <td className="px-4 py-3 pr-5 text-xs text-white/75">{model.status}</td>
+                      </tr>
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>

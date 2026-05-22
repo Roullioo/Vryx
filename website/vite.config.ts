@@ -6,6 +6,9 @@ import { fileURLToPath } from 'node:url'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  build: {
+    chunkSizeWarningLimit: 1500,
+  },
   resolve: {
     alias: {
       'd3-timer': fileURLToPath(new URL('./src/shims/d3-timer.ts', import.meta.url)),

@@ -719,7 +719,7 @@ export function AccountPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: modelId || undefined,
-            max_tokens: 8192,
+            max_tokens: 192,
             quantization: 'q4',
             conversation_id: activeConversationId,
             attachments: outgoingAttachments.map((attachment) => ({
@@ -1580,7 +1580,7 @@ export function AccountPage() {
                 </Panel>
                 <Panel className="p-5">
                   <p className="font-semibold text-fg">Streaming</p>
-                  <p className="mt-2 text-sm text-muted">Le chat utilise le flux P2P natif quand il est disponible, avec rendu caractère par caractère côté interface.</p>
+                  <p className="mt-2 text-sm text-muted">Le chat utilise le flux distribué quand il est disponible, avec rendu caractère par caractère côté interface.</p>
                   <div className="mt-4 rounded-2xl bg-emerald-500/10 p-4 text-sm font-semibold text-emerald-600 dark:text-emerald-300">Activé par défaut</div>
                 </Panel>
                 <Panel className="p-5">

@@ -11,7 +11,7 @@ use base64::Engine as _;
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, identify, kad, mdns, noise, relay,
+    autonat, dcutr, identify, kad, noise, relay,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, Swarm, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol,
@@ -35,7 +35,6 @@ use tower_http::cors::CorsLayer;
 // ============================================================
 
 mod vryx_codec {
-    use async_trait::async_trait;
     use futures::prelude::*;
     use libp2p::StreamProtocol;
     use serde::{de::DeserializeOwned, Serialize};
@@ -62,7 +61,6 @@ mod vryx_codec {
         }
     }
 
-    #[async_trait]
     impl<Req, Resp> libp2p::request_response::Codec for Codec<Req, Resp>
     where
         Req: Send + Serialize + DeserializeOwned,
@@ -402,7 +400,6 @@ mod base64_vec {
 
 #[derive(NetworkBehaviour)]
 struct VryxBehaviour {
-    mdns: mdns::tokio::Behaviour,
     request_response: request_response::Behaviour<vryx_codec::Codec<TensorRequest, TensorResponse>>,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
@@ -1245,7 +1242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "info,yamux=error,libp2p_yamux=error,\
              libp2p_noise=error,libp2p_autonat=error,\
              libp2p_relay=error,libp2p_dcutr=error,\
-             libp2p_mdns=error,libp2p_kad=error,libp2p_identify=error",
+             libp2p_kad=error,libp2p_identify=error",
         );
     }
     tracing_subscriber::fmt()
@@ -1268,11 +1265,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tensor_yamux_config,
         )?
         .with_quic()
-        .with_dns()?
         .with_relay_client(noise::Config::new, tensor_yamux_config)?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = key.public().to_peer_id();
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
             let p2p_request_timeout_s =
                 env_u64_clamped("VRYX_P2P_REQUEST_TIMEOUT_S", 3600, 30, 7200);
             let rr_config = request_response::Config::default()
@@ -1313,7 +1308,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into();
 
             Ok(VryxBehaviour {
-                mdns,
                 request_response,
                 kad,
                 identify,
@@ -2859,20 +2853,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                // mDNS (LAN uniquement, ignoré si bootstrap WAN configuré)
-                SwarmEvent::Behaviour(VryxBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    if args.bootstrap_node.is_some() { continue; }
-                    for (peer_id, multiaddr) in list {
-                        if discovered_peers.insert(peer_id) {
-                            println!("[LAN] Pair mDNS découvert : {} @ {}", peer_id, multiaddr);
-                            swarm.behaviour_mut().kad.add_address(&peer_id, multiaddr);
-                        }
-                    }
-                }
-
                 // Identify : ajoute les adresses à Kademlia
                 SwarmEvent::Behaviour(VryxBehaviourEvent::Identify(
-                    identify::Event::Received { peer_id, info },
+                    identify::Event::Received { peer_id, info, .. },
                 )) => {
                     println!("[P2P] Identify reçu de {} : addrs={:?} (observed={:?})", peer_id, info.listen_addrs, info.observed_addr);
                     let is_bootstrap = bootstrap_peer_id == Some(peer_id);
@@ -2939,8 +2922,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     ..
                 })) => {
                     println!("[P2P] Query Kad terminée : {} pairs trouvés", ok.peers.len());
-                    for peer_id in ok.peers {
+                    for peer_info in ok.peers {
+                        let peer_id = peer_info.peer_id;
                         if Some(peer_id) == bootstrap_peer_id { continue; }
+                        for addr in peer_info.addrs {
+                            swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                            swarm.add_peer_address(peer_id, addr);
+                        }
                         if discovered_peers.insert(peer_id) {
                             println!("[P2P] Pair Kad découvert (Query) : {}", peer_id);
                         }

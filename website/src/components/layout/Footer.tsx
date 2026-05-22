@@ -1,8 +1,10 @@
 import { Link } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
 import { useAuth } from '../../context/AuthContext'
 
 export function Footer() {
   const { user } = useAuth()
+  const { i18n, t } = useTranslation()
 
   return (
     <footer className="border-t border-border bg-bg py-12 sm:py-14 lg:py-16">
@@ -11,7 +13,7 @@ export function Footer() {
           <div className="max-w-sm">
             <Link to="/" className="inline-flex w-fit items-center gap-3 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 focus-visible:ring-offset-2 focus-visible:ring-offset-bg">
               <img
-                src="/logo.png"
+                src="/logo.webp"
                 alt="Vryx"
                 width={40}
                 height={40}
@@ -26,19 +28,19 @@ export function Footer() {
             </p>
             <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:gap-3">
               <Link to="/simulateur" className="btn-primary rounded-xl px-5 py-2.5 text-sm font-semibold">
-                Simuler
+                {t('footer.simulate')}
               </Link>
               <Link
                 to={user ? '/compte' : '/inscription'}
                 className="btn-secondary rounded-xl px-5 py-2.5 text-sm font-semibold"
               >
-                {user ? 'Mon compte' : 'Créer un compte'}
+                {user ? t('footer.account') : t('footer.createAccount')}
               </Link>
             </div>
           </div>
 
           <div>
-            <h4 className="font-mono text-xs font-semibold uppercase tracking-wider text-muted">Produit</h4>
+            <h4 className="font-mono text-xs font-semibold uppercase tracking-wider text-muted">{t('footer.product')}</h4>
             <ul className="mt-4 space-y-2.5 text-sm text-muted">
               <li>
                 <Link className="transition-colors hover:text-accent" to="/simulateur">
@@ -64,7 +66,7 @@ export function Footer() {
           </div>
 
           <div>
-            <h4 className="font-mono text-xs font-semibold uppercase tracking-wider text-muted">Workers</h4>
+            <h4 className="font-mono text-xs font-semibold uppercase tracking-wider text-muted">{t('footer.workers')}</h4>
             <ul className="mt-4 space-y-2.5 text-sm text-muted">
               <li>
                 <Link className="transition-colors hover:text-electric" to="/workers">
@@ -85,7 +87,7 @@ export function Footer() {
           </div>
 
           <div>
-            <h4 className="font-mono text-xs font-semibold uppercase tracking-wider text-muted">Ressources</h4>
+            <h4 className="font-mono text-xs font-semibold uppercase tracking-wider text-muted">{t('footer.resources')}</h4>
             <ul className="mt-4 space-y-2.5 text-sm text-muted">
               <li>
                 <Link className="transition-colors hover:text-accent" to="/#privacy">
@@ -103,8 +105,18 @@ export function Footer() {
 
         <div className="mt-10 border-t border-border pt-6">
           <div className="flex flex-col gap-3 text-sm text-muted sm:flex-row sm:items-center sm:justify-between">
-            <p>2026 Vryx. Tous droits réservés.</p>
-            <p className="font-mono text-xs tracking-wide">Inférence · SEPA · Europe</p>
+            <p>{t('footer.rights')}</p>
+            <label className="flex items-center gap-2 font-mono text-xs tracking-wide">
+              <span>{t('footer.language')}</span>
+              <select
+                value={i18n.language}
+                onChange={(e) => void i18n.changeLanguage(e.target.value)}
+                className="rounded-lg border border-border bg-surface px-2 py-1 text-fg outline-none focus:border-accent"
+              >
+                <option value="fr">FR</option>
+                <option value="en">EN</option>
+              </select>
+            </label>
           </div>
         </div>
       </div>

@@ -129,6 +129,37 @@ Schéma **créé et migré automatiquement** au démarrage de `website/server/sr
 | `created_at` | TIMESTAMP | Création |
 | `updated_at` | TIMESTAMP | Dernière MAJ |
 
+### Tables pricing V2 (`pricing_config`, `model_catalog`, plans)
+
+La grille commerciale V2 est centralisée en MariaDB : tarifs **input/output par modèle**, tiers, plans B2B, Private Pool, fine-tuning et garde-fous de marge.
+
+| Table | Rôle |
+|-------|------|
+| `pricing_config` | Singleton `id=1` : headline min input/output, ratio blended (75/25), publication, TVA, recharge Stripe min/recommandée/B2B, remise pool globale, marge Vryx min, worker share par défaut, remises volume JSON. |
+| `model_catalog` | Catalogue : slug, `hf_id`, `api_alias`, tier (`nano`…`code`), `eur_per_million_input/output`, pool in/out, worker share, coûts worker estimés, `availability_status`, statut actif/public. |
+| `pricing_tiers` | Grille par tier : input/output €/M, worker share par défaut. |
+| `subscription_plans` | Plans B2B (Developer, Pro, Team, Business, Scale). |
+| `private_pool_plans` | Plans Private Pool (S/M/L/XL). |
+| `fine_tuning_plans` | Plans LoRA (training €/M, setup, déploiement). |
+| `pricing_config_audit` | Journal des modifications admin (before/after JSON). |
+
+Moteur : `website/server/src/pricing-engine.js` — `computeRequestCost`, `computeBlendedPrice`, `validatePricingFloor`, `resolveModelRates`.
+
+Routes associées :
+
+| Route | Accès | Rôle |
+|-------|-------|------|
+| `GET /api/public/pricing` | Public | Headline in/out, plans, recharge, remises volume ; `published=false` → « sur devis ». |
+| `GET /api/public/models` | Public | Modèles publics avec pricing in/out/blended, availability, workers live. |
+| `GET/PATCH /api/admin/pricing` | Admin | Config globale (headline, recharge, pool discount, publication). |
+| `GET/PATCH /api/admin/pricing/tiers` | Admin | Grille tiers. |
+| `GET/PATCH /api/admin/plans/subscriptions` | Admin | Plans B2B. |
+| `GET/PATCH /api/admin/plans/private-pool` | Admin | Plans Private Pool. |
+| `GET/PATCH /api/admin/plans/fine-tuning` | Admin | Plans fine-tuning. |
+| `GET/POST/PATCH /api/admin/models/catalog` | Admin | CRUD catalogue + warnings garde-fous marge. |
+
+Billing : `recordApiKeyUsage` facture `prompt × rate_in + completion × rate_out` ; colonnes `cost_input_eur`, `cost_output_eur`, `billing_mode`, `pricing_snapshot_json` sur `api_key_usage`.
+
 ---
 
 ## 4. Site web — React + Express
@@ -150,6 +181,8 @@ Schéma **créé et migré automatiquement** au démarrage de `website/server/sr
 | `/admin/chat-p2p` | **Chat P2P** (SSE, métriques pipeline) |
 | `/admin/workers`, `/admin/workers/:peerId` | Workers |
 | `/admin/sessions`, `/admin/sessions/:sessionId` | Sessions P2P historisées |
+| `/admin/parametres/pricing` | Pricing global (headline in/out, plans B2B/pool/finetune, publication) |
+| `/admin/modeles` | Catalogue modèles, prix input/output, marge live, availability |
 
 **Composants admin notables :**
 

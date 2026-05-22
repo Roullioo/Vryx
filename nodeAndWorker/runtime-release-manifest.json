@@ -1,0 +1,38 @@
+{
+  "name": "vryx-worker-runtime",
+  "generatedAt": "2026-05-22T00:39:15.478Z",
+  "platform": "darwin-arm64",
+  "appVersion": "1.0.8",
+  "files": [
+    {
+      "path": "bin/darwin-arm64/rust-daemon",
+      "bytes": 17841792,
+      "sha256": "fecae835ce58810fe74ac1b936b3d20edfeb221a148a43ed4d2c2ecc77a0aa26",
+      "executable": true
+    },
+    {
+      "path": "python-inference/shard_runtime.py",
+      "bytes": 130890,
+      "sha256": "070b358293e3666a1f0aa944569ffe1fe93146b670bafcdd05ced66bd5488af5",
+      "executable": false
+    },
+    {
+      "path": "python-inference/distributed_llm_orchestrator.py",
+      "bytes": 232368,
+      "sha256": "d48c826cf253bb5131264fe76a9f08710ef898a0b463f0d6603519806a8532f1",
+      "executable": false
+    },
+    {
+      "path": "python-inference/requirements.txt",
+      "bytes": 860,
+      "sha256": "ffd318f932ea27c02e6471593e7e8b92fc880042752670c132062e273cf43901",
+      "executable": false
+    },
+    {
+      "path": "scripts/vryx-direct-p2p-diagnostic.sh",
+      "bytes": 2517,
+      "sha256": "97f3522d570022f2cd695691d3802f949e2e053eae6b4396c051760a6b69364a",
+      "executable": true
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 /**
  * Rapport visuel des workers : barres CSS (pas de SVG), fonctionne dans tous les contextes.
- * - Mode riche : parse pipeline_trace (Daisy Chain, TP) → graphiques par token + chargement par pair.
+ * - Mode riche : parse pipeline_trace → graphiques par token + chargement par pair.
  * - Mode agrégé : métriques du tour (latency_ms, compute_time_ms, tokens).
  *
  * Source de vérité du temps de calcul : `compute_time_ms` du proto `ProcessedTensorData`
@@ -9,6 +9,7 @@
  */
 import { useMemo } from 'react'
 
+import { displayLabel } from '../../lib/displayLabels'
 import {
   effectiveComputeMs,
   type WorkerRoundMetrics,
@@ -281,7 +282,7 @@ function RoundTimingCharts({ m }: { m: WorkerRoundMetrics }) {
   )
 }
 
-/** Barres par token généré (mode worker-only / TP avec generation_steps). */
+/** Barres par token généré avec generation_steps. */
 function TokenStepsChart({ steps }: { steps: { tokenIndex: number; totalMs: number; hopCount: number; byte?: number }[] }) {
   if (steps.length === 0) return null
   const maxMs = Math.max(0.5, ...steps.map((s) => s.totalMs))
@@ -312,8 +313,8 @@ function TokenStepsChart({ steps }: { steps: { tokenIndex: number; totalMs: numb
 }
 
 /**
- * Visualisation Daisy Chain : Nœud 1 → Nœud 2 → Nœud 3 …
- * Affiche le chemin de relais (Pipeline Parallelism) tracé par le `routing_path` du proto.
+ * Visualisation relais : Nœud 1 → Nœud 2 → Nœud 3 …
+ * Affiche le chemin de relais tracé par le proto.
  */
 export function DaisyChainViz({
   routingPath,
@@ -368,7 +369,7 @@ export function DaisyChainViz({
   )
 }
 
-/** Chargement des poids par pair (mode worker-only / TP avec steps_load). */
+/** Chargement des poids par pair avec steps_load. */
 function LoadChart({ loads }: { loads: { peer: string; loadMs: number; rank: number }[] }) {
   if (loads.length === 0) return null
   const maxMs = Math.max(1, ...loads.map((l) => l.loadMs))
@@ -472,7 +473,7 @@ export function WorkerComputeReport({
 
     const tokenChartData = generationSteps.length > 0 ? generationSteps : fallbackSteps
 
-    // `routing_path` du proto (chemin de relais Daisy Chain).
+    // Chemin de relais du proto.
     const routingPath = asArray(t.routing_path).filter(
       (p): p is string => typeof p === 'string' && p.length > 0,
     )
@@ -480,16 +481,16 @@ export function WorkerComputeReport({
     const routeCount = routingPath.length || peers.filter((p) => p.length > 0).length
     let headline =
       layout === 'pipeline_relay_daisy_chain' || routingPath.length > 1
-        ? `Pipeline Daisy Chain (${routeCount} nœuds)`
+        ? `Pipeline distribué (${routeCount} nœuds)`
         : layout === 'worker_only_pipeline'
-          ? 'Pipeline worker-only (P2P natif)'
+          ? 'Pipeline worker dédié'
           : layout === 'row_split_tensor_parallel'
-            ? 'Ancien TP row-split — désactivé pour le chat'
-            : layout || 'Pipeline P2P natif'
+            ? 'Ancienne trace distribuée — désactivée pour le chat'
+            : displayLabel(layout || 'pipeline_distribue')
 
     if (!ok && routeCount === 0 && layout === 'pipeline_relay_daisy_chain') {
       headline =
-        'Échec pipeline distribué (aucun peer dans la trace ; consulter l’erreur ci-dessus et les logs stage1)'
+        'Échec pipeline distribué (aucun nœud dans la trace ; consulter l’erreur ci-dessus et les logs)'
     }
 
     const traceComputeMs = typeof t.compute_time_ms === 'number' ? t.compute_time_ms : null
@@ -519,7 +520,7 @@ export function WorkerComputeReport({
 
   return (
     <div className="mt-3 space-y-3">
-      {/* En-tête pipeline détaillé (worker-only / TP) */}
+      {/* En-tête pipeline détaillé */}
       {parsed && (
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-bg/60 px-3 py-2">
           <span className="text-[10px] font-bold text-fg">{parsed.headline}</span>
@@ -546,7 +547,7 @@ export function WorkerComputeReport({
         </div>
       )}
 
-      {/* Daisy chain : Nœud 1 → Nœud 2 → Nœud 3, depuis routing_path ou pipeline_trace.peers. */}
+      {/* Relais : Nœud 1 → Nœud 2 → Nœud 3, depuis le chemin de trace ou pipeline_trace.peers. */}
       {(() => {
         const path =
           (parsed?.routingPath && parsed.routingPath.length > 0
@@ -559,7 +560,7 @@ export function WorkerComputeReport({
         return <DaisyChainViz routingPath={path} computeTimeMs={computeMs} />
       })()}
 
-      {/* Graphiques riches (worker-only / TP) */}
+      {/* Graphiques riches */}
       {parsed && parsed.loads.length > 0 && <LoadChart loads={parsed.loads} />}
       {parsed && parsed.tokenChartData.length > 0 && <TokenStepsChart steps={parsed.tokenChartData} />}
 
@@ -589,7 +590,7 @@ export function WorkerComputeReport({
         </div>
       )}
 
-      {/* Graphiques agrégés (Pipeline P2P natif sans trace détaillée). */}
+      {/* Graphiques agrégés sans trace détaillée. */}
       {fallbackOk && roundMetrics && (!hasRichTrace || (parsed && parsed.tokenChartData.length === 0 && parsed.loads.length === 0)) && (
         <RoundTimingCharts m={roundMetrics} />
       )}

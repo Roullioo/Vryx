@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { AdminShell } from '../components/admin/AdminShell'
 import { workerLabel, type LiveWorker } from '../components/admin/AdminP2PChatPanel'
 import { apiJson, apiUrl } from '../lib/api'
+import { displayLabel } from '../lib/displayLabels'
 
 type Worker = {
   pid: number
@@ -164,7 +165,7 @@ function StatusDot({ status }: { status: Worker['status'] }) {
         }`}
         aria-hidden
       />
-      <span className="text-xs font-medium text-fg">{status}</span>
+      <span className="text-xs font-medium text-fg">{displayLabel(status)}</span>
     </span>
   )
 }
@@ -396,8 +397,7 @@ export function AdminNodePage() {
             Ouvrir le Chat P2P dédié
           </Link>
           <p className="text-xs leading-relaxed text-muted sm:order-1 sm:max-w-xl">
-            Le chat temps réel et les traces détaillées du pipeline (Daisy Chain,{' '}
-            <span className="font-mono text-fg/90">compute_time_ms</span>) sont sur la page Chat P2P.
+            Le chat temps réel et les traces détaillées du pipeline distribué sont sur la page Chat P2P.
           </p>
         </div>
 
@@ -470,7 +470,7 @@ export function AdminNodePage() {
               </p>
             </div>
             <span className="shrink-0 rounded-md border border-accent/25 bg-accent/5 px-2 py-1 text-[11px] font-medium text-accent">
-              {poolSnapshot?.pool.status || 'initialisation'}
+              {displayLabel(poolSnapshot?.pool.status || 'initialisation')}
             </span>
           </div>
           <div className="grid gap-4 md:grid-cols-4">
@@ -634,7 +634,7 @@ export function AdminNodePage() {
           </div>
           <div className="panel p-5">
             <p className="text-xs font-medium uppercase tracking-wide text-muted">
-              Latence moyenne (gRPC)
+              Latence moyenne interne
             </p>
             <p className="mt-1 font-display text-2xl font-bold text-electric">
               {formatMs(avgWorkerLatency)}
@@ -786,7 +786,7 @@ export function AdminNodePage() {
             </p>
           </div>
           <div className="panel p-5 sm:p-6">
-            <h3 className="text-sm font-semibold text-fg">Latence gRPC (historique)</h3>
+            <h3 className="text-sm font-semibold text-fg">Latence interne historique</h3>
             <MiniSparkline
               points={history?.points ?? []}
               field="avgComputeMs"
@@ -817,7 +817,7 @@ export function AdminNodePage() {
                   <th className="px-4 py-3 pl-5">Statut</th>
                   <th className="px-4 py-3">PID</th>
                   <th className="px-4 py-3">Mode</th>
-                  <th className="px-4 py-3">Ports (gRPC / P2P)</th>
+                  <th className="px-4 py-3">Ports internes</th>
                   <th className="px-4 py-3">IPs distantes</th>
                   <th className="px-4 py-3">CPU</th>
                   <th className="px-4 py-3">RAM</th>
@@ -924,7 +924,7 @@ export function AdminNodePage() {
                             aria-hidden
                           />
                           <span className="text-xs font-medium text-fg">
-                            {w.online ? 'online' : 'offline'}
+                            {w.online ? 'En ligne' : 'Hors ligne'}
                           </span>
                         </span>
                       </td>
@@ -989,7 +989,7 @@ export function AdminNodePage() {
             Communication & tests des workers
           </h3>
           <p className="mt-1 text-xs text-muted">
-            Lance des sondes TCP/gRPC vers les workers détectés et mesure leurs latences. Le
+            Lance des sondes internes vers les workers détectés et mesure leurs latences. Le
             stress test envoie plusieurs appels en parallèle pour évaluer la robustesse.
           </p>
 

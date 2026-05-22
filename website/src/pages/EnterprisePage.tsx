@@ -25,9 +25,16 @@ const offerLabels: Record<Offer, string> = {
 
 const privacyLabels: Record<Privacy, string> = {
   standard: 'Standard',
-  eu_only: 'EU only',
+  eu_only: 'Europe uniquement',
   private_pool: 'Pool privé',
-  no_retention: 'No retention',
+  no_retention: 'Sans rétention',
+}
+
+const offerCopy: Record<Offer, string> = {
+  api: 'Crédits API, clés, usage et facturation en euros.',
+  private_pool: 'Capacité réservée, modèle choisi, SLA et traces dédiées.',
+  knowledge_ai: 'RAG sécurisé sur base documentaire, avec mode sans rétention possible.',
+  custom_ai: 'Dataset, LoRA/fine-tuning, évaluation et déploiement inference.',
 }
 
 function money(value: number, digits = 0) {
@@ -108,19 +115,62 @@ export function EnterprisePage() {
   }
 
   return (
-    <main className="bg-bg">
-      <section className="border-b border-border bg-surface/50 px-4 py-8 sm:px-6 lg:px-8">
-        <div className="mx-auto max-w-6xl">
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Enterprise</p>
-          <h1 className="mt-2 font-display text-4xl font-bold text-fg sm:text-5xl">Configurer une offre Vryx B2B.</h1>
-          <p className="mt-4 max-w-3xl text-base leading-7 text-muted">
-            API self-serve, pool privé, IA documentaire ou projet custom. Le formulaire produit une première estimation exploitable par l’équipe commerciale.
-          </p>
+    <main className="bg-bg text-fg">
+      <section className="page-hero bg-[#08111f] text-white">
+        <img
+          src="/assets/vryx-enterprise-hero.webp"
+          alt=""
+          className="absolute inset-0 h-full w-full object-cover object-center opacity-82"
+          decoding="async"
+          fetchPriority="high"
+        />
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(3,7,18,.96),rgba(3,7,18,.80)_44%,rgba(3,7,18,.32))]" aria-hidden />
+        <div className="relative mx-auto grid min-h-[inherit] max-w-6xl items-center px-4 py-16 sm:px-6 lg:px-8">
+          <div className="max-w-2xl">
+            <p className="text-xs font-semibold uppercase text-emerald-100/75">Enterprise AI infrastructure</p>
+            <h1 className="mt-5 font-display text-4xl font-semibold leading-[1.02] text-white sm:text-5xl lg:text-6xl">
+              Vryx Enterprise
+            </h1>
+            <p className="mt-5 text-base leading-8 text-white/74 sm:text-lg">
+              API, pool privé, Knowledge AI et projets custom sur une infrastructure IA distribuée, mesurée et
+              facturable en euros. Le réseau est prêt pour les pilotes B2B: sécurité, traces, credits, webhooks et
+              readiness score.
+            </p>
+            <div className="mt-8 flex flex-wrap gap-3">
+              <a href="#quote" className="rounded-lg bg-white px-5 py-3 text-sm font-semibold text-slate-950 hover:bg-white/90">
+                Configurer une offre
+              </a>
+              <Link to="/network" className="rounded-lg border border-white/25 bg-white/10 px-5 py-3 text-sm font-semibold text-white hover:bg-white/15">
+                Voir les preuves live
+              </Link>
+            </div>
+          </div>
         </div>
       </section>
 
-      <section className="mx-auto grid max-w-6xl gap-6 px-4 py-8 sm:px-6 lg:grid-cols-[minmax(0,1fr)_24rem] lg:px-8">
-        <form onSubmit={submit} className="rounded-2xl border border-border bg-card p-5 shadow-sm">
+      <section className="border-b border-border bg-card py-10">
+        <div className="mx-auto grid max-w-6xl gap-3 px-4 sm:grid-cols-2 sm:px-6 lg:grid-cols-4 lg:px-8">
+          {[
+            ['Readiness', 'Candidat production'],
+            ['Facturation', 'Crédits et ledger vérifiés'],
+            ['Sécurité', 'Routes séparées'],
+            ['Réseau', 'Bench multi-worker'],
+          ].map(([label, value]) => (
+            <div key={label} className="rounded-lg border border-border bg-bg p-4">
+              <p className="text-xs font-semibold uppercase text-muted">{label}</p>
+              <p className="mt-2 text-lg font-semibold">{value}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section id="quote" className="mx-auto grid max-w-6xl gap-6 px-4 py-10 sm:px-6 lg:grid-cols-[minmax(0,1fr)_24rem] lg:px-8">
+        <form onSubmit={submit} className="rounded-lg border border-border bg-card p-5 shadow-sm">
+          <div className="mb-6">
+            <p className="text-xs font-semibold uppercase text-accent">Configurateur B2B</p>
+            <h2 className="mt-2 font-display text-3xl font-semibold">Transformer un besoin en devis.</h2>
+          </div>
+
           <div className="grid gap-4 sm:grid-cols-2">
             <label className="block">
               <span className="text-xs font-semibold uppercase tracking-wide text-muted">Entreprise</span>
@@ -138,12 +188,10 @@ export function EnterprisePage() {
                 key={item}
                 type="button"
                 onClick={() => setOffer(item)}
-                className={`rounded-xl border p-4 text-left transition ${offer === item ? 'border-accent bg-accent/10' : 'border-border bg-surface hover:border-accent/40'}`}
+                className={`rounded-lg border p-4 text-left transition ${offer === item ? 'border-accent bg-accent/10' : 'border-border bg-surface hover:border-accent/40'}`}
               >
                 <span className="block font-semibold text-fg">{offerLabels[item]}</span>
-                <span className="mt-1 block text-xs text-muted">
-                  {item === 'api' ? 'Crédits API et usage développeur.' : item === 'private_pool' ? 'Capacité dédiée, SLA, workers réservés.' : item === 'knowledge_ai' ? 'RAG sécurisé sur documents métier.' : 'Accompagnement modèle, dataset, déploiement.'}
-                </span>
+                <span className="mt-1 block text-xs leading-5 text-muted">{offerCopy[item]}</span>
               </button>
             ))}
           </div>
@@ -170,9 +218,9 @@ export function EnterprisePage() {
                 {(Object.keys(privacyLabels) as Privacy[]).map((item) => <option key={item} value={item}>{privacyLabels[item]}</option>)}
               </select>
             </label>
-            <label className="flex items-center gap-3 rounded-xl border border-border bg-surface px-4 py-3 text-sm font-semibold text-fg">
+            <label className="flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-3 text-sm font-semibold text-fg">
               <input type="checkbox" checked={fineTuning} onChange={(event) => setFineTuning(event.target.checked)} className="h-4 w-4 accent-current" />
-              Fine-tuning / LoRA
+              LoRA / fine-tuning
             </label>
           </div>
 
@@ -188,15 +236,15 @@ export function EnterprisePage() {
             </p>
           ) : null}
 
-          <button type="submit" disabled={loading} className="mt-5 rounded-lg bg-accent px-5 py-3 text-sm font-semibold text-white hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50">
+          <button type="submit" disabled={loading} className="mt-5 rounded-lg bg-accent px-5 py-3 text-sm font-semibold text-on-accent hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50">
             {loading ? 'Enregistrement...' : 'Demander une offre'}
           </button>
         </form>
 
         <aside className="space-y-4">
-          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
+          <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
             <p className="text-xs font-semibold uppercase tracking-wide text-muted">Estimation</p>
-            <p className="mt-3 font-display text-4xl font-bold text-fg">{money(estimate.monthly)}</p>
+            <p className="mt-3 font-display text-4xl font-semibold text-fg">{money(estimate.monthly)}</p>
             <p className="mt-1 text-sm text-muted">par mois, setup {money(estimate.setup)}</p>
             <div className="mt-5 space-y-2 text-sm">
               <div className="flex justify-between gap-4"><span className="text-muted">Offre</span><span className="font-semibold text-fg">{offerLabels[offer]}</span></div>
@@ -205,18 +253,15 @@ export function EnterprisePage() {
               <div className="flex justify-between gap-4"><span className="text-muted">Workers</span><span className="font-mono text-fg">{dedicatedWorkers}</span></div>
             </div>
           </div>
-          <div className="rounded-2xl border border-border bg-card p-5 shadow-sm">
+          <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
             <p className="font-semibold text-fg">Inclut</p>
-            <ul className="mt-3 space-y-2 text-sm text-muted">
+            <ul className="mt-3 space-y-2 text-sm leading-6 text-muted">
               <li>SLA et capacité réservée selon offre.</li>
               <li>Logs, usage, coûts et facturation API.</li>
               <li>Mode no-retention possible.</li>
               <li>Support architecture et sécurité.</li>
             </ul>
           </div>
-          <Link to="/network" className="block rounded-2xl border border-border bg-surface p-5 text-sm font-semibold text-fg hover:border-accent/40">
-            Voir le réseau live public
-          </Link>
         </aside>
       </section>
     </main>
