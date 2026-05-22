@@ -70,72 +70,62 @@ mod vryx_codec {
         type Request = Req;
         type Response = Resp;
 
-        fn read_request<T>(
+        async fn read_request<T>(
             &mut self,
             _protocol: &Self::Protocol,
             io: &mut T,
-        ) -> impl Future<Output = io::Result<Self::Request>> + Send
+        ) -> io::Result<Self::Request>
         where
             T: AsyncRead + Unpin + Send,
         {
-            async move {
-                let mut buf = Vec::new();
-                io.take(MAX_SIZE).read_to_end(&mut buf).await?;
-                serde_json::from_slice(&buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
+            let mut buf = Vec::new();
+            io.take(MAX_SIZE).read_to_end(&mut buf).await?;
+            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
 
-        fn read_response<T>(
+        async fn read_response<T>(
             &mut self,
             _protocol: &Self::Protocol,
             io: &mut T,
-        ) -> impl Future<Output = io::Result<Self::Response>> + Send
+        ) -> io::Result<Self::Response>
         where
             T: AsyncRead + Unpin + Send,
         {
-            async move {
-                let mut buf = Vec::new();
-                io.take(MAX_SIZE).read_to_end(&mut buf).await?;
-                serde_json::from_slice(&buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
+            let mut buf = Vec::new();
+            io.take(MAX_SIZE).read_to_end(&mut buf).await?;
+            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
 
-        fn write_request<T>(
+        async fn write_request<T>(
             &mut self,
             _protocol: &Self::Protocol,
             io: &mut T,
             req: Self::Request,
-        ) -> impl Future<Output = io::Result<()>> + Send
+        ) -> io::Result<()>
         where
             T: AsyncWrite + Unpin + Send,
         {
-            async move {
-                let data = serde_json::to_vec(&req)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                io.write_all(&data).await?;
-                io.close().await?;
-                Ok(())
-            }
+            let data = serde_json::to_vec(&req)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            io.write_all(&data).await?;
+            io.close().await?;
+            Ok(())
         }
 
-        fn write_response<T>(
+        async fn write_response<T>(
             &mut self,
             _protocol: &Self::Protocol,
             io: &mut T,
             resp: Self::Response,
-        ) -> impl Future<Output = io::Result<()>> + Send
+        ) -> io::Result<()>
         where
             T: AsyncWrite + Unpin + Send,
         {
-            async move {
-                let data = serde_json::to_vec(&resp)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                io.write_all(&data).await?;
-                io.close().await?;
-                Ok(())
-            }
+            let data = serde_json::to_vec(&resp)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            io.write_all(&data).await?;
+            io.close().await?;
+            Ok(())
         }
     }
 }
