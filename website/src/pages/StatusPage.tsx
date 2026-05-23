@@ -41,13 +41,15 @@ type PublicStatus = {
     minOutputEurPerMillion?: number | null
     eurPerMillionTokens: number | null
     eurPerThousandTokens: number | null
-    estimatedGrossMarginPercent: number
-    workerRewardSharePercent: number
+    estimatedGrossMarginPercent: number | null
+    workerRewardSharePercent: number | null
   }
   network: {
     workersRegistered: number
     workersOnline: number
     workersLive: number
+    workersHealthy: number
+    uptimePercent: number
     modelsReady: number
     tokens1h: number
     tokens24h: number
@@ -63,11 +65,16 @@ type PublicStatus = {
     ttftP95Ms: number
     pingP50Ms: number
     pingP95Ms: number
-    revenue24h: number
-    workerRewards24h: number
+    revenue24h: number | null
+    workerRewards24h: number | null
+    infraCost24h?: number | null
+    electricityCost24h?: number | null
+    netMargin24h?: number | null
+    costPerTokenEur?: number | null
+    estimatedNetMarginPercent?: number | null
     apiRequests24h: number
     apiTokens24h: number
-    apiRevenue24h: number
+    apiRevenue24h: number | null
   }
   benchmark: {
     label: string
@@ -108,11 +115,22 @@ function fmtEur(value?: number | null, digits = 4) {
   })
 }
 
-function KpiCard({ label, value, hint, tone = 'cyan' }: { label: string; value: string; hint?: string; tone?: 'cyan' | 'emerald' | 'amber' | 'slate' }) {
+function fmtPercent(value?: number | null) {
+  return value == null ? 'masqué' : `${Number(value || 0).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} %`
+}
+
+function fmtCostPerToken(value?: number | null) {
+  const n = Number(value || 0)
+  if (n <= 0) return 'estimé public'
+  return `${n.toLocaleString('fr-FR', { maximumFractionDigits: 10 })} €/tok`
+}
+
+function KpiCard({ label, value, hint, tone = 'cyan' }: { label: string; value: string; hint?: string; tone?: 'cyan' | 'emerald' | 'amber' | 'slate' | 'rose' }) {
   const tones = {
     cyan: 'border-cyan-200/35 bg-cyan-50 text-cyan-950 dark:border-cyan-300/20 dark:bg-cyan-300/10 dark:text-cyan-50',
     emerald: 'border-emerald-200/40 bg-emerald-50 text-emerald-950 dark:border-emerald-300/20 dark:bg-emerald-300/10 dark:text-emerald-50',
     amber: 'border-amber-200/45 bg-amber-50 text-amber-950 dark:border-amber-300/25 dark:bg-amber-300/10 dark:text-amber-50',
+    rose: 'border-rose-200/45 bg-rose-50 text-rose-950 dark:border-rose-300/25 dark:bg-rose-300/10 dark:text-rose-50',
     slate: 'border-border bg-card text-fg',
   }
   return (
@@ -129,6 +147,16 @@ function DetailRow({ label, value }: { label: string; value: string }) {
     <div className="flex items-center justify-between gap-4 border-b border-border py-3 last:border-b-0">
       <span className="text-sm text-muted">{label}</span>
       <span className="text-right font-mono text-sm font-semibold text-fg">{value}</span>
+    </div>
+  )
+}
+
+function ProofTile({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-bg p-4">
+      <p className="text-xs font-semibold uppercase text-muted">{label}</p>
+      <p className="mt-2 font-display text-2xl font-semibold text-fg">{value}</p>
+      <p className="mt-2 text-sm leading-6 text-muted">{detail}</p>
     </div>
   )
 }
@@ -254,11 +282,31 @@ export function StatusPage() {
 
   const topModels = useMemo(() => (status?.models || []).slice(0, 8), [status])
   const liveWorkers = useMemo(() => (status?.workers || []).filter((worker) => worker.live).slice(0, 10), [status])
+  const publicRevenue24h = useMemo(() => {
+    if (status?.network.revenue24h != null) return { value: status.network.revenue24h, mode: 'réel' }
+    const price = Number(status?.pricing.eurPerMillionTokens || 0)
+    const tokens = Number(status?.network.tokens24h || 0)
+    if (price > 0 && tokens > 0) return { value: (tokens / 1_000_000) * price, mode: 'simulé public' }
+    return { value: 0, mode: 'en attente' }
+  }, [status])
+  const publicWorkerRewards24h = useMemo(() => {
+    if (status?.network.workerRewards24h != null) return { value: status.network.workerRewards24h, mode: 'réel' }
+    const share = Number(status?.pricing.workerRewardSharePercent || 0)
+    if (share > 0 && publicRevenue24h.value > 0) return { value: publicRevenue24h.value * (share / 100), mode: 'simulé public' }
+    return { value: 0, mode: 'masqué' }
+  }, [status, publicRevenue24h])
   const pricingLabel = status?.pricing.published === false
     ? 'Sur devis'
     : status?.pricing.minInputEurPerMillion != null && status?.pricing.minOutputEurPerMillion != null
       ? `${status.pricing.minInputEurPerMillion.toFixed(2)} / ${status.pricing.minOutputEurPerMillion.toFixed(2)} €/M`
       : fmtEur(status?.pricing.eurPerMillionTokens)
+  const costLabel = status?.network.costPerTokenEur
+    ? fmtCostPerToken(status.network.costPerTokenEur)
+    : status?.benchmark.costEstimatedEurPerMillion
+      ? `${fmtEur(status.benchmark.costEstimatedEurPerMillion, 2)} / M tok`
+      : status?.pricing.eurPerMillionTokens
+        ? `${fmtEur(status.pricing.eurPerMillionTokens, 2)} / M tok`
+        : 'Sur devis'
 
   return (
     <main className="bg-bg text-fg">
@@ -269,11 +317,11 @@ export function StatusPage() {
           <div className="pb-3">
             <p className="text-xs font-semibold uppercase text-cyan-100/70">Live Network</p>
             <h1 className="mt-5 max-w-4xl font-display text-4xl font-semibold leading-[1.03] text-white sm:text-5xl lg:text-6xl">
-              Le tableau public du réseau Vryx.
+              Le réseau Vryx, visible en temps réel.
             </h1>
             <p className="mt-5 max-w-2xl text-base leading-8 text-white/72 sm:text-lg">
-              Workers, modèles, tokens, latence, TPS, pricing et benchmark: cette page expose les preuves utiles sans
-              publier les peer IDs complets, IPs, ports ou informations sensibles.
+              Une page publique contrôlée pour montrer workers enregistrés, capacité live, tokens, latence, TPS,
+              pricing et benchmark du jour sans exposer peer IDs complets, IPs, ports ou données sensibles.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
               <Link to="/compte/chat" className="rounded-lg bg-white px-5 py-3 text-sm font-semibold text-slate-950 hover:bg-white/90">
@@ -315,9 +363,34 @@ export function StatusPage() {
 
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <KpiCard label="Workers en ligne" value={fmtInt(status?.network.workersOnline)} hint={`${fmtInt(status?.network.workersRegistered)} enregistrés`} tone="cyan" />
+          <KpiCard label="Workers live" value={fmtInt(status?.network.workersLive)} hint={`${fmtInt(status?.network.workersHealthy)} stables dans la fenêtre live`} tone="emerald" />
           <KpiCard label="Tokens 24h" value={fmtInt(status?.network.tokens24h)} hint={`${fmtInt(status?.network.tokens30d)} sur 30 jours`} tone="emerald" />
-          <KpiCard label="Latence p95" value={fmtMs(status?.network.latencyP95Ms)} hint={`p50 ${fmtMs(status?.network.latencyP50Ms)}`} tone="amber" />
-          <KpiCard label="Prix public" value={pricingLabel} hint={status?.pricing.published === false ? 'pricing privé' : 'input / output €/M'} tone="slate" />
+          <KpiCard label="Uptime réseau" value={fmtPercent(status?.network.uptimePercent)} hint={`${fmtInt(status?.network.activeWorkers24h)} worker(s) actifs 24h`} tone="slate" />
+        </div>
+
+        <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <KpiCard label="Latence p50 / p95" value={`${fmtMs(status?.network.latencyP50Ms)} / ${fmtMs(status?.network.latencyP95Ms)}`} hint={`TTFT p50 / p95: ${fmtMs(status?.network.ttftP50Ms)} / ${fmtMs(status?.network.ttftP95Ms)}`} tone="amber" />
+          <KpiCard label="TPS p50 / p95" value={`${fmtTps(status?.network.tpsActiveP50)} / ${fmtTps(status?.network.tpsActiveP95)}`} hint={`moyenne active ${fmtTps(status?.network.tpsActiveAvg)} tok/s`} tone="cyan" />
+          <KpiCard label="Coût estimé" value={costLabel} hint={status?.network.costPerTokenEur ? 'coût interne exposé' : 'tarif public ou bench'} tone="rose" />
+          <KpiCard label="Revenu réseau 24h" value={fmtEur(publicRevenue24h.value)} hint={publicRevenue24h.mode} tone="emerald" />
+        </div>
+
+        <div className="mt-8 rounded-lg border border-border bg-card p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase text-muted">Preuve publique redacted</p>
+              <h2 className="mt-2 font-display text-2xl font-semibold">Un réseau vivant, sans surface sensible inutile.</h2>
+            </div>
+            <span className="rounded-full border border-emerald-300/25 bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-600 dark:text-emerald-300">
+              public safe
+            </span>
+          </div>
+          <div className="mt-5 grid gap-4 md:grid-cols-4">
+            <ProofTile label="Identités" value="Redacted" detail="Les workers publics utilisent des labels courts, pas les peer IDs complets." />
+            <ProofTile label="Réseau" value="Sans IP/ports" detail="La page ne publie pas d’adresse machine ni de port de worker." />
+            <ProofTile label="Économie" value={publicRevenue24h.mode} detail="Le revenu est réel si autorisé, sinon simulé à partir du tarif public." />
+            <ProofTile label="Refresh" value="15 s" detail="Les données sont rafraîchies côté client et cachées très court côté API." />
+          </div>
         </div>
 
         <div className="mt-8 grid gap-5 xl:grid-cols-[1.1fr_.9fr]">
@@ -352,10 +425,15 @@ export function StatusPage() {
             <p className="text-xs font-semibold uppercase text-muted">Économie réseau</p>
             <div className="mt-4">
               <DetailRow label="Tokens 1h" value={fmtInt(status?.network.tokens1h)} />
-              <DetailRow label="Revenu estimé 24h" value={fmtEur(status?.network.revenue24h)} />
-              <DetailRow label="Redistribution worker 24h" value={fmtEur(status?.network.workerRewards24h)} />
-              <DetailRow label="Marge brute estimée" value={`${fmtInt(status?.pricing.estimatedGrossMarginPercent)} %`} />
-              <DetailRow label="Part worker" value={`${fmtInt(status?.pricing.workerRewardSharePercent)} %`} />
+              <DetailRow label="Prix public" value={pricingLabel} />
+              <DetailRow label={`Revenu réseau 24h (${publicRevenue24h.mode})`} value={fmtEur(publicRevenue24h.value)} />
+              <DetailRow label={`Redistribution worker 24h (${publicWorkerRewards24h.mode})`} value={publicWorkerRewards24h.mode === 'masqué' ? 'masquée' : fmtEur(publicWorkerRewards24h.value)} />
+              <DetailRow label="Marge nette estimée" value={fmtPercent(status?.network.estimatedNetMarginPercent)} />
+              <DetailRow label="Marge brute pricing" value={fmtPercent(status?.pricing.estimatedGrossMarginPercent)} />
+              <DetailRow label="Part worker" value={fmtPercent(status?.pricing.workerRewardSharePercent)} />
+              <DetailRow label="Requêtes API 24h" value={fmtInt(status?.network.apiRequests24h)} />
+              <DetailRow label="Tokens API 24h" value={fmtInt(status?.network.apiTokens24h)} />
+              <DetailRow label="Revenu API 24h" value={status?.network.apiRevenue24h == null ? 'masqué' : fmtEur(status.network.apiRevenue24h)} />
             </div>
           </section>
         </div>
