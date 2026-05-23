@@ -28,6 +28,9 @@ const AdminObservabilityPage = lazy(() => import('./pages/AdminObservabilityPage
 const AdminProductionReadinessPage = lazy(() =>
   import('./pages/AdminProductionReadinessPage').then((m) => ({ default: m.AdminProductionReadinessPage })),
 )
+const AdminInvestorDemoStatusPage = lazy(() =>
+  import('./pages/AdminInvestorDemoStatusPage').then((m) => ({ default: m.AdminInvestorDemoStatusPage })),
+)
 const AdminEnterpriseQuotesPage = lazy(() =>
   import('./pages/AdminEnterpriseQuotesPage').then((m) => ({ default: m.AdminEnterpriseQuotesPage })),
 )
@@ -75,6 +78,7 @@ export default function App() {
           <Route path="admin/sessions/:sessionId" element={<AdminSessionDetailPage />} />
           <Route path="admin/observabilite" element={<AdminObservabilityPage />} />
           <Route path="admin/production-readiness" element={<AdminProductionReadinessPage />} />
+          <Route path="admin/investor-demo" element={<AdminInvestorDemoStatusPage />} />
           <Route path="admin/parametres/pricing" element={<AdminPricingPage />} />
           <Route path="admin/modeles" element={<AdminModelsCatalogPage />} />
           <Route path="admin/enterprise" element={<AdminEnterpriseQuotesPage />} />

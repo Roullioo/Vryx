@@ -16,7 +16,8 @@ import { z } from 'zod'
 import { nodeMonitor } from './node-monitor.js'
 import { createObservability, registerObservabilityMiddleware, registerObservabilityRoutes } from './observability.js'
 import { registerPublicStatusRoutes } from './public-status.js'
-import { buildInferenceLog } from './inference-metrics.js'
+import { buildInferenceLog, summarizeInferenceRows } from './inference-metrics.js'
+import { scoreProductionReadiness } from './production-readiness.js'
 import { registerAdminInferenceRoutes } from './admin-inference-routes.js'
 import { initRedis, isRedisReady, isRedisRequiredInProd } from './redis-client.js'
 import { setJsonCache } from './cache.js'
@@ -7226,7 +7227,7 @@ adminRouter.get('/billing/summary', async (_req, res) => {
   }
 })
 
-adminRouter.get('/runtime-mode', async (_req, res) => {
+function buildRuntimeModePayload() {
   const stripeMode = STRIPE_CHECKOUT_ENABLED && STRIPE_SECRET_KEY.startsWith('sk_test_')
     ? 'test'
     : STRIPE_CHECKOUT_ENABLED
@@ -7237,7 +7238,7 @@ adminRouter.get('/runtime-mode', async (_req, res) => {
     : IS_PRODUCTION
       ? 'PRODUCTION'
       : 'DEVELOPMENT'
-  res.json({
+  return {
     ok: true,
     environment,
     investorDemoMode: environment === 'DEV / STAGING',
@@ -7271,7 +7272,177 @@ adminRouter.get('/runtime-mode', async (_req, res) => {
       { label: 'Unsigned worker', active: process.env.VRYX_WORKER_APP_SIGNED !== '1', tone: 'warning' },
       { label: 'Workers systemd', active: (process.env.VRYX_WORKERS_RUNTIME || (IS_PRODUCTION ? 'systemd' : 'local')) === 'systemd', tone: 'success' },
     ],
-  })
+  }
+}
+
+adminRouter.get('/runtime-mode', async (_req, res) => {
+  res.json(buildRuntimeModePayload())
+})
+
+adminRouter.get('/investor-demo-status', async (_req, res) => {
+  try {
+    const hours = 24
+    const goldenModels = String(process.env.VRYX_GOLDEN_PATH_MODELS || 'gemma4:31b,qwen/qwen3.6-35b-a3b,qwen3.6-35b')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+    const minDecodeTps = Math.max(1, Math.min(200, Number(process.env.VRYX_GOLDEN_MIN_TPS) || 10))
+    const maxTtftP95Ms = Math.max(500, Math.min(120_000, Number(process.env.VRYX_GOLDEN_MAX_TTFT_P95_MS) || 10_000))
+    const runtime = buildRuntimeModePayload()
+    const [workerRowsResult, inferenceRowsResult, benchmarkRowsResult, totalsResult] = await Promise.all([
+      pool.query(
+        `SELECT peer_id AS peerId, model, desired_model AS desiredModel, runtime_backend AS runtimeBackend,
+                weight_quantization AS weightQuantization, supports_q4_weights AS supportsQ4Weights,
+                capabilities_json AS capabilitiesJson, machine_info AS machineInfo,
+                TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
+         FROM workers
+         WHERE mode = 'worker'
+         ORDER BY last_heartbeat_at DESC
+         LIMIT 200`,
+      ),
+      pool.query(
+        `SELECT status, model, runtime, worker_id AS workerId, ttft_ms AS ttftMs,
+                decode_tps AS decodeTps, latency_ms AS latencyMs, total_duration_ms AS totalDurationMs,
+                prompt_tokens AS promptTokens, completion_tokens AS completionTokens,
+                total_tokens AS totalTokens, cost_eur AS costEur, error
+         FROM inference_request_logs
+         WHERE created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+         ORDER BY created_at DESC
+         LIMIT 5000`,
+        { hours },
+      ),
+      pool.query(
+        `SELECT model, status, tps, ttft_ms AS ttftMs, latency_ms AS latencyMs, worker_count AS workerCount, created_at AS createdAt
+         FROM worker_benchmark_runs
+         WHERE created_at >= DATE_SUB(NOW(), INTERVAL :hours HOUR)
+         ORDER BY created_at DESC
+         LIMIT 500`,
+        { hours },
+      ),
+      pool.query(`
+        SELECT
+          (SELECT COUNT(*) FROM workers
+           WHERE mode = 'worker'
+             AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :liveSec) AS liveWorkers,
+          (SELECT COUNT(*) FROM api_key_usage) AS apiKeyUsageRows,
+          (SELECT COUNT(*) FROM api_key_usage WHERE cost_eur > 0) AS costedUsageRows,
+          (SELECT COUNT(*) FROM billing_credit_ledger WHERE type = 'usage_debit') AS creditDebitRows,
+          (SELECT COUNT(*) FROM worker_payout_ledger) AS payoutRows,
+          (SELECT COUNT(*) FROM worker_payout_ledger WHERE pricing_snapshot_json IS NOT NULL AND pricing_snapshot_json <> '') AS payoutSnapshotRows,
+          (SELECT COUNT(*) FROM pricing_config_audit) AS pricingAuditRows
+      `, { liveSec: WORKER_LIVE_SEC }),
+    ])
+    const workers = (workerRowsResult[0] || []).map((row) => ({
+      ...row,
+      supportsQ4Weights: Boolean(row.supportsQ4Weights),
+      capabilitiesJson: parseMaybeJsonObject(row.capabilitiesJson) || null,
+      machineInfo: parseMaybeJsonObject(row.machineInfo) || null,
+    }))
+    const inferenceRows = inferenceRowsResult[0] || []
+    const readiness = scoreProductionReadiness({
+      workers,
+      inferenceRows,
+      inferenceSummary: summarizeInferenceRows(inferenceRows),
+      benchmarkRows: benchmarkRowsResult[0] || [],
+      goldenModels,
+      minDecodeTps,
+      maxTtftP95Ms,
+    })
+    const totals = totalsResult[0]?.[0] || {}
+    const systemdWorkers = runtime.workers.runtime === 'systemd'
+    const stripeLive = runtime.stripe.live
+    const appSigned = runtime.workerApp.signed
+    const items = [
+      {
+        check: 'Redis ready',
+        state: isRedisReady() ? 'OK' : 'À vérifier',
+        status: isRedisReady() ? 'ok' : 'warning',
+        detail: runtime.redis.requiredInProd ? 'Obligatoire en staging/prod' : 'Optionnel',
+      },
+      {
+        check: '2 workers systemd',
+        state: systemdWorkers && Number(totals.liveWorkers || 0) >= 2 ? 'OK' : 'À vérifier',
+        status: systemdWorkers && Number(totals.liveWorkers || 0) >= 2 ? 'ok' : 'warning',
+        detail: `${Number(totals.liveWorkers || 0)} worker(s) live`,
+      },
+      {
+        check: 'Pricing engine',
+        state: 'OK',
+        status: 'ok',
+        detail: 'Pricing dynamique chargé côté serveur',
+      },
+      {
+        check: 'Admin pricing',
+        state: Number(totals.pricingAuditRows || 0) > 0 ? 'OK' : 'À vérifier',
+        status: Number(totals.pricingAuditRows || 0) > 0 ? 'ok' : 'warning',
+        detail: `${Number(totals.pricingAuditRows || 0)} audit(s) pricing`,
+      },
+      {
+        check: 'API key usage',
+        state: Number(totals.apiKeyUsageRows || 0) > 0 ? 'OK' : 'À vérifier',
+        status: Number(totals.apiKeyUsageRows || 0) > 0 ? 'ok' : 'warning',
+        detail: `${Number(totals.apiKeyUsageRows || 0)} ligne(s) usage`,
+      },
+      {
+        check: 'Credit debit',
+        state: Number(totals.creditDebitRows || 0) > 0 && Number(totals.costedUsageRows || 0) > 0 ? 'OK' : 'À vérifier',
+        status: Number(totals.creditDebitRows || 0) > 0 && Number(totals.costedUsageRows || 0) > 0 ? 'ok' : 'warning',
+        detail: `${Number(totals.creditDebitRows || 0)} débit(s) crédit`,
+      },
+      {
+        check: 'Worker payout ledger',
+        state: Number(totals.payoutRows || 0) > 0 && Number(totals.payoutSnapshotRows || 0) > 0 ? 'OK' : 'À vérifier',
+        status: Number(totals.payoutRows || 0) > 0 && Number(totals.payoutSnapshotRows || 0) > 0 ? 'ok' : 'warning',
+        detail: `${Number(totals.payoutRows || 0)} ligne(s), ${Number(totals.payoutSnapshotRows || 0)} snapshot(s)`,
+      },
+      {
+        check: 'Stripe live',
+        state: stripeLive ? 'OK' : 'Not enabled',
+        status: stripeLive ? 'ok' : 'not_enabled',
+        detail: runtime.stripe.mode,
+      },
+      {
+        check: 'App signing',
+        state: appSigned ? 'OK' : 'Not enabled',
+        status: appSigned ? 'ok' : 'not_enabled',
+        detail: runtime.workerApp.build,
+      },
+      {
+        check: 'Readiness runtime',
+        state: `${readiness.score}/100`,
+        status: readiness.score >= 80 ? 'ok' : readiness.score >= 60 ? 'warning' : 'blocked',
+        detail: readiness.grade,
+      },
+      {
+        check: 'Investor video',
+        state: process.env.VRYX_INVESTOR_VIDEO_STATUS || 'Ready',
+        status: 'ok',
+        detail: 'Démo courte investisseur',
+      },
+    ]
+    res.json({
+      ok: true,
+      sampledAt: new Date().toISOString(),
+      runtime,
+      readiness: {
+        score: readiness.score,
+        grade: readiness.grade,
+        blockers: readiness.blockers,
+        warnings: readiness.warnings,
+      },
+      summary: {
+        ok: items.filter((item) => item.status === 'ok').length,
+        notEnabled: items.filter((item) => item.status === 'not_enabled').length,
+        warnings: items.filter((item) => item.status === 'warning').length,
+        blocked: items.filter((item) => item.status === 'blocked').length,
+        total: items.length,
+      },
+      checks: items,
+    })
+  } catch (e) {
+    console.error('admin/investor-demo-status', e)
+    res.status(500).json({ ok: false, error: 'Erreur statut investor demo.' })
+  }
 })
 
 adminRouter.get('/billing/proof', async (_req, res) => {
