@@ -567,7 +567,8 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _requires_distributed_shards(model_id: str) -> bool:
-    if _env_truthy("VRYX_LLAMA_CPP_DIRECT"):
+    normalized = str(model_id or "").lower()
+    if _env_truthy("VRYX_LLAMA_CPP_DIRECT") and ("llama" in normalized or "gemma" in normalized):
         return False
     if (
         _env_truthy("VRYX_WORKER_SHARD_ONLY")

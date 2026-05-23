@@ -672,10 +672,10 @@ def _worker_matches_model(worker: dict[str, Any], model_id: Optional[str] = None
 
 
 def _requires_distributed_shards(model_id: Optional[str] = None) -> bool:
-    if LLAMA_CPP_DIRECT:
-        return False
     norm = _model_key(model_id or MODEL_ID)
     tail = _model_tail(norm)
+    if LLAMA_CPP_DIRECT and any(marker in norm for marker in ("llama", "gemma")):
+        return False
     # Les très gros modèles ne doivent jamais passer par le chemin direct
     # `mlx_lm.generate` : un worker tenterait de charger le modèle complet,
     # puis répondrait "shard-only", ce qui finit côté UI en "Réponse vide".
