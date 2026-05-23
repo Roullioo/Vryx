@@ -1,4 +1,4 @@
-name: rust-linux-build
+name: CI Rust Linux
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
 
 jobs:
   rust-daemon-linux:
-    name: Rust daemon Linux release build
+    name: cargo fmt, clippy, test, release build
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -19,6 +19,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install protobuf compiler
         run: |
@@ -27,6 +29,15 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -p rust-daemon -- -D warnings
+
+      - name: Test rust-daemon
+        run: cargo test -p rust-daemon
 
       - name: Build rust-daemon
         run: cargo build --release -p rust-daemon

@@ -1,0 +1,79 @@
+name: CI Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  node-audit:
+    name: npm audit - web, API, Electron
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: website
+            cwd: website
+            lockfile: website/package-lock.json
+          - name: server
+            cwd: website/server
+            lockfile: website/server/package-lock.json
+          - name: electron
+            cwd: AppMacos
+            lockfile: AppMacos/package-lock.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ matrix.lockfile }}
+      - name: Install dependencies
+        working-directory: ${{ matrix.cwd }}
+        run: npm ci
+      - name: Audit dependencies
+        working-directory: ${{ matrix.cwd }}
+        run: npm audit --audit-level=moderate
+
+  rust-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+  python-audit:
+    name: pip-audit runtime requirements
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Audit Python requirements
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r nodeAndWorker/python-inference/requirements.txt
+
+  secret-scan:
+    name: committed secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Scan tracked files for committed secrets
+        run: node scripts/ci-secret-scan.mjs

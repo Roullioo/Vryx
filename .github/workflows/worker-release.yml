@@ -36,12 +36,18 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run build:mac:unsigned
+      - name: Generate macOS checksums
+        shell: bash
+        run: |
+          find release -type f ! -name 'SHA256SUMS-*' -print0 \
+            | xargs -0 shasum -a 256 > release/SHA256SUMS-macos.txt
       - name: Upload macOS worker artifact
         uses: actions/upload-artifact@v4
         with:
           name: vryx-worker-macos-unsigned
           path: |
             AppMacos/release/mac*/**
+            AppMacos/release/SHA256SUMS-macos.txt
             nodeAndWorker/runtime-release-manifest.json
 
   windows-worker:
@@ -72,6 +78,11 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: npm run build:win:installer
+      - name: Generate Windows checksums
+        shell: bash
+        run: |
+          cd release
+          sha256sum *.exe *.blockmap > SHA256SUMS-windows.txt
       - name: Upload Windows worker artifact
         uses: actions/upload-artifact@v4
         with:
@@ -79,4 +90,5 @@ jobs:
           path: |
             AppMacos/release/*.exe
             AppMacos/release/*.blockmap
+            AppMacos/release/SHA256SUMS-windows.txt
             nodeAndWorker/runtime-release-manifest.json

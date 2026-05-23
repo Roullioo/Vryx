@@ -9,7 +9,7 @@ on:
 
 jobs:
   web:
-    name: Frontend build and audit
+    name: CI frontend - React/Vite build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -28,7 +28,7 @@ jobs:
       - run: npm run build
 
   api:
-    name: Backend checks and audit
+    name: CI backend - API tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -53,7 +53,7 @@ jobs:
           node --check scripts/worker-command-e2e.mjs
 
   rust:
-    name: Rust daemon fmt, clippy and release build
+    name: CI Rust - fmt, clippy, test, release build
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -68,10 +68,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy -p rust-daemon -- -D warnings
+      - run: cargo test -p rust-daemon
       - run: cargo build --release -p rust-daemon
 
   python-runtime:
-    name: Python runtime syntax
+    name: CI Python - runtime unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -79,11 +80,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install lightweight runtime test dependencies
+        run: python -m pip install --upgrade pip numpy grpcio protobuf gguf
       - name: Compile Python runtime
         run: python -m compileall -q nodeAndWorker/python-inference nodeAndWorker/scripts
+      - name: Run Python runtime unit tests
+        env:
+          PYTHONPATH: nodeAndWorker/python-inference
+          VRYX_P2P_RELAY_URL: http://127.0.0.1:3031
+        run: python -m unittest discover -s nodeAndWorker/python-inference -p 'test_*.py' -v
 
   electron-smoke:
-    name: Electron worker smoke build
+    name: CI Electron - worker smoke build
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:

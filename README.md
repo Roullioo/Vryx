@@ -10,6 +10,20 @@ Le projet vise une alternative pragmatique aux datacenters GPU classiques : util
 
 ---
 
+## CI / Due Diligence
+
+| Workflow | Ce qu’il prouve |
+| --- | --- |
+| **Investor CI** | Frontend React/Vite, backend API, Rust fmt/clippy/test/build, Python unit tests, Electron smoke build, audits dépendances. |
+| **CI Security** | `npm audit`, `cargo audit`, `pip-audit`, scan de secrets committés. |
+| **CI Rust Linux** | Build Linux release du daemon avec fmt, clippy et tests. |
+| **P2P Staging Bench** | Golden path staging avec seuils TPS, succès, réponses vides et artefacts de preuve. |
+| **Worker Release Build** | Builds macOS/Windows du worker Electron et checksums SHA-256 pour release. |
+
+Les workflows sont conçus pour être lisibles par un CTO/investisseur : chaque couche critique a un job nommé explicitement, et les jobs dépendants de secrets externes se déclenchent seulement quand l’environnement le permet.
+
+---
+
 ## Ce que Vryx prouve
 
 | Signal | Ce qui existe dans le repo |
