@@ -688,6 +688,145 @@
   gap: 10px;
 }
 
+.investor-worker-grid {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: 1.1fr 1fr 0.95fr 0.85fr;
+  gap: 14px;
+}
+
+.onboarding-steps,
+.health-list,
+.diagnostic-grid,
+.release-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.onboarding-steps {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.onboarding-step,
+.health-list > div,
+.diagnostic-grid > div,
+.readiness-card {
+  position: relative;
+  min-height: 78px;
+  overflow: hidden;
+  border-radius: 16px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.onboarding-step::before,
+.health-list > div::before,
+.diagnostic-grid > div::before,
+.readiness-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: #f59e0b;
+}
+
+.onboarding-step.is-ok::before,
+.health-list > div.is-ok::before,
+.diagnostic-grid > div.is-ok::before,
+.readiness-card.is-ok::before {
+  background: #34d399;
+}
+
+.onboarding-step span,
+.health-list span,
+.diagnostic-grid span,
+.readiness-card span {
+  display: block;
+  color: rgba(255, 250, 255, 0.58);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.onboarding-step b,
+.health-list b,
+.diagnostic-grid b,
+.readiness-card b {
+  display: block;
+  margin-top: 6px;
+  color: white;
+  font-family: var(--font-display);
+  font-size: 15px;
+  line-height: 1.15;
+}
+
+.onboarding-step small,
+.health-list small,
+.readiness-card p {
+  display: block;
+  margin-top: 6px;
+  color: rgba(255, 250, 255, 0.62);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.health-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 7px 10px;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.health-badge.is-ok {
+  color: #9ff7c8;
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.health-badge.is-warn {
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.health-badge.is-bad {
+  color: #fecdd3;
+  background: rgba(251, 113, 133, 0.11);
+}
+
+.diagnostic-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.release-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.release-grid .settings-card {
+  grid-column: span 2;
+}
+
+.reputation-score {
+  display: flex;
+  align-items: end;
+  gap: 6px;
+}
+
+.reputation-score b {
+  font-family: var(--font-display);
+  font-size: 54px;
+  line-height: 0.9;
+}
+
+.reputation-score span {
+  color: rgba(255, 250, 255, 0.58);
+  font-size: 14px;
+  font-weight: 900;
+}
+
 .side-stack {
   display: grid;
   gap: 14px;
@@ -2206,6 +2345,10 @@ select option {
     grid-template-columns: 1fr;
   }
 
+  .investor-worker-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .hardware-layout,
   .sessions-layout {
     grid-template-columns: 1fr;
@@ -2218,6 +2361,11 @@ select option {
   .metrics-grid,
   .models-layout {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .onboarding-steps,
+  .diagnostic-grid {
+    grid-template-columns: 1fr;
   }
 
   .view-stage {
@@ -2282,6 +2430,15 @@ select option {
   .metrics-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
+  }
+
+  .investor-worker-grid,
+  .release-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .release-grid .settings-card {
+    grid-column: auto;
   }
 
   .tool-grid {

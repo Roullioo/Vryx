@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('electron', {
   openCacheDir: () => ipcRenderer.invoke('open-cache-dir'),
   getEarnings: (token) => ipcRenderer.invoke('get-earnings', token),
   getNetworkStats: () => ipcRenderer.invoke('get-network-stats'),
+  getReleaseReadiness: () => ipcRenderer.invoke('get-release-readiness'),
+  checkWorkerUpdate: () => ipcRenderer.invoke('check-worker-update'),
   authLogin: (credentials) => ipcRenderer.invoke('auth-login', credentials),
   authRegister: (credentials) => ipcRenderer.invoke('auth-register', credentials),
   authLogout: () => ipcRenderer.invoke('auth-logout'),
@@ -33,6 +35,10 @@ contextBridge.exposeInMainWorld('electron', {
   onAuthUpdated: (callback) => {
     ipcRenderer.removeAllListeners('auth-updated');
     ipcRenderer.on('auth-updated', (_event, value) => callback(value));
+  },
+  onWorkerUpdateStatus: (callback) => {
+    ipcRenderer.removeAllListeners('worker-update-status');
+    ipcRenderer.on('worker-update-status', (_event, value) => callback(value));
   },
   getRole: () => process.env.VELOCITY_ROLE || 'worker',
 });

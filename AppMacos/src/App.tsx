@@ -15,6 +15,7 @@ import {
   MemoryStick,
   Network,
   Power,
+  RefreshCw,
   Save,
   Server,
   Settings2,
@@ -177,6 +178,21 @@ type NetworkStats = {
   avgTokensPerActiveWorker30d: number
 }
 
+type WorkerUpdateStatus = {
+  ok: boolean
+  currentVersion?: string
+  available?: boolean
+  release?: { version?: string }
+  error?: string
+}
+
+type ReleaseReadiness = {
+  appVersion: string
+  runtimeVersion: string
+  updateFeedUrl: string
+  checks: Array<{ id: string; label: string; ok: boolean; detail: string }>
+}
+
 declare global {
   interface Window {
     electron?: {
@@ -192,6 +208,8 @@ declare global {
       openCacheDir: () => Promise<string>
       getEarnings: (token?: string) => Promise<any>
       getNetworkStats: () => Promise<NetworkStats>
+      getReleaseReadiness: () => Promise<ReleaseReadiness>
+      checkWorkerUpdate: () => Promise<WorkerUpdateStatus>
       authLogin: (credentials: { email: string; password: string }) => Promise<any>
       authRegister: (credentials: { email: string; password: string }) => Promise<any>
       authLogout: () => Promise<{ ok: boolean }>
@@ -201,6 +219,7 @@ declare global {
       onWorkerLog: (callback: (value: { level: 'info' | 'error'; line: string }) => void) => void
       onWorkerMetrics: (callback: (value: WorkerMetrics) => void) => void
       onAuthUpdated: (callback: (value: { config: WorkerConfig; user: { id: string; email: string } }) => void) => void
+      onWorkerUpdateStatus: (callback: (value: WorkerUpdateStatus) => void) => void
     }
   }
 }
@@ -609,6 +628,92 @@ function networkRevenue30d(
   }
 }
 
+function scoreTone(score: number): 'ok' | 'warn' | 'bad' {
+  if (score >= 82) return 'ok'
+  if (score >= 58) return 'warn'
+  return 'bad'
+}
+
+function healthToneClass(tone: 'ok' | 'warn' | 'bad') {
+  if (tone === 'ok') return 'is-ok'
+  if (tone === 'bad') return 'is-bad'
+  return 'is-warn'
+}
+
+function recentIso(value?: string, maxAgeMs = 120_000) {
+  if (!value) return false
+  const ts = Date.parse(value)
+  return Number.isFinite(ts) && Date.now() - ts < maxAgeMs
+}
+
+function computeWorkerHealth(
+  config: WorkerConfig,
+  hardware: HardwareStats,
+  model: ModelInfo,
+  workerState: WorkerState,
+  metrics: WorkerMetrics | null,
+  issues: string[],
+) {
+  const checks = [
+    { label: 'Compte VRYX', ok: Boolean(config.authToken && config.userId), detail: config.userEmail || `Utilisateur #${config.userId || '—'}` },
+    { label: 'Hardware détecté', ok: Boolean(hardware.cpu && hardware.gpuName), detail: `${hardware.gpuName} · ${hardware.vramGb || hardware.totalMemoryGb} Go` },
+    { label: 'Mémoire modèle', ok: config.memoryGb >= model.shardMinGb, detail: `${config.memoryGb} Go alloués · min shard ${model.shardMinGb} Go` },
+    { label: 'Worker local', ok: workerState.state === 'working' || Boolean(metrics?.online), detail: workerState.message },
+    { label: 'P2P réseau', ok: Boolean(metrics?.p2pReady), detail: `${Number(metrics?.activeConnections || 0)} connexion(s)` },
+    { label: 'Heartbeat', ok: recentIso(metrics?.lastHeartbeatAt), detail: metrics?.lastHeartbeatAt || 'en attente' },
+  ]
+  const blockingIssues = issues.filter((issue) => !issue.includes('gated')).length
+  const okCount = checks.filter((check) => check.ok).length
+  const score = clamp(Math.round((okCount / checks.length) * 100) - blockingIssues * 8, 0, 100)
+  return {
+    score,
+    tone: scoreTone(score),
+    label: score >= 82 ? 'Vert' : score >= 58 ? 'Orange' : 'Rouge',
+    checks,
+  }
+}
+
+function computeWorkerReputation(metrics: WorkerMetrics | null, revenue: ReturnType<typeof estimateWorkerRevenue>) {
+  const uptimeScore = clamp((Number(metrics?.uptimeSec || 0) / (8 * 3600)) * 32, 0, 32)
+  const tokenScore = clamp(Math.log10(Number(metrics?.tokensGenerated || 0) + 1) * 13, 0, 26)
+  const jobScore = clamp(Number(metrics?.jobs || 0) * 5, 0, 20)
+  const networkScore = metrics?.p2pReady ? 14 : metrics?.online ? 7 : 0
+  const errorPenalty = metrics?.lastError ? 18 : 0
+  const score = clamp(Math.round(8 + uptimeScore + tokenScore + jobScore + networkScore - errorPenalty), 0, 100)
+  const grade = score >= 90 ? 'A' : score >= 76 ? 'B' : score >= 58 ? 'C' : 'D'
+  return {
+    score,
+    grade,
+    tone: scoreTone(score),
+    expectedMonthly: revenue.monthly,
+  }
+}
+
+function networkDiagnostics(config: WorkerConfig, metrics: WorkerMetrics | null, networkStats: NetworkStats | null) {
+  return [
+    {
+      label: 'TCP local',
+      value: `127.0.0.1:${config.apiPort}`,
+      ok: Boolean(metrics?.online || metrics?.p2pReady),
+    },
+    {
+      label: 'P2P public',
+      value: metrics?.p2pReady ? 'connecté' : 'en attente',
+      ok: Boolean(metrics?.p2pReady),
+    },
+    {
+      label: 'Relay fallback',
+      value: config.bootstrapNode ? 'bootstrap configuré' : 'bootstrap manquant',
+      ok: Boolean(config.bootstrapNode),
+    },
+    {
+      label: 'Latence API',
+      value: metrics?.pingMs ? `${Math.round(metrics.pingMs)} ms` : networkStats?.sampledAt ? 'réseau joignable' : 'à mesurer',
+      ok: Boolean(metrics?.pingMs || networkStats?.ok),
+    },
+  ]
+}
+
 function estimatePowerWatts(hardware?: HardwareStats | null) {
   const name = `${hardware?.gpuVendor || ''} ${hardware?.gpuName || ''}`.toLowerCase()
   const mem = Number(hardware?.vramGb || hardware?.totalMemoryGb || 0)
@@ -985,6 +1090,8 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [earningsPeriod, setEarningsPeriod] = useState<'1h' | '24h' | '7d' | '30d' | '1y'>('24h')
   const [liveNow, setLiveNow] = useState(Date.now())
+  const [releaseReadiness, setReleaseReadiness] = useState<ReleaseReadiness | null>(null)
+  const [updateStatus, setUpdateStatus] = useState<WorkerUpdateStatus | null>(null)
   const lastMetricTokensRef = useRef(0)
 
   const selectedModel = useMemo(
@@ -1024,6 +1131,9 @@ function App() {
     window.electron.getNetworkStats()
       .then(setNetworkStats)
       .catch(() => setNetworkStats(null))
+    window.electron.getReleaseReadiness()
+      .then(setReleaseReadiness)
+      .catch(() => setReleaseReadiness(null))
   }
 
   useEffect(() => {
@@ -1049,6 +1159,7 @@ function App() {
         setAuthError('')
       }
     })
+    window.electron?.onWorkerUpdateStatus((value) => setUpdateStatus(value))
     const networkTimer = window.setInterval(() => {
       window.electron?.getNetworkStats().then(setNetworkStats).catch(() => undefined)
     }, 60_000)
@@ -1198,6 +1309,11 @@ function App() {
     await navigator.clipboard.writeText(metrics?.peerId || '')
   }
 
+  const checkWorkerUpdate = async () => {
+    const out = await window.electron?.checkWorkerUpdate()
+    if (out) setUpdateStatus(out)
+  }
+
   const logoutWorker = async () => {
     await window.electron?.authLogout()
     const next = await window.electron?.getConfig()
@@ -1300,6 +1416,32 @@ function App() {
               <button className="btn primary" onClick={saveConfig}><Save size={16} /> Sauvegarder</button>
               <button className="btn secondary" onClick={() => window.electron?.openCacheDir()}><FolderOpen size={16} /> Cache local</button>
               <button className="btn danger" onClick={logoutWorker}><LogOut size={16} /> Déconnexion</button>
+            </div>
+          </div>
+          <div className="surface p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="section-title">Release investisseur</h2>
+              <button className="btn secondary" onClick={checkWorkerUpdate}><RefreshCw size={16} /> Vérifier update</button>
+            </div>
+            <div className="release-grid mt-4">
+              <div className="settings-card">
+                <b>App {releaseReadiness?.appVersion || '—'}</b>
+                <p>Runtime worker {releaseReadiness?.runtimeVersion || '—'} · feed {releaseReadiness?.updateFeedUrl || '—'}</p>
+                <p>
+                  {updateStatus?.ok
+                    ? updateStatus.available
+                      ? `Update disponible ${updateStatus.release?.version || ''}`
+                      : `À jour (${updateStatus.currentVersion || releaseReadiness?.runtimeVersion || 'runtime'})`
+                    : updateStatus?.error || 'Vérification manuelle disponible.'}
+                </p>
+              </div>
+              {(releaseReadiness?.checks || []).map((check) => (
+                <div key={check.id} className={`readiness-card ${check.ok ? 'is-ok' : 'is-warn'}`}>
+                  <span>{check.ok ? 'prêt' : 'à configurer'}</span>
+                  <b>{check.label}</b>
+                  <p>{check.detail}</p>
+                </div>
+              ))}
             </div>
           </div>
         </div>
@@ -1685,6 +1827,29 @@ function App() {
     const generatedEarned = generatedTokens * modelRewardPerToken(selectedModel)
     const dashboardShardLayers = shardLayerLabel(metrics, selectedModel, config, hardware)
     const dashboardShardGb = shardModelGbLabel(metrics, selectedModel, config, hardware)
+    const health = computeWorkerHealth(config, hardware, selectedModel, workerState, metrics, issues)
+    const reputation = computeWorkerReputation(metrics, dashboardRevenue)
+    const diagnostics = networkDiagnostics(config, metrics, networkStats)
+    const onboardingSteps = [
+      {
+        label: '1. Compte',
+        title: config.userEmail || `Worker #${config.userId || 'non lié'}`,
+        ok: Boolean(config.authToken && config.userId),
+        action: 'Connecté',
+      },
+      {
+        label: '2. Machine',
+        title: `${hardware.gpuName} · ${config.memoryGb} Go`,
+        ok: config.memoryGb >= selectedModel.shardMinGb && issues.length === 0,
+        action: issues.length ? 'À régler' : 'Prête',
+      },
+      {
+        label: '3. Start',
+        title: workerState.state === 'working' ? 'Worker visible réseau' : 'Lancement en un clic',
+        ok: workerState.state === 'working',
+        action: workerState.state === 'working' ? 'Live' : 'Démarrer',
+      },
+    ]
     return (
       <div className="dashboard-grid">
         <div className="hero-panel">
@@ -1723,6 +1888,74 @@ function App() {
           <Stat label="Tokens générés total" value={number(generatedTokens)} icon={Activity} />
           <Stat label="Tokens session active" value={number(metrics?.activeSessionTokens || 0)} icon={BarChart3} />
           <Stat label="Tokens/s actif" value={`${liveTps.toLocaleString('fr-FR')} tok/s`} icon={Gauge} />
+        </div>
+
+        <div className="investor-worker-grid">
+          <div className="surface p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="section-title">Onboarding 3 clics</h2>
+              <span className={`state-pill ${workerState.state === 'working' ? 'is-live' : ''}`}>{workerState.state === 'working' ? 'démo live' : 'prêt démo'}</span>
+            </div>
+            <div className="onboarding-steps mt-4">
+              {onboardingSteps.map((step) => (
+                <div key={step.label} className={`onboarding-step ${step.ok ? 'is-ok' : ''}`}>
+                  <span>{step.label}</span>
+                  <b>{step.title}</b>
+                  <small>{step.action}</small>
+                </div>
+              ))}
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button className="btn primary" onClick={workerState.state === 'working' ? stopWorker : startWorker}>
+                <Power size={16} /> {workerState.state === 'working' ? 'Stop worker' : 'Start worker'}
+              </button>
+              <button className="btn secondary" onClick={() => setActiveTab('allocation')}><MemoryStick size={16} /> Ajuster mémoire</button>
+            </div>
+          </div>
+
+          <div className="surface p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="section-title">Health check</h2>
+              <span className={`health-badge ${healthToneClass(health.tone)}`}>{health.label} · {health.score}/100</span>
+            </div>
+            <div className="health-list mt-4">
+              {health.checks.map((check) => (
+                <div key={check.label} className={check.ok ? 'is-ok' : 'is-warn'}>
+                  <span>{check.label}</span>
+                  <b>{check.ok ? 'OK' : 'À vérifier'}</b>
+                  <small>{check.detail}</small>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="surface p-5">
+            <h2 className="section-title">Diagnostic réseau</h2>
+            <div className="diagnostic-grid mt-4">
+              {diagnostics.map((item) => (
+                <div key={item.label} className={item.ok ? 'is-ok' : 'is-warn'}>
+                  <span>{item.label}</span>
+                  <b>{item.value}</b>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="surface p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 className="section-title">Réputation worker</h2>
+              <span className={`health-badge ${healthToneClass(reputation.tone)}`}>Grade {reputation.grade}</span>
+            </div>
+            <div className="reputation-score mt-4">
+              <b>{reputation.score}</b>
+              <span>/100</span>
+            </div>
+            <div className="mt-3 grid gap-2 text-xs text-muted">
+              <p>Projection mensuelle: <b className="text-fg">{money(reputation.expectedMonthly)}</b></p>
+              <p>Uptime: <b className="text-fg">{formatUptime(metrics?.uptimeSec || 0)}</b> · Jobs: <b className="text-fg">{number(metrics?.jobs || 0)}</b></p>
+              <p>Tokens: <b className="text-fg">{number(metrics?.tokensGenerated || 0)}</b> · Erreurs: <b className={metrics?.lastError ? 'text-alert' : 'text-fg'}>{metrics?.lastError ? '1 active' : '0 active'}</b></p>
+            </div>
+          </div>
         </div>
 
         <div className="side-stack">

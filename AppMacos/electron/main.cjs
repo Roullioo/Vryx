@@ -564,6 +564,51 @@ async function checkWorkerSoftwareUpdate(reason = 'periodic') {
   return result;
 }
 
+function getReleaseReadiness() {
+  const macSigning = Boolean(process.env.CSC_LINK || process.env.CSC_NAME || process.env.APPLE_DEVELOPER_ID);
+  const macNotarization = Boolean(
+    process.env.APPLE_ID &&
+    process.env.APPLE_APP_SPECIFIC_PASSWORD &&
+    process.env.APPLE_TEAM_ID
+  );
+  const windowsSigning = Boolean(
+    process.env.WIN_CSC_LINK ||
+    process.env.WINDOWS_CERTIFICATE_FILE ||
+    process.env.CSC_LINK
+  );
+  return {
+    appVersion: app.getVersion(),
+    runtimeVersion: currentWorkerVersion(),
+    updateFeedUrl: `${DEFAULT_API_URL}/api/worker/releases/current`,
+    checks: [
+      {
+        id: 'runtime-updates',
+        label: 'Update runtime worker',
+        ok: true,
+        detail: 'Manifest signé par hash SHA-256 côté commande distante, vérifié avant application.',
+      },
+      {
+        id: 'mac-signing',
+        label: 'Signature macOS',
+        ok: macSigning,
+        detail: macSigning ? 'Identité de signature disponible dans l’environnement de build.' : 'Configurer CSC_LINK/CSC_NAME ou APPLE_DEVELOPER_ID dans CI.',
+      },
+      {
+        id: 'mac-notarization',
+        label: 'Notarisation macOS',
+        ok: macNotarization,
+        detail: macNotarization ? 'Identifiants Apple présents pour le hook notarize.' : 'Configurer APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD et APPLE_TEAM_ID.',
+      },
+      {
+        id: 'windows-signing',
+        label: 'Signature Windows',
+        ok: windowsSigning,
+        detail: windowsSigning ? 'Certificat Windows disponible dans l’environnement de build.' : 'Configurer WIN_CSC_LINK ou WINDOWS_CERTIFICATE_FILE.',
+      },
+    ],
+  };
+}
+
 async function acknowledgeRemoteCommand(config, command, status = 'acknowledged', error = null, peerId = null) {
   if (!command?.id) return;
   await fetchJsonPost(`${DEFAULT_API_URL}/api/workers/heartbeat`, {
@@ -1490,6 +1535,7 @@ app.whenReady().then(() => {
       };
     }
   });
+  ipcMain.handle('get-release-readiness', () => getReleaseReadiness());
   ipcMain.handle('check-worker-update', async () => checkWorkerSoftwareUpdate('manual'));
   ipcMain.handle('probe-dependency', (_event, name) => new Promise((resolve) => {
     execFile(name, ['--version'], { timeout: 5000 }, (error, stdout, stderr) => {
