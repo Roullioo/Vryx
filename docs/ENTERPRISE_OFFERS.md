@@ -23,12 +23,12 @@ Offre B2B prioritaire.
 - Logs, dashboard, couts, privacy renforcee.
 - Prix d'entree : 3 500 EUR/mois.
 
-## 3. Vryx Custom AI
+## 3. Vryx Knowledge AI / Custom AI
 
 Projet client.
 
 - Dataset client.
-- RAG, LoRA/fine-tuning ou integration metier.
+- Knowledge AI/RAG securise d'abord, LoRA/fine-tuning seulement si le dataset le justifie.
 - Evaluation, deploiement inference et maintenance.
 - No-retention ou pool prive selon contrat.
 - Prix d'entree : 6 000 EUR/mois + setup.
@@ -39,12 +39,14 @@ La page `/enterprise` contient un configurateur B2B avec :
 
 - offre ;
 - modele cible ;
+- methode : Knowledge AI, RAG, fine-tuning, LoRA ou full training ;
 - volume tokens ;
 - latence cible ;
 - SLA ;
 - confidentialite ;
-- fine-tuning ;
 - taille dataset ;
+- nombre de documents ;
+- secteur sensible ou non ;
 - workers dedies ;
 - devis automatique.
 

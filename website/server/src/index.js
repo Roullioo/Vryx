@@ -901,10 +901,65 @@ function estimatePromptTokens(prompt) {
   return estimatePromptTokensRaw(prompt)
 }
 
+function analyzeCustomAiPlan(input) {
+  const method = input.aiMethod || (input.fineTuning ? 'lora' : 'knowledge_ai')
+  const datasetGb = Math.max(0, Number(input.datasetGb || 0))
+  const datasetDocuments = Math.max(0, Math.floor(Number(input.datasetDocuments || 0)))
+  const sensitiveSector = Boolean(input.sensitiveSector || input.privacyLevel === 'no_retention' || input.privacyLevel === 'private_pool')
+  const wantsTraining = method === 'fine_tuning' || method === 'lora' || method === 'full_training' || Boolean(input.fineTuning)
+  const recommendedMethod =
+    sensitiveSector ? 'knowledge_ai'
+      : wantsTraining && datasetGb >= 5 && datasetDocuments >= 5_000 ? method
+        : datasetGb > 0 || datasetDocuments > 0 ? 'knowledge_ai'
+          : 'rag'
+  const methodLabels = {
+    knowledge_ai: 'Vryx Knowledge AI',
+    rag: 'RAG sécurisé',
+    fine_tuning: 'Fine-tuning supervisé',
+    lora: 'LoRA',
+    full_training: 'Full training',
+  }
+  const methodSetup =
+    method === 'full_training' ? 45_000
+      : method === 'fine_tuning' ? 18_000
+        : method === 'lora' ? 7_500
+          : method === 'rag' ? 3_500
+            : 4_500
+  const datasetSetup =
+    method === 'full_training' ? datasetGb * 260
+      : method === 'fine_tuning' ? datasetGb * 180
+        : method === 'lora' ? datasetGb * 140
+          : datasetGb * 90
+  const documentSetup = Math.min(20_000, datasetDocuments * (method === 'knowledge_ai' || method === 'rag' ? 0.04 : 0.015))
+  const durationWeeks =
+    method === 'full_training' ? Math.max(12, Math.ceil(10 + datasetGb / 50))
+      : method === 'fine_tuning' ? Math.max(6, Math.ceil(4 + datasetGb / 80))
+        : method === 'lora' ? Math.max(3, Math.ceil(2 + datasetGb / 120))
+          : Math.max(2, Math.ceil(1 + datasetGb / 250 + datasetDocuments / 100_000))
+  const recommendationReason = recommendedMethod === method
+    ? 'La méthode choisie est cohérente avec le volume, la sensibilité et le besoin annoncé.'
+    : 'Pour ce cas, une base documentaire sécurisée avec recherche/RAG est probablement plus fiable et moins risquée qu’un entraînement pur.'
+
+  return {
+    method,
+    methodLabel: methodLabels[method] || method,
+    recommendedMethod,
+    recommendedLabel: methodLabels[recommendedMethod] || recommendedMethod,
+    recommendationReason,
+    datasetGb,
+    datasetDocuments,
+    sensitiveSector,
+    estimatedDurationWeeks: durationWeeks,
+    setupEur: toEuroAmount(methodSetup + datasetSetup + documentSetup, 2),
+    requiresPrivateProcessing: sensitiveSector || method === 'full_training',
+  }
+}
+
 async function estimateEnterpriseQuote(input) {
   const billingRate = await resolveBillingEurPerMillion()
   const monthlyTokens = Math.max(1_000_000, Number(input.monthlyTokens || 0))
   const usageBase = euroFromTokens(monthlyTokens, billingRate)
+  const customAiPlan = analyzeCustomAiPlan(input)
   const offerMultiplier =
     input.offer === 'private_pool' ? 5
       : input.offer === 'custom_ai' ? 7
@@ -923,18 +978,28 @@ async function estimateEnterpriseQuote(input) {
       : /35b|a3b/i.test(String(input.modelChoice || '')) ? 1.25
         : 1
   const dedicatedWorkerBase = Math.max(0, Number(input.dedicatedWorkers || 0)) * 950
-  const fineTuningSetup = input.fineTuning ? 4500 : 0
-  const datasetSetup = Math.max(0, Number(input.datasetGb || 0)) * 120
+  const customAiMonthly =
+    input.offer === 'custom_ai'
+      ? customAiPlan.method === 'full_training' ? 8_000
+        : customAiPlan.method === 'fine_tuning' ? 4_500
+          : customAiPlan.method === 'lora' ? 2_500
+            : 1_200
+      : 0
   const monthlyMin =
     input.offer === 'api' ? 250
       : input.offer === 'private_pool' ? 3500
         : 6000
-  const monthlyEstimate = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier * slaMultiplier * modelMultiplier + dedicatedWorkerBase)
-  const setupEstimate = input.offer === 'api' ? 0 : 2500 + fineTuningSetup + datasetSetup
+  const monthlyEstimate = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier * slaMultiplier * modelMultiplier + dedicatedWorkerBase + customAiMonthly)
+  const setupEstimate = input.offer === 'api' ? 0 : 2500 + customAiPlan.setupEur
   return {
     monthlyEstimateEur: toEuroAmount(monthlyEstimate, 2),
     setupEstimateEur: toEuroAmount(setupEstimate, 2),
     unitTokenCostEurPerMillion: billingRate,
+    recommendedMethod: customAiPlan.recommendedMethod,
+    recommendedLabel: customAiPlan.recommendedLabel,
+    recommendationReason: customAiPlan.recommendationReason,
+    estimatedDurationWeeks: customAiPlan.estimatedDurationWeeks,
+    datasetAnalysis: customAiPlan,
     assumptions: {
       monthlyTokens,
       offerMultiplier,
@@ -943,9 +1008,12 @@ async function estimateEnterpriseQuote(input) {
       modelMultiplier,
       modelChoice: input.modelChoice || null,
       slaTier: input.slaTier || 'standard',
-      datasetGb: Math.max(0, Number(input.datasetGb || 0)),
+      datasetGb: customAiPlan.datasetGb,
+      datasetDocuments: customAiPlan.datasetDocuments,
       dedicatedWorkers: Math.max(0, Number(input.dedicatedWorkers || 0)),
-      fineTuning: Boolean(input.fineTuning),
+      fineTuning: customAiPlan.method === 'fine_tuning' || customAiPlan.method === 'lora' || customAiPlan.method === 'full_training' || Boolean(input.fineTuning),
+      aiMethod: customAiPlan.method,
+      sensitiveSector: customAiPlan.sensitiveSector,
     },
   }
 }
@@ -1045,6 +1113,9 @@ const enterpriseQuoteSchema = z.object({
   offer: z.enum(['api', 'private_pool', 'custom_ai']),
   projectName: z.string().trim().max(160).optional().default(''),
   modelChoice: z.string().trim().min(2).max(140).optional().default('Qwen/Qwen3.6-35B-A3B'),
+  aiMethod: z.enum(['knowledge_ai', 'rag', 'fine_tuning', 'lora', 'full_training']).optional().default('knowledge_ai'),
+  datasetDocuments: z.number().int().min(0).max(50_000_000).optional().default(0),
+  sensitiveSector: z.boolean().optional().default(false),
   slaTier: z.enum(['standard', 'business', 'mission_critical']).optional().default('standard'),
   monthlyTokens: z.number().min(1_000_000).max(50_000_000_000),
   latencyTargetMs: z.number().min(250).max(60_000),
@@ -2722,7 +2793,7 @@ app.post('/api/enterprise/quote', enterpriseQuoteLimiter, async (req, res) => {
         monthlyTokens: Math.floor(data.monthlyTokens),
         latencyTargetMs: Math.floor(data.latencyTargetMs),
         privacyLevel: data.privacyLevel,
-        fineTuning: data.fineTuning ? 1 : 0,
+        fineTuning: data.fineTuning || ['fine_tuning', 'lora', 'full_training'].includes(data.aiMethod) ? 1 : 0,
         dedicatedWorkers: Math.floor(data.dedicatedWorkers || 0),
         monthlyEstimateEur: estimate.monthlyEstimateEur,
         setupEstimateEur: estimate.setupEstimateEur,

@@ -5,6 +5,7 @@ import { apiJson } from '../lib/api'
 type Offer = 'api' | 'private_pool' | 'custom_ai'
 type Privacy = 'standard' | 'eu_only' | 'private_pool' | 'no_retention'
 type SlaTier = 'standard' | 'business' | 'mission_critical'
+type AiMethod = 'knowledge_ai' | 'rag' | 'fine_tuning' | 'lora' | 'full_training'
 
 type QuoteResult = {
   ok: true
@@ -14,6 +15,9 @@ type QuoteResult = {
     monthlyEstimateEur: number
     setupEstimateEur: number
     unitTokenCostEurPerMillion: number
+    recommendedLabel?: string
+    recommendationReason?: string
+    estimatedDurationWeeks?: number
   }
 }
 
@@ -45,7 +49,23 @@ const slaLabels: Record<SlaTier, string> = {
 const offerCopy: Record<Offer, string> = {
   api: 'Self-serve développeurs : crédits, clés API, usage, factures et coût par modèle.',
   private_pool: 'Capacité dédiée ou semi-dédiée : modèles choisis, SLA, logs, privacy renforcée.',
-  custom_ai: 'Projet IA complet : dataset, RAG/fine-tuning, évaluation, inférence et maintenance.',
+  custom_ai: 'Knowledge AI d’abord : base documentaire sécurisée, puis LoRA/fine-tuning si utile.',
+}
+
+const aiMethodLabels: Record<AiMethod, string> = {
+  knowledge_ai: 'Knowledge AI',
+  rag: 'RAG sécurisé',
+  fine_tuning: 'Fine-tuning',
+  lora: 'LoRA',
+  full_training: 'Full training',
+}
+
+const aiMethodCopy: Record<AiMethod, string> = {
+  knowledge_ai: 'IA métier connectée à une base documentaire, recommandée pour juridique, finance, industrie et santé.',
+  rag: 'Recherche + génération avec sources, plus rapide à déployer qu’un entraînement.',
+  fine_tuning: 'Adaptation supervisée du comportement quand les exemples sont nombreux et propres.',
+  lora: 'Adaptation légère, moins chère qu’un fine-tuning complet.',
+  full_training: 'Cas rare, long et coûteux, réservé aux gros budgets et datasets contrôlés.',
 }
 
 function money(value: number, digits = 0) {
@@ -66,6 +86,9 @@ function estimateLocal({
   slaTier,
   modelChoice,
   datasetGb,
+  datasetDocuments,
+  sensitiveSector,
+  aiMethod,
 }: {
   offer: Offer
   monthlyTokens: number
@@ -75,16 +98,44 @@ function estimateLocal({
   slaTier: SlaTier
   modelChoice: string
   datasetGb: number
+  datasetDocuments: number
+  sensitiveSector: boolean
+  aiMethod: AiMethod
 }) {
   const usageBase = (Math.max(1_000_000, monthlyTokens) / 1_000_000) * 0.3
   const offerMultiplier = offer === 'private_pool' ? 5 : offer === 'custom_ai' ? 7 : 1.8
   const privacyMultiplier = privacyLevel === 'no_retention' ? 1.45 : privacyLevel === 'private_pool' ? 1.65 : privacyLevel === 'eu_only' ? 1.2 : 1
   const slaMultiplier = slaTier === 'mission_critical' ? 1.75 : slaTier === 'business' ? 1.25 : 1
   const modelMultiplier = /70b|405b|large|premium/i.test(modelChoice) ? 1.55 : /35b|a3b/i.test(modelChoice) ? 1.25 : 1
+  const methodMonthly = offer === 'custom_ai'
+    ? aiMethod === 'full_training' ? 8000
+      : aiMethod === 'fine_tuning' ? 4500
+        : aiMethod === 'lora' ? 2500
+          : 1200
+    : 0
+  const methodSetup = aiMethod === 'full_training' ? 45000
+    : aiMethod === 'fine_tuning' ? 18000
+      : aiMethod === 'lora' ? 7500
+        : aiMethod === 'rag' ? 3500
+          : 4500
+  const datasetSetup = datasetGb * (aiMethod === 'full_training' ? 260 : aiMethod === 'fine_tuning' ? 180 : aiMethod === 'lora' ? 140 : 90)
+  const documentSetup = Math.min(20_000, Math.max(0, datasetDocuments) * (aiMethod === 'knowledge_ai' || aiMethod === 'rag' ? 0.04 : 0.015))
   const monthlyMin = offer === 'api' ? 250 : offer === 'private_pool' ? 3500 : 6000
-  const monthly = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier * slaMultiplier * modelMultiplier + dedicatedWorkers * 950)
-  const setup = offer === 'api' ? 0 : 2500 + (fineTuning ? 4500 : 0) + Math.max(0, datasetGb) * 120
-  return { monthly, setup }
+  const monthly = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier * slaMultiplier * modelMultiplier + dedicatedWorkers * 950 + methodMonthly)
+  const setup = offer === 'api' ? 0 : 2500 + methodSetup + datasetSetup + documentSetup
+  const wantsTraining = fineTuning || ['fine_tuning', 'lora', 'full_training'].includes(aiMethod)
+  const recommendedMethod = sensitiveSector || privacyLevel === 'no_retention' || privacyLevel === 'private_pool'
+    ? 'Knowledge AI'
+    : wantsTraining && datasetGb >= 5 && datasetDocuments >= 5000
+      ? aiMethodLabels[aiMethod]
+      : datasetGb > 0 || datasetDocuments > 0
+        ? 'Knowledge AI'
+        : 'RAG sécurisé'
+  const durationWeeks = aiMethod === 'full_training' ? Math.max(12, Math.ceil(10 + datasetGb / 50))
+    : aiMethod === 'fine_tuning' ? Math.max(6, Math.ceil(4 + datasetGb / 80))
+      : aiMethod === 'lora' ? Math.max(3, Math.ceil(2 + datasetGb / 120))
+        : Math.max(2, Math.ceil(1 + datasetGb / 250 + datasetDocuments / 100_000))
+  return { monthly, setup, recommendedMethod, durationWeeks }
 }
 
 export function EnterprisePage() {
@@ -97,17 +148,19 @@ export function EnterprisePage() {
   const [monthlyTokens, setMonthlyTokens] = useState(250_000_000)
   const [latencyTargetMs, setLatencyTargetMs] = useState(2500)
   const [privacyLevel, setPrivacyLevel] = useState<Privacy>('eu_only')
-  const [fineTuning, setFineTuning] = useState(false)
+  const [aiMethod, setAiMethod] = useState<AiMethod>('knowledge_ai')
   const [dedicatedWorkers, setDedicatedWorkers] = useState(2)
   const [datasetGb, setDatasetGb] = useState(0)
+  const [datasetDocuments, setDatasetDocuments] = useState(25_000)
+  const [sensitiveSector, setSensitiveSector] = useState(true)
   const [notes, setNotes] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<QuoteResult | null>(null)
 
   const estimate = useMemo(
-    () => estimateLocal({ offer, monthlyTokens, privacyLevel, dedicatedWorkers, fineTuning, slaTier, modelChoice, datasetGb }),
-    [datasetGb, dedicatedWorkers, fineTuning, modelChoice, monthlyTokens, offer, privacyLevel, slaTier],
+    () => estimateLocal({ offer, monthlyTokens, privacyLevel, dedicatedWorkers, fineTuning: ['fine_tuning', 'lora', 'full_training'].includes(aiMethod), slaTier, modelChoice, datasetGb, datasetDocuments, sensitiveSector, aiMethod }),
+    [aiMethod, datasetDocuments, datasetGb, dedicatedWorkers, modelChoice, monthlyTokens, offer, privacyLevel, sensitiveSector, slaTier],
   )
 
   async function submit(event: FormEvent) {
@@ -123,11 +176,14 @@ export function EnterprisePage() {
         projectName,
         offer,
         modelChoice,
+        aiMethod,
+        datasetDocuments,
+        sensitiveSector,
         slaTier,
         monthlyTokens,
         latencyTargetMs,
         privacyLevel,
-        fineTuning,
+        fineTuning: ['fine_tuning', 'lora', 'full_training'].includes(aiMethod),
         dedicatedWorkers,
         datasetGb,
         notes,
@@ -159,8 +215,8 @@ export function EnterprisePage() {
               Vryx Enterprise
             </h1>
             <p className="mt-5 text-base leading-8 text-white/74 sm:text-lg">
-              Trois offres vendables dès maintenant : API self-serve, Private Pool B2B et Custom AI/fine-tuning.
-              Chaque demande produit un devis chiffré, un niveau SLA, un modèle cible et un projet admin traçable.
+              Trois offres vendables dès maintenant : API self-serve, Private Pool B2B et Knowledge AI.
+              Le fine-tuning reste disponible quand le diagnostic montre qu’il est vraiment utile.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
               <a href="#quote" className="rounded-lg bg-white px-5 py-3 text-sm font-semibold text-slate-950 hover:bg-white/90">
@@ -179,7 +235,7 @@ export function EnterprisePage() {
           {[
             ['Vryx API', offerStartingPrice.api],
             ['Private Pool', offerStartingPrice.private_pool],
-            ['Custom AI', offerStartingPrice.custom_ai],
+            ['Knowledge AI', offerStartingPrice.custom_ai],
             ['Preuves', 'Readiness, billing, workers'],
           ].map(([label, value]) => (
             <div key={label} className="rounded-lg border border-border bg-bg p-4">
@@ -264,16 +320,40 @@ export function EnterprisePage() {
             </label>
           </div>
 
-          <div className="mt-5 grid gap-4 sm:grid-cols-[1fr_auto]">
+          <div className="mt-5 grid gap-4 sm:grid-cols-2">
+            <label className="block">
+              <span className="text-xs font-semibold uppercase tracking-wide text-muted">Documents estimés</span>
+              <input value={datasetDocuments} onChange={(event) => setDatasetDocuments(Number(event.target.value))} type="number" min={0} max={50_000_000} step={1000} className="mt-2 w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent" />
+            </label>
+            <label className="flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-3 text-sm font-semibold text-fg">
+              <input type="checkbox" checked={sensitiveSector} onChange={(event) => setSensitiveSector(event.target.checked)} className="h-4 w-4 accent-current" />
+              Données sensibles ou secteur régulé
+            </label>
+          </div>
+
+          <div className="mt-5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted">Méthode IA</p>
+            <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+              {(Object.keys(aiMethodLabels) as AiMethod[]).map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => setAiMethod(item)}
+                  className={`rounded-lg border p-3 text-left transition ${aiMethod === item ? 'border-accent bg-accent/10' : 'border-border bg-surface hover:border-accent/40'}`}
+                >
+                  <span className="block text-sm font-semibold text-fg">{aiMethodLabels[item]}</span>
+                  <span className="mt-1 block text-xs leading-5 text-muted">{aiMethodCopy[item]}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mt-5 grid gap-4 sm:grid-cols-1">
             <label className="block">
               <span className="text-xs font-semibold uppercase tracking-wide text-muted">Confidentialité</span>
               <select value={privacyLevel} onChange={(event) => setPrivacyLevel(event.target.value as Privacy)} className="mt-2 w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent">
                 {(Object.keys(privacyLabels) as Privacy[]).map((item) => <option key={item} value={item}>{privacyLabels[item]}</option>)}
               </select>
-            </label>
-            <label className="flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-3 text-sm font-semibold text-fg">
-              <input type="checkbox" checked={fineTuning} onChange={(event) => setFineTuning(event.target.checked)} className="h-4 w-4 accent-current" />
-              LoRA / fine-tuning
             </label>
           </div>
 
@@ -286,6 +366,7 @@ export function EnterprisePage() {
           {result ? (
             <p className="mt-4 rounded-lg border border-success/40 bg-success/10 px-3 py-2 text-sm text-success">
               Demande #{result.id} enregistrée. Estimation serveur: {money(result.estimate.monthlyEstimateEur)} / mois.
+              {result.estimate.recommendedLabel ? ` Recommandation: ${result.estimate.recommendedLabel}.` : ''}
             </p>
           ) : null}
 
@@ -299,22 +380,32 @@ export function EnterprisePage() {
             <p className="text-xs font-semibold uppercase tracking-wide text-muted">Estimation</p>
             <p className="mt-3 font-display text-4xl font-semibold text-fg">{money(estimate.monthly)}</p>
             <p className="mt-1 text-sm text-muted">par mois, setup {money(estimate.setup)}</p>
+            <div className="mt-4 rounded-lg border border-accent/30 bg-accent/8 p-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-accent">Diagnostic</p>
+              <p className="mt-1 text-sm font-semibold text-fg">{estimate.recommendedMethod}</p>
+              <p className="mt-1 text-xs leading-5 text-muted">
+                Durée estimée : {estimate.durationWeeks} semaine(s). Pour les données sensibles, Vryx recommande Knowledge AI/RAG privé avant tout entraînement.
+              </p>
+            </div>
             <div className="mt-5 space-y-2 text-sm">
               <div className="flex justify-between gap-4"><span className="text-muted">Offre</span><span className="font-semibold text-fg">{offerLabels[offer]}</span></div>
+              <div className="flex justify-between gap-4"><span className="text-muted">Méthode</span><span className="font-semibold text-fg">{aiMethodLabels[aiMethod]}</span></div>
               <div className="flex justify-between gap-4"><span className="text-muted">Confidentialité</span><span className="font-semibold text-fg">{privacyLabels[privacyLevel]}</span></div>
               <div className="flex justify-between gap-4"><span className="text-muted">SLA</span><span className="font-semibold text-fg">{slaLabels[slaTier]}</span></div>
               <div className="flex justify-between gap-4"><span className="text-muted">Modèle</span><span className="max-w-40 truncate font-semibold text-fg">{modelChoice}</span></div>
               <div className="flex justify-between gap-4"><span className="text-muted">Tokens</span><span className="font-mono text-fg">{monthlyTokens.toLocaleString('fr-FR')}</span></div>
+              <div className="flex justify-between gap-4"><span className="text-muted">Documents</span><span className="font-mono text-fg">{datasetDocuments.toLocaleString('fr-FR')}</span></div>
               <div className="flex justify-between gap-4"><span className="text-muted">Workers</span><span className="font-mono text-fg">{dedicatedWorkers}</span></div>
             </div>
           </div>
           <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
             <p className="font-semibold text-fg">Inclut</p>
             <ul className="mt-3 space-y-2 text-sm leading-6 text-muted">
-              <li>SLA et capacité réservée selon offre.</li>
-              <li>Logs, usage, coûts et facturation API.</li>
+              <li>Upload dataset sécurisé et analyse documentaire.</li>
+              <li>Recommandation RAG / LoRA / fine-tuning.</li>
+              <li>Queue job, tracking entraînement et évaluation modèle.</li>
+              <li>Déploiement inference et coût API suivi.</li>
               <li>Mode no-retention possible.</li>
-              <li>Support architecture et sécurité.</li>
             </ul>
           </div>
         </aside>

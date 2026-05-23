@@ -10,7 +10,7 @@ Vryx monetizes AI inference capacity. Customers pay for tokens, private capacity
 | --- | --- | --- | --- |
 | Vryx API | Developers, startups, internal tools | OpenAI-compatible inference with prepaid credits | Credit packs from 50 EUR |
 | Vryx Private Pool | SMEs and enterprise teams | Dedicated or semi-dedicated model capacity with SLA | From 3,500 EUR/month |
-| Vryx Custom AI | Enterprise teams with domain data | RAG, fine-tuning, integration and managed inference | From 6,000 EUR/month plus setup |
+| Vryx Knowledge AI / Custom AI | Enterprise teams with domain data | Secure document AI first, then LoRA/fine-tuning when justified | From 6,000 EUR/month plus setup |
 
 ## Revenue Loop
 
@@ -72,3 +72,8 @@ The money path is credible when a test proves:
 
 Reference: `docs/BILLING_MONEY_PATH.md`.
 
+## Knowledge AI Before Fine-Tuning
+
+For legal, finance, health, industry and defense-adjacent buyers, the default recommendation is Vryx Knowledge AI: secure dataset ingestion, retrieval, citations, no-retention options and private inference. Fine-tuning is positioned as a second-stage product when the customer has clean examples, evaluation data and a clear behavior-adaptation goal.
+
+Reference: `docs/VRYX_KNOWLEDGE_AI_AND_FINE_TUNE_STUDIO.md`.

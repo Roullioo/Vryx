@@ -31,6 +31,14 @@ type EnterpriseQuote = {
       modelChoice?: string
       slaTier?: string
       datasetGb?: number
+      datasetDocuments?: number
+      aiMethod?: string
+      sensitiveSector?: boolean
+    }
+    estimate?: {
+      recommendedLabel?: string
+      recommendationReason?: string
+      estimatedDurationWeeks?: number
     }
   }
 }
@@ -71,6 +79,14 @@ const stageLabels: Record<string, string> = {
   pilot_running: 'Pilote en cours',
   customer: 'Client',
   lost: 'Perdu',
+}
+
+const methodLabels: Record<string, string> = {
+  knowledge_ai: 'Knowledge AI',
+  rag: 'RAG sécurisé',
+  fine_tuning: 'Fine-tuning',
+  lora: 'LoRA',
+  full_training: 'Full training',
 }
 
 function money(value: number) {
@@ -235,11 +251,16 @@ export function AdminEnterpriseQuotesPage() {
                   </td>
                   <td className="px-4 py-3">
                     <span className="rounded-md bg-accent/10 px-2 py-1 text-xs font-semibold text-accent">{quote.offer}</span>
-                    <p className="mt-2 text-xs text-muted">{quote.dedicatedWorkers} worker(s) dédié(s) · {quote.fineTuning ? 'fine-tuning' : 'sans fine-tuning'}</p>
+                    <p className="mt-2 text-xs text-muted">{quote.dedicatedWorkers} worker(s) dédié(s) · {methodLabels[quote.quote?.input?.aiMethod || ''] || (quote.fineTuning ? 'fine-tuning' : 'Knowledge AI')}</p>
                     <p className="mt-1 max-w-48 truncate text-xs text-muted">{quote.quote?.input?.modelChoice || 'modèle à préciser'} · {quote.quote?.input?.slaTier || 'SLA standard'}</p>
+                    {quote.quote?.estimate?.recommendedLabel ? <p className="mt-1 max-w-48 text-xs font-semibold text-success">Reco: {quote.quote.estimate.recommendedLabel}</p> : null}
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-fg">{compact(quote.monthlyTokens)} tokens/mois<br />{quote.latencyTargetMs} ms cible</td>
-                  <td className="px-4 py-3 text-xs text-muted">{quote.privacyLevel}</td>
+                  <td className="px-4 py-3 text-xs text-muted">
+                    {quote.privacyLevel}
+                    {quote.quote?.input?.sensitiveSector ? <p className="mt-1 font-semibold text-alert">secteur sensible</p> : null}
+                    {quote.quote?.input?.datasetDocuments ? <p className="mt-1 font-mono text-muted">{compact(quote.quote.input.datasetDocuments)} docs</p> : null}
+                  </td>
                   <td className="px-4 py-3">
                     <span className="rounded-md bg-accent/10 px-2 py-1 text-xs font-semibold text-accent">{stageLabels[quote.commercialStage] || quote.commercialStage}</span>
                     <p className="mt-2 text-xs text-muted">{statusLabels[quote.status] || quote.status}</p>
