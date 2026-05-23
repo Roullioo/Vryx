@@ -33,6 +33,7 @@ Les workflows sont conçus pour être lisibles par un CTO/investisseur : chaque 
 | **Réseau P2P** | libp2p TCP/QUIC, relay fallback, diagnostic direct, orchestration initiateur/worker. |
 | **Readiness investisseur** | Score de production readiness, golden path, benchmarks TPS/TTFT, détection des réponses vides. |
 | **Business loop** | Stripe checkout, crédits prépayés, billing ledger, worker payout ledger, pipeline Enterprise. |
+| **Worker payouts** | Classes worker, score qualité, anti-fraude, KYC léger, batch payout et ledger auditable. |
 | **Ops** | PM2, Nginx, MariaDB, observability admin, scripts de déploiement VPS. |
 
 ---

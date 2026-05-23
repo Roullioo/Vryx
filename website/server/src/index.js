@@ -132,8 +132,19 @@ function resolveInitiatorChatUrl(body) {
 const WORKER_LIVE_SEC = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE_SEC) || 30))
 const WORKER_RESERVATION_TTL_SEC = Math.max(30, Math.min(900, Number(process.env.WORKER_RESERVATION_TTL_SEC) || 180))
 const WORKER_HEALTH_MIN_FOR_SCHEDULER = Math.max(0, Math.min(100, Number(process.env.WORKER_HEALTH_MIN_FOR_SCHEDULER) || 35))
+const WORKER_MIN_WITHDRAWAL_EUR = Math.max(5, Math.min(500, Number(process.env.VRYX_WORKER_MIN_WITHDRAWAL_EUR) || 25))
+const WORKER_KYC_MONTHLY_THRESHOLD_EUR = Math.max(50, Math.min(10000, Number(process.env.VRYX_WORKER_KYC_MONTHLY_THRESHOLD_EUR) || 1000))
 const VRYX_TOKEN_STREAM_BATCH_MS = Math.max(0, Math.min(250, Number(process.env.VRYX_TOKEN_STREAM_BATCH_MS) || 35))
 const WORKER_UNSCHEDULABLE_RUNTIME_STATES = new Set(['loading', 'downloading', 'reserved', 'running', 'busy', 'failed', 'cooldown'])
+const WORKER_PAYOUT_CLASSES = new Set(['compute', 'relay', 'test', 'unstable', 'premium', 'dedicated_b2b'])
+const WORKER_PAYOUT_CLASS_MULTIPLIER = {
+  compute: 1,
+  relay: 0.1,
+  test: 0,
+  unstable: 0.25,
+  premium: 1.15,
+  dedicated_b2b: 1.25,
+}
 /** Adresses e-mail promues admin automatiquement à chaque démarrage. */
 const FORCED_ADMIN_EMAILS = (
   process.env.ADMIN_EMAILS || ''
@@ -521,6 +532,82 @@ function workerHealthScore(workerLike) {
               ? 'degraded'
               : 'risky'
   return { score, state, reasons }
+}
+
+function normalizeWorkerPayoutClass(value) {
+  const raw = String(value || '').trim().toLowerCase()
+  return WORKER_PAYOUT_CLASSES.has(raw) ? raw : 'compute'
+}
+
+function inferWorkerPayoutClass(workerLike) {
+  const explicit = normalizeWorkerPayoutClass(workerLike?.workerPayoutClass || workerLike?.worker_payout_class)
+  if (explicit !== 'compute') return explicit
+  const mode = String(workerLike?.mode || 'worker').toLowerCase()
+  if (mode === 'bootstrap' || mode === 'initiator') return 'relay'
+  const desired = String(workerLike?.desiredState || workerLike?.desired_state || 'active').toLowerCase()
+  const runtimeState = String(workerLike?.runtimeState || workerLike?.runtime_state || 'idle').toLowerCase()
+  const health = workerHealthScore(workerLike)
+  if (desired !== 'active' || runtimeState === 'failed' || health.score < 35) return 'unstable'
+  return explicit
+}
+
+function clampScore(value, fallback = 1) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(0, Math.min(1.25, n))
+}
+
+function computeWorkerPayoutPlan(workerLike, {
+  model,
+  allocatedCost,
+  workerSharePercent,
+  successful = true,
+} = {}) {
+  const workerClass = inferWorkerPayoutClass(workerLike)
+  const health = workerHealthScore(workerLike)
+  const seconds = Number(workerLike?.secondsSinceHeartbeat ?? workerLike?.seconds_since_heartbeat ?? 999999)
+  const tokensGenerated = Number(workerLike?.tokens_generated || workerLike?.tokensGenerated || 0)
+  const payoutStatus = String(workerLike?.payoutStatus || workerLike?.payout_status || 'enabled').toLowerCase()
+  const fraudFlags = []
+
+  if (payoutStatus === 'blocked') fraudFlags.push('payout_blocked')
+  if (payoutStatus === 'hold') fraudFlags.push('manual_hold')
+  if (!successful) fraudFlags.push('request_not_successful')
+  if (!Number.isFinite(seconds) || seconds > WORKER_OFFLINE_SEC) fraudFlags.push('heartbeat_stale')
+  if (health.score < WORKER_HEALTH_MIN_FOR_SCHEDULER) fraudFlags.push('low_health_score')
+  if (!modelKeyMatches(workerLike?.model, model)) fraudFlags.push('model_mismatch')
+  if (tokensGenerated <= 0) fraudFlags.push('no_historical_tokens')
+  if (workerClass === 'test') fraudFlags.push('test_worker_no_payout')
+  if (workerClass === 'unstable') fraudFlags.push('unstable_worker_discount')
+
+  const availabilityScore = clampScore(health.score / 100)
+  const latencyScore = Number.isFinite(seconds) && seconds <= WORKER_LIVE_SEC ? 1 : 0.4
+  const successScore = successful ? 1 : 0
+  const modelScore = modelKeyMatches(workerLike?.model, model) ? 1 : 0.85
+  const qualityScore = clampScore(availabilityScore * latencyScore * successScore * modelScore)
+  const classMultiplier = WORKER_PAYOUT_CLASS_MULTIPLIER[workerClass] ?? 1
+  const effectiveShare = Math.max(0, Math.min(80, Number(workerSharePercent || 0) * classMultiplier * qualityScore))
+  const payout = resolveWorkerPayout({
+    costEur: allocatedCost,
+    workerSharePercent: effectiveShare,
+  })
+  const status = payoutStatus === 'blocked' || !successful || workerClass === 'test'
+    ? 'void'
+    : fraudFlags.some((flag) => ['manual_hold', 'heartbeat_stale', 'low_health_score', 'model_mismatch'].includes(flag))
+      ? 'fraud_review'
+      : 'pending'
+
+  return {
+    workerClass,
+    qualityScore: toEuroAmount(qualityScore, 3),
+    availabilityScore: toEuroAmount(availabilityScore, 3),
+    latencyScore: toEuroAmount(latencyScore, 3),
+    successScore,
+    fraudFlags,
+    status,
+    workerSharePercent: payout.workerSharePercent,
+    payoutEur: status === 'void' ? 0 : payout.workerPayoutEur,
+  }
 }
 
 function workerSchedulabilityIssue(workerLike) {
@@ -2007,6 +2094,11 @@ async function ensureWorkersTable() {
   if (!present.has('worker_secret_expires_at')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_secret_expires_at TIMESTAMP NULL DEFAULT NULL`)
   if (!present.has('worker_next_secret_hash')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_next_secret_hash VARCHAR(64) NULL`)
   if (!present.has('worker_next_secret_expires_at')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_next_secret_expires_at TIMESTAMP NULL DEFAULT NULL`)
+  if (!present.has('worker_payout_class')) await pool.query(`ALTER TABLE workers ADD COLUMN worker_payout_class ENUM('compute','relay','test','unstable','premium','dedicated_b2b') NOT NULL DEFAULT 'compute'`)
+  if (!present.has('kyc_status')) await pool.query(`ALTER TABLE workers ADD COLUMN kyc_status ENUM('not_required','required','submitted','approved','rejected') NOT NULL DEFAULT 'not_required'`)
+  if (!present.has('payout_status')) await pool.query(`ALTER TABLE workers ADD COLUMN payout_status ENUM('enabled','hold','blocked') NOT NULL DEFAULT 'enabled'`)
+  if (!present.has('payout_min_withdrawal_eur')) await pool.query(`ALTER TABLE workers ADD COLUMN payout_min_withdrawal_eur DECIMAL(12,2) NULL`)
+  if (!present.has('payout_notes')) await pool.query(`ALTER TABLE workers ADD COLUMN payout_notes VARCHAR(500) NULL`)
 }
 
 async function ensureWorkerReservationsTable() {
@@ -2240,13 +2332,69 @@ async function ensureWorkerPayoutLedgerTable() {
       worker_share_percent DECIMAL(6,3) NOT NULL DEFAULT 0,
       payout_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
       currency CHAR(3) NOT NULL DEFAULT 'EUR',
+      worker_class ENUM('compute','relay','test','unstable','premium','dedicated_b2b') NOT NULL DEFAULT 'compute',
+      quality_score DECIMAL(6,3) NOT NULL DEFAULT 0,
+      availability_score DECIMAL(6,3) NOT NULL DEFAULT 0,
+      latency_score DECIMAL(6,3) NOT NULL DEFAULT 0,
+      success_score DECIMAL(6,3) NOT NULL DEFAULT 1,
+      fraud_flags_json LONGTEXT NULL,
       pricing_snapshot_json LONGTEXT NULL,
-      status ENUM('pending','payable','paid','void') NOT NULL DEFAULT 'pending',
+      status ENUM('pending','payable','approved','paid','void','fraud_review') NOT NULL DEFAULT 'pending',
+      payout_batch_id VARCHAR(80) NULL,
+      invoice_reference VARCHAR(120) NULL,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      approved_at TIMESTAMP NULL,
+      paid_at TIMESTAMP NULL,
       PRIMARY KEY (id),
       KEY idx_worker_payout_peer_time (peer_id, created_at),
       KEY idx_worker_payout_usage (api_key_usage_id),
-      KEY idx_worker_payout_status (status, created_at)
+      KEY idx_worker_payout_status (status, created_at),
+      KEY idx_worker_payout_batch (payout_batch_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
+  const [cols] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='worker_payout_ledger'`,
+  )
+  const present = new Set(cols.map((c) => c.COLUMN_NAME))
+  const addColumn = async (name, sql) => {
+    if (!present.has(name)) await pool.query(sql)
+  }
+  await addColumn('worker_class', `ALTER TABLE worker_payout_ledger ADD COLUMN worker_class ENUM('compute','relay','test','unstable','premium','dedicated_b2b') NOT NULL DEFAULT 'compute' AFTER currency`)
+  await addColumn('quality_score', `ALTER TABLE worker_payout_ledger ADD COLUMN quality_score DECIMAL(6,3) NOT NULL DEFAULT 0 AFTER worker_class`)
+  await addColumn('availability_score', `ALTER TABLE worker_payout_ledger ADD COLUMN availability_score DECIMAL(6,3) NOT NULL DEFAULT 0 AFTER quality_score`)
+  await addColumn('latency_score', `ALTER TABLE worker_payout_ledger ADD COLUMN latency_score DECIMAL(6,3) NOT NULL DEFAULT 0 AFTER availability_score`)
+  await addColumn('success_score', `ALTER TABLE worker_payout_ledger ADD COLUMN success_score DECIMAL(6,3) NOT NULL DEFAULT 1 AFTER latency_score`)
+  await addColumn('fraud_flags_json', `ALTER TABLE worker_payout_ledger ADD COLUMN fraud_flags_json LONGTEXT NULL AFTER success_score`)
+  await addColumn('payout_batch_id', `ALTER TABLE worker_payout_ledger ADD COLUMN payout_batch_id VARCHAR(80) NULL AFTER status`)
+  await addColumn('invoice_reference', `ALTER TABLE worker_payout_ledger ADD COLUMN invoice_reference VARCHAR(120) NULL AFTER payout_batch_id`)
+  await addColumn('approved_at', `ALTER TABLE worker_payout_ledger ADD COLUMN approved_at TIMESTAMP NULL AFTER created_at`)
+  await addColumn('paid_at', `ALTER TABLE worker_payout_ledger ADD COLUMN paid_at TIMESTAMP NULL AFTER approved_at`)
+  try {
+    await pool.query(`
+      ALTER TABLE worker_payout_ledger
+      MODIFY status ENUM('pending','payable','approved','paid','void','fraud_review') NOT NULL DEFAULT 'pending'
+    `)
+  } catch {
+    /* older MySQL variants may already be compatible */
+  }
+  try {
+    await pool.query(`CREATE INDEX idx_worker_payout_batch ON worker_payout_ledger (payout_batch_id)`)
+  } catch {
+    /* index already exists */
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS worker_payout_batches (
+      id VARCHAR(80) NOT NULL,
+      status ENUM('draft','processing','paid','failed','cancelled') NOT NULL DEFAULT 'draft',
+      currency CHAR(3) NOT NULL DEFAULT 'EUR',
+      total_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+      row_count INT UNSIGNED NOT NULL DEFAULT 0,
+      created_by BIGINT UNSIGNED NULL,
+      notes VARCHAR(500) NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      paid_at TIMESTAMP NULL,
+      PRIMARY KEY (id),
+      KEY idx_worker_payout_batches_status_time (status, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
 }
@@ -2748,10 +2896,14 @@ async function recordWorkerPayoutForUsage(conn, {
   if (!usageId || cost <= 0 || total <= 0) return
 
   const [workers] = await conn.query(
-    `SELECT peer_id, model
+    `SELECT peer_id, mode, model, desired_state, runtime_state, health_score,
+            tokens_generated, last_heartbeat_at,
+            worker_payout_class, payout_status, kyc_status, payout_min_withdrawal_eur,
+            TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) AS secondsSinceHeartbeat
      FROM workers
      WHERE mode = 'worker'
        AND desired_state = 'active'
+       AND payout_status <> 'blocked'
        AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :offline
      ORDER BY last_heartbeat_at DESC
      LIMIT 16`,
@@ -2766,7 +2918,7 @@ async function recordWorkerPayoutForUsage(conn, {
   const splitPrompt = Math.floor(Number(promptTokens || 0) / selectedWorkers.length)
   const splitCompletion = Math.floor(Number(completionTokens || 0) / selectedWorkers.length)
   const splitTotal = Math.floor(total / selectedWorkers.length)
-  const pricingSnapshot = JSON.stringify({
+  const basePricingSnapshot = {
     usageId: String(usageId),
     model,
     billingMode: costBreakdown?.billingMode || 'public',
@@ -2774,8 +2926,10 @@ async function recordWorkerPayoutForUsage(conn, {
     inputCostEur: costBreakdown?.inputCostEur ?? null,
     outputCostEur: costBreakdown?.outputCostEur ?? null,
     volumeDiscountPercent: costBreakdown?.volumeDiscountPercent ?? 0,
-    allocation: 'equal_live_model_workers',
-  })
+    allocation: 'quality_weighted_live_model_workers',
+    minWithdrawalEur: WORKER_MIN_WITHDRAWAL_EUR,
+    kycMonthlyThresholdEur: WORKER_KYC_MONTHLY_THRESHOLD_EUR,
+  }
 
   for (const [index, worker] of selectedWorkers.entries()) {
     const isLast = index === selectedWorkers.length - 1
@@ -2791,17 +2945,36 @@ async function recordWorkerPayoutForUsage(conn, {
     const allocatedTotal = isLast
       ? Math.max(0, total - splitTotal * (selectedWorkers.length - 1))
       : splitTotal
-    const payout = resolveWorkerPayout({
-      costEur: allocatedCost,
+    const payout = computeWorkerPayoutPlan(worker, {
+      model,
+      allocatedCost,
       workerSharePercent: defaultShare ?? PRICING_FALLBACK.workerRewardSharePercent,
+      successful: true,
+    })
+    const pricingSnapshot = JSON.stringify({
+      ...basePricingSnapshot,
+      worker: {
+        class: payout.workerClass,
+        payoutStatus: worker.payout_status || 'enabled',
+        kycStatus: worker.kyc_status || 'not_required',
+        qualityScore: payout.qualityScore,
+        availabilityScore: payout.availabilityScore,
+        latencyScore: payout.latencyScore,
+        successScore: payout.successScore,
+        fraudFlags: payout.fraudFlags,
+      },
     })
     await conn.query(
       `INSERT INTO worker_payout_ledger
          (peer_id, api_key_usage_id, user_id, model, prompt_tokens, completion_tokens, total_tokens,
-          customer_cost_eur, worker_share_percent, payout_eur, pricing_snapshot_json)
+          customer_cost_eur, worker_share_percent, payout_eur, currency,
+          worker_class, quality_score, availability_score, latency_score, success_score,
+          fraud_flags_json, pricing_snapshot_json, status)
        VALUES
          (:peerId, :usageId, :userId, :model, :promptTokens, :completionTokens, :totalTokens,
-          :customerCostEur, :workerSharePercent, :payoutEur, :pricingSnapshot)`,
+          :customerCostEur, :workerSharePercent, :payoutEur, 'EUR',
+          :workerClass, :qualityScore, :availabilityScore, :latencyScore, :successScore,
+          :fraudFlagsJson, :pricingSnapshot, :status)`,
       {
         peerId: worker.peer_id,
         usageId,
@@ -2812,8 +2985,15 @@ async function recordWorkerPayoutForUsage(conn, {
         totalTokens: allocatedTotal,
         customerCostEur: allocatedCost,
         workerSharePercent: payout.workerSharePercent,
-        payoutEur: payout.workerPayoutEur,
+        payoutEur: payout.payoutEur,
+        workerClass: payout.workerClass,
+        qualityScore: payout.qualityScore,
+        availabilityScore: payout.availabilityScore,
+        latencyScore: payout.latencyScore,
+        successScore: payout.successScore,
+        fraudFlagsJson: JSON.stringify(payout.fraudFlags),
         pricingSnapshot,
+        status: payout.status,
       },
     )
   }
@@ -5665,6 +5845,18 @@ function parseMaybeJsonObject(value) {
   }
 }
 
+function parseMaybeJsonArray(value) {
+  if (!value) return []
+  if (Array.isArray(value)) return value
+  if (typeof value !== 'string') return []
+  try {
+    const parsed = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
 function compareVersionLike(a, b) {
   const pa = String(a || '').split(/[^0-9A-Za-z]+/).filter(Boolean)
   const pb = String(b || '').split(/[^0-9A-Za-z]+/).filter(Boolean)
@@ -7766,6 +7958,9 @@ adminRouter.get('/workers/registered', async (req, res) => {
               w.health_score AS storedHealthScore, w.runtime_state AS runtimeState,
               w.reserved_until AS reservedUntil, w.current_job_id AS currentJobId,
               w.capabilities_json AS capabilitiesJson,
+              w.worker_payout_class AS workerPayoutClass, w.payout_status AS payoutStatus,
+              w.kyc_status AS kycStatus, w.payout_min_withdrawal_eur AS payoutMinWithdrawalEur,
+              w.payout_notes AS payoutNotes,
               w.last_command_at AS lastCommandAt, w.last_command_status AS lastCommandStatus,
               w.last_command_error AS lastCommandError,
               w.last_heartbeat_at AS lastHeartbeatAt, w.first_seen_at AS firstSeenAt,
@@ -7829,6 +8024,11 @@ adminRouter.get('/workers/registered', async (req, res) => {
         healthReasons: health.reasons,
         storedHealthScore: Number(r.storedHealthScore || 0),
         runtimeState: r.runtimeState || 'idle',
+        workerPayoutClass: r.workerPayoutClass || 'compute',
+        payoutStatus: r.payoutStatus || 'enabled',
+        kycStatus: r.kycStatus || 'not_required',
+        payoutMinWithdrawalEur: r.payoutMinWithdrawalEur != null ? Number(r.payoutMinWithdrawalEur) : WORKER_MIN_WITHDRAWAL_EUR,
+        payoutNotes: r.payoutNotes ?? null,
         reservedUntil: toIsoDate(r.reservedUntil),
         currentJobId: r.currentJobId ?? null,
         capabilities: parseMaybeJsonObject(r.capabilitiesJson) || workerCapabilities(r),
@@ -7840,6 +8040,142 @@ adminRouter.get('/workers/registered', async (req, res) => {
   } catch (e) {
     console.error('admin/workers/registered', e)
     return res.status(500).json({ error: 'Erreur lecture workers.' })
+  }
+})
+
+adminRouter.get('/worker-payouts', async (req, res) => {
+  const limit = Math.max(10, Math.min(500, Number(req.query.limit) || 100))
+  const status = String(req.query.status || '').trim()
+  const allowedStatuses = new Set(['pending', 'payable', 'approved', 'paid', 'void', 'fraud_review'])
+  try {
+    const statusClause = allowedStatuses.has(status) ? 'WHERE p.status = :status' : ''
+    const [rows] = await pool.query(
+      `SELECT p.id, p.peer_id AS peerId, p.api_key_usage_id AS usageId, p.user_id AS userId,
+              p.model, p.prompt_tokens AS promptTokens, p.completion_tokens AS completionTokens,
+              p.total_tokens AS totalTokens, p.customer_cost_eur AS customerCostEur,
+              p.worker_share_percent AS workerSharePercent, p.payout_eur AS payoutEur,
+              p.currency, p.worker_class AS workerClass, p.quality_score AS qualityScore,
+              p.availability_score AS availabilityScore, p.latency_score AS latencyScore,
+              p.success_score AS successScore, p.fraud_flags_json AS fraudFlagsJson,
+              p.status, p.payout_batch_id AS payoutBatchId, p.invoice_reference AS invoiceReference,
+              p.created_at AS createdAt, p.approved_at AS approvedAt, p.paid_at AS paidAt,
+              w.kyc_status AS kycStatus, w.payout_status AS workerPayoutStatus,
+              w.payout_min_withdrawal_eur AS payoutMinWithdrawalEur,
+              u.email AS ownerEmail
+       FROM worker_payout_ledger p
+       LEFT JOIN workers w ON w.peer_id = p.peer_id
+       LEFT JOIN users u ON u.id = p.user_id
+       ${statusClause}
+       ORDER BY p.created_at DESC
+       LIMIT :limit`,
+      { status, limit },
+    )
+    const [summaryRows] = await pool.query(
+      `SELECT status, COUNT(*) AS rows, COALESCE(SUM(payout_eur), 0) AS payoutEur,
+              COUNT(DISTINCT peer_id) AS workers
+       FROM worker_payout_ledger
+       GROUP BY status`,
+    )
+    const [[monthTotals]] = await pool.query(
+      `SELECT COUNT(*) AS rows, COALESCE(SUM(payout_eur), 0) AS payoutEur,
+              COUNT(DISTINCT peer_id) AS workers
+       FROM worker_payout_ledger
+       WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+         AND status IN ('pending','payable','approved','paid')`,
+    )
+    return res.json({
+      minWithdrawalEur: WORKER_MIN_WITHDRAWAL_EUR,
+      kycMonthlyThresholdEur: WORKER_KYC_MONTHLY_THRESHOLD_EUR,
+      summary: summaryRows.map((r) => ({
+        status: r.status,
+        rows: Number(r.rows || 0),
+        payoutEur: Number(r.payoutEur || 0),
+        workers: Number(r.workers || 0),
+      })),
+      month: {
+        rows: Number(monthTotals?.rows || 0),
+        payoutEur: Number(monthTotals?.payoutEur || 0),
+        workers: Number(monthTotals?.workers || 0),
+      },
+      rows: rows.map((r) => ({
+        id: String(r.id),
+        peerId: r.peerId,
+        usageId: r.usageId != null ? String(r.usageId) : null,
+        userId: r.userId != null ? String(r.userId) : null,
+        ownerEmail: r.ownerEmail ?? null,
+        model: r.model ?? null,
+        promptTokens: Number(r.promptTokens || 0),
+        completionTokens: Number(r.completionTokens || 0),
+        totalTokens: Number(r.totalTokens || 0),
+        customerCostEur: Number(r.customerCostEur || 0),
+        workerSharePercent: Number(r.workerSharePercent || 0),
+        payoutEur: Number(r.payoutEur || 0),
+        currency: r.currency || 'EUR',
+        workerClass: r.workerClass || 'compute',
+        qualityScore: Number(r.qualityScore || 0),
+        availabilityScore: Number(r.availabilityScore || 0),
+        latencyScore: Number(r.latencyScore || 0),
+        successScore: Number(r.successScore || 0),
+        fraudFlags: parseMaybeJsonArray(r.fraudFlagsJson),
+        status: r.status,
+        payoutBatchId: r.payoutBatchId ?? null,
+        invoiceReference: r.invoiceReference ?? null,
+        kycStatus: r.kycStatus || 'not_required',
+        workerPayoutStatus: r.workerPayoutStatus || 'enabled',
+        payoutMinWithdrawalEur: r.payoutMinWithdrawalEur != null ? Number(r.payoutMinWithdrawalEur) : WORKER_MIN_WITHDRAWAL_EUR,
+        createdAt: toIsoDate(r.createdAt),
+        approvedAt: toIsoDate(r.approvedAt),
+        paidAt: toIsoDate(r.paidAt),
+      })),
+    })
+  } catch (e) {
+    console.error('admin/worker-payouts', e)
+    return res.status(500).json({ error: 'Erreur lecture payouts workers.' })
+  }
+})
+
+adminRouter.patch('/worker-payouts/:id', async (req, res) => {
+  const id = Number(req.params.id)
+  const schema = z.object({
+    status: z.enum(['pending', 'payable', 'approved', 'paid', 'void', 'fraud_review']).optional(),
+    payoutBatchId: z.string().trim().max(80).optional().nullable(),
+    invoiceReference: z.string().trim().max(120).optional().nullable(),
+  })
+  const parsed = schema.safeParse(req.body || {})
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'Payout invalide.' })
+  if (!parsed.success) return res.status(400).json({ error: 'Payload invalide.', details: parsed.error.flatten() })
+  const data = parsed.data
+  if (!data.status && data.payoutBatchId === undefined && data.invoiceReference === undefined) {
+    return res.status(400).json({ error: 'Aucun changement fourni.' })
+  }
+  try {
+    const updates = []
+    const params = { id }
+    if (data.status) {
+      updates.push('status = :status')
+      params.status = data.status
+      if (data.status === 'approved') updates.push('approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP)')
+      if (data.status === 'paid') {
+        updates.push('approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP)')
+        updates.push('paid_at = COALESCE(paid_at, CURRENT_TIMESTAMP)')
+      }
+      if (['pending', 'payable', 'fraud_review', 'void'].includes(data.status)) {
+        updates.push('paid_at = NULL')
+      }
+    }
+    if (data.payoutBatchId !== undefined) {
+      updates.push('payout_batch_id = :payoutBatchId')
+      params.payoutBatchId = data.payoutBatchId || null
+    }
+    if (data.invoiceReference !== undefined) {
+      updates.push('invoice_reference = :invoiceReference')
+      params.invoiceReference = data.invoiceReference || null
+    }
+    await pool.query(`UPDATE worker_payout_ledger SET ${updates.join(', ')} WHERE id = :id`, params)
+    return res.json({ ok: true })
+  } catch (e) {
+    console.error('admin/worker-payouts/update', e)
+    return res.status(500).json({ error: 'Erreur mise à jour payout worker.' })
   }
 })
 

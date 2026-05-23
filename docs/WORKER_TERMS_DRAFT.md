@@ -27,6 +27,7 @@ Le payout est calcule selon :
 
 - tokens generes valides,
 - modele supporte,
+- classe worker : compute, relay, test, unstable, premium ou dedicated_b2b,
 - quantization/backend,
 - taux de succes,
 - uptime,
@@ -34,11 +35,15 @@ Le payout est calcule selon :
 - reputation,
 - disponibilite sur pools premium ou dedies.
 
+Le ledger distingue les statuts pending, payable, approved, paid, fraud_review et void. Un worker test ou bloque peut apparaitre dans le ledger pour preuve technique, mais son payout peut etre nul.
+
 Vryx peut retenir ou annuler un payout en cas de fraude, fausse metrique, job invalide, violation securite, charge non terminee ou usage abusif.
 
 ## KYC et seuils
 
 Vryx peut demander des informations d'identite, fiscales ou bancaires avant payout, notamment au-dela d'un seuil mensuel ou legal.
+
+Le seuil de retrait minimum et le seuil KYC mensuel sont configurables cote serveur. Par defaut, Vryx cible un retrait minimum de 25 EUR et une revue KYC a partir de 1000 EUR sur 30 jours.
 
 ## Securite
 
@@ -58,7 +63,7 @@ Vryx peut suspendre un worker sans preavis en cas de risque securite, fraude, no
 
 - Statut fiscal worker par pays.
 - Modele de facture ou auto-facturation.
-- KYC et lutte anti-fraude.
+- KYC et lutte anti-fraude avancee.
 - Clauses de confidentialite detaillees.
 - Limitation de responsabilite.
 - Politique de contestation payout.
