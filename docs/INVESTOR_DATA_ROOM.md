@@ -24,6 +24,7 @@ Angle investisseur : le coeur technique existe ; la levee finance l'industrialis
 - Workflow CI `Investor CI`.
 - Workflow release worker `Worker Release Build`.
 - All credentials used during investor-readiness testing were rotated after validation.
+- 2026-05-23: staging credentials were rotated again after the VPS demo validation pass; test users, API keys, admin credits, checkout sessions and user-linked payout rows were purged from the staging database after a SQL backup.
 - Redis/Valkey is used as a speed, coordination and job layer while MariaDB remains the source of truth for users, credits, pricing, usage, payouts and audits.
 - Billing money path auditable : `docs/BILLING_MONEY_PATH.md` et `/api/admin/billing/proof`.
 - Enterprise offers : `docs/ENTERPRISE_OFFERS.md`.

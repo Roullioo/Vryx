@@ -66,6 +66,8 @@ For the investor demo, Vryx should be presented as a staging-grade billable infr
 
 This keeps the claim precise. The demo must keep dynamic pricing, API keys, credit debit, `api_key_usage`, `worker_payout_ledger`, Redis/Valkey, systemd workers, readiness/network proof, CI and video evidence active. Stripe live, VAT invoices, real bank payouts, app signing/notarization and signed auto-update remain production/post-demo roadmap items.
 
+Credential hygiene note, 2026-05-23: all test credentials used during staging validation were rotated after validation. The staging user table and user-linked billing/API/payout demo rows were purged after a SQL backup; `julientruffier.dev@gmail.com` and `baptiste.peru@gmail.com` remain configured as forced admin emails and are promoted automatically when the accounts are recreated.
+
 ## Investor Narrative
 
 Vryx is past the "idea" stage. The repo contains a functioning technical stack, billing primitives, worker orchestration, readiness scoring and operational dashboards. The fundraising round is designed to fund the transition from advanced prototype to production-grade B2B infrastructure:
