@@ -4,8 +4,8 @@ export const BILLING_MODES = ['public', 'private_pool']
 export const AVAILABILITY_STATUSES = ['available', 'limited', 'reservation', 'unavailable']
 
 const STRIPE_FEE_PERCENT = 1.5
-const STRIPE_FEE_FIXED_EUR = 0.25
-const INFRA_MARGIN_PERCENT = 5
+const PAYMENT_FEE_RESERVE_PERCENT = 2
+const INFRA_OPS_RESERVE_PERCENT = 3
 
 export function clampPercent(value, fallback = 0) {
   const n = Number(value)
@@ -113,7 +113,7 @@ export function resolveWorkerPayout({ costEur, workerSharePercent }) {
 export function estimateStripeFeeEur(amountEur) {
   const amount = Number(amountEur) || 0
   if (amount <= 0) return 0
-  return toEuroAmount(amount * (STRIPE_FEE_PERCENT / 100) + STRIPE_FEE_FIXED_EUR, 4)
+  return toEuroAmount(amount * (STRIPE_FEE_PERCENT / 100), 4)
 }
 
 export function validatePricingFloor({
@@ -143,14 +143,16 @@ export function validatePricingFloor({
     promptTokens: samplePrompt,
     completionTokens: sampleCompletion,
   })
-  const workerCostInput = estimatedWorkerCostInput != null ? Number(estimatedWorkerCostInput) : input * 0.35
-  const workerCostOutput = estimatedWorkerCostOutput != null ? Number(estimatedWorkerCostOutput) : output * 0.45
-  const floorWorkerCost = computeTokenCostEur(samplePrompt, workerCostInput) + computeTokenCostEur(sampleCompletion, workerCostOutput)
-  const stripeFee = estimateStripeFeeEur(sampleCost.totalCostEur)
-  const infraCost = sampleCost.totalCostEur * (INFRA_MARGIN_PERCENT / 100)
+  const workerCostInput = estimatedWorkerCostInput != null ? Number(estimatedWorkerCostInput) : null
+  const workerCostOutput = estimatedWorkerCostOutput != null ? Number(estimatedWorkerCostOutput) : null
+  const floorWorkerCost = workerCostInput != null && workerCostOutput != null
+    ? computeTokenCostEur(samplePrompt, workerCostInput) + computeTokenCostEur(sampleCompletion, workerCostOutput)
+    : 0
+  const paymentFee = sampleCost.totalCostEur * (PAYMENT_FEE_RESERVE_PERCENT / 100)
+  const infraOpsReserve = sampleCost.totalCostEur * (INFRA_OPS_RESERVE_PERCENT / 100)
   const workerPayout = sampleCost.totalCostEur * share
   const vryxGross = sampleCost.totalCostEur - workerPayout
-  const vryxNet = vryxGross - stripeFee - infraCost
+  const vryxNet = vryxGross - paymentFee - infraOpsReserve
   const netMarginPercent = sampleCost.totalCostEur > 0 ? (vryxNet / sampleCost.totalCostEur) * 100 : 0
 
   if (input <= 0 || output <= 0) {
@@ -159,8 +161,15 @@ export function validatePricingFloor({
   if (output < input) {
     warnings.push({ level: 'warning', code: 'output_below_input', message: 'Le prix output est inférieur au prix input — inhabituel pour l\'inférence.' })
   }
-  if (sampleCost.totalCostEur < floorWorkerCost) {
-    warnings.push({ level: 'error', code: 'below_worker_floor', message: 'Le prix public est inférieur au coût worker estimé sur un échantillon 75/25.' })
+  if (workerPayout > sampleCost.totalCostEur) {
+    warnings.push({ level: 'error', code: 'payout_above_revenue', message: 'La part worker dépasse le revenu client.' })
+  }
+  if (floorWorkerCost > 0 && workerPayout < floorWorkerCost) {
+    warnings.push({
+      level: 'warning',
+      code: 'worker_floor_above_payout',
+      message: 'Le payout worker est inférieur au coût worker indicatif. Cela concerne la rentabilité worker, pas la marge Vryx.',
+    })
   }
   if (netMarginPercent < minMargin) {
     warnings.push({
@@ -181,7 +190,9 @@ export function validatePricingFloor({
       vryxGrossEur: toEuroAmount(vryxGross, 4),
       vryxNetEur: toEuroAmount(vryxNet, 4),
       netMarginPercent: Number(netMarginPercent.toFixed(2)),
-      stripeFeeEur: stripeFee,
+      paymentFeeReserveEur: toEuroAmount(paymentFee, 4),
+      infraOpsReserveEur: toEuroAmount(infraOpsReserve, 4),
+      stripeFeeEur: estimateStripeFeeEur(sampleCost.totalCostEur),
     },
   }
 }

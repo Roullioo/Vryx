@@ -31,11 +31,20 @@ const floor = validatePricingFloor({
 assert.ok(Array.isArray(floor.warnings))
 
 const lowMargin = validatePricingFloor({
+  inputEur: 0.02,
+  outputEur: 0.06,
+  workerSharePercent: 85,
+  minVryxNetMarginPercent: 20,
+})
+assert.ok(lowMargin.warnings.some((w) => w.code === 'low_margin'))
+
+const tinyPriceStillProfitable = validatePricingFloor({
   inputEur: 0.001,
   outputEur: 0.002,
   workerSharePercent: 60,
   minVryxNetMarginPercent: 20,
 })
-assert.ok(lowMargin.warnings.some((w) => w.code === 'low_margin' || w.code === 'below_worker_floor'))
+assert.equal(tinyPriceStillProfitable.preview.netMarginPercent, 35)
+assert.ok(!tinyPriceStillProfitable.warnings.some((w) => w.code === 'below_worker_floor'))
 
 console.log('pricing-models-api-test: ok')
