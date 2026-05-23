@@ -245,6 +245,7 @@ python3 vps_deploy.py
 | [`docs/COMPLIANCE_AND_DATA_PROTECTION.md`](./docs/COMPLIANCE_AND_DATA_PROTECTION.md) | Protection données, DPA, no-retention, incidents. |
 | [`docs/compliance/README.md`](./docs/compliance/README.md) | Pack conformité B2B : RGPD, retention, logs, datasets, contrats. |
 | [`docs/VRYX_KNOWLEDGE_AI_AND_FINE_TUNE_STUDIO.md`](./docs/VRYX_KNOWLEDGE_AI_AND_FINE_TUNE_STUDIO.md) | Module Knowledge AI, RAG et Fine-Tune Studio. |
+| [`docs/AFFILIATE_PROGRAM.md`](./docs/AFFILIATE_PROGRAM.md) | Programme affiliation : codes, tracking, commissions limitées, anti-fraude. |
 | [`docs/WORKER_RELEASE_RUNBOOK.md`](./docs/WORKER_RELEASE_RUNBOOK.md) | Build et release worker desktop. |
 
 ---

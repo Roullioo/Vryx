@@ -172,6 +172,9 @@ const VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET = (() => {
 const VRYX_BILLING_ENFORCE_CREDITS = process.env.VRYX_BILLING_ENFORCE_CREDITS === '1'
 const VRYX_BILLING_CREDIT_PACKAGES = parseCreditPackages(process.env.VRYX_BILLING_CREDIT_PACKAGES_EUR || '20,50,100,250,500,2000')
 const VRYX_APP_BASE_URL = (process.env.VRYX_APP_BASE_URL || CORS_ORIGIN || 'https://vryx.eu').replace(/\/$/, '')
+const AFFILIATE_DEFAULT_COMMISSION_PERCENT = Math.max(0, Math.min(50, Number(process.env.VRYX_AFFILIATE_DEFAULT_COMMISSION_PERCENT || 10)))
+const AFFILIATE_DEFAULT_DURATION_MONTHS = Math.max(1, Math.min(36, Number(process.env.VRYX_AFFILIATE_DEFAULT_DURATION_MONTHS || 12)))
+const AFFILIATE_DEFAULT_CLIENT_CAP_EUR = Math.max(0, Number(process.env.VRYX_AFFILIATE_DEFAULT_CLIENT_CAP_EUR || 500))
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim()
 const VRYX_BENCH_TOKEN = String(process.env.VRYX_BENCH_TOKEN || '').trim()
@@ -1030,6 +1033,38 @@ function sha256Hex(raw) {
   return crypto.createHash('sha256').update(String(raw || '')).digest('hex')
 }
 
+function normalizeReferralCode(raw) {
+  return String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '')
+    .slice(0, 40)
+}
+
+function newReferralCode(seed = '') {
+  const base = normalizeReferralCode(seed).replace(/[_-]+/g, '').slice(0, 14)
+  const suffix = crypto.randomBytes(3).toString('hex').toUpperCase()
+  return `${base || 'VRYX'}-${suffix}`
+}
+
+function referralCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: COOKIE_SECURE,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  }
+}
+
+function requestIpHash(req) {
+  return sha256Hex(req.ip || req.socket?.remoteAddress || '')
+}
+
+function requestUserAgentHash(req) {
+  return sha256Hex(req.headers['user-agent'] || '')
+}
+
 function validateSecurityConfig() {
   const fatal = []
   if (!JWT_SECRET || JWT_SECRET.length < 32) {
@@ -1105,6 +1140,17 @@ const accountCheckoutSchema = z.object({
 const adminCreditSchema = z.object({
   amountEur: z.number().min(-100_000).max(100_000).refine((value) => Math.abs(value) >= 0.000001, 'Montant nul.'),
   description: z.string().trim().max(240).optional().default('Ajustement admin'),
+})
+
+const affiliatePartnerSchema = z.object({
+  name: z.string().trim().min(2).max(160),
+  email: emailSchema.optional().nullable(),
+  code: z.string().trim().min(2).max(40).optional(),
+  commissionPercent: z.number().min(0).max(50).optional().default(AFFILIATE_DEFAULT_COMMISSION_PERCENT),
+  commissionMonths: z.number().int().min(1).max(36).optional().default(AFFILIATE_DEFAULT_DURATION_MONTHS),
+  clientCapEur: z.number().min(0).max(1_000_000).nullable().optional().default(AFFILIATE_DEFAULT_CLIENT_CAP_EUR),
+  status: z.enum(['active', 'paused', 'blocked']).optional().default('active'),
+  notes: z.string().trim().max(2000).optional().default(''),
 })
 
 const enterpriseQuoteSchema = z.object({
@@ -2347,6 +2393,78 @@ async function ensureBillingTables() {
   }
 }
 
+async function ensureAffiliateTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS affiliate_partners (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NULL,
+      name VARCHAR(160) NOT NULL,
+      email VARCHAR(255) NULL,
+      code VARCHAR(40) NOT NULL,
+      status ENUM('active','paused','blocked') NOT NULL DEFAULT 'active',
+      commission_percent DECIMAL(5,2) NOT NULL DEFAULT 10.00,
+      commission_months INT UNSIGNED NOT NULL DEFAULT 12,
+      client_cap_eur DECIMAL(12,2) NULL,
+      notes TEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_affiliate_code (code),
+      KEY idx_affiliate_user (user_id),
+      KEY idx_affiliate_status (status),
+      CONSTRAINT fk_affiliate_partner_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS affiliate_attributions (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      partner_id BIGINT UNSIGNED NOT NULL,
+      user_id BIGINT UNSIGNED NOT NULL,
+      referral_code VARCHAR(40) NOT NULL,
+      source VARCHAR(80) NULL,
+      first_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      attributed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMP NOT NULL,
+      status ENUM('active','expired','void','fraud_review') NOT NULL DEFAULT 'active',
+      ip_hash CHAR(64) NULL,
+      user_agent_hash CHAR(64) NULL,
+      metadata_json LONGTEXT NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_affiliate_attribution_user (user_id),
+      KEY idx_affiliate_attr_partner (partner_id, attributed_at),
+      KEY idx_affiliate_attr_status (status, expires_at),
+      CONSTRAINT fk_affiliate_attr_partner FOREIGN KEY (partner_id) REFERENCES affiliate_partners(id) ON DELETE CASCADE,
+      CONSTRAINT fk_affiliate_attr_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS affiliate_commission_ledger (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      partner_id BIGINT UNSIGNED NOT NULL,
+      attribution_id BIGINT UNSIGNED NOT NULL,
+      user_id BIGINT UNSIGNED NOT NULL,
+      source_type VARCHAR(80) NOT NULL,
+      source_id VARCHAR(120) NOT NULL,
+      customer_amount_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+      commission_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
+      commission_eur DECIMAL(12,6) NOT NULL DEFAULT 0,
+      currency CHAR(3) NOT NULL DEFAULT 'EUR',
+      status ENUM('pending','approved','paid','void','fraud_review') NOT NULL DEFAULT 'pending',
+      metadata_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      approved_at TIMESTAMP NULL,
+      paid_at TIMESTAMP NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_affiliate_commission_source (source_type, source_id, partner_id),
+      KEY idx_affiliate_commission_partner (partner_id, created_at),
+      KEY idx_affiliate_commission_status (status, created_at),
+      CONSTRAINT fk_affiliate_commission_partner FOREIGN KEY (partner_id) REFERENCES affiliate_partners(id) ON DELETE CASCADE,
+      CONSTRAINT fk_affiliate_commission_attr FOREIGN KEY (attribution_id) REFERENCES affiliate_attributions(id) ON DELETE CASCADE,
+      CONSTRAINT fk_affiliate_commission_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
+}
+
 async function ensureEnterpriseQuoteRequestsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS enterprise_quote_requests (
@@ -2509,6 +2627,95 @@ async function insertBillingLedgerEntry(conn, {
     },
   )
   return amount
+}
+
+async function maybeAttributeReferralForUser(userId, req, conn = pool) {
+  const code = normalizeReferralCode(req.cookies?.vryx_ref || req.body?.referralCode || req.query?.ref || '')
+  if (!code || !userId) return null
+  const [partners] = await conn.query(
+    `SELECT id, code, commission_months AS commissionMonths
+     FROM affiliate_partners
+     WHERE code = :code AND status = 'active'
+     LIMIT 1`,
+    { code },
+  )
+  const partner = partners[0]
+  if (!partner) return null
+  const expiresAt = new Date()
+  expiresAt.setMonth(expiresAt.getMonth() + Math.max(1, Number(partner.commissionMonths || AFFILIATE_DEFAULT_DURATION_MONTHS)))
+  await conn.query(
+    `INSERT IGNORE INTO affiliate_attributions
+       (partner_id, user_id, referral_code, source, expires_at, ip_hash, user_agent_hash, metadata_json)
+     VALUES
+       (:partnerId, :userId, :referralCode, :source, :expiresAt, :ipHash, :userAgentHash, :metadataJson)`,
+    {
+      partnerId: partner.id,
+      userId,
+      referralCode: code,
+      source: String(req.cookies?.vryx_ref_source || req.query?.utm_source || 'referral').slice(0, 80),
+      expiresAt,
+      ipHash: requestIpHash(req),
+      userAgentHash: requestUserAgentHash(req),
+      metadataJson: JSON.stringify({
+        path: req.originalUrl || req.url || null,
+        source: req.cookies?.vryx_ref_source || req.query?.utm_source || null,
+      }),
+    },
+  )
+  return { partnerId: String(partner.id), code }
+}
+
+async function recordAffiliateCommissionForCreditPurchase(conn, { userId, amountEur, sourceId, eventId = null }) {
+  const amount = toEuroAmount(amountEur)
+  if (!Number.isFinite(Number(userId)) || Number(userId) <= 0 || amount <= 0 || !sourceId) return null
+  const [rows] = await conn.query(
+    `SELECT a.id AS attributionId, a.partner_id AS partnerId,
+            p.commission_percent AS commissionPercent,
+            p.client_cap_eur AS clientCapEur
+     FROM affiliate_attributions a
+     JOIN affiliate_partners p ON p.id = a.partner_id
+     WHERE a.user_id = :userId
+       AND a.status = 'active'
+       AND p.status = 'active'
+       AND a.expires_at >= CURRENT_TIMESTAMP
+     LIMIT 1`,
+    { userId },
+  )
+  const attribution = rows[0]
+  if (!attribution) return null
+  const [[paid]] = await conn.query(
+    `SELECT COALESCE(SUM(commission_eur), 0) AS total
+     FROM affiliate_commission_ledger
+     WHERE attribution_id = :attributionId
+       AND status IN ('pending','approved','paid')`,
+    { attributionId: attribution.attributionId },
+  )
+  const cap = attribution.clientCapEur == null ? AFFILIATE_DEFAULT_CLIENT_CAP_EUR : Number(attribution.clientCapEur)
+  const remaining = cap > 0 ? Math.max(0, cap - Number(paid?.total || 0)) : Number.POSITIVE_INFINITY
+  if (remaining <= 0) return null
+  const pct = Math.max(0, Math.min(50, Number(attribution.commissionPercent || AFFILIATE_DEFAULT_COMMISSION_PERCENT)))
+  const rawCommission = toEuroAmount(amount * (pct / 100))
+  const commission = toEuroAmount(Math.min(rawCommission, remaining))
+  if (commission <= 0) return null
+  await conn.query(
+    `INSERT IGNORE INTO affiliate_commission_ledger
+       (partner_id, attribution_id, user_id, source_type, source_id, customer_amount_eur,
+        commission_percent, commission_eur, metadata_json)
+     VALUES
+       (:partnerId, :attributionId, :userId, 'stripe_checkout_session', :sourceId, :customerAmountEur,
+        :commissionPercent, :commissionEur, :metadataJson)`,
+    {
+      partnerId: attribution.partnerId,
+      attributionId: attribution.attributionId,
+      userId,
+      sourceId,
+      customerAmountEur: amount,
+      commissionPercent: pct,
+      commissionEur: commission,
+      metadataJson: JSON.stringify({ eventId, capEur: Number.isFinite(cap) ? cap : null }),
+    },
+  )
+  return { partnerId: String(attribution.partnerId), commissionEur: commission }
 }
 
 async function ensureApiCreditForRequest(req, { prompt, maxTokens, model = null }) {
@@ -2766,6 +2973,30 @@ const {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
+})
+
+app.get('/r/:code', async (req, res) => {
+  const code = normalizeReferralCode(req.params.code)
+  if (code) {
+    res.cookie('vryx_ref', code, referralCookieOptions())
+    const source = String(req.query.utm_source || req.query.source || 'affiliate').slice(0, 80)
+    res.cookie('vryx_ref_source', source, referralCookieOptions())
+  }
+  const next = typeof req.query.next === 'string' && req.query.next.startsWith('/') ? req.query.next : '/?ref=partner'
+  res.redirect(next)
+})
+
+app.post('/api/referrals/track', async (req, res) => {
+  const code = normalizeReferralCode(req.body?.code || req.query?.code || '')
+  if (!code) return res.status(400).json({ ok: false, error: 'Code referral requis.' })
+  const [partners] = await pool.query(
+    `SELECT code FROM affiliate_partners WHERE code = :code AND status = 'active' LIMIT 1`,
+    { code },
+  )
+  if (!partners[0]) return res.status(404).json({ ok: false, error: 'Code referral invalide.' })
+  res.cookie('vryx_ref', code, referralCookieOptions())
+  res.cookie('vryx_ref_source', String(req.body?.source || req.query?.source || 'affiliate').slice(0, 80), referralCookieOptions())
+  res.json({ ok: true, code })
 })
 
 app.post('/api/enterprise/quote', enterpriseQuoteLimiter, async (req, res) => {
@@ -3774,6 +4005,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       { email, hash },
     )
     const id = String(result.insertId)
+    await maybeAttributeReferralForUser(id, req).catch((e) => console.error('affiliate attribution register', e))
     // Promotion automatique : la 1re inscription d'un e-mail admin force is_admin = 1.
     let isAdmin = FORCED_ADMIN_EMAILS.includes(email)
     if (isAdmin) {
@@ -3978,6 +4210,7 @@ async function finishGoogleAuth({ code, rawState, redirectUri }) {
         { email, hash, googleId, isAdmin: isAdmin ? 1 : 0 },
       )
       id = String(result.insertId)
+      await maybeAttributeReferralForUser(id, { cookies: {}, body: {}, query: {}, headers: {}, ip: '', socket: {}, originalUrl: 'google_oauth' }).catch(() => {})
     } else {
       await pool.query(
         'UPDATE users SET google_id = COALESCE(google_id, :googleId), is_admin = GREATEST(is_admin, :isAdmin), last_login_at = CURRENT_TIMESTAMP WHERE id = :id',
@@ -4311,6 +4544,118 @@ accountRouter.post('/billing/checkout', async (req, res) => {
   } catch (e) {
     console.error('account/billing/checkout', e)
     res.status(500).json({ error: 'Impossible de créer le paiement.' })
+  }
+})
+
+accountRouter.get('/affiliate', async (req, res) => {
+  try {
+    const [partners] = await pool.query(
+      `SELECT id, name, code, status, commission_percent AS commissionPercent,
+              commission_months AS commissionMonths, client_cap_eur AS clientCapEur, created_at AS createdAt
+       FROM affiliate_partners
+       WHERE user_id = :userId
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      { userId: req.user.id },
+    )
+    const partner = partners[0]
+    if (!partner) {
+      return res.json({
+        ok: true,
+        partner: null,
+        defaults: {
+          commissionPercent: AFFILIATE_DEFAULT_COMMISSION_PERCENT,
+          commissionMonths: AFFILIATE_DEFAULT_DURATION_MONTHS,
+          clientCapEur: AFFILIATE_DEFAULT_CLIENT_CAP_EUR,
+        },
+      })
+    }
+    const [[totals]] = await pool.query(
+      `SELECT COUNT(*) AS rowsCount,
+              COALESCE(SUM(customer_amount_eur), 0) AS referredRevenueEur,
+              COALESCE(SUM(commission_eur), 0) AS commissionEur,
+              COALESCE(SUM(status = 'paid'), 0) AS paidRows
+       FROM affiliate_commission_ledger
+       WHERE partner_id = :partnerId`,
+      { partnerId: partner.id },
+    )
+    const [[attributions]] = await pool.query(
+      `SELECT COUNT(*) AS clients
+       FROM affiliate_attributions
+       WHERE partner_id = :partnerId`,
+      { partnerId: partner.id },
+    )
+    const [recent] = await pool.query(
+      `SELECT customer_amount_eur AS customerAmountEur, commission_eur AS commissionEur,
+              status, created_at AS createdAt
+       FROM affiliate_commission_ledger
+       WHERE partner_id = :partnerId
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      { partnerId: partner.id },
+    )
+    res.json({
+      ok: true,
+      partner: {
+        id: String(partner.id),
+        name: partner.name,
+        code: partner.code,
+        link: `${VRYX_APP_BASE_URL}/r/${encodeURIComponent(partner.code)}`,
+        status: partner.status,
+        commissionPercent: Number(partner.commissionPercent || 0),
+        commissionMonths: Number(partner.commissionMonths || 0),
+        clientCapEur: partner.clientCapEur == null ? null : Number(partner.clientCapEur),
+        clients: Number(attributions?.clients || 0),
+        referredRevenueEur: Number(totals?.referredRevenueEur || 0),
+        commissionEur: Number(totals?.commissionEur || 0),
+        rowsCount: Number(totals?.rowsCount || 0),
+        paidRows: Number(totals?.paidRows || 0),
+        recent: recent.map((row) => ({
+          customerAmountEur: Number(row.customerAmountEur || 0),
+          commissionEur: Number(row.commissionEur || 0),
+          status: row.status,
+          createdAt: toIsoDate(row.createdAt),
+        })),
+      },
+    })
+  } catch (e) {
+    console.error('account/affiliate', e)
+    res.status(500).json({ error: 'Erreur dashboard affiliation.' })
+  }
+})
+
+accountRouter.post('/affiliate', async (req, res) => {
+  try {
+    const userId = Number(req.user.id)
+    const [[existing]] = await pool.query('SELECT id FROM affiliate_partners WHERE user_id = :userId LIMIT 1', { userId })
+    if (existing) return res.status(409).json({ error: 'Programme partenaire déjà activé.' })
+    const [[user]] = await pool.query('SELECT email FROM users WHERE id = :userId LIMIT 1', { userId })
+    const name = String(req.body?.name || user?.email || 'Vryx Partner').slice(0, 160)
+    let code = newReferralCode(name)
+    for (let i = 0; i < 5; i += 1) {
+      const [hit] = await pool.query('SELECT id FROM affiliate_partners WHERE code = :code LIMIT 1', { code })
+      if (!hit[0]) break
+      code = newReferralCode(name)
+    }
+    await pool.query(
+      `INSERT INTO affiliate_partners
+         (user_id, name, email, code, commission_percent, commission_months, client_cap_eur)
+       VALUES
+         (:userId, :name, :email, :code, :commissionPercent, :commissionMonths, :clientCapEur)`,
+      {
+        userId,
+        name,
+        email: user?.email || null,
+        code,
+        commissionPercent: AFFILIATE_DEFAULT_COMMISSION_PERCENT,
+        commissionMonths: AFFILIATE_DEFAULT_DURATION_MONTHS,
+        clientCapEur: AFFILIATE_DEFAULT_CLIENT_CAP_EUR,
+      },
+    )
+    res.status(201).json({ ok: true, code, link: `${VRYX_APP_BASE_URL}/r/${encodeURIComponent(code)}` })
+  } catch (e) {
+    console.error('account/affiliate create', e)
+    res.status(500).json({ error: 'Impossible d’activer l’affiliation.' })
   }
 })
 
@@ -5057,6 +5402,12 @@ app.post('/api/billing/stripe/webhook', async (req, res) => {
           referenceType: 'stripe_checkout_session',
           referenceId: providerSessionId,
           metadata: { eventId: event.id || null, paymentIntent: session.payment_intent || null },
+        })
+        await recordAffiliateCommissionForCreditPurchase(conn, {
+          userId,
+          amountEur,
+          sourceId: providerSessionId,
+          eventId: event.id || null,
         })
       }
       await conn.commit()
@@ -6483,6 +6834,124 @@ adminRouter.patch('/plans/fine-tuning/:slug', async (req, res) => {
     res.json({ ok: true, plans: await getAllFineTuningPlans(pool) })
   } catch (e) {
     res.status(500).json({ error: 'Erreur plan fine-tuning.' })
+  }
+})
+
+adminRouter.get('/affiliates', async (_req, res) => {
+  try {
+    const [partners] = await pool.query(
+      `SELECT p.id, p.user_id AS userId, p.name, p.email, p.code, p.status,
+              p.commission_percent AS commissionPercent, p.commission_months AS commissionMonths,
+              p.client_cap_eur AS clientCapEur, p.created_at AS createdAt,
+              COUNT(DISTINCT a.user_id) AS clients,
+              COALESCE(SUM(c.customer_amount_eur), 0) AS referredRevenueEur,
+              COALESCE(SUM(c.commission_eur), 0) AS commissionEur,
+              COALESCE(SUM(c.status = 'pending'), 0) AS pendingRows
+       FROM affiliate_partners p
+       LEFT JOIN affiliate_attributions a ON a.partner_id = p.id
+       LEFT JOIN affiliate_commission_ledger c ON c.partner_id = p.id
+       GROUP BY p.id
+       ORDER BY p.created_at DESC
+       LIMIT 200`,
+    )
+    res.json({
+      ok: true,
+      partners: partners.map((row) => ({
+        id: String(row.id),
+        userId: row.userId == null ? null : String(row.userId),
+        name: row.name,
+        email: row.email || null,
+        code: row.code,
+        link: `${VRYX_APP_BASE_URL}/r/${encodeURIComponent(row.code)}`,
+        status: row.status,
+        commissionPercent: Number(row.commissionPercent || 0),
+        commissionMonths: Number(row.commissionMonths || 0),
+        clientCapEur: row.clientCapEur == null ? null : Number(row.clientCapEur),
+        clients: Number(row.clients || 0),
+        referredRevenueEur: Number(row.referredRevenueEur || 0),
+        commissionEur: Number(row.commissionEur || 0),
+        pendingRows: Number(row.pendingRows || 0),
+        createdAt: toIsoDate(row.createdAt),
+      })),
+      defaults: {
+        commissionPercent: AFFILIATE_DEFAULT_COMMISSION_PERCENT,
+        commissionMonths: AFFILIATE_DEFAULT_DURATION_MONTHS,
+        clientCapEur: AFFILIATE_DEFAULT_CLIENT_CAP_EUR,
+      },
+    })
+  } catch (e) {
+    console.error('admin/affiliates', e)
+    res.status(500).json({ error: 'Erreur lecture affiliation.' })
+  }
+})
+
+adminRouter.post('/affiliates', async (req, res) => {
+  const parsed = affiliatePartnerSchema.safeParse(req.body)
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0] || 'Partenaire invalide.'
+    return res.status(400).json({ error: first })
+  }
+  const data = parsed.data
+  const code = data.code ? normalizeReferralCode(data.code) : newReferralCode(data.name)
+  try {
+    const [result] = await pool.query(
+      `INSERT INTO affiliate_partners
+         (name, email, code, status, commission_percent, commission_months, client_cap_eur, notes)
+       VALUES
+         (:name, :email, :code, :status, :commissionPercent, :commissionMonths, :clientCapEur, :notes)`,
+      {
+        name: data.name,
+        email: data.email || null,
+        code,
+        status: data.status,
+        commissionPercent: data.commissionPercent,
+        commissionMonths: data.commissionMonths,
+        clientCapEur: data.clientCapEur,
+        notes: data.notes || null,
+      },
+    )
+    res.status(201).json({ ok: true, id: String(result.insertId || ''), code, link: `${VRYX_APP_BASE_URL}/r/${encodeURIComponent(code)}` })
+  } catch (e) {
+    if (e?.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Code affiliation déjà utilisé.' })
+    console.error('admin/affiliates create', e)
+    res.status(500).json({ error: 'Erreur création partenaire.' })
+  }
+})
+
+adminRouter.patch('/affiliates/:id', async (req, res) => {
+  const parsed = affiliatePartnerSchema.partial().safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Partenaire invalide.' })
+  const id = Number(req.params.id)
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: 'ID partenaire invalide.' })
+  const data = parsed.data
+  const updates = []
+  const params = { id }
+  for (const [key, column] of [
+    ['name', 'name'],
+    ['email', 'email'],
+    ['status', 'status'],
+    ['commissionPercent', 'commission_percent'],
+    ['commissionMonths', 'commission_months'],
+    ['clientCapEur', 'client_cap_eur'],
+    ['notes', 'notes'],
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(data, key)) {
+      updates.push(`${column} = :${key}`)
+      params[key] = data[key] ?? null
+    }
+  }
+  if (data.code) {
+    updates.push('code = :code')
+    params.code = normalizeReferralCode(data.code)
+  }
+  if (!updates.length) return res.json({ ok: true })
+  try {
+    await pool.query(`UPDATE affiliate_partners SET ${updates.join(', ')} WHERE id = :id`, params)
+    res.json({ ok: true })
+  } catch (e) {
+    if (e?.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Code affiliation déjà utilisé.' })
+    console.error('admin/affiliates patch', e)
+    res.status(500).json({ error: 'Erreur mise à jour partenaire.' })
   }
 })
 
@@ -9303,6 +9772,7 @@ async function start() {
   await ensureApiKeysTable()
   await ensureApiKeyUsageTable()
   await ensureBillingTables()
+  await ensureAffiliateTables()
   await ensureEnterpriseQuoteRequestsTable()
   await ensureEnterpriseCustomerProjectsTable()
   await ensurePricingAndModelCatalogTables(pool, PRICING_FALLBACK)
