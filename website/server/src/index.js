@@ -9,7 +9,6 @@ import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import cookieParser from 'cookie-parser'
-import rateLimit from 'express-rate-limit'
 import mysql from 'mysql2/promise'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
@@ -23,6 +22,21 @@ import { initRedis, isRedisReady, isRedisRequiredInProd } from './redis-client.j
 import { setJsonCache } from './cache.js'
 import { claimIdempotencyKey, clearIdempotencyKey } from './idempotency.js'
 import { computeRequestCost, computeBlendedPrice, resolveWorkerPayout } from './pricing-engine.js'
+import { createCsrfProtection } from './middlewares/csrf.js'
+import { createRateLimiters } from './middlewares/rate-limit.js'
+import {
+  createRequireAdmin,
+  createRequireApiKey,
+  createRequireAuth,
+  createSessionAuthMiddleware,
+} from './middlewares/auth.js'
+import { tokenMatchesSecret as timingSafeTokenMatches } from './services/security.js'
+import {
+  estimatePromptTokens as estimatePromptTokensRaw,
+  euroFromTokens as euroFromTokensForRate,
+  toEuroAmount as toEuroAmountRaw,
+  toMoneyAmount as toMoneyAmountForRate,
+} from './services/billing.js'
 import {
   ensurePricingAndModelCatalogTables,
   getPricingConfig,
@@ -161,6 +175,11 @@ const VRYX_APP_BASE_URL = (process.env.VRYX_APP_BASE_URL || CORS_ORIGIN || 'http
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim()
 const VRYX_BENCH_TOKEN = String(process.env.VRYX_BENCH_TOKEN || '').trim()
+const csrfProtection = createCsrfProtection({
+  corsOrigins: CORS_ORIGINS,
+  cookieName: COOKIE_NAME,
+  legacyCookieName: LEGACY_COOKIE_NAME,
+})
 
 /** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
 let pipelineChatSessions = 0
@@ -190,13 +209,6 @@ const INTERNAL_TOKEN = String(process.env.VRYX_INTERNAL_TOKEN || (IS_PRODUCTION 
 const RAW_ALLOW_UNSECURE_WORKERS = process.env.ALLOW_UNSECURE_WORKERS === '1'
 const ALLOW_UNSECURE_WORKERS = RAW_ALLOW_UNSECURE_WORKERS && !IS_PRODUCTION
 
-function tokenMatchesSecret(token, secret) {
-  const tokenBuf = Buffer.from(String(token || ''))
-  const secretBuf = Buffer.from(String(secret || ''))
-  if (tokenBuf.length === 0 || tokenBuf.length !== secretBuf.length) return false
-  return crypto.timingSafeEqual(tokenBuf, secretBuf)
-}
-
 async function requireWorkerSecret(req, res, next) {
   const authHeader = req.headers['authorization'] || ''
   let token = ''
@@ -206,7 +218,7 @@ async function requireWorkerSecret(req, res, next) {
     token = req.query.token || req.headers['x-worker-token'] || ''
   }
   if (ALLOW_UNSECURE_WORKERS) return next()
-  if (WORKER_SECRET && tokenMatchesSecret(token, WORKER_SECRET)) return next()
+  if (WORKER_SECRET && timingSafeTokenMatches(token, WORKER_SECRET)) return next()
   const peerId = String(req.body?.peer_id || req.query.peer_id || '').trim()
   if (peerId && token) {
     try {
@@ -230,48 +242,6 @@ async function requireWorkerSecret(req, res, next) {
     }
   }
   return res.status(401).json({ error: 'Unauthorized: Invalid worker secret token.' })
-}
-
-function normalizedOrigin(value) {
-  if (!value) return ''
-  try {
-    return new URL(String(value)).origin.toLowerCase()
-  } catch {
-    return ''
-  }
-}
-
-function csrfProtection(req, res, next) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-    return next()
-  }
-  const origin = req.headers['origin']
-  const referer = req.headers['referer']
-  const host = req.get('host') || ''
-  const protocol = req.protocol || 'http'
-  const localUrl = `${protocol}://${host}`
-  const allowedOrigins = new Set([
-    normalizedOrigin(localUrl),
-    ...CORS_ORIGINS.map(normalizedOrigin),
-    'https://vryx.eu',
-    'https://www.vryx.eu'
-  ].filter(Boolean))
-
-  if (origin) {
-    if (!allowedOrigins.has(normalizedOrigin(origin))) {
-      return res.status(403).json({ error: 'CSRF Protection: Invalid request origin.' })
-    }
-  } else if (referer) {
-    if (!allowedOrigins.has(normalizedOrigin(referer))) {
-      return res.status(403).json({ error: 'CSRF Protection: Invalid request referer.' })
-    }
-  } else {
-    const hasAuthCookie = req.cookies && (req.cookies[COOKIE_NAME] || req.cookies[LEGACY_COOKIE_NAME])
-    if (hasAuthCookie) {
-      return res.status(403).json({ error: 'CSRF Protection: Missing request origin or referer.' })
-    }
-  }
-  next()
 }
 
 const p2pTokenStreams = new Map()
@@ -912,23 +882,23 @@ async function resolveBillingEurPerMillion() {
 }
 
 function toMoneyAmount(tokens, eurPerMillion = VRYX_EUR_PER_MILLION) {
-  if (!Number.isFinite(tokens) || tokens <= 0) return 0
-  return Number(((tokens / 1_000_000) * eurPerMillion).toFixed(4))
+  const n = Number(tokens)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return toEuroAmountRaw(toMoneyAmountForRate(n, eurPerMillion), 4)
 }
 
 function toEuroAmount(value, precision = 6) {
-  const n = Number(value)
-  if (!Number.isFinite(n)) return 0
-  return Number(n.toFixed(precision))
+  return toEuroAmountRaw(value, precision)
 }
 
 function euroFromTokens(tokens, eurPerMillion = VRYX_EUR_PER_MILLION) {
-  if (!Number.isFinite(tokens) || tokens <= 0) return 0
-  return toEuroAmount((tokens / 1_000_000) * eurPerMillion)
+  const n = Number(tokens)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return euroFromTokensForRate(n, eurPerMillion)
 }
 
 function estimatePromptTokens(prompt) {
-  return Math.max(1, Math.ceil(String(prompt || '').length / 4))
+  return estimatePromptTokensRaw(prompt)
 }
 
 async function estimateEnterpriseQuote(input) {
@@ -2427,78 +2397,10 @@ function clearAuthCookie(res) {
   })
 }
 
-function authMiddleware(req, res, next) {
-  const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]
-  const token = bearer || req.cookies?.[COOKIE_NAME] || req.cookies?.[LEGACY_COOKIE_NAME]
-  if (!token) {
-    req.user = null
-    return next()
-  }
-  const decoded = verifyToken(token)
-  if (!decoded || typeof decoded.sub !== 'string') {
-    req.user = null
-    return next()
-  }
-  req.user = { id: decoded.sub, email: decoded.email }
-  next()
-}
-
-async function requireAuth(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Authentification requise.' })
-  try {
-    const [rows] = await pool.query('SELECT id, email, is_admin AS isAdmin FROM users WHERE id = :id LIMIT 1', {
-      id: req.user.id,
-    })
-    if (!rows[0]) {
-      clearAuthCookie(res)
-      return res.status(401).json({ error: 'Session invalide.' })
-    }
-    req.user.email = rows[0].email
-    req.user.isAdmin = Boolean(rows[0].isAdmin)
-    next()
-  } catch (e) {
-    console.error('requireAuth', e)
-    res.status(500).json({ error: 'Erreur de vérification de la session.' })
-  }
-}
-
-async function requireApiKey(req, res, next) {
-  const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
-  if (!bearer || !bearer.startsWith('vel_sk_')) {
-    return res.status(401).json({
-      error: {
-        message: 'Clé API Vryx requise. Utilisez Authorization: Bearer vel_sk_live_...',
-        type: 'invalid_request_error',
-      },
-    })
-  }
-  try {
-    const keyHash = apiKeyHash(bearer)
-    const [rows] = await pool.query(
-      `SELECT k.id, k.user_id AS userId, u.email
-       FROM api_keys k
-       JOIN users u ON u.id = k.user_id
-       WHERE k.key_hash = :keyHash
-         AND k.revoked_at IS NULL
-       LIMIT 1`,
-      { keyHash },
-    )
-    const hit = rows[0]
-    if (!hit) {
-      return res.status(401).json({
-        error: { message: 'Clé API Vryx invalide ou révoquée.', type: 'invalid_request_error' },
-      })
-    }
-    await pool.query('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = :id', { id: hit.id })
-    req.apiUser = { id: String(hit.userId), email: hit.email, keyId: String(hit.id) }
-    return next()
-  } catch (e) {
-    console.error('api key auth', e)
-    return res.status(500).json({
-      error: { message: 'Erreur de vérification de la clé API.', type: 'server_error' },
-    })
-  }
-}
+const authMiddleware = createSessionAuthMiddleware({ cookieName: COOKIE_NAME, legacyCookieName: LEGACY_COOKIE_NAME, verifyToken })
+const requireAuth = createRequireAuth({ pool, clearAuthCookie })
+const requireApiKey = createRequireApiKey({ pool, apiKeyHash })
+const requireAdmin = createRequireAdmin({ pool })
 
 async function getUserCreditBalance(userId, conn = pool) {
   const [[row]] = await conn.query(
@@ -2728,25 +2630,6 @@ async function recordApiKeyUsage(req, { model, promptTokens = 0, completionToken
   }
 }
 
-/** Vérifie en base que l'utilisateur courant est administrateur. */
-async function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: 'Authentification requise.' })
-  try {
-    const [rows] = await pool.query(
-      'SELECT is_admin FROM users WHERE id = :id LIMIT 1',
-      { id: req.user.id },
-    )
-    if (!rows[0] || !rows[0].is_admin) {
-      return res.status(403).json({ error: 'Accès réservé aux administrateurs.' })
-    }
-    req.user.isAdmin = true
-    next()
-  } catch (e) {
-    console.error('requireAdmin', e)
-    res.status(500).json({ error: 'Erreur de vérification des droits.' })
-  }
-}
-
 const app = express()
 app.set('trust proxy', 1)
 const observability = createObservability({ serviceName: 'vryx-api' })
@@ -2800,29 +2683,15 @@ app.post('/api/internal/p2p-token-stream', (req, res) => {
   res.json({ ok: true })
 })
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de tentatives. Réessayez plus tard.' },
-})
-
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 40,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de tentatives de connexion. Réessayez plus tard.' },
-})
-
-const enterpriseQuoteLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 12,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de demandes Enterprise. Réessayez plus tard.' },
-})
+const {
+  authLimiter,
+  loginLimiter,
+  enterpriseQuoteLimiter,
+  accountChatLimiter,
+  workerLimiter,
+  adminWorkerPingLimiter,
+  chatLimiter,
+} = createRateLimiters()
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
@@ -4098,8 +3967,6 @@ app.get('/api/auth/google/callback', async (req, res) => {
 const accountRouter = express.Router()
 accountRouter.use(requireAuth)
 
-const accountChatLimiter = rateLimit({ windowMs: 60_000, max: 30, message: { error: 'Trop de messages. Patientez un instant.' } })
-
 accountRouter.get('/overview', async (req, res) => {
   try {
     const userId = req.user.id
@@ -5004,7 +4871,7 @@ app.post('/api/internal/bench/chat', accountChatLimiter, async (req, res) => {
   const bearer = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
   const headerToken = String(req.headers['x-vryx-bench-token'] || '').trim()
   const token = bearer || headerToken
-  if (!tokenMatchesSecret(token, VRYX_BENCH_TOKEN)) {
+  if (!timingSafeTokenMatches(token, VRYX_BENCH_TOKEN)) {
     return res.status(401).json({ ok: false, error: 'bench_unauthorized' })
   }
   try {
@@ -5045,7 +4912,7 @@ function verifyStripeWebhookSignature(req) {
   if (!Number.isFinite(ageSeconds) || ageSeconds > 300) return false
   const payload = `${timestamp}.${rawBody.toString('utf8')}`
   const digest = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(payload).digest('hex')
-  return tokenMatchesSecret(digest, expected)
+  return timingSafeTokenMatches(digest, expected)
 }
 
 app.post('/api/billing/stripe/webhook', async (req, res) => {
@@ -5585,22 +5452,6 @@ const heartbeatBodySchema = z.object({
     .optional(),
 })
 
-const workerLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de heartbeats.' },
-})
-
-const adminWorkerPingLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Trop de mesures de latence. Réessayez dans une minute.' },
-})
-
 app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (req, res) => {
   const parsed = heartbeatBodySchema.safeParse(req.body)
   if (!parsed.success) {
@@ -6010,9 +5861,6 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     return res.status(500).json({ error: 'Erreur enregistrement worker.' })
   }
 })
-
-// Limiteur partagé par le chat P2P admin (rate-limit côté initiateur).
-const chatLimiter = rateLimit({ windowMs: 60_000, max: 20, message: { error: 'Trop de requêtes.' } })
 
 app.get('/api/workers/status', requireWorkerSecret, async (_req, res) => {
   try {
@@ -9344,7 +9192,7 @@ app.get('/api/internal/live-peers', async (req, res) => {
     return res.status(403).json({ ok: false, error: 'Réservé localhost' })
   }
   const token = String(req.headers['x-internal-token'] || '')
-  if (!INTERNAL_TOKEN || !tokenMatchesSecret(token, INTERNAL_TOKEN)) {
+  if (!INTERNAL_TOKEN || !timingSafeTokenMatches(token, INTERNAL_TOKEN)) {
     return res.status(403).json({ ok: false, error: 'Token interne requis' })
   }
   try {
