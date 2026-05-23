@@ -14,6 +14,7 @@ const ClientsPage = lazy(() => import('./pages/ClientsPage').then((m) => ({ defa
 const WorkersPage = lazy(() => import('./pages/WorkersPage').then((m) => ({ default: m.WorkersPage })))
 const StatusPage = lazy(() => import('./pages/StatusPage').then((m) => ({ default: m.StatusPage })))
 const EnterprisePage = lazy(() => import('./pages/EnterprisePage').then((m) => ({ default: m.EnterprisePage })))
+const PartnerPage = lazy(() => import('./pages/PartnerPage').then((m) => ({ default: m.PartnerPage })))
 const AdminOverviewPage = lazy(() => import('./pages/AdminOverviewPage').then((m) => ({ default: m.AdminOverviewPage })))
 const AdminUsersPage = lazy(() => import('./pages/AdminUsersPage').then((m) => ({ default: m.AdminUsersPage })))
 const AdminUserDetailPage = lazy(() => import('./pages/AdminUsersPage').then((m) => ({ default: m.AdminUserDetailPage })))
@@ -60,6 +61,7 @@ export default function App() {
           <Route path="network" element={<StatusPage />} />
           <Route path="investor-readiness" element={<AdminProductionReadinessPage />} />
           <Route path="enterprise" element={<EnterprisePage />} />
+          <Route path="partner" element={<PartnerPage />} />
           <Route path="compte/*" element={<AccountPage />} />
           <Route path="panel/modeles" element={<ModelsPanelPage />} />
           <Route path="admin" element={<AdminOverviewPage />} />
