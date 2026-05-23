@@ -58,6 +58,14 @@ These files contain the deeper technical source material:
 | CI | Investor CI, Rust Linux CI, security CI, release workflow | Persisted green run screenshots |
 | Commercial | Enterprise configurator and CRM-style admin pipeline | Signed LOIs or paid pilot documents |
 
+## Demo Scope Statement
+
+For the investor demo, Vryx should be presented as a staging-grade billable infrastructure proof:
+
+> The economic flow is validated in staging through admin credits and ledger writes. Stripe live, real invoicing and signed worker app distribution are the next production steps.
+
+This keeps the claim precise. The demo must keep dynamic pricing, API keys, credit debit, `api_key_usage`, `worker_payout_ledger`, Redis/Valkey, systemd workers, readiness/network proof, CI and video evidence active. Stripe live, VAT invoices, real bank payouts, app signing/notarization and signed auto-update remain production/post-demo roadmap items.
+
 ## Investor Narrative
 
 Vryx is past the "idea" stage. The repo contains a functioning technical stack, billing primitives, worker orchestration, readiness scoring and operational dashboards. The fundraising round is designed to fund the transition from advanced prototype to production-grade B2B infrastructure:
@@ -67,4 +75,3 @@ Vryx is past the "idea" stage. The repo contains a functioning technical stack, 
 3. prove daily golden path reliability;
 4. convert first B2B pilots;
 5. expand worker capacity and enterprise private pools.
-

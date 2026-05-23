@@ -14,6 +14,12 @@ Vryx monetizes AI inference capacity. Customers pay for tokens, private capacity
 
 ## Revenue Loop
 
+For the investor demo, the economic flow is validated in staging mode: admin credits can replace live card payment, while pricing, API keys, credit debit, `api_key_usage` and `worker_payout_ledger` remain real. This is intentionally not a fake demo mode; it is a bank-payment-free staging path.
+
+Investor wording:
+
+> The economic flow is validated in staging through admin credits and ledger writes. Stripe live, real invoicing and signed worker app distribution are the next production steps.
+
 ```mermaid
 flowchart LR
   A["Customer buys credits"] --> B["Stripe checkout"]
@@ -56,6 +62,20 @@ Vryx should not price as if it owns and amortizes all GPUs. The model is a marke
 | `api_key_usage` | Per-request tokens, cost, pricing snapshot and latency. |
 | `worker_payout_ledger` | Pending, approved and paid worker payout rows. |
 | `pricing_config_audit` | History of pricing changes. |
+
+## Demo Versus Production Scope
+
+| Topic | Demo / staging status | Production roadmap |
+| --- | --- | --- |
+| Stripe live | Not required for demo; admin credits and Stripe test can validate the path. | Enable live checkout, webhook secret rotation, invoices and tax settings. |
+| Real bank payouts | Not required for demo; payout ledger proves worker economics. | Add payout provider, bank details, tax/KYC checks and payment batches. |
+| VAT and legal invoices | Not required for demo. | Finalize tax settings, invoice templates and accounting export. |
+| Apple notarization | Optional for demo. | Required before broad macOS worker distribution. |
+| Windows signing | Optional for demo. | Required before broad Windows worker distribution. |
+| Signed auto-update | Optional for demo. | Required before public worker app rollout. |
+| Google OAuth production | Optional if email/password admin works. | Configure production OAuth credentials and redirect URIs. |
+
+The production claim should stay precise: Vryx has a validated staging money path and auditable ledgers today; live payment operations and signed worker distribution are the next production hardening steps.
 
 ## Investor Acceptance Criteria
 

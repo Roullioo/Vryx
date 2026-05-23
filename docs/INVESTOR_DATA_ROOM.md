@@ -28,6 +28,37 @@ Angle investisseur : le coeur technique existe ; la levee finance l'industrialis
 - Billing money path auditable : `docs/BILLING_MONEY_PATH.md` et `/api/admin/billing/proof`.
 - Enterprise offers : `docs/ENTERPRISE_OFFERS.md`.
 
+## Cadrage demo vs production
+
+Phrase a utiliser :
+
+> Le flux economique est valide en mode staging via credits admin et ledger. Stripe live, facturation reelle et signature des apps workers sont les prochaines etapes de production.
+
+En demo, garder actif :
+
+- pricing dynamique ;
+- Admin Pricing ;
+- cles API ;
+- credits admin ;
+- debit de credits ;
+- `api_key_usage` ;
+- `worker_payout_ledger` ;
+- Redis/Valkey ;
+- workers systemd ;
+- readiness / Network ;
+- CI verte ;
+- video demo.
+
+En post-demo / production, garder dans la roadmap sans les presenter comme termines :
+
+- Stripe live ;
+- notarisation Apple ;
+- signature Windows ;
+- OAuth Google production ;
+- auto-update worker signe ;
+- vrais payouts bancaires ;
+- TVA et factures reelles.
+
 ## Metrics a exposer en pitch
 
 - Workers enregistres et workers live.
