@@ -84,6 +84,10 @@ const VRYX_OPENAI_DEFAULT_MAX_TOKENS = (() => {
   if (!Number.isFinite(n)) return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, 4096)
   return Math.min(VRYX_P2P_ADMIN_MAX_NEW_TOKENS, Math.max(16, Math.floor(n)))
 })()
+const VRYX_OPENAI_UPSTREAM_TIMEOUT_MS = Math.max(
+  5_000,
+  Math.min(300_000, Number(process.env.VRYX_OPENAI_UPSTREAM_TIMEOUT_MS) || 60_000),
+)
 const VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS = (() => {
   const n = Number(process.env.VRYX_ACCOUNT_CHAT_DEFAULT_NEW_TOKENS)
   if (!Number.isFinite(n)) return 192
@@ -127,6 +131,13 @@ function resolveInitiatorChatUrl(body) {
     throw err
   }
   return raw
+}
+
+function upstreamTimeoutSignal(ms = VRYX_OPENAI_UPSTREAM_TIMEOUT_MS) {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(ms)
+  }
+  return undefined
 }
 /** Heartbeat récent pour la liste « workers live » (sidebar admin). */
 const WORKER_LIVE_SEC = Math.max(5, Math.min(120, Number(process.env.WORKER_LIVE_SEC) || 30))
@@ -4011,6 +4022,7 @@ openAiRouter.post('/chat/completions', async (req, res) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
         body: JSON.stringify(chatBody),
+        signal: upstreamTimeoutSignal(),
       })
       if (!upstream.ok || !upstream.body) {
         throw new Error(`Initiateur indisponible (${upstream.status})`)
@@ -4112,6 +4124,7 @@ openAiRouter.post('/chat/completions', async (req, res) => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(chatBody),
+      signal: upstreamTimeoutSignal(),
     })
     const data = await upstream.json().catch(() => null)
     if (!upstream.ok || !data || data.ok === false) {
@@ -4159,15 +4172,17 @@ openAiRouter.post('/chat/completions', async (req, res) => {
       usage,
     })
   } catch (e) {
-    const message = e instanceof Error ? e.message : 'Erreur Vryx.'
+    const isTimeout = e?.name === 'TimeoutError' || e?.name === 'AbortError'
+    const message = isTimeout ? 'Timeout initiateur Vryx.' : e instanceof Error ? e.message : 'Erreur Vryx.'
+    const statusCode = isTimeout ? 504 : 502
     if (stream && !res.headersSent) {
-      return res.status(502).json({ error: { message, type: 'server_error' } })
+      return res.status(statusCode).json({ error: { message, type: 'server_error' } })
     }
     if (stream) {
       sendOpenAiSse(res, { error: { message, type: 'server_error' } })
       return res.end()
     }
-    return res.status(502).json({ error: { message, type: 'server_error' } })
+    return res.status(statusCode).json({ error: { message, type: 'server_error' } })
   }
 })
 
@@ -7209,6 +7224,54 @@ adminRouter.get('/billing/summary', async (_req, res) => {
     console.error('admin/billing/summary', e)
     res.status(500).json({ ok: false, error: 'Erreur synthèse billing.' })
   }
+})
+
+adminRouter.get('/runtime-mode', async (_req, res) => {
+  const stripeMode = STRIPE_CHECKOUT_ENABLED && STRIPE_SECRET_KEY.startsWith('sk_test_')
+    ? 'test'
+    : STRIPE_CHECKOUT_ENABLED
+      ? 'live_or_custom'
+      : 'disabled'
+  const environment = VRYX_BILLING_MODE === 'admin_credit' && !STRIPE_CHECKOUT_ENABLED
+    ? 'DEV / STAGING'
+    : IS_PRODUCTION
+      ? 'PRODUCTION'
+      : 'DEVELOPMENT'
+  res.json({
+    ok: true,
+    environment,
+    investorDemoMode: environment === 'DEV / STAGING',
+    billingMode: VRYX_BILLING_MODE,
+    payment: VRYX_BILLING_MODE === 'admin_credit' ? 'crédits admin' : 'checkout Stripe',
+    enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
+    stripe: {
+      enabled: STRIPE_ENABLED,
+      checkoutEnabled: STRIPE_CHECKOUT_ENABLED,
+      mode: stripeMode,
+      live: stripeMode === 'live_or_custom',
+    },
+    redis: {
+      enabled: process.env.REDIS_ENABLED === '1',
+      requiredInProd: isRedisRequiredInProd(),
+      ready: isRedisReady(),
+    },
+    workerApp: {
+      build: process.env.VRYX_WORKER_APP_BUILD || 'unsigned dev build',
+      signed: process.env.VRYX_WORKER_APP_SIGNED === '1',
+    },
+    workers: {
+      runtime: process.env.VRYX_WORKERS_RUNTIME || (IS_PRODUCTION ? 'systemd' : 'local'),
+    },
+    badges: [
+      { label: 'Investor demo mode', active: environment === 'DEV / STAGING', tone: 'accent' },
+      { label: 'Admin credits', active: VRYX_BILLING_MODE === 'admin_credit', tone: 'success' },
+      { label: 'Credits enforced', active: VRYX_BILLING_ENFORCE_CREDITS, tone: 'success' },
+      { label: 'Stripe disabled', active: !STRIPE_CHECKOUT_ENABLED, tone: 'warning' },
+      { label: 'Redis active', active: isRedisReady(), tone: 'success' },
+      { label: 'Unsigned worker', active: process.env.VRYX_WORKER_APP_SIGNED !== '1', tone: 'warning' },
+      { label: 'Workers systemd', active: (process.env.VRYX_WORKERS_RUNTIME || (IS_PRODUCTION ? 'systemd' : 'local')) === 'systemd', tone: 'success' },
+    ],
+  })
 })
 
 adminRouter.get('/billing/proof', async (_req, res) => {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { AdminShell } from '../components/admin/AdminShell'
+import { AdminRuntimeModeBanner } from '../components/admin/AdminRuntimeModeBanner'
 import { apiJson } from '../lib/api'
 
 type EventItem = {
@@ -79,6 +80,8 @@ export function AdminObservabilityPage() {
 
   return (
     <AdminShell title="Observabilité" subtitle="Erreurs structurées, alertes PM2/systemd et santé du pipeline">
+      <AdminRuntimeModeBanner />
+
       {error ? <div className="mb-5 rounded-xl border border-alert/30 bg-alert/10 p-4 text-sm text-alert">{error}</div> : null}
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">

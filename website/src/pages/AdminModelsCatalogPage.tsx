@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AdminShell } from '../components/admin/AdminShell'
+import { AdminRuntimeModeBanner } from '../components/admin/AdminRuntimeModeBanner'
 import { ModelFamilyLogo } from '../components/ModelFamilyLogo'
 import {
   fetchAdminModels,
@@ -191,6 +192,8 @@ export function AdminModelsCatalogPage() {
         </button>
       }
     >
+      <AdminRuntimeModeBanner />
+
       <div className="space-y-5">
         <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {kpi('Modèles', models.length, `${stats.activeModels} actifs · ${stats.publicModels} publics`)}

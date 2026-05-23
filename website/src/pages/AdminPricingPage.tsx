@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AdminShell } from '../components/admin/AdminShell'
+import { AdminRuntimeModeBanner } from '../components/admin/AdminRuntimeModeBanner'
 import { VryxButton, VryxCard } from '../components/ui/VryxPrimitives'
 import {
   fetchAdminPricingBundle,
@@ -175,6 +176,8 @@ export function AdminPricingPage() {
         ) : null
       }
     >
+      <AdminRuntimeModeBanner />
+
       <div className="mb-4 flex flex-wrap gap-2">
         {tabs.map((item) => (
           <button
