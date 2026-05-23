@@ -1,6 +1,7 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { apiJson } from '../lib/api'
 
 export function RegisterPage() {
   const { register } = useAuth()
@@ -21,6 +22,18 @@ export function RegisterPage() {
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [googleEnabled, setGoogleEnabled] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    apiJson<{ google?: { enabled?: boolean } }>('/api/auth/config').then((result) => {
+      if (!active) return
+      setGoogleEnabled(result.ok ? Boolean(result.data.google?.enabled) : false)
+    })
+    return () => {
+      active = false
+    }
+  }, [])
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault()
@@ -99,16 +112,22 @@ export function RegisterPage() {
             </button>
           </form>
 
-          <div className="mt-6">
-            <button
-              type="button"
-              className="btn-secondary relative flex w-full items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold"
-              onClick={startGoogle}
-            >
-              <img src="/google.webp" alt="" className="h-5 w-5" />
-              Créer avec Google
-            </button>
-          </div>
+          {googleEnabled ? (
+            <div className="mt-6">
+              <button
+                type="button"
+                className="btn-secondary relative flex w-full items-center justify-center gap-2 rounded-lg py-3 text-sm font-semibold"
+                onClick={startGoogle}
+              >
+                <img src="/google.webp" alt="" className="h-5 w-5" />
+                Créer avec Google
+              </button>
+            </div>
+          ) : (
+            <p className="mt-6 rounded-lg border border-border bg-surface px-4 py-3 text-center text-sm text-muted">
+              Connexion Google bientôt disponible.
+            </p>
+          )}
 
           <p className="mt-8 text-center text-sm text-muted">
             Déjà inscrit ?{' '}

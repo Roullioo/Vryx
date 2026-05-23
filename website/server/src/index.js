@@ -4189,6 +4189,15 @@ openAiRouter.post('/chat/completions', async (req, res) => {
 
 app.use('/v1', openAiRouter)
 
+app.get('/api/auth/config', (_req, res) => {
+  res.json({
+    ok: true,
+    google: {
+      enabled: Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET),
+    },
+  })
+})
+
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   const parsed = registerBodySchema.safeParse(req.body)
   if (!parsed.success) {
