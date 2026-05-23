@@ -9,6 +9,7 @@
     "test:inference-metrics": "node scripts/inference-metrics-test.mjs",
     "test:production-readiness": "node scripts/production-readiness-test.mjs",
     "test:pricing-models": "node scripts/pricing-models-api-test.mjs",
+    "test:money-path": "node scripts/money-path-test.mjs",
     "test:p2p-stream": "node scripts/p2p-stream-e2e.mjs",
     "test:worker-command": "node scripts/worker-command-e2e.mjs",
     "gate:production-readiness": "node scripts/production-readiness-gate.mjs",

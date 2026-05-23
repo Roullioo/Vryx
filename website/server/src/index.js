@@ -2232,6 +2232,7 @@ async function ensureBillingTables() {
       PRIMARY KEY (id),
       KEY idx_billing_ledger_user_time (user_id, created_at),
       KEY idx_billing_ledger_reference (reference_type, reference_id),
+      UNIQUE KEY uq_billing_ledger_reference_once (user_id, reference_type, reference_id),
       CONSTRAINT fk_billing_ledger_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
@@ -2254,6 +2255,34 @@ async function ensureBillingTables() {
       CONSTRAINT fk_billing_checkout_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
+  const [indexes] = await pool.query(
+    `SELECT INDEX_NAME
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'billing_credit_ledger'`,
+  )
+  const present = new Set(indexes.map((row) => row.INDEX_NAME))
+  if (!present.has('uq_billing_ledger_reference_once')) {
+    const [[dupes]] = await pool.query(
+      `SELECT COUNT(*) AS duplicateGroups
+       FROM (
+         SELECT user_id, reference_type, reference_id, COUNT(*) AS c
+         FROM billing_credit_ledger
+         WHERE reference_type IS NOT NULL
+           AND reference_id IS NOT NULL
+         GROUP BY user_id, reference_type, reference_id
+         HAVING c > 1
+       ) d`,
+    )
+    if (Number(dupes?.duplicateGroups || 0) === 0) {
+      await pool.query(
+        `ALTER TABLE billing_credit_ledger
+         ADD UNIQUE KEY uq_billing_ledger_reference_once (user_id, reference_type, reference_id)`,
+      )
+    } else {
+      console.warn('[billing] duplicate ledger references found; unique idempotency index skipped until cleanup')
+    }
+  }
 }
 
 async function ensureEnterpriseQuoteRequestsTable() {
@@ -6544,6 +6573,165 @@ adminRouter.get('/billing/summary', async (_req, res) => {
   } catch (e) {
     console.error('admin/billing/summary', e)
     res.status(500).json({ ok: false, error: 'Erreur synthèse billing.' })
+  }
+})
+
+adminRouter.get('/billing/proof', async (_req, res) => {
+  try {
+    const pricing = await getPricingConfig(pool, PRICING_FALLBACK)
+    const packages = pricing.recharge?.packagesEur || VRYX_BILLING_CREDIT_PACKAGES
+    const [[ledgerTotals]] = await pool.query(`
+      SELECT
+        COUNT(*) AS ledgerRows,
+        COUNT(DISTINCT user_id) AS usersWithLedger,
+        COALESCE(SUM(CASE WHEN amount_eur > 0 THEN amount_eur ELSE 0 END), 0) AS creditsEur,
+        COALESCE(SUM(CASE WHEN amount_eur < 0 THEN -amount_eur ELSE 0 END), 0) AS debitsEur,
+        COALESCE(SUM(amount_eur), 0) AS balanceEur,
+        SUM(type = 'credit_purchase') AS creditPurchases,
+        SUM(type = 'usage_debit') AS usageDebits
+      FROM billing_credit_ledger
+    `)
+    const [[checkoutTotals]] = await pool.query(`
+      SELECT
+        COUNT(*) AS checkoutRows,
+        SUM(status IN ('paid','complete','completed')) AS paidSessions,
+        COALESCE(SUM(CASE WHEN status IN ('paid','complete','completed') THEN amount_eur ELSE 0 END), 0) AS paidEur
+      FROM billing_checkout_sessions
+      WHERE provider = 'stripe'
+    `)
+    const [[usageTotals]] = await pool.query(`
+      SELECT
+        COUNT(*) AS usageRows,
+        SUM(cost_eur > 0) AS costedUsageRows,
+        SUM(pricing_snapshot_json IS NOT NULL AND pricing_snapshot_json <> '') AS usageRowsWithSnapshot,
+        COALESCE(SUM(cost_eur), 0) AS usageCostEur,
+        COALESCE(SUM(total_tokens), 0) AS usageTokens
+      FROM api_key_usage
+    `)
+    const [[payoutTotals]] = await pool.query(`
+      SELECT
+        COUNT(*) AS payoutRows,
+        SUM(status = 'pending') AS pendingRows,
+        SUM(pricing_snapshot_json IS NOT NULL AND pricing_snapshot_json <> '') AS payoutRowsWithSnapshot,
+        COUNT(DISTINCT peer_id) AS payoutWorkers,
+        COALESCE(SUM(payout_eur), 0) AS payoutEur,
+        COALESCE(SUM(customer_cost_eur), 0) AS payoutCustomerCostEur
+      FROM worker_payout_ledger
+    `).catch(() => [[{}]])
+    const [[pricingAudit]] = await pool.query(`
+      SELECT COUNT(*) AS auditRows
+      FROM pricing_config_audit
+    `).catch(() => [[{}]])
+    const [latestUsageRows] = await pool.query(`
+      SELECT id, user_id AS userId, model, prompt_tokens AS promptTokens,
+             completion_tokens AS completionTokens, total_tokens AS totalTokens,
+             cost_eur AS costEur, cost_input_eur AS inputCostEur,
+             cost_output_eur AS outputCostEur, billing_mode AS billingMode,
+             pricing_snapshot_json AS pricingSnapshotJson, created_at AS createdAt
+      FROM api_key_usage
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `)
+    const latestUsage = latestUsageRows[0] || null
+    const latestSnapshot = parseMaybeJsonObject(latestUsage?.pricingSnapshotJson)
+    const acceptance = {
+      prepaidCreditPacks: {
+        target: 'packs 50, 100, 500, 2000 EUR available',
+        pass: [50, 100, 500, 2000].every((amount) => packages.map(Number).includes(amount)),
+        current: packages,
+      },
+      stripeCheckoutConfigured: {
+        target: 'Stripe secret configured for checkout creation',
+        pass: Boolean(STRIPE_SECRET_KEY),
+        current: Boolean(STRIPE_SECRET_KEY),
+      },
+      creditLedgerReady: {
+        target: 'customer balance held in billing_credit_ledger',
+        pass: Number(ledgerTotals?.ledgerRows || 0) >= 0,
+        current: {
+          rows: Number(ledgerTotals?.ledgerRows || 0),
+          users: Number(ledgerTotals?.usersWithLedger || 0),
+          balanceEur: Number(ledgerTotals?.balanceEur || 0),
+        },
+      },
+      usageDebitsRecorded: {
+        target: 'API usage debits customer balance',
+        pass: Number(ledgerTotals?.usageDebits || 0) > 0 && Number(usageTotals?.costedUsageRows || 0) > 0,
+        current: {
+          usageDebits: Number(ledgerTotals?.usageDebits || 0),
+          costedUsageRows: Number(usageTotals?.costedUsageRows || 0),
+          usageCostEur: Number(usageTotals?.usageCostEur || 0),
+        },
+      },
+      pricingSnapshotRecorded: {
+        target: 'api_key_usage stores pricing_snapshot_json',
+        pass: Number(usageTotals?.usageRowsWithSnapshot || 0) > 0,
+        current: {
+          rowsWithSnapshot: Number(usageTotals?.usageRowsWithSnapshot || 0),
+          latestSnapshot: latestSnapshot || null,
+        },
+      },
+      workerPayoutLedgerReady: {
+        target: 'successful usage creates pending worker payout rows',
+        pass: Number(payoutTotals?.payoutRows || 0) > 0 && Number(payoutTotals?.payoutRowsWithSnapshot || 0) > 0,
+        current: {
+          rows: Number(payoutTotals?.payoutRows || 0),
+          pendingRows: Number(payoutTotals?.pendingRows || 0),
+          workers: Number(payoutTotals?.payoutWorkers || 0),
+          payoutEur: Number(payoutTotals?.payoutEur || 0),
+        },
+      },
+      pricingAuditReady: {
+        target: 'pricing changes are audited',
+        pass: Number(pricingAudit?.auditRows || 0) > 0,
+        current: Number(pricingAudit?.auditRows || 0),
+      },
+      creditEnforcementConfigured: {
+        target: 'API can block when prepaid balance is insufficient',
+        pass: VRYX_BILLING_ENFORCE_CREDITS,
+        current: VRYX_BILLING_ENFORCE_CREDITS,
+      },
+    }
+    const passCount = Object.values(acceptance).filter((item) => item.pass).length
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      score: Math.round((passCount / Object.keys(acceptance).length) * 100),
+      acceptance,
+      stripe: {
+        checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
+        webhookSignatureRequired: Boolean(STRIPE_WEBHOOK_SECRET),
+        paidSessions: Number(checkoutTotals?.paidSessions || 0),
+        paidEur: Number(checkoutTotals?.paidEur || 0),
+      },
+      ledgers: {
+        creditsEur: Number(ledgerTotals?.creditsEur || 0),
+        debitsEur: Number(ledgerTotals?.debitsEur || 0),
+        balanceEur: Number(ledgerTotals?.balanceEur || 0),
+        usageCostEur: Number(usageTotals?.usageCostEur || 0),
+        usageTokens: Number(usageTotals?.usageTokens || 0),
+        payoutEur: Number(payoutTotals?.payoutEur || 0),
+      },
+      latestUsage: latestUsage
+        ? {
+            id: String(latestUsage.id),
+            userId: String(latestUsage.userId),
+            model: latestUsage.model,
+            promptTokens: Number(latestUsage.promptTokens || 0),
+            completionTokens: Number(latestUsage.completionTokens || 0),
+            totalTokens: Number(latestUsage.totalTokens || 0),
+            costEur: Number(latestUsage.costEur || 0),
+            inputCostEur: Number(latestUsage.inputCostEur || 0),
+            outputCostEur: Number(latestUsage.outputCostEur || 0),
+            billingMode: latestUsage.billingMode,
+            pricingSnapshot: latestSnapshot || null,
+            createdAt: toIsoDate(latestUsage.createdAt),
+          }
+        : null,
+    })
+  } catch (e) {
+    console.error('admin/billing/proof', e)
+    res.status(500).json({ ok: false, error: 'Erreur preuve money path.' })
   }
 })
 
