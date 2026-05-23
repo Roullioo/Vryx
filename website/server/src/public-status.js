@@ -379,13 +379,15 @@ export function registerPublicStatusRoutes(app, options) {
   app.get('/api/public/golden-path-status', async (req, res) => {
     try {
       const hours = Math.max(1, Math.min(168, Number(req.query.hours) || 24))
-      const cacheKey = `public:golden-path-status:v1:${hours}`
-      const cached = await getJsonCache(cacheKey)
-      if (cached) return res.json(cached)
       const goldenModels = String(process.env.VRYX_GOLDEN_PATH_MODELS || 'gemma4:31b,qwen/qwen3.6-35b-a3b,qwen3.6-35b')
         .split(',')
         .map((value) => value.trim())
         .filter(Boolean)
+      const minDecodeTps = Math.max(1, Math.min(200, Number(process.env.VRYX_GOLDEN_MIN_TPS) || 10))
+      const maxTtftP95Ms = Math.max(500, Math.min(120_000, Number(process.env.VRYX_GOLDEN_MAX_TTFT_P95_MS) || 10_000))
+      const cacheKey = `public:golden-path-status:v1:${hours}:${goldenModels.join(',')}:${minDecodeTps}:${maxTtftP95Ms}`
+      const cached = await getJsonCache(cacheKey)
+      if (cached) return res.json(cached)
       const [workerRows, inferenceRows, benchmarkRows] = await Promise.all([
         pool.query(
           `SELECT peer_id AS peerId, model, desired_model AS desiredModel, runtime_backend AS runtimeBackend,
@@ -451,6 +453,8 @@ export function registerPublicStatusRoutes(app, options) {
         inferenceSummary: summarizeInferenceRows(requests),
         benchmarkRows: benchmarks,
         goldenModels,
+        minDecodeTps,
+        maxTtftP95Ms,
       })
       const benchmarkOk = benchmarks.filter((row) => row.status === 'ok' && Number(row.tps || 0) > 0)
       const latestBenchmark = benchmarks[0] || null
