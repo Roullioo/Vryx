@@ -49,6 +49,19 @@ En demo, garder actif :
 - CI verte ;
 - video demo.
 
+Configuration VPS recommandee :
+
+```env
+VRYX_BILLING_MODE=admin_credit
+VRYX_BILLING_ENFORCE_CREDITS=1
+STRIPE_ENABLED=0
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+STRIPE_PUBLISHABLE_KEY=
+REDIS_ENABLED=1
+REDIS_REQUIRED_IN_PROD=1
+```
+
 En post-demo / production, garder dans la roadmap sans les presenter comme termines :
 
 - Stripe live ;

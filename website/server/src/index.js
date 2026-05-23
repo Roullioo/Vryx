@@ -181,6 +181,7 @@ const VRYX_ACCOUNT_MONTHLY_TOKEN_BUDGET = (() => {
   return Math.max(1_000_000, Math.min(5_000_000_000, Math.floor(n)))
 })()
 const VRYX_BILLING_ENFORCE_CREDITS = process.env.VRYX_BILLING_ENFORCE_CREDITS === '1'
+const VRYX_BILLING_MODE = String(process.env.VRYX_BILLING_MODE || 'stripe_test').trim() || 'stripe_test'
 const VRYX_BILLING_CREDIT_PACKAGES = parseCreditPackages(process.env.VRYX_BILLING_CREDIT_PACKAGES_EUR || '20,50,100,250,500,2000')
 const VRYX_APP_BASE_URL = (process.env.VRYX_APP_BASE_URL || CORS_ORIGIN || 'https://vryx.eu').replace(/\/$/, '')
 const AFFILIATE_DEFAULT_COMMISSION_PERCENT = Math.max(0, Math.min(50, Number(process.env.VRYX_AFFILIATE_DEFAULT_COMMISSION_PERCENT || 10)))
@@ -188,6 +189,8 @@ const AFFILIATE_DEFAULT_DURATION_MONTHS = Math.max(1, Math.min(36, Number(proces
 const AFFILIATE_DEFAULT_CLIENT_CAP_EUR = Math.max(0, Number(process.env.VRYX_AFFILIATE_DEFAULT_CLIENT_CAP_EUR || 500))
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || '').trim()
 const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim()
+const STRIPE_ENABLED = process.env.STRIPE_ENABLED !== '0'
+const STRIPE_CHECKOUT_ENABLED = STRIPE_ENABLED && Boolean(STRIPE_SECRET_KEY)
 const VRYX_BENCH_TOKEN = String(process.env.VRYX_BENCH_TOKEN || '').trim()
 const csrfProtection = createCsrfProtection({
   corsOrigins: CORS_ORIGINS,
@@ -4608,8 +4611,9 @@ accountRouter.get('/billing', async (req, res) => {
       ok: true,
       currency: 'EUR',
       balanceEur: await getUserCreditBalance(userId),
+      billingMode: VRYX_BILLING_MODE,
       enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
-      checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
+      checkoutEnabled: STRIPE_CHECKOUT_ENABLED,
       packages: pricing.recharge?.packagesEur || await getBillingCreditPackages(),
       pricing: publicPricingDto(pricing),
       monthUsage: {
@@ -4668,7 +4672,7 @@ accountRouter.post('/billing/checkout', async (req, res) => {
   if (!packages.includes(amountEur)) {
     return res.status(400).json({ error: 'Pack de crédits indisponible.' })
   }
-  if (!STRIPE_SECRET_KEY) {
+  if (!STRIPE_CHECKOUT_ENABLED) {
     return res.status(501).json({ error: 'Checkout Stripe non configuré côté serveur.' })
   }
   try {
@@ -5512,7 +5516,7 @@ function verifyStripeWebhookSignature(req) {
 }
 
 app.post('/api/billing/stripe/webhook', async (req, res) => {
-  if (!STRIPE_SECRET_KEY) return res.status(501).json({ ok: false, error: 'Stripe non configuré.' })
+  if (!STRIPE_CHECKOUT_ENABLED) return res.status(501).json({ ok: false, error: 'Stripe non configuré.' })
   if (!verifyStripeWebhookSignature(req)) return res.status(400).json({ ok: false, error: 'Signature Stripe invalide.' })
   let stripeIdempotencyKey = ''
   try {
@@ -7177,8 +7181,9 @@ adminRouter.get('/billing/summary', async (_req, res) => {
     res.json({
       ok: true,
       currency: 'EUR',
+      billingMode: VRYX_BILLING_MODE,
       enforceCredits: VRYX_BILLING_ENFORCE_CREDITS,
-      checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
+      checkoutEnabled: STRIPE_CHECKOUT_ENABLED,
       packages: pricing.recharge?.packagesEur || VRYX_BILLING_CREDIT_PACKAGES,
       pricing: publicPricingDto(pricing),
       totals: {
@@ -7271,9 +7276,13 @@ adminRouter.get('/billing/proof', async (_req, res) => {
         current: packages,
       },
       stripeCheckoutConfigured: {
-        target: 'Stripe secret configured for checkout creation',
-        pass: Boolean(STRIPE_SECRET_KEY),
-        current: Boolean(STRIPE_SECRET_KEY),
+        target: 'Stripe checkout configured, or staging uses admin credits explicitly',
+        pass: STRIPE_CHECKOUT_ENABLED || VRYX_BILLING_MODE === 'admin_credit',
+        current: {
+          billingMode: VRYX_BILLING_MODE,
+          stripeEnabled: STRIPE_ENABLED,
+          checkoutEnabled: STRIPE_CHECKOUT_ENABLED,
+        },
       },
       creditLedgerReady: {
         target: 'customer balance held in billing_credit_ledger',
@@ -7326,11 +7335,14 @@ adminRouter.get('/billing/proof', async (_req, res) => {
     res.json({
       ok: true,
       generatedAt: new Date().toISOString(),
+      billingMode: VRYX_BILLING_MODE,
       score: Math.round((passCount / Object.keys(acceptance).length) * 100),
       acceptance,
       stripe: {
-        checkoutEnabled: Boolean(STRIPE_SECRET_KEY),
-        webhookSignatureRequired: Boolean(STRIPE_WEBHOOK_SECRET),
+        enabled: STRIPE_ENABLED,
+        checkoutEnabled: STRIPE_CHECKOUT_ENABLED,
+        mode: STRIPE_CHECKOUT_ENABLED && STRIPE_SECRET_KEY.startsWith('sk_test_') ? 'test' : STRIPE_CHECKOUT_ENABLED ? 'live_or_custom' : 'disabled',
+        webhookSignatureRequired: STRIPE_ENABLED && Boolean(STRIPE_WEBHOOK_SECRET),
         paidSessions: Number(checkoutTotals?.paidSessions || 0),
         paidEur: Number(checkoutTotals?.paidEur || 0),
       },

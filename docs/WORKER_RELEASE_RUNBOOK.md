@@ -17,10 +17,15 @@ npm run build
 
 ```bash
 cd AppMacos
+export CSC_IDENTITY_AUTO_DISCOVERY=false
 npm run build:mac:unsigned
 ```
 
 Artefact attendu : `AppMacos/release/mac*/Vryx.app`. Ce build sert aux tests internes. Il n'est pas acceptable pour distribution publique large sans signature Developer ID et notarisation.
+
+Data room wording:
+
+> Worker app packaged in unsigned developer mode. Production signing/notarization planned before public worker acquisition.
 
 ## Build macOS signe/notarise
 
@@ -46,6 +51,15 @@ npm run build:win:signed
 ```
 
 Alternative CI : configurer Azure Trusted Signing via les variables `VRYX_AZURE_TRUSTED_SIGNING_*`. Le script `verify:win-signature` doit passer avant publication.
+
+## Build Windows dev/unsigned
+
+```bash
+cd AppMacos
+npm run build:win
+```
+
+Ce build est acceptable pour test interne ou demo controlee. Il ne doit pas etre presente comme un artefact public signe.
 
 ## Validation release
 
