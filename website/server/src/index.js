@@ -937,23 +937,30 @@ async function estimateEnterpriseQuote(input) {
   const usageBase = euroFromTokens(monthlyTokens, billingRate)
   const offerMultiplier =
     input.offer === 'private_pool' ? 5
-      : input.offer === 'knowledge_ai' ? 3.5
-        : input.offer === 'custom_ai' ? 7
-          : 1.8
+      : input.offer === 'custom_ai' ? 7
+        : 1.8
   const privacyMultiplier =
     input.privacyLevel === 'no_retention' ? 1.45
       : input.privacyLevel === 'private_pool' ? 1.65
         : input.privacyLevel === 'eu_only' ? 1.2
           : 1
+  const slaMultiplier =
+    input.slaTier === 'mission_critical' ? 1.75
+      : input.slaTier === 'business' ? 1.25
+        : 1
+  const modelMultiplier =
+    /70b|405b|large|premium/i.test(String(input.modelChoice || '')) ? 1.55
+      : /35b|a3b/i.test(String(input.modelChoice || '')) ? 1.25
+        : 1
   const dedicatedWorkerBase = Math.max(0, Number(input.dedicatedWorkers || 0)) * 950
   const fineTuningSetup = input.fineTuning ? 4500 : 0
+  const datasetSetup = Math.max(0, Number(input.datasetGb || 0)) * 120
   const monthlyMin =
     input.offer === 'api' ? 250
-      : input.offer === 'knowledge_ai' ? 1500
-        : input.offer === 'private_pool' ? 3500
-          : 6000
-  const monthlyEstimate = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier + dedicatedWorkerBase)
-  const setupEstimate = input.offer === 'api' ? 0 : 2500 + fineTuningSetup
+      : input.offer === 'private_pool' ? 3500
+        : 6000
+  const monthlyEstimate = Math.max(monthlyMin, usageBase * offerMultiplier * privacyMultiplier * slaMultiplier * modelMultiplier + dedicatedWorkerBase)
+  const setupEstimate = input.offer === 'api' ? 0 : 2500 + fineTuningSetup + datasetSetup
   return {
     monthlyEstimateEur: toEuroAmount(monthlyEstimate, 2),
     setupEstimateEur: toEuroAmount(setupEstimate, 2),
@@ -962,6 +969,11 @@ async function estimateEnterpriseQuote(input) {
       monthlyTokens,
       offerMultiplier,
       privacyMultiplier,
+      slaMultiplier,
+      modelMultiplier,
+      modelChoice: input.modelChoice || null,
+      slaTier: input.slaTier || 'standard',
+      datasetGb: Math.max(0, Number(input.datasetGb || 0)),
       dedicatedWorkers: Math.max(0, Number(input.dedicatedWorkers || 0)),
       fineTuning: Boolean(input.fineTuning),
     },
@@ -1060,12 +1072,16 @@ const adminCreditSchema = z.object({
 const enterpriseQuoteSchema = z.object({
   company: z.string().trim().min(2).max(160),
   email: emailSchema,
-  offer: z.enum(['api', 'private_pool', 'knowledge_ai', 'custom_ai']),
+  offer: z.enum(['api', 'private_pool', 'custom_ai']),
+  projectName: z.string().trim().max(160).optional().default(''),
+  modelChoice: z.string().trim().min(2).max(140).optional().default('Qwen/Qwen3.6-35B-A3B'),
+  slaTier: z.enum(['standard', 'business', 'mission_critical']).optional().default('standard'),
   monthlyTokens: z.number().min(1_000_000).max(50_000_000_000),
   latencyTargetMs: z.number().min(250).max(60_000),
   privacyLevel: z.enum(['standard', 'eu_only', 'private_pool', 'no_retention']),
   fineTuning: z.boolean().optional().default(false),
   dedicatedWorkers: z.number().int().min(0).max(128).optional().default(0),
+  datasetGb: z.number().min(0).max(100_000).optional().default(0),
   notes: z.string().trim().max(2000).optional().default(''),
 })
 
@@ -1077,6 +1093,11 @@ const enterpriseQuoteAdminSchema = z.object({
   nextStep: z.string().trim().max(500).nullable().optional(),
   signedDocumentUrl: z.string().trim().max(1000).nullable().optional(),
   notes: z.string().trim().max(5000).nullable().optional(),
+})
+
+const enterpriseProjectBodySchema = z.object({
+  name: z.string().trim().min(2).max(160).optional(),
+  status: z.enum(['scoping', 'dataset_waiting', 'build', 'evaluation', 'live', 'paused', 'closed']).optional().default('scoping'),
 })
 
 const pool = mysql.createPool({
@@ -2320,6 +2341,35 @@ async function ensureEnterpriseQuoteRequestsTable() {
   if (!present.has('next_step')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN next_step VARCHAR(500) NULL`)
   if (!present.has('signed_document_url')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN signed_document_url TEXT NULL`)
   if (!present.has('updated_by_user_id')) await pool.query(`ALTER TABLE enterprise_quote_requests ADD COLUMN updated_by_user_id BIGINT UNSIGNED NULL`)
+}
+
+async function ensureEnterpriseCustomerProjectsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS enterprise_customer_projects (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      quote_id BIGINT UNSIGNED NULL,
+      company VARCHAR(160) NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      name VARCHAR(160) NOT NULL,
+      offer VARCHAR(40) NOT NULL,
+      model_choice VARCHAR(140) NULL,
+      sla_tier VARCHAR(40) NOT NULL DEFAULT 'standard',
+      privacy_level VARCHAR(40) NOT NULL DEFAULT 'standard',
+      dataset_gb DECIMAL(12,2) NOT NULL DEFAULT 0,
+      fine_tuning TINYINT(1) NOT NULL DEFAULT 0,
+      dedicated_workers INT UNSIGNED NOT NULL DEFAULT 0,
+      monthly_estimate_eur DECIMAL(12,2) NOT NULL DEFAULT 0,
+      setup_estimate_eur DECIMAL(12,2) NOT NULL DEFAULT 0,
+      status VARCHAR(40) NOT NULL DEFAULT 'scoping',
+      project_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_enterprise_projects_status (status, updated_at),
+      KEY idx_enterprise_projects_quote (quote_id),
+      CONSTRAINT fk_enterprise_project_quote FOREIGN KEY (quote_id) REFERENCES enterprise_quote_requests(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `)
 }
 
 async function ensureForcedAdmins() {
@@ -6747,6 +6797,7 @@ adminRouter.get('/enterprise/quotes', async (req, res) => {
               q.status, q.commercial_stage AS commercialStage, q.pilot_amount_eur AS pilotAmountEur,
               q.expected_close_date AS expectedCloseDate, q.next_step AS nextStep,
               q.signed_document_url AS signedDocumentUrl, q.notes,
+              q.quote_json AS quoteJson,
               q.created_at AS createdAt, q.updated_at AS updatedAt,
               q.updated_by_user_id AS updatedByUserId, u.email AS updatedByEmail
        FROM enterprise_quote_requests q
@@ -6777,6 +6828,7 @@ adminRouter.get('/enterprise/quotes', async (req, res) => {
         nextStep: row.nextStep || '',
         signedDocumentUrl: row.signedDocumentUrl || '',
         notes: row.notes || '',
+        quote: parseMaybeJsonObject(row.quoteJson),
         createdAt: toIsoDate(row.createdAt),
         updatedAt: toIsoDate(row.updatedAt),
         updatedByUserId: row.updatedByUserId ?? null,
@@ -6825,6 +6877,110 @@ adminRouter.patch('/enterprise/quotes/:id', async (req, res) => {
   } catch (e) {
     console.error('admin/enterprise/quotes patch', e)
     res.status(500).json({ ok: false, error: 'Erreur mise à jour pipeline Enterprise.' })
+  }
+})
+
+adminRouter.get('/enterprise/projects', async (_req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, quote_id AS quoteId, company, email, name, offer, model_choice AS modelChoice,
+              sla_tier AS slaTier, privacy_level AS privacyLevel, dataset_gb AS datasetGb,
+              fine_tuning AS fineTuning, dedicated_workers AS dedicatedWorkers,
+              monthly_estimate_eur AS monthlyEstimateEur, setup_estimate_eur AS setupEstimateEur,
+              status, created_at AS createdAt, updated_at AS updatedAt
+       FROM enterprise_customer_projects
+       ORDER BY updated_at DESC, id DESC
+       LIMIT 200`,
+    )
+    res.json({
+      ok: true,
+      projects: rows.map((row) => ({
+        id: String(row.id),
+        quoteId: row.quoteId == null ? null : String(row.quoteId),
+        company: row.company,
+        email: row.email,
+        name: row.name,
+        offer: row.offer,
+        modelChoice: row.modelChoice || '',
+        slaTier: row.slaTier || 'standard',
+        privacyLevel: row.privacyLevel || 'standard',
+        datasetGb: Number(row.datasetGb || 0),
+        fineTuning: Boolean(row.fineTuning),
+        dedicatedWorkers: Number(row.dedicatedWorkers || 0),
+        monthlyEstimateEur: Number(row.monthlyEstimateEur || 0),
+        setupEstimateEur: Number(row.setupEstimateEur || 0),
+        status: row.status,
+        createdAt: toIsoDate(row.createdAt),
+        updatedAt: toIsoDate(row.updatedAt),
+      })),
+    })
+  } catch (e) {
+    console.error('admin/enterprise/projects', e)
+    res.status(500).json({ ok: false, error: 'Erreur lecture projets Enterprise.' })
+  }
+})
+
+adminRouter.post('/enterprise/quotes/:id/project', async (req, res) => {
+  const parsed = enterpriseProjectBodySchema.safeParse(req.body || {})
+  if (!parsed.success) return res.status(400).json({ ok: false, error: 'Projet invalide.' })
+  try {
+    const [quotes] = await pool.query('SELECT * FROM enterprise_quote_requests WHERE id = :id LIMIT 1', { id: req.params.id })
+    const quote = quotes[0]
+    if (!quote) return res.status(404).json({ ok: false, error: 'Demande introuvable.' })
+    const quoteJson = parseMaybeJsonObject(quote.quote_json)
+    const input = quoteJson.input || {}
+    const name = parsed.data.name || input.projectName || `${quote.company} ${quote.offer}`
+    const [result] = await pool.query(
+      `INSERT INTO enterprise_customer_projects
+         (quote_id, company, email, name, offer, model_choice, sla_tier, privacy_level,
+          dataset_gb, fine_tuning, dedicated_workers, monthly_estimate_eur, setup_estimate_eur,
+          status, project_json)
+       VALUES
+         (:quoteId, :company, :email, :name, :offer, :modelChoice, :slaTier, :privacyLevel,
+          :datasetGb, :fineTuning, :dedicatedWorkers, :monthlyEstimateEur, :setupEstimateEur,
+          :status, :projectJson)`,
+      {
+        quoteId: quote.id,
+        company: quote.company,
+        email: quote.email,
+        name,
+        offer: quote.offer,
+        modelChoice: input.modelChoice || null,
+        slaTier: input.slaTier || 'standard',
+        privacyLevel: quote.privacy_level,
+        datasetGb: Number(input.datasetGb || 0),
+        fineTuning: quote.fine_tuning ? 1 : 0,
+        dedicatedWorkers: Number(quote.dedicated_workers || 0),
+        monthlyEstimateEur: Number(quote.monthly_estimate_eur || 0),
+        setupEstimateEur: Number(quote.setup_estimate_eur || 0),
+        status: parsed.data.status,
+        projectJson: JSON.stringify({
+          source: 'enterprise_quote',
+          quoteId: String(quote.id),
+          input,
+          estimate: quoteJson.estimate || null,
+          deliverables: [
+            'Architecture cible',
+            'Accès API ou pool privé',
+            'Dashboard usage/coûts',
+            input.fineTuning ? 'Plan fine-tuning/évaluation' : 'Runbook inférence',
+          ],
+        }),
+      },
+    )
+    await pool.query(
+      `UPDATE enterprise_quote_requests
+       SET commercial_stage = 'pilot_running',
+           status = CASE WHEN status = 'new' THEN 'contacted' ELSE status END,
+           next_step = COALESCE(NULLIF(next_step, ''), 'Projet client créé dans le pipeline Enterprise.'),
+           updated_by_user_id = :userId
+       WHERE id = :id`,
+      { id: quote.id, userId: req.user?.id || null },
+    )
+    res.json({ ok: true, projectId: String(result.insertId || '') })
+  } catch (e) {
+    console.error('admin/enterprise/quote project', e)
+    res.status(500).json({ ok: false, error: 'Erreur création projet Enterprise.' })
   }
 })
 
@@ -9229,6 +9385,7 @@ async function start() {
   await ensureApiKeyUsageTable()
   await ensureBillingTables()
   await ensureEnterpriseQuoteRequestsTable()
+  await ensureEnterpriseCustomerProjectsTable()
   await ensurePricingAndModelCatalogTables(pool, PRICING_FALLBACK)
   await ensureForcedAdmins()
   nodeMonitor.startSampling()

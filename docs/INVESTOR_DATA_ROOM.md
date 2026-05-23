@@ -24,6 +24,7 @@ Angle investisseur : le coeur technique existe ; la levee finance l'industrialis
 - All credentials used during investor-readiness testing were rotated after validation.
 - Redis/Valkey is used as a speed, coordination and job layer while MariaDB remains the source of truth for users, credits, pricing, usage, payouts and audits.
 - Billing money path auditable : `docs/BILLING_MONEY_PATH.md` et `/api/admin/billing/proof`.
+- Enterprise offers : `docs/ENTERPRISE_OFFERS.md`.
 
 ## Metrics a exposer en pitch
 

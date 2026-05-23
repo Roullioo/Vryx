@@ -25,6 +25,33 @@ type EnterpriseQuote = {
   updatedAt?: string | null
   updatedByEmail?: string | null
   updatedByUserId?: string | number | null
+  quote?: {
+    input?: {
+      projectName?: string
+      modelChoice?: string
+      slaTier?: string
+      datasetGb?: number
+    }
+  }
+}
+
+type EnterpriseProject = {
+  id: string
+  quoteId: string | null
+  company: string
+  email: string
+  name: string
+  offer: string
+  modelChoice: string
+  slaTier: string
+  privacyLevel: string
+  datasetGb: number
+  fineTuning: boolean
+  dedicatedWorkers: number
+  monthlyEstimateEur: number
+  setupEstimateEur: number
+  status: string
+  updatedAt: string | null
 }
 
 const statusLabels: Record<string, string> = {
@@ -62,6 +89,7 @@ function dateTime(value: string | null) {
 
 export function AdminEnterpriseQuotesPage() {
   const [quotes, setQuotes] = useState<EnterpriseQuote[]>([])
+  const [projects, setProjects] = useState<EnterpriseProject[]>([])
   const [editing, setEditing] = useState<EnterpriseQuote | null>(null)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
@@ -69,7 +97,10 @@ export function AdminEnterpriseQuotesPage() {
   useEffect(() => {
     let cancelled = false
     async function load() {
-      const r = await apiJson<{ ok: true; quotes: EnterpriseQuote[] }>('/api/admin/enterprise/quotes')
+      const [r, p] = await Promise.all([
+        apiJson<{ ok: true; quotes: EnterpriseQuote[] }>('/api/admin/enterprise/quotes'),
+        apiJson<{ ok: true; projects: EnterpriseProject[] }>('/api/admin/enterprise/projects'),
+      ])
       if (cancelled) return
       if (r.ok) {
         setQuotes(r.data.quotes)
@@ -77,6 +108,7 @@ export function AdminEnterpriseQuotesPage() {
       } else {
         setError(r.error)
       }
+      if (p.ok) setProjects(p.data.projects)
     }
     void load()
     const id = window.setInterval(load, 30_000)
@@ -117,6 +149,26 @@ export function AdminEnterpriseQuotesPage() {
     setEditing(null)
   }
 
+  async function createProject(quote: EnterpriseQuote) {
+    setSaving(true)
+    setError('')
+    const r = await apiJson<{ ok: true; projectId: string }>(`/api/admin/enterprise/quotes/${encodeURIComponent(quote.id)}/project`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: quote.quote?.input?.projectName || `${quote.company} ${quote.offer}`,
+        status: quote.pilotAmountEur ? 'build' : 'scoping',
+      }),
+    })
+    setSaving(false)
+    if (!r.ok) {
+      setError(r.error)
+      return
+    }
+    const p = await apiJson<{ ok: true; projects: EnterpriseProject[] }>('/api/admin/enterprise/projects')
+    if (p.ok) setProjects(p.data.projects)
+    setQuotes((rows) => rows.map((row) => (row.id === quote.id ? { ...row, commercialStage: 'pilot_running' } : row)))
+  }
+
   return (
     <AdminShell title="Enterprise" subtitle="Demandes commerciales B2B et pipeline estimé">
       {error ? <div className="mb-5 rounded-xl border border-alert/40 bg-alert/8 px-4 py-3 text-sm text-alert">{error}</div> : null}
@@ -127,6 +179,24 @@ export function AdminEnterpriseQuotesPage() {
           <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Lettres d'intérêt</p><p className="mt-1 font-display text-2xl font-bold text-accent">{interestCount}</p></div>
           <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Pilotes payants</p><p className="mt-1 font-display text-2xl font-bold text-success">{paidPilots.length}</p></div>
           <div className="panel p-5"><p className="text-xs uppercase tracking-wide text-muted">Pipeline mensuel</p><p className="mt-1 font-display text-2xl font-bold text-success">{money(pipelineValue)}</p></div>
+        </section>
+        <section className="grid gap-3 lg:grid-cols-3">
+          <div className="panel p-5">
+            <p className="text-xs uppercase tracking-wide text-muted">Projets clients</p>
+            <p className="mt-1 font-display text-2xl font-bold text-fg">{projects.length}</p>
+          </div>
+          {projects.slice(0, 2).map((project) => (
+            <div key={project.id} className="panel p-5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-semibold text-fg">{project.name}</p>
+                  <p className="mt-1 text-xs text-muted">{project.company} · {project.modelChoice || 'modèle à préciser'}</p>
+                </div>
+                <span className="rounded-md bg-success/10 px-2 py-1 text-xs font-semibold text-success">{project.status}</span>
+              </div>
+              <p className="mt-3 font-mono text-sm text-fg">{money(project.monthlyEstimateEur)} / mois · setup {money(project.setupEstimateEur)}</p>
+            </div>
+          ))}
         </section>
         <section className="panel p-5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -161,10 +231,12 @@ export function AdminEnterpriseQuotesPage() {
                     <p className="font-semibold text-fg">{quote.company}</p>
                     <p className="text-xs text-muted">{quote.email}</p>
                     {quote.notes ? <p className="mt-2 max-w-md text-xs text-muted">{quote.notes}</p> : null}
+                    {quote.quote?.input?.projectName ? <p className="mt-2 text-xs font-semibold text-fg">{quote.quote.input.projectName}</p> : null}
                   </td>
                   <td className="px-4 py-3">
                     <span className="rounded-md bg-accent/10 px-2 py-1 text-xs font-semibold text-accent">{quote.offer}</span>
                     <p className="mt-2 text-xs text-muted">{quote.dedicatedWorkers} worker(s) dédié(s) · {quote.fineTuning ? 'fine-tuning' : 'sans fine-tuning'}</p>
+                    <p className="mt-1 max-w-48 truncate text-xs text-muted">{quote.quote?.input?.modelChoice || 'modèle à préciser'} · {quote.quote?.input?.slaTier || 'SLA standard'}</p>
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-fg">{compact(quote.monthlyTokens)} tokens/mois<br />{quote.latencyTargetMs} ms cible</td>
                   <td className="px-4 py-3 text-xs text-muted">{quote.privacyLevel}</td>
@@ -180,9 +252,14 @@ export function AdminEnterpriseQuotesPage() {
                   </td>
                   <td className="px-4 py-3 text-xs text-muted">{dateTime(quote.createdAt)}</td>
                   <td className="px-4 py-3 text-right">
-                    <button type="button" onClick={() => setEditing(quote)} className="rounded-xl border border-border px-3 py-2 text-xs font-semibold text-fg hover:bg-surface">
-                      Qualifier
-                    </button>
+                    <div className="flex flex-col items-end gap-2">
+                      <button type="button" onClick={() => setEditing(quote)} className="rounded-xl border border-border px-3 py-2 text-xs font-semibold text-fg hover:bg-surface">
+                        Qualifier
+                      </button>
+                      <button type="button" disabled={saving || projects.some((project) => project.quoteId === quote.id)} onClick={() => void createProject(quote)} className="rounded-xl bg-accent px-3 py-2 text-xs font-semibold text-on-accent disabled:cursor-not-allowed disabled:opacity-45">
+                        Créer projet
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
