@@ -173,6 +173,10 @@ async function main() {
           VRYX_BENCH_MODEL: targetModel,
           VRYX_BENCH_POOL: 'auto',
           VRYX_BENCH_QUANT: 'q4',
+          VRYX_BENCH_LOAD_MODE: 'shard',
+          VRYX_BENCH_FORCE_DISTRIBUTED: '1',
+          VRYX_BENCH_MIN_COMPUTE_WORKERS: '2',
+          VRYX_DISABLE_MLX_LM_DIRECT: '1',
           VRYX_BENCH_TARGET_TPS: targetTps,
           VRYX_BENCH_TOKENS: process.env.VRYX_MULTIWORKER_BENCH_TOKENS || '128,256',
           VRYX_BENCH_PROMPT:

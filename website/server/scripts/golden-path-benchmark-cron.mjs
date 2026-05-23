@@ -8,6 +8,9 @@ const rootDir = process.env.VRYX_ROOT_DIR || '/var/www/vryx'
 const model = process.env.VRYX_GOLDEN_BENCH_MODEL || 'gemma4:31b'
 const quant = process.env.VRYX_GOLDEN_BENCH_QUANT || 'q4'
 const poolPreference = process.env.VRYX_GOLDEN_BENCH_POOL || 'auto'
+const loadMode = process.env.VRYX_GOLDEN_BENCH_LOAD_MODE || ''
+const forceDistributed = process.env.VRYX_GOLDEN_BENCH_FORCE_DISTRIBUTED || ''
+const minComputeWorkers = process.env.VRYX_GOLDEN_BENCH_MIN_COMPUTE_WORKERS || ''
 const targetTps = Number(process.env.VRYX_GOLDEN_BENCH_TARGET_TPS || 10)
 const baseTokenCounts = parseTokenCounts(process.env.VRYX_GOLDEN_BENCH_TOKENS || '128,256')
 const repeat = Math.max(1, Math.floor(Number(process.env.VRYX_GOLDEN_BENCH_REPEAT || 1)))
@@ -58,6 +61,9 @@ function runBench() {
         VRYX_BENCH_MODEL: model,
         VRYX_BENCH_QUANT: quant,
         VRYX_BENCH_POOL: poolPreference,
+        VRYX_BENCH_LOAD_MODE: loadMode,
+        VRYX_BENCH_FORCE_DISTRIBUTED: forceDistributed,
+        VRYX_BENCH_MIN_COMPUTE_WORKERS: minComputeWorkers,
         VRYX_BENCH_TARGET_TPS: String(targetTps),
         VRYX_BENCH_TOKENS: tokenCounts,
         VRYX_BENCH_PROMPT: prompt,
@@ -162,6 +168,9 @@ async function writeArtifact(bench, parsed, verdict) {
     model,
     quant,
     poolPreference,
+    loadMode,
+    forceDistributed,
+    minComputeWorkers,
     targetTps,
     baseTokenCounts,
     repeat,

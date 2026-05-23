@@ -567,14 +567,18 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 
 def _requires_distributed_shards(model_id: str) -> bool:
-    if "Qwen3.6-35B" in model_id or model_id == "Qwen/Qwen3.6-35B-A3B":
-        return False
     if _env_truthy("VRYX_LLAMA_CPP_DIRECT"):
         return False
-    return (
+    if (
         _env_truthy("VRYX_WORKER_SHARD_ONLY")
         or _env_truthy("VRYX_EXPECT_MODEL_SHARDS_ONLY")
         or _env_truthy("VRYX_DISABLE_MLX_LM_DIRECT")
+    ):
+        return True
+    if "Qwen3.6-35B" in model_id or model_id == "Qwen/Qwen3.6-35B-A3B":
+        return False
+    return (
+        _env_truthy("VRYX_WORKER_SHARD_ONLY")
     )
 
 

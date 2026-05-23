@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_DIR="${SCRIPT_DIR}/python-inference"
 VENV_PATH="${PYTHON_DIR}/venv"
 DAEMON_BIN="${SCRIPT_DIR}/target/release/rust-daemon"
+PREBUILT_DAEMON_BIN="${SCRIPT_DIR}/bin/darwin-arm64/rust-daemon"
 RUNTIME_DAEMON_BIN="${TMPDIR:-/tmp}/vryx-rust-daemon"
 KEYS_DIR="${SCRIPT_DIR}/.vryx-keys-mac"
 
@@ -146,6 +147,11 @@ if free < required:
     sys.exit(43)
 PY
 }
+
+if [[ ! -f "${DAEMON_BIN}" && -x "${PREBUILT_DAEMON_BIN}" ]]; then
+  mkdir -p "${SCRIPT_DIR}/target/release"
+  cp "${PREBUILT_DAEMON_BIN}" "${DAEMON_BIN}"
+fi
 
 if [[ ! -f "${DAEMON_BIN}" || "${SCRIPT_DIR}/rust-daemon/src/main.rs" -nt "${DAEMON_BIN}" || "${SCRIPT_DIR}/rust-daemon/Cargo.toml" -nt "${DAEMON_BIN}" ]]; then
   echo "[*] Compilation du daemon Rust…"
