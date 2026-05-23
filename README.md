@@ -243,6 +243,7 @@ python3 vps_deploy.py
 | [`docs/investor-data-room/README.md`](./docs/investor-data-room/README.md) | Data room investisseur structurée pour lecture non-développeur. |
 | [`docs/SECURITY_ARCHITECTURE_VRYX.md`](./docs/SECURITY_ARCHITECTURE_VRYX.md) | Sécurité API, workers, données et production. |
 | [`docs/COMPLIANCE_AND_DATA_PROTECTION.md`](./docs/COMPLIANCE_AND_DATA_PROTECTION.md) | Protection données, DPA, no-retention, incidents. |
+| [`docs/compliance/README.md`](./docs/compliance/README.md) | Pack conformité B2B : RGPD, retention, logs, datasets, contrats. |
 | [`docs/WORKER_RELEASE_RUNBOOK.md`](./docs/WORKER_RELEASE_RUNBOOK.md) | Build et release worker desktop. |
 
 ---

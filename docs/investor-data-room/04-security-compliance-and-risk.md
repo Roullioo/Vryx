@@ -65,3 +65,12 @@ Key next steps before enterprise contracts:
 
 Reference: `docs/SECURITY_ARCHITECTURE_VRYX.md`.
 
+## Compliance Pack
+
+For regulated buyers, use the dedicated compliance pack:
+
+- `docs/compliance/01-gdpr-processing-register.md`
+- `docs/compliance/02-data-retention-and-deletion-policy.md`
+- `docs/compliance/03-security-controls-and-access-logs.md`
+- `docs/compliance/04-datasets-models-and-ai-use-policy.md`
+- `docs/compliance/05-enterprise-contract-checklist.md`

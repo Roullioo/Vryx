@@ -2,6 +2,8 @@
 
 Derniere mise a jour : 2026-05-22.
 
+> Compliance pack detaille : `docs/compliance/README.md`.
+
 Ce document est une base operationnelle. Il ne remplace pas une validation avocat/DPO, mais il donne les controles attendus pour vendre Vryx en B2B.
 
 ## Donnees traitees
