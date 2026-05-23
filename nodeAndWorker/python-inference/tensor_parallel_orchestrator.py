@@ -322,10 +322,11 @@ def run_row_split_tensor_parallel(peer_ids: list[str]) -> dict[str, Any]:
 
 def _fetch_tp_peers_from_express() -> list[str]:
     """Fallback : interroge l'API Express interne (localhost uniquement) pour les workers live."""
+    internal_token = os.getenv("VRYX_INTERNAL_TOKEN", "vryx-internal-localhost")
     for port in (48953, 4000, 3000):
         try:
             url = f"http://127.0.0.1:{port}/api/internal/live-peers"
-            req = urllib.request.Request(url, method="GET", headers={"X-Internal-Token": "vryx-internal-localhost"})
+            req = urllib.request.Request(url, method="GET", headers={"X-Internal-Token": internal_token})
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 j = json.loads(resp.read().decode("utf-8"))
             if j.get("ok") and isinstance(j.get("peers"), list):

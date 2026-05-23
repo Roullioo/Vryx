@@ -49,6 +49,13 @@ function publicBenchmarkError(error) {
   return 'Benchmark golden path échoué. Détails complets réservés à l’admin.'
 }
 
+function publicMetric(value, { exposeExact = false, bucket = 1000 } = {}) {
+  const n = Number(value) || 0
+  if (exposeExact || n <= 0) return n
+  const step = Math.max(1, Number(bucket) || 1000)
+  return Math.round(n / step) * step
+}
+
 function gpuClass(gpuName, runtimeBackend) {
   const value = `${gpuName || ''} ${runtimeBackend || ''}`.toLowerCase()
   if (value.includes('apple') || value.includes('mlx')) return 'Apple Silicon'
@@ -130,7 +137,8 @@ export function registerPublicStatusRoutes(app, options) {
     try {
       const requestedModel = typeof req.query.model === 'string' ? req.query.model.trim().toLowerCase() : ''
       const exposeWorkerDetails = process.env.VRYX_PUBLIC_EXPOSE_WORKER_DETAILS === '1'
-      const cacheKey = `public:network-status:v1:${requestedModel || 'all'}:${exposeWorkerDetails ? 'details' : 'redacted'}`
+      const exposeBusinessMetrics = process.env.VRYX_PUBLIC_EXPOSE_BUSINESS_METRICS === '1'
+      const cacheKey = `public:network-status:v1:${requestedModel || 'all'}:${exposeWorkerDetails ? 'details' : 'redacted'}:${exposeBusinessMetrics ? 'business' : 'safe'}`
       const cached = await getJsonCache(cacheKey)
       if (cached) return res.json(cached)
       const [workerRows, ledgerRows, sessionRows, apiRows, models] = await Promise.all([
@@ -288,14 +296,19 @@ export function registerPublicStatusRoutes(app, options) {
         ok: true,
         sampledAt: new Date().toISOString(),
         publicExposure: exposeWorkerDetails ? 'worker_details_enabled' : 'redacted',
+        redaction: {
+          workerDetails: exposeWorkerDetails ? 'exact' : 'redacted',
+          businessMetrics: exposeBusinessMetrics ? 'exact' : 'hidden',
+          tokenCounters: exposeWorkerDetails ? 'exact' : 'bucketed',
+        },
         pricing: {
           published: pricingConfig ? Boolean(pricingConfig.pricingPublished) : true,
           minInputEurPerMillion: pricingConfig?.pricingPublished ? Number(pricingConfig.headline?.minInputEurPerMillion ?? effectiveEurPerMillion) : null,
           minOutputEurPerMillion: pricingConfig?.pricingPublished ? Number(pricingConfig.headline?.minOutputEurPerMillion ?? effectiveEurPerMillion) : null,
           eurPerMillionTokens: pricingConfig?.pricingPublished ? effectiveEurPerMillion : null,
           eurPerThousandTokens: pricingConfig?.pricingPublished ? Number((effectiveEurPerMillion / 1000).toFixed(6)) : null,
-          estimatedGrossMarginPercent: grossMarginPercent,
-          workerRewardSharePercent: effectiveWorkerRewardShare,
+          estimatedGrossMarginPercent: exposeBusinessMetrics ? grossMarginPercent : null,
+          workerRewardSharePercent: exposeBusinessMetrics ? effectiveWorkerRewardShare : null,
           volumeDiscounts: pricingConfig?.volumeDiscounts || [],
         },
         network: {
@@ -305,9 +318,9 @@ export function registerPublicStatusRoutes(app, options) {
           workersHealthy: healthyWorkers,
           uptimePercent,
           modelsReady: publicModels.filter((model) => model.ready).length,
-          tokens1h: Number(ledger.tokens1h || 0),
-          tokens24h,
-          tokens30d: Number(ledger.tokens30d || 0),
+          tokens1h: publicMetric(ledger.tokens1h, { exposeExact: exposeWorkerDetails }),
+          tokens24h: publicMetric(tokens24h, { exposeExact: exposeWorkerDetails }),
+          tokens30d: publicMetric(ledger.tokens30d, { exposeExact: exposeWorkerDetails }),
           activeWorkers24h: Number(ledger.activeWorkers24h || 0),
           activeSessionSamples24h: sessions.length,
           tpsActiveAvg: activeTps.length ? Number((activeTps.reduce((sum, value) => sum + value, 0) / activeTps.length).toFixed(3)) : 0,
@@ -319,16 +332,16 @@ export function registerPublicStatusRoutes(app, options) {
           ttftP95Ms: percentile(ttftSamples, 95),
           pingP50Ms: percentile(pingSamples, 50),
           pingP95Ms: percentile(pingSamples, 95),
-          revenue24h,
-          workerRewards24h,
-          infraCost24h,
-          electricityCost24h,
-          netMargin24h,
-          costPerTokenEur,
-          estimatedNetMarginPercent: revenue24h > 0 ? Number(((netMargin24h / revenue24h) * 100).toFixed(2)) : 0,
-          apiRequests24h: Number(api.apiRequests24h || 0),
-          apiTokens24h: Number(api.apiTokens24h || 0),
-          apiRevenue24h: Number(api.apiRevenue24h || 0),
+          revenue24h: exposeBusinessMetrics ? revenue24h : null,
+          workerRewards24h: exposeBusinessMetrics ? workerRewards24h : null,
+          infraCost24h: exposeBusinessMetrics ? infraCost24h : null,
+          electricityCost24h: exposeBusinessMetrics ? electricityCost24h : null,
+          netMargin24h: exposeBusinessMetrics ? netMargin24h : null,
+          costPerTokenEur: exposeBusinessMetrics ? costPerTokenEur : null,
+          estimatedNetMarginPercent: exposeBusinessMetrics && revenue24h > 0 ? Number(((netMargin24h / revenue24h) * 100).toFixed(2)) : null,
+          apiRequests24h: publicMetric(api.apiRequests24h, { exposeExact: exposeWorkerDetails, bucket: 10 }),
+          apiTokens24h: publicMetric(api.apiTokens24h, { exposeExact: exposeWorkerDetails }),
+          apiRevenue24h: exposeBusinessMetrics ? Number(api.apiRevenue24h || 0) : null,
         },
         benchmark: {
           label: `${benchmarkModel} / Apple M4 Max`,

@@ -1746,12 +1746,13 @@ def _discover_tp_peers() -> tuple[bool, list[str]]:
 
 
 def _discover_local_heartbeat_peers() -> list[str]:
+    internal_token = os.getenv("VRYX_INTERNAL_TOKEN", "vryx-internal-localhost")
     for port in (48953, 4000):
         try:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/api/internal/live-peers",
                 method="GET",
-                headers={"X-Internal-Token": "vryx-internal-localhost"},
+                headers={"X-Internal-Token": internal_token},
             )
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 j = json.loads(resp.read().decode("utf-8"))

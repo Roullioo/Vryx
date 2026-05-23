@@ -186,6 +186,7 @@ function isUserPipelineChatActive(userId) {
 }
 
 const WORKER_SECRET = String(process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET || '').trim()
+const INTERNAL_TOKEN = String(process.env.VRYX_INTERNAL_TOKEN || (IS_PRODUCTION ? '' : 'vryx-internal-localhost')).trim()
 const RAW_ALLOW_UNSECURE_WORKERS = process.env.ALLOW_UNSECURE_WORKERS === '1'
 const ALLOW_UNSECURE_WORKERS = RAW_ALLOW_UNSECURE_WORKERS && !IS_PRODUCTION
 
@@ -987,6 +988,9 @@ function validateSecurityConfig() {
   if (IS_PRODUCTION) {
     if (!WORKER_SECRET || WORKER_SECRET.length < 32) {
       fatal.push('VRYX_WORKER_SECRET ou WORKER_INFERENCE_DELEGATE_SECRET est obligatoire en production.')
+    }
+    if (!INTERNAL_TOKEN || INTERNAL_TOKEN.length < 32) {
+      fatal.push('VRYX_INTERNAL_TOKEN est obligatoire en production pour les endpoints internes localhost.')
     }
     if (!COOKIE_SECURE) {
       fatal.push('COOKIE_SECURE=true est obligatoire en production.')
@@ -6014,16 +6018,11 @@ app.get('/api/workers/network-stats', async (_req, res) => {
           COUNT(DISTINCT CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) THEN peer_id END) AS activeWorkers30d
        FROM worker_token_ledger`,
     )
-    const [[payoutLedger]] = await pool.query(
-      `SELECT
-          COALESCE(SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) THEN payout_eur ELSE 0 END), 0) AS payout24hEur,
-          COALESCE(SUM(CASE WHEN status IN ('pending','payable') THEN payout_eur ELSE 0 END), 0) AS payoutPendingEur
-       FROM worker_payout_ledger`,
-    ).catch(() => [[{}]])
     const totalTokens30d = Number(ledger.totalTokens30d || 0)
     const activeWorkers30d = Number(ledger.activeWorkers30d || 0)
     return res.json({
       ok: true,
+      exposure: 'public_redacted',
       sampledAt: new Date().toISOString(),
       onlineCount: Number(workers.onlineCount || 0),
       registeredWorkers: Number(workers.registeredWorkers || 0),
@@ -6032,8 +6031,6 @@ app.get('/api/workers/network-stats', async (_req, res) => {
       totalTokens1h: Number(ledger.totalTokens1h || 0),
       totalTokens24h: Number(ledger.totalTokens24h || 0),
       totalTokens30d,
-      workerPayout24hEur: Number(payoutLedger.payout24hEur || 0),
-      workerPayoutPendingEur: Number(payoutLedger.payoutPendingEur || 0),
       avgTokensPerActiveWorker30d: activeWorkers30d > 0 ? Math.round(totalTokens30d / activeWorkers30d) : 0,
     })
   } catch (e) {
@@ -9002,8 +8999,8 @@ app.get('/api/internal/live-peers', async (req, res) => {
   if (!isLocal) {
     return res.status(403).json({ ok: false, error: 'Réservé localhost' })
   }
-  const token = req.headers['x-internal-token'] || ''
-  if (token !== 'vryx-internal-localhost') {
+  const token = String(req.headers['x-internal-token'] || '')
+  if (!INTERNAL_TOKEN || !tokenMatchesSecret(token, INTERNAL_TOKEN)) {
     return res.status(403).json({ ok: false, error: 'Token interne requis' })
   }
   try {
