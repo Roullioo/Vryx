@@ -8,7 +8,24 @@ Le score cible pour considérer Vryx comme candidat prod est `>= 90`.
 
 ```text
 GET /api/admin/production-readiness?hours=24
+GET /api/admin/production-readiness/evidence?hours=24
+GET /api/admin/production-readiness/evidence?hours=24&download=1
 ```
+
+Le dashboard investisseur est disponible côté app sur `/investor-readiness`.
+Il reprend la page admin production readiness et ajoute une preuve JSON téléchargeable
+pour la data room.
+
+Le fichier evidence JSON contient :
+
+- score readiness et grade ;
+- modèles golden path figés ;
+- dernier benchmark golden path ;
+- preuve `99% / 100 requêtes` si disponible ;
+- TPS p50/p95 ;
+- TTFT p95 ;
+- coût EUR par million de tokens quand il est mesuré ;
+- checklist d'acceptance investisseur.
 
 ## Endpoints publics
 
@@ -70,6 +87,20 @@ deploy/systemd/vryx-golden-path-benchmark.timer
 ```
 
 Le timer lance un benchmark toutes les 15 minutes et écrit dans `worker_benchmark_runs`, ce qui alimente ensuite les endpoints publics/admin.
+
+## Gate GitHub golden path
+
+Le workflow `P2P Staging Bench` produit deux artefacts :
+
+- `p2p-staging-bench.jsonl` : sorties brutes par requête ;
+- `p2p-staging-bench-summary.json` : résumé investisseur avec acceptance gates.
+
+Le job échoue si les seuils golden path ne passent pas :
+
+- taux de succès minimum `VRYX_BENCH_MIN_SUCCESS_RATE` (99 par défaut) ;
+- zéro réponse vide par défaut ;
+- TPS cible atteint ;
+- nombre minimum de workers compute atteint.
 
 ## Critères actuels
 

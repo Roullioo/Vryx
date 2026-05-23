@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AdminShell } from '../components/admin/AdminShell'
-import { apiJson } from '../lib/api'
+import { apiJson, apiUrl } from '../lib/api'
 import { displayLabel, displayMaybeCode } from '../lib/displayLabels'
 
 type Readiness = {
@@ -35,6 +35,14 @@ type ReadinessResponse = {
   sampledAt: string
   windowHours: number
   readiness: Readiness
+}
+
+type EvidenceResponse = {
+  ok: boolean
+  acceptance: Record<string, { pass: boolean; target: string; current: unknown }>
+  evidence: {
+    downloadableJson: string
+  }
 }
 
 type InferenceSummaryResponse = {
@@ -108,6 +116,16 @@ function scoreTone(score: number) {
   return 'text-alert'
 }
 
+function evidenceCurrent(value: unknown) {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return '—'
+  }
+}
+
 function MetricCard({ label, value, hint, tone = 'text-fg' }: { label: string; value: string; hint?: string; tone?: string }) {
   return (
     <div className="panel p-5">
@@ -145,24 +163,27 @@ export function AdminProductionReadinessPage() {
   const [inference, setInference] = useState<InferenceSummaryResponse | null>(null)
   const [goldenPath, setGoldenPath] = useState<GoldenPathResponse | null>(null)
   const [benchmarks, setBenchmarks] = useState<BenchmarksResponse | null>(null)
+  const [evidence, setEvidence] = useState<EvidenceResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
     async function load() {
-      const [r, i, g, b] = await Promise.all([
+      const [r, i, g, b, e] = await Promise.all([
         apiJson<ReadinessResponse>('/api/admin/production-readiness?hours=24'),
         apiJson<InferenceSummaryResponse>('/api/admin/inference/summary?hours=24'),
         apiJson<GoldenPathResponse>('/api/public/golden-path-status?hours=24'),
         apiJson<BenchmarksResponse>('/api/public/benchmarks'),
+        apiJson<EvidenceResponse>('/api/admin/production-readiness/evidence?hours=24'),
       ])
       if (cancelled) return
-      const failures = [r, i, g, b].map((item) => (item.ok ? null : item.error)).filter((item): item is string => Boolean(item))
+      const failures = [r, i, g, b, e].map((item) => (item.ok ? null : item.error)).filter((item): item is string => Boolean(item))
       setError(failures[0] || null)
       if (r.ok) setReadiness(r.data)
       if (i.ok) setInference(i.data)
       if (g.ok) setGoldenPath(g.data)
       if (b.ok) setBenchmarks(b.data)
+      if (e.ok) setEvidence(e.data)
     }
     void load()
     const id = window.setInterval(load, 20_000)
@@ -175,6 +196,9 @@ export function AdminProductionReadinessPage() {
   const ready = readiness?.readiness
   const latestBenchmark = goldenPath?.goldenPath.latestBenchmark
   const scoreLabel = ready ? `${ready.score}/100` : '—'
+  const evidencePass = evidence ? Object.values(evidence.acceptance).filter((item) => item.pass).length : 0
+  const evidenceTotal = evidence ? Object.values(evidence.acceptance).length : 0
+  const evidenceItems = evidence ? Object.entries(evidence.acceptance) : []
   const proofItems = useMemo(() => {
     if (!ready) return []
     return [
@@ -184,6 +208,25 @@ export function AdminProductionReadinessPage() {
       `${ready.goldenPath.liveWorkers} worker(s) golden live`,
     ]
   }, [ready])
+
+  async function downloadEvidence() {
+    const path = evidence?.evidence.downloadableJson || '/api/admin/production-readiness/evidence?hours=24&download=1'
+    const res = await fetch(apiUrl(path), { credentials: 'include' })
+    if (!res.ok) {
+      setError('Téléchargement evidence impossible.')
+      return
+    }
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    link.href = url
+    link.download = `vryx-investor-readiness-${stamp}.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+  }
 
   return (
     <AdminShell title="Production readiness" subtitle="Score investisseur, golden path et preuves techniques sur 24 heures">
@@ -208,9 +251,21 @@ export function AdminProductionReadinessPage() {
                 <p className="text-xs font-medium uppercase tracking-wide text-muted">Golden path figé</p>
                 <h2 className="mt-1 font-display text-2xl font-bold text-fg">{ready?.goldenPath.models.join(', ') || '—'}</h2>
               </div>
-              <span className={`rounded-full px-3 py-1 text-xs font-semibold ${goldenPath?.goldenPath.stable99Proven ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
-                {goldenPath?.goldenPath.stable99Proven ? '99% prouvé' : 'preuve incomplète'}
-              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className={`rounded-full px-3 py-1 text-xs font-semibold ${goldenPath?.goldenPath.stable99Proven ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
+                  {goldenPath?.goldenPath.stable99Proven ? '99% prouvé' : 'preuve incomplète'}
+                </span>
+                <span className="rounded-full bg-surface px-3 py-1 text-xs font-semibold text-muted">
+                  evidence {evidencePass}/{evidenceTotal || '—'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void downloadEvidence()}
+                  className="rounded-lg border border-border px-3 py-2 text-xs font-semibold text-fg hover:bg-surface"
+                >
+                  Télécharger preuve JSON
+                </button>
+              </div>
             </div>
             <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               {proofItems.map((item) => (
@@ -246,6 +301,32 @@ export function AdminProductionReadinessPage() {
           <ListPanel title="Blockers" items={(ready?.blockers ?? []).map(displayMaybeCode)} empty="Aucun blocker déclaré." tone="text-alert" />
           <ListPanel title="Warnings" items={(ready?.warnings ?? []).map(displayMaybeCode)} empty="Aucun warning déclaré." tone="text-warning" />
           <ListPanel title="Actions" items={(ready?.actions ?? []).map(displayMaybeCode)} empty="Aucune action requise." tone="text-electric" />
+        </section>
+
+        <section className="rounded-2xl border border-border bg-card p-5 shadow-sm">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-muted">Acceptance investisseur</p>
+              <h2 className="mt-1 font-display text-xl font-bold text-fg">Golden path qui ne doit pas planter</h2>
+            </div>
+            <p className="font-mono text-sm font-semibold text-muted">{evidencePass}/{evidenceTotal || '—'} checks</p>
+          </div>
+          <div className="mt-4 grid gap-3 lg:grid-cols-2">
+            {evidenceItems.length ? evidenceItems.map(([key, item]) => (
+              <div key={key} className="rounded-xl bg-surface p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm font-semibold text-fg">{displayLabel(key)}</p>
+                  <span className={`rounded-full px-2 py-1 text-xs font-semibold ${item.pass ? 'bg-success/10 text-success' : 'bg-warning/10 text-warning'}`}>
+                    {item.pass ? 'OK' : 'À prouver'}
+                  </span>
+                </div>
+                <p className="mt-2 text-xs text-muted">{item.target}</p>
+                <p className="mt-2 break-words font-mono text-xs text-fg">{evidenceCurrent(item.current)}</p>
+              </div>
+            )) : (
+              <div className="rounded-xl bg-surface p-4 text-sm text-muted">Chargement des preuves.</div>
+            )}
+          </div>
         </section>
       </div>
     </AdminShell>

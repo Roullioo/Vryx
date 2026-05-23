@@ -19,6 +19,10 @@ on:
         description: Minimum best TPS required for this staging bench.
         required: false
         default: '0.1'
+      min_success_rate:
+        description: Minimum success rate required across bench runs.
+        required: false
+        default: '99'
   workflow_call:
   push:
     tags:
@@ -40,6 +44,8 @@ jobs:
       VRYX_BENCH_POOL: velocity_mlx
       VRYX_BENCH_TOKENS: ${{ inputs.tokens || vars.VRYX_BENCH_TOKENS || '16,32' }}
       VRYX_BENCH_TARGET_TPS: ${{ inputs.target_tps || vars.VRYX_BENCH_TARGET_TPS || '0.1' }}
+      VRYX_BENCH_MIN_SUCCESS_RATE: ${{ inputs.min_success_rate || vars.VRYX_BENCH_MIN_SUCCESS_RATE || '99' }}
+      VRYX_BENCH_MAX_EMPTY_RESPONSES: ${{ vars.VRYX_BENCH_MAX_EMPTY_RESPONSES || '0' }}
       VRYX_BENCH_HTTP_TIMEOUT: '2400'
     steps:
       - uses: actions/checkout@v4
@@ -61,9 +67,64 @@ jobs:
           set -o pipefail
           python3 nodeAndWorker/scripts/bench_vps_chat_tps.py | tee p2p-staging-bench.jsonl
 
+      - name: Validate golden-path thresholds
+        if: env.VRYX_SKIP_BENCH != '1'
+        run: |
+          python3 - <<'PY'
+          import json, os, statistics, sys
+
+          rows = []
+          with open("p2p-staging-bench.jsonl", "r", encoding="utf-8") as fh:
+              for line in fh:
+                  line = line.strip()
+                  if line:
+                      rows.append(json.loads(line))
+
+          runs = [row for row in rows if "tokens_requested" in row]
+          summary = next((row for row in reversed(rows) if "target_reached" in row), {})
+          ok_runs = [row for row in runs if row.get("ok")]
+          empty = sum(1 for row in runs if row.get("empty_response"))
+          success_rate = (len(ok_runs) / len(runs) * 100.0) if runs else 0.0
+          tps_values = [
+              float(row.get("decode_only_tps") or row.get("decode_tps") or row.get("trace_actual_tps") or row.get("tps_wall") or 0)
+              for row in ok_runs
+          ]
+          ttft_values = [float(row.get("ttft_ms") or 0) for row in ok_runs if float(row.get("ttft_ms") or 0) > 0]
+          cost_per_million = float(os.getenv("VRYX_BENCH_COST_PER_MILLION_EUR", "0") or "0")
+          evidence = {
+              "ok": True,
+              "model": os.getenv("VRYX_BENCH_MODEL"),
+              "generatedAt": os.getenv("GITHUB_RUN_ID"),
+              "runs": len(runs),
+              "successRate": round(success_rate, 3),
+              "emptyResponses": empty,
+              "targetTps": float(os.getenv("VRYX_BENCH_TARGET_TPS", "0")),
+              "tpsP50": round(float(statistics.median(tps_values)), 3) if tps_values else 0.0,
+              "tpsP95": round(sorted(tps_values)[max(0, int(len(tps_values) * 0.95) - 1)], 3) if tps_values else 0.0,
+              "ttftP95Ms": round(sorted(ttft_values)[max(0, int(len(ttft_values) * 0.95) - 1)], 3) if ttft_values else 0.0,
+              "costPerMillionEur": cost_per_million or None,
+              "summary": summary,
+              "acceptance": {
+                  "successRate": success_rate >= float(os.getenv("VRYX_BENCH_MIN_SUCCESS_RATE", "99")),
+                  "zeroEmptyResponses": empty <= int(os.getenv("VRYX_BENCH_MAX_EMPTY_RESPONSES", "0")),
+                  "targetTps": bool(summary.get("target_reached")),
+                  "minComputeWorkers": bool(summary.get("min_compute_workers_reached") is not False),
+              },
+          }
+          evidence["ok"] = all(evidence["acceptance"].values())
+          with open("p2p-staging-bench-summary.json", "w", encoding="utf-8") as fh:
+              json.dump(evidence, fh, ensure_ascii=False, indent=2)
+              fh.write("\\n")
+          print(json.dumps(evidence, ensure_ascii=False, indent=2))
+          if not evidence["ok"]:
+              sys.exit(2)
+          PY
+
       - name: Upload bench artifact
         if: always() && env.VRYX_SKIP_BENCH != '1'
         uses: actions/upload-artifact@v4
         with:
           name: p2p-staging-bench
-          path: p2p-staging-bench.jsonl
+          path: |
+            p2p-staging-bench.jsonl
+            p2p-staging-bench-summary.json

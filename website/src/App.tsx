@@ -58,6 +58,7 @@ export default function App() {
           <Route path="comparatif" element={<ComparePage />} />
           <Route path="status" element={<StatusPage />} />
           <Route path="network" element={<StatusPage />} />
+          <Route path="investor-readiness" element={<AdminProductionReadinessPage />} />
           <Route path="enterprise" element={<EnterprisePage />} />
           <Route path="compte/*" element={<AccountPage />} />
           <Route path="panel/modeles" element={<ModelsPanelPage />} />
