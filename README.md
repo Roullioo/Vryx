@@ -240,6 +240,7 @@ python3 vps_deploy.py
 | [`docs/INFRASTRUCTURE_A_Z.md`](./docs/INFRASTRUCTURE_A_Z.md) | Architecture complète, routes, tables, daemon, runtime. |
 | [`docs/GOLDEN_PATH_PRODUCTION_READINESS.md`](./docs/GOLDEN_PATH_PRODUCTION_READINESS.md) | Contrat golden path, métriques et benchmarks. |
 | [`docs/INVESTOR_DATA_ROOM.md`](./docs/INVESTOR_DATA_ROOM.md) | Positionnement, preuves, roadmap, risques, data room. |
+| [`docs/investor-data-room/README.md`](./docs/investor-data-room/README.md) | Data room investisseur structurée pour lecture non-développeur. |
 | [`docs/SECURITY_ARCHITECTURE_VRYX.md`](./docs/SECURITY_ARCHITECTURE_VRYX.md) | Sécurité API, workers, données et production. |
 | [`docs/COMPLIANCE_AND_DATA_PROTECTION.md`](./docs/COMPLIANCE_AND_DATA_PROTECTION.md) | Protection données, DPA, no-retention, incidents. |
 | [`docs/WORKER_RELEASE_RUNBOOK.md`](./docs/WORKER_RELEASE_RUNBOOK.md) | Build et release worker desktop. |

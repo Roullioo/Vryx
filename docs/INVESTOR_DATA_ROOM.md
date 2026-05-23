@@ -1,5 +1,7 @@
 # Vryx investor data room
 
+> Start here for the structured room: `docs/investor-data-room/README.md`.
+
 Derniere mise a jour : 2026-05-22.
 
 ## Positionnement
