@@ -405,6 +405,7 @@ RELAY_TIMEOUT_BY_METHOD: dict[str, float] = {
     "vryx.shard.pipeline": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_PIPELINE_SEC", 300.0, floor=30.0),
     "vryx.pipeline.forward": _timeout_sec("VRYX_RELAY_TIMEOUT_PIPELINE_FORWARD_SEC", 300.0, floor=30.0),
 }
+RELAY_HTTP_KEEPALIVE_SKIP_METHODS = frozenset(RELAY_TIMEOUT_BY_METHOD)
 
 
 def timeout_for_dtype(dtype: str, default: float = TIMEOUT) -> float:
@@ -2188,7 +2189,7 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
     # falling back would replay the same expensive forward. Use one-shot HTTP
     # for those calls so a transport error is reported exactly once.
     ka = None
-    if RELAY_HTTP_KEEPALIVE and dtype not in ("vryx.shard.pipeline", "vryx.pipeline.forward"):
+    if RELAY_HTTP_KEEPALIVE and dtype not in RELAY_HTTP_KEEPALIVE_SKIP_METHODS:
         ka = _relay_try_http_keepalive(
             url, body, timeout, t0, serialization_ms, len(payload), peer_id, relay_session_id, routing_path,
         )

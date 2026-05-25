@@ -87,6 +87,7 @@ class OrchestratorPatternTests(unittest.TestCase):
             '"micro_decode_budget"',
             "_relay_try_http_keepalive",
             "timeout_for_dtype",
+            "RELAY_HTTP_KEEPALIVE_SKIP_METHODS",
             '"vryx.shard.init": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_INIT_SEC", 120.0',
             'decode_microbatch") is True',
             "relay_iteration_guard",
@@ -144,6 +145,8 @@ class ImportSmoke(unittest.TestCase):
         self.assertEqual(m.timeout_for_dtype("vryx.shard.build"), 900.0)
         self.assertEqual(m.timeout_for_dtype("vryx.pipeline.forward"), 300.0)
         self.assertEqual(m.timeout_for_dtype("vryx.shard.decode"), 120.0)
+        self.assertIn("vryx.shard.init", m.RELAY_HTTP_KEEPALIVE_SKIP_METHODS)
+        self.assertIn("vryx.pipeline.forward", m.RELAY_HTTP_KEEPALIVE_SKIP_METHODS)
 
 
 if __name__ == "__main__":
