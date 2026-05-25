@@ -36,6 +36,19 @@ fi
 MLX_STRICT="${VRYX_MLX_STRICT:-1}"
 CLEAR_WORKER_CACHE="${VRYX_CLEAR_WORKER_CACHE:-0}"
 MLX_CACHE_DIR="${VRYX_WORKER_SHARD_CACHE_DIR:-${HOME}/.vryx-worker-shards-mlx}"
+# Workers Mac Velocity = shards distribués par défaut. Sans ces garde-fous,
+# inference_server démarre un préwarm MLX direct résident et peut OOM sur M1 16GB
+# avant même le premier vryx.shard.init.
+WORKER_SHARD_ONLY="${VRYX_WORKER_SHARD_ONLY:-1}"
+EXPECT_MODEL_SHARDS_ONLY="${VRYX_EXPECT_MODEL_SHARDS_ONLY:-${WORKER_SHARD_ONLY}}"
+DISABLE_MLX_LM_DIRECT="${VRYX_DISABLE_MLX_LM_DIRECT:-${WORKER_SHARD_ONLY}}"
+if [[ -n "${VRYX_MLX_PREWARM:-}" ]]; then
+  MLX_PREWARM="${VRYX_MLX_PREWARM}"
+elif [[ "${WORKER_SHARD_ONLY}" == "1" || "${WORKER_SHARD_ONLY}" == "true" ]]; then
+  MLX_PREWARM=0
+else
+  MLX_PREWARM=1
+fi
 # QUIC P2P caché : 0 par défaut sur Mac (moins de cas « processus UE » / blocages au démarrage).
 WORKER_HIDDEN_QUIC="${VRYX_WORKER_HIDDEN_QUIC:-0}"
 # Bench WAN stable : éviter d'apprendre des IP privées distantes (les circuits relay restent autorisés).
@@ -224,6 +237,11 @@ start_one() {
   # Variables Velocity MLX
   VRYX_ENABLE_MLX_RUNTIME=1 \
   VRYX_ENABLE_MLX_KERNELS=1 \
+  VRYX_WORKER_MODEL="${MODEL_ID}" \
+  VRYX_WORKER_SHARD_ONLY="${WORKER_SHARD_ONLY}" \
+  VRYX_EXPECT_MODEL_SHARDS_ONLY="${EXPECT_MODEL_SHARDS_ONLY}" \
+  VRYX_DISABLE_MLX_LM_DIRECT="${DISABLE_MLX_LM_DIRECT}" \
+  VRYX_MLX_PREWARM="${MLX_PREWARM}" \
   VRYX_MLX_WEIGHT_DTYPE="${VRYX_MLX_WEIGHT_DTYPE:-fp16}" \
   VRYX_MLX_MAX_SHARD_GB="${MLX_MAX_SHARD_GB}" \
   VRYX_MLX_SCAN_BACKEND="${VRYX_MLX_SCAN_BACKEND:-chunked}" \
@@ -278,6 +296,10 @@ start_one() {
   nohup env \
     "VRYX_WORKER_SECRET=${WORKER_SECRET}" \
     VRYX_RUNTIME_BACKEND=mlx \
+    VRYX_WORKER_SHARD_ONLY="${WORKER_SHARD_ONLY}" \
+    VRYX_EXPECT_MODEL_SHARDS_ONLY="${EXPECT_MODEL_SHARDS_ONLY}" \
+    VRYX_DISABLE_MLX_LM_DIRECT="${DISABLE_MLX_LM_DIRECT}" \
+    VRYX_MLX_PREWARM="${MLX_PREWARM}" \
     VRYX_SUPPORTS_MLX=1 \
     VRYX_SUPPORTS_Q4_WEIGHTS=1 \
     VRYX_MLX_WEIGHT_DTYPE="${VRYX_MLX_WEIGHT_DTYPE:-fp16}" \
@@ -310,7 +332,7 @@ for i in $(seq 1 "${WORKER_COUNT}"); do
 done
 
 echo ""
-echo "[OK] ${WORKER_COUNT} workers MLX lancés (Metal / Apple Silicon, strict=${MLX_STRICT}, poids=${VRYX_MLX_WEIGHT_DTYPE:-fp16}, shard_max=${MLX_MAX_SHARD_GB}GB, scan=${VRYX_MLX_SCAN_BACKEND:-chunked}, setsid=${USE_SETSID}, pause_inter_workers=${INTER_WORKER_DELAY}s)."
+echo "[OK] ${WORKER_COUNT} workers MLX lancés (Metal / Apple Silicon, strict=${MLX_STRICT}, poids=${VRYX_MLX_WEIGHT_DTYPE:-fp16}, shard_max=${MLX_MAX_SHARD_GB}GB, scan=${VRYX_MLX_SCAN_BACKEND:-chunked}, shard_only=${WORKER_SHARD_ONLY}, direct_mlx_disabled=${DISABLE_MLX_LM_DIRECT}, prewarm=${MLX_PREWARM}, setsid=${USE_SETSID}, pause_inter_workers=${INTER_WORKER_DELAY}s)."
 echo "    Logs Python : /tmp/vryx-mac-mlx-worker{1..${WORKER_COUNT}}-python.log"
 echo "    Logs Rust   : /tmp/vryx-mac-mlx-worker{1..${WORKER_COUNT}}-rust.log"
 echo "    Greedy MLX rapide : pénalité répétition 1.0 ; QUIC P2P caché désactivé par défaut."
