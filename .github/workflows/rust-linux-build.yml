@@ -12,6 +12,8 @@ jobs:
     name: cargo fmt, clippy, test, release build
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
 
     steps:
       - name: Checkout
@@ -40,4 +42,19 @@ jobs:
         run: cargo test -p rust-daemon
 
       - name: Build rust-daemon
-        run: cargo build --release -p rust-daemon
+        run: cargo build --release --locked -p rust-daemon
+
+      - name: Package rust-daemon artifact
+        run: |
+          mkdir -p dist
+          cp target/release/rust-daemon dist/rust-daemon-linux-x86_64
+          sha256sum dist/rust-daemon-linux-x86_64 > dist/rust-daemon-linux-x86_64.sha256
+
+      - name: Upload rust-daemon Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-daemon-linux-x86_64
+          path: |
+            dist/rust-daemon-linux-x86_64
+            dist/rust-daemon-linux-x86_64.sha256
+          if-no-files-found: error
