@@ -592,7 +592,9 @@ fn extract_transport_trace_from_response_data(data: &[u8]) -> serde_json::Value 
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
         return serde_json::Value::Null;
     };
-    v.get("transport_trace").cloned().unwrap_or(serde_json::Value::Null)
+    v.get("transport_trace")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 async fn call_local_inference_once(
@@ -986,7 +988,10 @@ fn resolve_worker_secret() -> String {
         .to_string()
 }
 
-fn apply_worker_secret_headers(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+fn apply_worker_secret_headers(
+    req: reqwest::RequestBuilder,
+    token: &str,
+) -> reqwest::RequestBuilder {
     if token.is_empty() {
         req
     } else {
@@ -1040,7 +1045,10 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                                     "mode": payload.mode,
                                     "command_ack": { "id": cmd_id, "status": "acknowledged" }
                                 });
-                                let ack_req = apply_worker_secret_headers(client.post(&ack_url).json(&ack_payload), &token);
+                                let ack_req = apply_worker_secret_headers(
+                                    client.post(&ack_url).json(&ack_payload),
+                                    &token,
+                                );
                                 let _ = ack_req.send().await;
                                 std::process::exit(0);
                             }
@@ -1058,7 +1066,10 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                                     "mode": payload.mode,
                                     "command_ack": { "id": cmd_id, "status": "acknowledged" }
                                 });
-                                let ack_req = apply_worker_secret_headers(client.post(&ack_url).json(&ack_payload), &token);
+                                let ack_req = apply_worker_secret_headers(
+                                    client.post(&ack_url).json(&ack_payload),
+                                    &token,
+                                );
                                 let _ = ack_req.send().await;
                             }
                             "hot_reload_python" => {
@@ -1133,7 +1144,10 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                                         "error": ack_error,
                                     }
                                 });
-                                let ack_req = apply_worker_secret_headers(client.post(&ack_url).json(&ack_payload), &token);
+                                let ack_req = apply_worker_secret_headers(
+                                    client.post(&ack_url).json(&ack_payload),
+                                    &token,
+                                );
                                 let _ = ack_req.send().await;
                             }
                             _ => {
