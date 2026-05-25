@@ -31,6 +31,18 @@ use tokio::io::AsyncWriteExt;
 use tokio::time;
 use tower_http::cors::CorsLayer;
 
+fn daemon_commit() -> &'static str {
+    option_env!("VRYX_DAEMON_GIT_COMMIT").unwrap_or("unknown")
+}
+
+fn daemon_version_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "vryx-daemon",
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": daemon_commit(),
+    })
+}
+
 // ============================================================
 //  Codec P2P personnalisé (512 MB pour les poids de modèle)
 // ============================================================
@@ -1402,6 +1414,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let my_peer_id = *swarm.local_peer_id();
     println!("\n╔══════════════════════════════════════════════╗");
     println!("║  Vryx Node  │  mode = {}  ", args.mode);
+    println!("║  vryx-daemon commit: {}", daemon_commit());
     println!("║  PeerId : {}", my_peer_id);
     println!("╚══════════════════════════════════════════════╝\n");
 
@@ -1535,8 +1548,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let relay_peer_transports = Arc::clone(&peer_transports);
         let quic_requested_status = hidden_quic_requested;
         let registry_status_peers = Arc::clone(&initiator_registry_workers);
+        let my_peer_id_health = my_peer_id.to_string();
+        let mode_health = args.mode.clone();
 
         let app = Router::new()
+            .route("/api/health", get(move || {
+                let peer_id = my_peer_id_health.clone();
+                let mode = mode_health.clone();
+                async move {
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "peer_id": peer_id,
+                        "daemon_mode": mode,
+                        "daemon_version": daemon_version_json(),
+                    }))
+                }
+            }))
             .route("/api/status", get(move || {
                 let connections = active_status_peers.lock().unwrap().len();
                 let t_in = tokens_in.load(Ordering::Relaxed);
@@ -1554,6 +1581,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let mut j = serde_json::json!({
                         "peer_id": my_peer_id_str,
                         "daemon_mode": mode_s,
+                        "daemon_version": daemon_version_json(),
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "commit": daemon_commit(),
                         "active_connections": connections,
                         "tokens_in": t_in,
                         "tokens_out": t_out,
