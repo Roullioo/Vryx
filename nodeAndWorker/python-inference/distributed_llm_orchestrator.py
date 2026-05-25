@@ -61,6 +61,7 @@ import hashlib
 import http.client
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -77,6 +78,11 @@ import urllib.request
 import numpy as np
 
 from batching import BatchQueue, batching_trace
+
+try:
+    import redis  # type: ignore
+except Exception:
+    redis = None
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -105,6 +111,9 @@ HF_DOWNLOAD_ALLOW_PATTERNS = [
 ]
 RELAY_URL = os.environ.get("VRYX_P2P_RELAY_URL", "http://127.0.0.1:3031").rstrip("/")
 DECODE_MICROBATCH = os.environ.get("VRYX_DECODE_MICROBATCH", "1").strip().lower() not in ("0", "false", "no", "off")
+PIPELINE_DECODE_MICROBATCH = os.environ.get("VRYX_PIPELINE_DECODE_MICROBATCH", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 try:
     DECODE_MICROBATCH_CAP = max(2, min(64, int(os.environ.get("VRYX_DECODE_MICROBATCH_CAP", "32") or "32")))
 except (TypeError, ValueError):
@@ -385,6 +394,16 @@ SHARD_BUILD_TIMEOUT = _timeout_sec("VRYX_SHARD_BUILD_TIMEOUT_SEC", 600.0)
 SHARD_READY_TIMEOUT = _timeout_sec("VRYX_SHARD_READY_TIMEOUT_SEC", min(180.0, SHARD_BUILD_TIMEOUT), floor=5.0)
 SHARD_STATUS_TIMEOUT = _timeout_sec("VRYX_SHARD_STATUS_TIMEOUT_SEC", 120.0, floor=20.0)
 MLX_DIRECT_RELAY_TIMEOUT = _timeout_sec("VRYX_MLX_DIRECT_RELAY_TIMEOUT_SEC", 30.0, floor=5.0)
+RELAY_TIMEOUT_BY_METHOD: dict[str, float] = {
+    "vryx.shard.status": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_STATUS_SEC", 15.0, floor=5.0),
+    "vryx.shard.init": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_INIT_SEC", 120.0, floor=15.0),
+    "vryx.shard.load": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_LOAD_SEC", 900.0, floor=30.0),
+    "vryx.shard.build": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_BUILD_SEC", 900.0, floor=30.0),
+    "vryx.shard.prefill": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_PREFILL_SEC", 300.0, floor=30.0),
+    "vryx.shard.decode": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_DECODE_SEC", 120.0, floor=15.0),
+    "vryx.shard.pipeline": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_PIPELINE_SEC", 300.0, floor=30.0),
+    "vryx.pipeline.forward": _timeout_sec("VRYX_RELAY_TIMEOUT_PIPELINE_FORWARD_SEC", 300.0, floor=30.0),
+}
 SHARD_TTL = int(os.environ.get("VRYX_DIST_SHARD_TTL", "1800"))
 POOL_TTL = int(os.environ.get("VRYX_POOL_TTL_SEC", str(max(SHARD_TTL, 24 * 3600))))
 KEEP_POOL_SHARDS = os.environ.get("VRYX_POOL_KEEP_SHARDS", "true").lower() not in ("0", "false", "no")
@@ -425,7 +444,20 @@ CHUNKED_PREFILL = os.environ.get("VRYX_CHUNKED_PREFILL", "0").lower() in ("1", "
 PREFILL_CHUNK_TOKENS = int(os.environ.get("VRYX_PREFILL_CHUNK_TOKENS", "512"))
 RING_ATTENTION = os.environ.get("VRYX_RING_ATTENTION", "0").lower() in ("1", "true", "yes")
 PIPELINE_OVERLAP = os.environ.get("VRYX_PIPELINE_OVERLAP", "0").lower() in ("1", "true", "yes")
+PREFILL_PIPELINE_OVERLAP = os.environ.get("VRYX_PREFILL_PIPELINE_OVERLAP", "0").lower() in ("1", "true", "yes")
+BENCH_MINIMAL_PROMPT_TEMPLATE = os.environ.get("VRYX_BENCH_MINIMAL_PROMPT_TEMPLATE", "0").lower() in ("1", "true", "yes")
+PIPELINE_KEEP_WARM = os.environ.get("VRYX_PIPELINE_KEEP_WARM", "1").strip().lower() not in ("0", "false", "no", "off")
+PIPELINE_SESSION_TTL_SEC = max(30, int(os.environ.get("VRYX_PIPELINE_SESSION_TTL_SEC", "3600") or "3600"))
+PIPELINE_PREWARM_MODEL = os.environ.get("VRYX_PIPELINE_PREWARM_MODEL", "Qwen/Qwen3.6-35B-A3B").strip()
+PIPELINE_REQUIRE_WARM_SESSION = os.environ.get("VRYX_PIPELINE_REQUIRE_WARM_SESSION", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+PIPELINE_SESSION_REDIS_URL = (
+    os.environ.get("VRYX_PIPELINE_SESSION_REDIS_URL", "").strip()
+    or os.environ.get("REDIS_URL", "").strip()
+)
 PERSISTENT_RELAY = os.environ.get("VRYX_PERSISTENT_RELAY", "1").lower() not in ("0", "false", "no")
+RELAY_HTTP_KEEPALIVE = os.environ.get("VRYX_RELAY_HTTP_KEEPALIVE", "1").lower() not in ("0", "false", "no")
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
 POOL_PREFERENCE_DEFAULT = os.environ.get("VRYX_POOL_PREFERENCE", "auto").lower()
@@ -848,6 +880,12 @@ def _apply_preferred_worker_order(
     return ordered, ordered, missing
 
 
+def _preserve_explicit_pipeline_order() -> bool:
+    explicit = os.environ.get("VRYX_DIST_PEER_IDS", "").strip()
+    opt = os.environ.get("VRYX_PRESERVE_PIPELINE_ORDER", "").strip().lower()
+    return bool(explicit) or opt in ("1", "true", "yes", "on")
+
+
 def _large_model_requires_real_accelerators() -> bool:
     if os.environ.get("VRYX_ALLOW_SHARED_ACCELERATOR_PEERS", "0").strip().lower() in ("1", "true", "yes", "on"):
         return False
@@ -1029,12 +1067,18 @@ def _assert_shard_cache_disk() -> tuple[bool, str]:
 def _relay_timeout_payload(
     peer_id: str,
     dtype: str,
+    request_id: str,
     relay_session_id: str,
     timeout: float,
     elapsed_ms: int,
     payload_size: int,
     routing_path: list | None,
     detail: str = "",
+    worker_seen_request: Optional[bool] = None,
+    p2p_transport: str = "unknown",
+    route_mode: str = "initiator_http_relay",
+    axum_ms: Optional[int] = None,
+    libp2p_send_ms: Optional[int] = None,
 ) -> dict[str, Any]:
     hop = _short(peer_id)
     session_label = relay_session_id[:20] if relay_session_id else "n/a"
@@ -1055,7 +1099,22 @@ def _relay_timeout_payload(
         "target_peer": peer_id,
         "routing_path": route,
         "session_id": relay_session_id,
+        "request_id": request_id,
         "persistent_relay": PERSISTENT_RELAY,
+        "relay_trace": {
+            "method": dtype,
+            "peer_id": peer_id,
+            "timeout_ms": int(timeout * 1000),
+            "elapsed_ms": elapsed_ms,
+            "request_id": request_id,
+            "session_id": relay_session_id,
+            "payload_bytes": payload_size,
+            "route_mode": route_mode,
+            "p2p_transport": p2p_transport,
+            "axum_ms": axum_ms,
+            "libp2p_send_ms": libp2p_send_ms,
+            "worker_seen_request": worker_seen_request,
+        },
     }
 
 # ── Modèle VPS (singleton) ─────────────────────────────────────────────────────
@@ -1138,7 +1197,14 @@ def _live_worker_model_id() -> Optional[str]:
 
 def _activate_model_from_options(options: Optional[dict[str, Any]]) -> str:
     opts = options or {}
-    requested = opts.get("model_id") or opts.get("modelId") or _live_worker_model_id()
+    requested = opts.get("model_id") or opts.get("modelId")
+    if not requested:
+        lock_env = os.environ.get("VRYX_DIST_MODEL_LOCK", "").strip().lower()
+        explicit_peers = bool(os.environ.get("VRYX_DIST_PEER_IDS", "").strip())
+        if lock_env in ("1", "true", "yes", "on") or explicit_peers:
+            requested = MODEL_ID_DEFAULT
+        else:
+            requested = _live_worker_model_id()
     return _activate_model_id(requested)
 
 
@@ -1271,6 +1337,23 @@ def _format_prompt_for_model(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         return f"Question: {prompt}\nRéponse:"
+    if BENCH_MINIMAL_PROMPT_TEMPLATE:
+        try:
+            try:
+                return tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                return tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+        except Exception:
+            return prompt
 
     system_msg = (
         "Tu es l'assistant Vryx, une interface de chat connectée au réseau de calcul Vryx. "
@@ -2052,10 +2135,20 @@ def _relay_try_http_keepalive(
 
 def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOUT,
                routing_path: list | None = None) -> dict:
+    trace_ctx = _current_trace_ctx()
+    if trace_ctx is not None:
+        trace_ctx.count_call("/api/p2p/relay")
+        trace_ctx.count_call("request_response_send_request")
+        if dtype in trace_ctx.call_counts:
+            trace_ctx.count_call(dtype)
     url = f"{RELAY_URL}/api/p2p/relay"
     t0 = time.perf_counter()
     serialization_start = time.perf_counter()
     relay_session_id = ""
+    relay_request_id = hashlib.sha1(
+        f"{peer_id}:{dtype}:{time.time_ns()}:{len(payload)}".encode("utf-8")
+    ).hexdigest()[:16]
+    timeout = float(RELAY_TIMEOUT_BY_METHOD.get(dtype, timeout))
     try:
         payload_obj = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
         if isinstance(payload_obj, dict):
@@ -2068,12 +2161,19 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
         "data_b64": base64.standard_b64encode(payload).decode("ascii"),
         "routing_path": routing_path or [],
         "session_id": relay_session_id,
+        "request_id": relay_request_id,
         "persistent_relay": PERSISTENT_RELAY,
     }).encode("utf-8")
     serialization_ms = int((time.perf_counter() - serialization_start) * 1000)
-    ka = _relay_try_http_keepalive(
-        url, body, timeout, t0, serialization_ms, len(payload), peer_id, relay_session_id, routing_path,
-    )
+    # Long pipeline forwards can spend tens of seconds inside a slow worker.
+    # If a stale HTTP keep-alive socket is closed after the request was sent,
+    # falling back would replay the same expensive forward. Use one-shot HTTP
+    # for those calls so a transport error is reported exactly once.
+    ka = None
+    if RELAY_HTTP_KEEPALIVE and dtype not in ("vryx.shard.pipeline", "vryx.pipeline.forward"):
+        ka = _relay_try_http_keepalive(
+            url, body, timeout, t0, serialization_ms, len(payload), peer_id, relay_session_id, routing_path,
+        )
     if ka is not None:
         return ka
     req = urllib.request.Request(
@@ -2093,21 +2193,33 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
             return result
     except urllib.error.HTTPError as e:
         body_err = ""
+        parsed_err: dict[str, Any] = {}
         try:
             body_err = e.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
+        try:
+            parsed_err = json.loads(body_err or "{}")
+        except Exception:
+            parsed_err = {}
         lowered = body_err.lower()
         if e.code in (502, 504) and ("timeout" in lowered or "timed out" in lowered or "délai" in lowered):
+            relay_trace = parsed_err.get("relay_trace") if isinstance(parsed_err.get("relay_trace"), dict) else {}
             return _relay_timeout_payload(
                 peer_id,
                 dtype,
+                relay_request_id,
                 relay_session_id,
                 timeout,
                 int((time.perf_counter() - t0) * 1000),
                 len(payload),
                 routing_path,
                 detail=f"http_{e.code}:{body_err[:160]}",
+                worker_seen_request=relay_trace.get("worker_seen_request"),
+                p2p_transport=str(relay_trace.get("p2p_transport") or "unknown"),
+                route_mode=str(relay_trace.get("route_mode") or "initiator_http_relay"),
+                axum_ms=relay_trace.get("axum_ms"),
+                libp2p_send_ms=relay_trace.get("libp2p_send_ms"),
             )
         return {
             "ok": False,
@@ -2121,6 +2233,7 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
         return _relay_timeout_payload(
             peer_id,
             dtype,
+            relay_request_id,
             relay_session_id,
             timeout,
             int((time.perf_counter() - t0) * 1000),
@@ -2134,6 +2247,7 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
             return _relay_timeout_payload(
                 peer_id,
                 dtype,
+                relay_request_id,
                 relay_session_id,
                 timeout,
                 int((time.perf_counter() - t0) * 1000),
@@ -2269,6 +2383,99 @@ def _run_batch_worker(key: str, peer_id: str, dtype: str, routing_path: list[str
                     item.future.set_error(exc)
 
 
+def _pipeline_micro_budget_from_payload(payload: dict[str, Any]) -> int:
+    try:
+        budget = max(1, int(payload.get("micro_decode_budget") or 1))
+    except (TypeError, ValueError):
+        budget = 1
+    return max(1, min(budget, DECODE_MICROBATCH_CAP))
+
+
+def _pipeline_micro_decode_enabled(payload: dict[str, Any], peers: list[str]) -> bool:
+    if not DECODE_MICROBATCH or not PIPELINE_DECODE_MICROBATCH or len(peers) < 2:
+        return False
+    if int(payload.get("step") or 0) < 1:
+        return False
+    if not bool(payload.get("use_kv_cache", WORKER_KV_CACHE)):
+        return False
+    sampling = payload.get("sampling") if isinstance(payload.get("sampling"), dict) else {}
+    temp = float(sampling.get("temperature", SAMPLING_TEMPERATURE))
+    if temp > 1e-9:
+        return False
+    return _pipeline_micro_budget_from_payload(payload) > 1
+
+
+def _relay_pipeline_chain_once(
+    peers: list[str],
+    dtype: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    current_payload = payload
+    hop_traces: list[dict[str, Any]] = []
+    result: dict[str, Any] = {"ok": False, "error": "pipeline chain empty"}
+    for hop_index, hop_peer in enumerate(peers):
+        t_hop = time.perf_counter()
+        encode_t0 = time.perf_counter()
+        current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
+        request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
+        request_payload_bytes = len(current_payload_bytes)
+        result = _relay_raw(
+            hop_peer,
+            dtype,
+            current_payload_bytes,
+            timeout=PIPELINE_STEP_TIMEOUT,
+            routing_path=[],
+        )
+        hop_traces.append({
+            "peer": hop_peer,
+            "rank": hop_index,
+            "request_payload_bytes": request_payload_bytes,
+            "request_json_encode_ms": request_json_encode_ms,
+            "payload_dtype": dtype,
+            "payload_hidden_transport": current_payload.get("hidden_transport"),
+            "relay_ms": result.get("relay_ms"),
+            "serialization_ms": result.get("serialization_ms"),
+            "hidden_bytes": result.get("hidden_bytes"),
+            "worker_compute_ms": result.get("worker_compute_ms") or result.get("compute_time_ms"),
+            "compute_time_ms": result.get("compute_time_ms") or result.get("worker_compute_ms"),
+            "shard_session_id": result.get("shard_session_id"),
+            "ms": int((time.perf_counter() - t_hop) * 1000),
+            "ok": result.get("ok", True) is not False,
+            "error": result.get("error"),
+        })
+        if not result.get("ok", True):
+            break
+        decode_t0 = time.perf_counter()
+        response = _decode_pipeline_response(result)
+        hop_traces[-1]["response_json_decode_ms"] = int((time.perf_counter() - decode_t0) * 1000)
+        if not isinstance(response, dict):
+            result = {"ok": False, "error": f"hop {hop_index} response invalid"}
+            hop_traces[-1]["ok"] = False
+            hop_traces[-1]["error"] = result["error"]
+            break
+        worker_trace = response.get("transport_trace") if isinstance(response.get("transport_trace"), dict) else {}
+        if worker_trace:
+            hop_traces[-1]["worker_transport_trace"] = worker_trace
+            hop_traces[-1]["payload_hidden_transport_effective"] = (
+                worker_trace.get("hidden_transport_effective") or response.get("hidden_transport")
+            )
+            hop_traces[-1]["response_serialize_ms"] = worker_trace.get("response_serialize_ms")
+            hop_traces[-1]["worker_grpc_payload_bytes"] = worker_trace.get("worker_grpc_payload_bytes")
+            hop_traces[-1]["python_mlx_pure_compute_ms"] = worker_trace.get("python_mlx_pure_compute_ms")
+        if hop_index < len(peers) - 1:
+            if response.get("ok") is False:
+                result = {"ok": False, "error": response.get("error") or f"hop {hop_index} refused"}
+                hop_traces[-1]["ok"] = False
+                hop_traces[-1]["error"] = result["error"]
+                break
+            next_payload_encode_t0 = time.perf_counter()
+            next_payload_preview = json.dumps(response, ensure_ascii=False).encode("utf-8")
+            hop_traces[-1]["next_hop_payload_bytes"] = len(next_payload_preview)
+            hop_traces[-1]["next_hop_json_encode_ms"] = int((time.perf_counter() - next_payload_encode_t0) * 1000)
+            current_payload = response
+    return result, hop_traces
+
+
 def _relay_pipeline_step(
     peer_id: str,
     dtype: str,
@@ -2278,44 +2485,80 @@ def _relay_pipeline_step(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if routing_path and PIPELINE_CHAIN_MODE in ("vps_sequential", "initiator_sequential", "sequential"):
         peers = [peer_id] + list(routing_path)
-        current_payload = payload
-        hop_traces: list[dict[str, Any]] = []
         t_chain = time.perf_counter()
-        result: dict[str, Any] = {"ok": False, "error": "pipeline chain empty"}
-        for hop_index, hop_peer in enumerate(peers):
-            t_hop = time.perf_counter()
-            result = _relay_raw(
-                hop_peer,
-                dtype,
-                json.dumps(current_payload, ensure_ascii=False).encode("utf-8"),
-                timeout=PIPELINE_STEP_TIMEOUT,
-                routing_path=[],
-            )
-            hop_traces.append({
-                "peer": hop_peer,
-                "rank": hop_index,
-                "relay_ms": result.get("relay_ms"),
-                "serialization_ms": result.get("serialization_ms"),
-                "hidden_bytes": result.get("hidden_bytes"),
-                "ms": int((time.perf_counter() - t_hop) * 1000),
-                "ok": result.get("ok", True) is not False,
-                "error": result.get("error"),
-            })
-            if not result.get("ok", True):
-                break
-            response = _decode_pipeline_response(result)
-            if not isinstance(response, dict):
-                result = {"ok": False, "error": f"hop {hop_index} response invalid"}
-                hop_traces[-1]["ok"] = False
-                hop_traces[-1]["error"] = result["error"]
-                break
-            if hop_index < len(peers) - 1:
-                if response.get("ok") is False:
-                    result = {"ok": False, "error": response.get("error") or f"hop {hop_index} refused"}
-                    hop_traces[-1]["ok"] = False
-                    hop_traces[-1]["error"] = result["error"]
+        hop_traces: list[dict[str, Any]] = []
+        micro_budget = _pipeline_micro_budget_from_payload(payload)
+        if _pipeline_micro_decode_enabled(payload, peers):
+            emitted: list[int] = []
+            current_payload = dict(payload)
+            base_step = int(payload.get("step") or 0)
+            all_ids_seed = list(payload.get("history_token_ids") or payload.get("token_ids") or [])
+            stop_ids_raw = payload.get("stop_token_ids") or []
+            stop_ids_int = {
+                int(s) for s in stop_ids_raw
+                if isinstance(s, (int, float)) or (isinstance(s, str) and str(s).isdigit())
+            }
+            eos_id = payload.get("eos_token_id")
+            result: dict[str, Any] = {"ok": False, "error": "pipeline micro empty"}
+            last_response: dict[str, Any] | None = None
+            for micro_i in range(micro_budget):
+                current_payload["micro_decode_budget"] = 1
+                current_payload["pipeline_micro_round"] = micro_i
+                result, round_traces = _relay_pipeline_chain_once(peers, dtype, current_payload)
+                for trace in round_traces:
+                    trace["micro_round"] = micro_i
+                hop_traces.extend(round_traces)
+                if not result.get("ok", True):
                     break
-                current_payload = response
+                response = _decode_pipeline_response(result)
+                last_response = response if isinstance(response, dict) else None
+                if not isinstance(response, dict) or response.get("ok") is False:
+                    result = {"ok": False, "error": (response or {}).get("error") or "pipeline micro response invalid"}
+                    break
+                token_raw = response.get("next_token_id")
+                if token_raw is None:
+                    result = {"ok": False, "error": "pipeline micro missing next_token_id"}
+                    break
+                token_id = int(token_raw)
+                emitted.append(token_id)
+                if eos_id is not None and token_id == int(eos_id):
+                    break
+                if token_id in stop_ids_int:
+                    break
+                if micro_i + 1 >= micro_budget:
+                    break
+                all_ids = all_ids_seed + emitted
+                current_payload = {
+                    **payload,
+                    "token_ids": [token_id],
+                    "history_token_ids": all_ids,
+                    "step": base_step + micro_i + 1,
+                    "seq_pos": len(all_ids) - 1,
+                    "decode_mode": "single_token_stateful",
+                    "stateful_required": True,
+                    "use_kv_cache": True,
+                    "micro_decode_budget": 1,
+                }
+            if emitted and isinstance(last_response, dict):
+                final = dict(last_response)
+                final["candidate_token_ids"] = emitted
+                final["accepted_token_count"] = len(emitted)
+                final["next_token_id"] = emitted[-1]
+                final["decode_microbatch"] = len(emitted) > 1
+                final["speculative_method"] = "pipeline_chain_micro_greedy" if len(emitted) > 1 else final.get("speculative_method")
+                final["speculative_available"] = len(emitted) > 1
+                result = _relay_result_from_response(final)
+            return result, {
+                **batching_trace(False, 1),
+                "decode_batch_ms": int((time.perf_counter() - t_chain) * 1000),
+                "chain_mode": PIPELINE_CHAIN_MODE,
+                "hop_traces": hop_traces,
+                "worker_to_worker_bypass": True,
+                "pipeline_micro_decode": True,
+                "pipeline_micro_tokens": len(emitted),
+            }
+
+        result, hop_traces = _relay_pipeline_chain_once(peers, dtype, payload)
         return result, {
             **batching_trace(False, 1),
             "decode_batch_ms": int((time.perf_counter() - t_chain) * 1000),
@@ -2909,12 +3152,248 @@ def _push_weights_to_worker(
 
 # session_key → session_id (pour réutiliser les poids déjà poussés)
 _worker_sessions: Dict[str, str] = {}
+_worker_session_meta: Dict[str, dict[str, Any]] = {}
 _worker_session_lock = threading.Lock()
 _pool_registry: Dict[str, dict] = {}
 _pool_registry_lock = threading.Lock()
 
 # Incrémenter si la sémantique de la clé ou l'ordre des tranches change (sinon cache désaligné).
 _SESSION_CACHE_KEY_VERSION = "v4-gguf-lazy-pool-registry"
+
+
+class _PipelineTraceContext:
+    def __init__(self) -> None:
+        self.call_counts: dict[str, int] = {
+            "vryx.shard.init": 0,
+            "vryx.shard.load": 0,
+            "vryx.shard.build": 0,
+            "vryx.shard.status": 0,
+            "vryx.shard.unload": 0,
+            "/api/p2p/relay": 0,
+            "request_response_send_request": 0,
+        }
+        self.phase_trace: dict[str, Any] = {
+            "select_workers_ms": 0,
+            "reserve_workers_ms": 0,
+            "session_lookup_ms": 0,
+            "session_init_ms": 0,
+            "shard_load_ms": 0,
+            "shard_build_ms": 0,
+            "ready_poll_ms": 0,
+            "prefill_ms": 0,
+            "decode_total_ms": 0,
+            "microbatch_enabled": bool(DECODE_MICROBATCH and PIPELINE_DECODE_MICROBATCH),
+            "microbatch_cap": DECODE_MICROBATCH_CAP,
+            "microbatch_actual": 1,
+            "tokens": [],
+        }
+        self.session: dict[str, Any] = {
+            "reused": False,
+            "reuse_source": None,
+            "reuse_reason": None,
+        }
+
+    def count_call(self, key: str, inc: int = 1) -> None:
+        self.call_counts[key] = int(self.call_counts.get(key, 0) or 0) + inc
+
+    def add_phase_ms(self, key: str, value_ms: int) -> None:
+        self.phase_trace[key] = int(self.phase_trace.get(key, 0) or 0) + max(0, int(value_ms or 0))
+
+    def set_phase(self, key: str, value: Any) -> None:
+        self.phase_trace[key] = value
+
+    def set_session(self, reused: bool, source: Optional[str] = None, reason: Optional[str] = None) -> None:
+        self.session = {
+            "reused": bool(reused),
+            "reuse_source": source,
+            "reuse_reason": reason,
+        }
+
+
+_TRACE_TLS = threading.local()
+
+
+def _current_trace_ctx() -> Optional[_PipelineTraceContext]:
+    return getattr(_TRACE_TLS, "pipeline_trace_ctx", None)
+
+
+class _PipelineSessionManager:
+    def __init__(self) -> None:
+        self._redis_client = None
+        self._redis_failed = False
+        self._redis_lock_prefix = "vryx:pipeline:lock:"
+        self._redis_session_prefix = "vryx:pipeline:session:"
+
+    def _ttl_sec(self) -> int:
+        return PIPELINE_SESSION_TTL_SEC
+
+    def _revision(self) -> str:
+        return str(HF_REVISION or "main").strip() or "main"
+
+    def _now_ms(self) -> int:
+        return _now_ms()
+
+    def _expires_at_ms(self) -> int:
+        return self._now_ms() + self._ttl_sec() * 1000
+
+    def _redis(self):
+        if self._redis_failed or redis is None or not PIPELINE_SESSION_REDIS_URL:
+            return None
+        if self._redis_client is not None:
+            return self._redis_client
+        try:
+            client = redis.from_url(PIPELINE_SESSION_REDIS_URL, decode_responses=True)
+            client.ping()
+            self._redis_client = client
+            return client
+        except Exception:
+            self._redis_failed = True
+            return None
+
+    def make_key(
+        self,
+        model_key: str,
+        quantization: str,
+        peers: list[str],
+        assignments: list[tuple[Any, int, int, bool, bool]],
+    ) -> str:
+        assignment_sig = ";".join(
+            f"{peer}:{ls}-{le}:{int(has_emb)}:{int(has_head)}"
+            for peer, ls, le, has_emb, has_head in assignments
+        )
+        return "|".join([
+            _SESSION_CACHE_KEY_VERSION,
+            MODEL_ID,
+            self._revision(),
+            str(quantization or "fp16").lower(),
+            model_key,
+            ",".join(peers),
+            assignment_sig,
+        ])
+
+    def lookup(self, key: str) -> tuple[Optional[str], dict[str, Any], str]:
+        now = self._now_ms()
+        with _worker_session_lock:
+            meta = dict(_worker_session_meta.get(key) or {})
+            session_id = str(_worker_sessions.get(key) or meta.get("session_id") or "")
+            expires_at_ms = int(meta.get("expires_at_ms") or 0)
+            if session_id and expires_at_ms > now:
+                return session_id, meta, "memory"
+            if key in _worker_sessions:
+                _worker_sessions.pop(key, None)
+            if key in _worker_session_meta:
+                _worker_session_meta.pop(key, None)
+        client = self._redis()
+        if client is None:
+            return None, {}, "none"
+        try:
+            raw = client.get(self._redis_session_prefix + key)
+            if not raw:
+                return None, {}, "redis_miss"
+            meta = json.loads(raw)
+            expires_at_ms = int(meta.get("expires_at_ms") or 0)
+            if expires_at_ms <= now:
+                client.delete(self._redis_session_prefix + key)
+                return None, meta, "redis_expired"
+            session_id = str(meta.get("session_id") or "")
+            if session_id:
+                with _worker_session_lock:
+                    _worker_sessions[key] = session_id
+                    _worker_session_meta[key] = dict(meta)
+                return session_id, meta, "redis"
+        except Exception:
+            pass
+        return None, {}, "redis_error"
+
+    def store(self, key: str, session_id: str, meta: dict[str, Any]) -> None:
+        payload = dict(meta)
+        payload["session_id"] = session_id
+        payload["expires_at_ms"] = int(payload.get("expires_at_ms") or self._expires_at_ms())
+        with _worker_session_lock:
+            _worker_sessions[key] = session_id
+            _worker_session_meta[key] = dict(payload)
+        client = self._redis()
+        if client is not None:
+            try:
+                client.set(self._redis_session_prefix + key, json.dumps(payload, ensure_ascii=False), ex=self._ttl_sec())
+            except Exception:
+                pass
+
+    def touch(self, key: str, session_id: str) -> None:
+        now_expires = self._expires_at_ms()
+        with _worker_session_lock:
+            meta = dict(_worker_session_meta.get(key) or {})
+            if not meta:
+                meta = {"session_id": session_id}
+            meta["session_id"] = session_id
+            meta["last_used_ms"] = self._now_ms()
+            meta["expires_at_ms"] = now_expires
+            _worker_sessions[key] = session_id
+            _worker_session_meta[key] = meta
+        client = self._redis()
+        if client is not None:
+            try:
+                redis_key = self._redis_session_prefix + key
+                raw = client.get(redis_key)
+                payload = json.loads(raw) if raw else {}
+                payload.update(meta)
+                client.set(redis_key, json.dumps(payload, ensure_ascii=False), ex=self._ttl_sec())
+            except Exception:
+                pass
+
+    def invalidate(self, key: str, session_id: str = "") -> None:
+        with _worker_session_lock:
+            cached = str(_worker_sessions.get(key) or "")
+            if not session_id or cached == session_id:
+                _worker_sessions.pop(key, None)
+                _worker_session_meta.pop(key, None)
+            if session_id:
+                for cached_key, cached_session in list(_worker_sessions.items()):
+                    if cached_session == session_id:
+                        _worker_sessions.pop(cached_key, None)
+                        _worker_session_meta.pop(cached_key, None)
+        client = self._redis()
+        if client is not None:
+            try:
+                client.delete(self._redis_session_prefix + key)
+            except Exception:
+                pass
+
+    def acquire_creation_lock(self, key: str, wait_sec: float = 15.0) -> tuple[bool, Optional[str]]:
+        client = self._redis()
+        if client is None:
+            return True, None
+        token = f"{os.getpid()}-{threading.get_ident()}-{random.randint(0, 999999)}"
+        lock_key = self._redis_lock_prefix + key
+        deadline = time.perf_counter() + max(0.5, wait_sec)
+        while time.perf_counter() < deadline:
+            try:
+                if client.set(lock_key, token, nx=True, ex=max(10, int(wait_sec))):
+                    return True, token
+            except Exception:
+                return True, None
+            time.sleep(0.2)
+            session_id, _meta, _source = self.lookup(key)
+            if session_id:
+                return False, None
+        return True, None
+
+    def release_creation_lock(self, key: str, token: Optional[str]) -> None:
+        if not token:
+            return
+        client = self._redis()
+        if client is None:
+            return
+        lock_key = self._redis_lock_prefix + key
+        try:
+            raw = client.get(lock_key)
+            if raw == token:
+                client.delete(lock_key)
+        except Exception:
+            pass
+
+
+PIPELINE_SESSION_MANAGER = _PipelineSessionManager()
 
 
 def _model_fingerprint(model_config: dict) -> str:
@@ -3333,14 +3812,7 @@ def _validate_cached_session(
 
 
 def _invalidate_worker_session_cache(key: str, pool_id: str, reason: str, session_id: str = "") -> None:
-    with _worker_session_lock:
-        cached = _worker_sessions.get(key)
-        if not session_id or cached == session_id:
-            _worker_sessions.pop(key, None)
-        if session_id:
-            for cached_key, cached_session in list(_worker_sessions.items()):
-                if cached_session == session_id:
-                    _worker_sessions.pop(cached_key, None)
+    PIPELINE_SESSION_MANAGER.invalidate(key, session_id)
     _register_pool(pool_id, {
         "status": "invalidated",
         "ready": False,
@@ -3424,6 +3896,61 @@ def _failover_routing_path(routing_path: list[str], session_id: str, pool_info: 
     return None
 
 
+def _plan_pipeline_assignments(
+    peers: list[str],
+    model_config: dict[str, Any],
+    catalog: dict[str, Any],
+    latency_matrix: dict[str, Any],
+    pool_class: str,
+) -> tuple[list[str], list[tuple[Any, int, int, bool, bool]]]:
+    n = len(peers)
+    total_layers = model_config["num_hidden_layers_total"]
+    prepared_gguf_assignments = _prepared_gguf_assignments_for_peers(peers)
+    if prepared_gguf_assignments:
+        ordered = [a[0] for a in prepared_gguf_assignments]
+        return ordered, prepared_gguf_assignments
+
+    if _preserve_explicit_pipeline_order():
+        ordered = list(peers)
+    else:
+        ranked = sorted(peers, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True)
+        if n >= 2:
+            last_peer = ranked[0]
+            first_peer = ranked[1]
+            middle = [p for p in ranked[2:] if p not in (first_peer, last_peer)]
+            ordered = [first_peer] + sorted(
+                middle,
+                key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p),
+                reverse=True,
+            ) + [last_peer]
+        else:
+            ordered = ranked
+    counts = _weighted_counts(total_layers, ordered, catalog)
+    rebalanced_counts = _rebalance_pipeline_first_shard(counts, ordered, catalog, model_config, pool_class)
+    if rebalanced_counts != counts:
+        print(
+            "[VPS] Placement pipeline asymétrique actif : "
+            f"{[_short(p) for p in ordered]} couches {counts} -> {rebalanced_counts}"
+        )
+        counts = rebalanced_counts
+    if n >= 3 and model_config.get("model_type") != "gpt2":
+        max_last_layers = min(2, total_layers)
+        if counts[-1] > max_last_layers:
+            overflow = counts[-1] - max_last_layers
+            counts[-1] = max_last_layers
+            for j in range(overflow):
+                counts[j % (n - 1)] += 1
+
+    assignments = []
+    start = 0
+    for i, peer in enumerate(ordered):
+        n_layers = counts[i]
+        end = start + n_layers - 1
+        assignments.append((peer, start, end, i == 0, i == n - 1))
+        start = end + 1
+    return ordered, assignments
+
+
 def _get_or_create_session(
     peers: list[str],
     model_config: dict,
@@ -3438,16 +3965,19 @@ def _get_or_create_session(
     """
     transport = _normalize_hidden_transport(hidden_transport)
     weight_quantization = str(requested_weight_quantization or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16")).lower()
-    # Toujours la même clé et le même ordre de tranches que routing_path (pairs triés).
     model_key = _model_fingerprint(model_config)
     catalog = _fetch_worker_catalog()
     latency_matrix = _refresh_latency_matrix(peers)
-    key = _SESSION_CACHE_KEY_VERSION + "|" + pool_class + "|" + weight_quantization + "|" + model_key + "|" + "|".join(peers)
+    ordered_peers, assignments = _plan_pipeline_assignments(peers, model_config, catalog, latency_matrix, pool_class)
+    peers[:] = ordered_peers
+    key = PIPELINE_SESSION_MANAGER.make_key(model_key, weight_quantization, peers, assignments)
     pool_id = "pool-" + str(abs(hash(key)))[:12]
-    with _worker_session_lock:
-        if key in _worker_sessions:
-            print(f"[VPS] Réutilisation session pour {len(peers)} workers")
-            session_id = _worker_sessions[key]
+    trace_ctx = _current_trace_ctx()
+    lock_token: Optional[str] = None
+    try:
+        session_id, cached_meta, cache_source = PIPELINE_SESSION_MANAGER.lookup(key)
+        if session_id:
+            print(f"[VPS] Réutilisation session pour {len(peers)} workers via {cache_source}")
             with _pool_registry_lock:
                 existing_pool = dict(_pool_registry.get(pool_id, {}))
             sticky_path = list(existing_pool.get("routing_path") or peers)
@@ -3455,7 +3985,7 @@ def _get_or_create_session(
             if not validation.get("cache_valid"):
                 reason = validation.get("fallback_reason") or "cached_session_not_ready"
                 print(f"[VPS] Session hot obsolète {session_id[:16]}… invalidée : {reason}")
-                _worker_sessions.pop(key, None)
+                PIPELINE_SESSION_MANAGER.invalidate(key, session_id)
                 _register_pool(pool_id, {
                     "status": "invalidated",
                     "ready": False,
@@ -3466,8 +3996,11 @@ def _get_or_create_session(
                 })
             else:
                 peers[:] = sticky_path
+                PIPELINE_SESSION_MANAGER.touch(key, session_id)
                 actual_pool_class = str(validation.get("actual_pool_class") or pool_class)
                 validation_reason = validation.get("fallback_reason")
+                if trace_ctx is not None:
+                    trace_ctx.set_session(True, cache_source, validation_reason or "hot_session_ready")
                 if actual_pool_class != pool_class:
                     print(
                         f"[VPS] Pool réel {actual_pool_class} au lieu de {pool_class} "
@@ -3490,49 +4023,18 @@ def _get_or_create_session(
                 })
                 return session_id, "reused", []
 
+        lock_acquired, lock_token = PIPELINE_SESSION_MANAGER.acquire_creation_lock(key)
+        if not lock_acquired:
+            session_id, _meta, cache_source = PIPELINE_SESSION_MANAGER.lookup(key)
+            if session_id:
+                if trace_ctx is not None:
+                    trace_ctx.set_session(True, cache_source, "hot_session_created_by_other_process")
+                return session_id, "reused", []
+
         session_id = f"vryx-{int(time.time() * 1000)}"
         n = len(peers)
-        total_layers = model_config["num_hidden_layers_total"]
-        # Hot Pool Placement : latence d'abord, puis VRAM/GPU. Le dernier worker garde lm_head.
-        prepared_gguf_assignments = _prepared_gguf_assignments_for_peers(peers)
-        if prepared_gguf_assignments:
-            assignments = prepared_gguf_assignments
-            peers[:] = [a[0] for a in assignments]
+        if _prepared_gguf_assignments_for_peers(peers):
             print(f"[VPS] Placement GGUF préparé actif ({len(assignments)} workers) : {[p[:12] for p in peers]}")
-        else:
-            ranked = sorted(peers, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True)
-            if n >= 2:
-                last_peer = ranked[0]
-                first_peer = ranked[1]
-                middle = [p for p in ranked[2:] if p not in (first_peer, last_peer)]
-                ordered = [first_peer] + sorted(middle, key=lambda p: (_hot_pool_score(p, catalog, latency_matrix), p), reverse=True) + [last_peer]
-            else:
-                ordered = ranked
-            counts = _weighted_counts(total_layers, ordered, catalog)
-            rebalanced_counts = _rebalance_pipeline_first_shard(counts, ordered, catalog, model_config, pool_class)
-            if rebalanced_counts != counts:
-                print(
-                    "[VPS] Placement pipeline asymétrique actif : "
-                    f"{[_short(p) for p in ordered]} couches {counts} -> {rebalanced_counts}"
-                )
-                counts = rebalanced_counts
-            if n >= 3 and model_config.get("model_type") != "gpt2":
-                # Le dernier worker porte aussi norm + lm_head : on évite de lui ajouter trop de couches.
-                max_last_layers = min(2, total_layers)
-                if counts[-1] > max_last_layers:
-                    overflow = counts[-1] - max_last_layers
-                    counts[-1] = max_last_layers
-                    for j in range(overflow):
-                        counts[j % (n - 1)] += 1
-
-            assignments = []
-            start = 0
-            for i, peer in enumerate(ordered):
-                n_layers = counts[i]
-                end = start + n_layers - 1
-                assignments.append((peer, start, end, i == 0, i == n - 1))
-                start = end + 1
-            peers[:] = ordered
 
         # Purge des anciens shards pour libérer /tmp avant d'écrire les nouveaux
         _purge_old_shards(keep_session=session_id)
@@ -3644,9 +4146,15 @@ def _get_or_create_session(
             elapsed = 0
             init_attempts = max(1, int(os.environ.get("VRYX_SHARD_INIT_ATTEMPTS", "2")))
             for attempt in range(init_attempts):
+                if trace_ctx is not None:
+                    trace_ctx.count_call("vryx.shard.init")
+                    trace_ctx.count_call("/api/p2p/relay")
+                    trace_ctx.count_call("request_response_send_request")
                 t0 = time.perf_counter()
                 r = _relay_raw(peer, "vryx.shard.init", init_payload, timeout=SHARD_INIT_TIMEOUT)
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                if trace_ctx is not None:
+                    trace_ctx.add_phase_ms("session_init_ms", elapsed)
                 relay_ok = r.get("ok") is not False and not str(r.get("error") or "").strip()
                 if relay_ok:
                     break
@@ -3682,11 +4190,23 @@ def _get_or_create_session(
                     wait_started = time.perf_counter()
                     poll_n = 0
                     last_reason: str | None = None
+                    ready_poll_start = time.perf_counter()
                     while time.perf_counter() - wait_started < SHARD_READY_TIMEOUT:
+                        if trace_ctx is not None:
+                            trace_ctx.count_call("vryx.shard.status")
+                            trace_ctx.count_call("/api/p2p/relay")
+                            trace_ctx.count_call("request_response_send_request")
                         status = _query_worker_status(peer, session_id)
                         ready, reason, shard_hit = _session_ready_from_status(status, session_id, MODEL_ID)
                         if ready and shard_hit is not None:
                             weights_loaded = shard_hit.get("weights_loaded", weights_loaded)
+                            if trace_ctx is not None:
+                                trace_ctx.add_phase_ms(
+                                    "ready_poll_ms",
+                                    int((time.perf_counter() - ready_poll_start) * 1000),
+                                )
+                                trace_ctx.add_phase_ms("shard_load_ms", int(shard_hit.get("download_ms") or 0))
+                                trace_ctx.add_phase_ms("shard_build_ms", int(shard_hit.get("build_ms") or 0))
                             print(
                                 f"[VPS] Worker {i} ({peer[:16]}) prêt : "
                                 f"{weights_loaded} poids, build={shard_hit.get('build_ms')}ms"
@@ -3697,6 +4217,11 @@ def _get_or_create_session(
                         )
                         poll_n += 1
                         time.sleep(_shard_ready_sleep_sec(poll_n))
+                    if trace_ctx is not None:
+                        trace_ctx.add_phase_ms(
+                            "ready_poll_ms",
+                            int((time.perf_counter() - ready_poll_start) * 1000),
+                        )
                     detail = (
                         f"worker_not_ready_after_{int(SHARD_READY_TIMEOUT)}s: "
                         f"{last_reason or 'session_not_ready'}"
@@ -3852,7 +4377,29 @@ def _get_or_create_session(
                 f"[VPS] Pool MLX demandé mais pool réel={actual_pool_class} "
                 f"raison={validation_reason or 'runtime_status_mismatch'}"
             )
-        _worker_sessions[key] = session_id
+        session_meta = {
+            "model_id": MODEL_ID,
+            "model_key": model_key,
+            "weight_quantization": weight_quantization,
+            "routing_path": list(peers),
+            "assignments": [
+                {
+                    "peer": peer,
+                    "layer_start": ls,
+                    "layer_end": le,
+                    "has_embedding": has_emb,
+                    "has_lm_head": has_head,
+                }
+                for peer, ls, le, has_emb, has_head in assignments
+            ],
+            "created_at_ms": _now_ms(),
+            "last_used_ms": _now_ms(),
+            "expires_at_ms": _now_ms() + PIPELINE_SESSION_TTL_SEC * 1000,
+            "revision": str(HF_REVISION or "main"),
+            "pool_class": pool_class,
+            "reuse_reason": "fresh_session_init",
+        }
+        PIPELINE_SESSION_MANAGER.store(key, session_id, session_meta)
         _register_pool(pool_id, {
             "status": "hot",
             "session_status": "created",
@@ -3864,13 +4411,15 @@ def _get_or_create_session(
         })
         # TTL logique long : les workers gardent le modèle résident, sauf expiration explicite.
         def _expire():
-            time.sleep(POOL_TTL)
-            with _worker_session_lock:
-                _worker_sessions.pop(key, None)
+            time.sleep(PIPELINE_SESSION_TTL_SEC if PIPELINE_KEEP_WARM else POOL_TTL)
+            PIPELINE_SESSION_MANAGER.invalidate(key)
             _register_pool(pool_id, {"status": "expired", "ready": False})
         threading.Thread(target=_expire, daemon=True).start()
-
+        if trace_ctx is not None:
+            trace_ctx.set_session(False, "created", "fresh_session_init")
         return session_id, "created", []
+    finally:
+        PIPELINE_SESSION_MANAGER.release_creation_lock(key, lock_token)
 
 
 # ── Boucle autorégressive ─────────────────────────────────────────────────────
@@ -4153,6 +4702,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
       - VPS dé-tokenise, boucle jusqu'à EOS
     """
     options = options or {}
+    trace_ctx = _PipelineTraceContext()
+    _TRACE_TLS.pipeline_trace_ctx = trace_ctx
+    select_workers_started = time.perf_counter()
     stream_id = str(options.get("stream_id") or "")
     stream_secret = str(options.get("stream_secret") or "")
     stream_callback_url = str(options.get("stream_callback_url") or "")
@@ -4244,7 +4796,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     while True:
         discovery_attempt += 1
         peers_raw = _discover_live_peers()
-        peers_sorted = sorted(set(peers_raw))
+        if _preserve_explicit_pipeline_order():
+            peers_sorted = list(dict.fromkeys(peers_raw))
+        else:
+            peers_sorted = sorted(set(peers_raw))
         catalog = _fetch_worker_catalog()
 
         # Ordre canonique : même ordre à chaque requête et pour les tranches shard.init (embedding → … → lm_head).
@@ -4265,12 +4820,26 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                     })
             peers_sorted = compatible_peers
 
-        selected_peers, pool_class, pool_fallback_reason = _select_pool_peers(
-            peers_sorted,
-            catalog,
-            pool_preference,
-            min_workers=min_workers_required,
+        explicit_pair_requested = bool(preferred_worker_peer_ids)
+        explicit_pair_available = (
+            explicit_pair_requested
+            and len(preferred_worker_peer_ids) >= min_workers_required
+            and all(peer in peers_sorted for peer in preferred_worker_peer_ids[:min_workers_required])
         )
+        if explicit_pair_available:
+            selected_peers = [
+                peer for peer in preferred_worker_peer_ids
+                if peer in peers_sorted
+            ]
+            pool_class = "explicit_preferred"
+            pool_fallback_reason = None
+        else:
+            selected_peers, pool_class, pool_fallback_reason = _select_pool_peers(
+                peers_sorted,
+                catalog,
+                pool_preference,
+                min_workers=min_workers_required,
+            )
         peers_sorted = sorted(selected_peers)
         if preferred_worker_peer_ids:
             peers_sorted, preferred_workers_applied, preferred_workers_missing = _apply_preferred_worker_order(
@@ -4281,12 +4850,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 pool_fallback_reason = None
             else:
                 pool_fallback_reason = "scheduler_preferred_workers_unavailable"
+        preserve_requested_order = _preserve_explicit_pipeline_order() or bool(preferred_workers_applied)
         peers_sorted = _filter_workers_by_catalog_public_ip_optional(peers_sorted, catalog)
         selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
-        peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
+        if not preserve_requested_order:
+            peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
         peers_sorted, shared_accelerator_groups = _coalesce_shared_accelerator_peers(peers_sorted, catalog)
         selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
-        peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
+        if not preserve_requested_order:
+            peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
 
         if len(peers_sorted) >= min_workers_required:
             break
@@ -4300,6 +4872,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             f"{len(peers_sorted)}/{min_workers_required} (tentative {discovery_attempt})"
         )
         time.sleep(DIST_WAIT_FOR_MIN_WORKERS_POLL_SEC)
+    trace_ctx.set_phase("select_workers_ms", int((time.perf_counter() - select_workers_started) * 1000))
 
     if len(peers_sorted) < min_workers_required:
         mismatch_note = ""
@@ -4357,6 +4930,13 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     else:
         formatted_prompt, input_ids = _tokenize_prompt(prompt, tokenizer, model_config)
         decode_cap = _clamp_decode_cap(len(input_ids), decode_cap, model_config)
+    raw_prompt_token_count = 0
+    try:
+        raw_prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        raw_prompt_token_count = len(raw_prompt_ids if isinstance(raw_prompt_ids, list) else [raw_prompt_ids])
+    except Exception:
+        raw_prompt_token_count = 0
+    template_overhead_tokens = max(0, len(input_ids) - raw_prompt_token_count)
     if decode_cap <= 0:
         return {
             "ok": False,
@@ -4448,6 +5028,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
     n = _routing_pipeline_width(len(peers_sorted), min_workers=min_workers_required)
     peers = peers_sorted[:n]
+    trace_ctx.set_phase("reserve_workers_ms", 0)
 
     # Sur runtime MLX, hidden q4/int8 compresse les états ; la restauration peut brouiller fortement
     # les logits alors que les poids sont en fp16 → texte multilingue aberrant. fp16 coûte plus de
@@ -4466,6 +5047,29 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         peers, model_config, model_manifest, hidden_transport, pool_class, requested_quantization
     )
     setup_ms = int((time.perf_counter() - t_setup) * 1000)
+    phase_trace = trace_ctx.phase_trace
+    known_setup_ms = int(phase_trace.get("session_init_ms") or 0) + int(phase_trace.get("shard_load_ms") or 0) + int(phase_trace.get("shard_build_ms") or 0) + int(phase_trace.get("ready_poll_ms") or 0)
+    phase_trace["session_lookup_ms"] = max(0, setup_ms - known_setup_ms)
+    if PIPELINE_REQUIRE_WARM_SESSION and sess_status != "reused":
+        reason = trace_ctx.session.get("reuse_reason") or f"session_status={sess_status}"
+        return {
+            "ok": False,
+            "text": "",
+            "error": f"Session chaude requise mais non disponible: {reason}",
+            "trace": {
+                "layout": "pipeline_relay_daisy_chain",
+                "ok": False,
+                "routing_path": peers,
+                "peers": peers,
+                "setup_ms": setup_ms,
+                "session_status": sess_status,
+                "session_reused": False,
+                "session_reuse_reason": reason,
+                "phase_trace": phase_trace,
+                "call_counts": trace_ctx.call_counts,
+            },
+            "metrics": {"prompt_tokens": len(input_ids), "completion_tokens": 0, "total_tokens": len(input_ids)},
+        }
     if sess_status == "failed" or session_id is None:
         detail_hint = ""
         capacity_diag = next(
@@ -4502,6 +5106,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "peers": peers,
                 "setup_ms": setup_ms,
                 "session_status": sess_status,
+                "session_reused": bool(trace_ctx.session.get("reused")),
+                "session_reuse_reason": trace_ctx.session.get("reuse_reason") or "session_prepare_failed",
+                "phase_trace": phase_trace,
+                "call_counts": trace_ctx.call_counts,
                 "shard_prep_diag": shard_prep_diag,
                 "shared_accelerator_groups": shared_accelerator_groups,
             },
@@ -4512,6 +5120,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     pool_info = _pool_for_session(session_id)
     latency_matrix_for_decode = pool_info.get("peer_latency_matrix") or selection_latency_matrix
     dynamic_microbatch_cap = _microbatch_cap_for_rtt(peers, latency_matrix_for_decode)
+    trace_ctx.phase_trace["microbatch_enabled"] = bool(DECODE_MICROBATCH and PIPELINE_DECODE_MICROBATCH)
+    trace_ctx.phase_trace["microbatch_cap"] = int(dynamic_microbatch_cap)
     stream_open = {"ok": False, "results": []}
     pool_id = str(pool_info.get("pool_id") or "")
     if hidden_transport == "q4":
@@ -4570,8 +5180,25 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     eos_id = tokenizer.eos_token_id
     stop_ids = _stop_token_ids(tokenizer)
     routing_path = list(pool_info.get("routing_path") or peers)  # [w1, w2, w3]
-    quic_probe = _quic_probe(routing_path, session_id, pool_id, hidden_transport)
     model_key = _model_fingerprint(model_config)
+    session_cache_assignments = [
+        (
+            str(a.get("peer") or ""),
+            int(a.get("layer_start") or 0),
+            int(a.get("layer_end") or 0),
+            bool(a.get("has_embedding")),
+            bool(a.get("has_lm_head")),
+        )
+        for a in (pool_info.get("assignments") or [])
+        if isinstance(a, dict)
+    ]
+    session_cache_key = PIPELINE_SESSION_MANAGER.make_key(
+        model_key,
+        str(requested_quantization or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16")).lower(),
+        list(routing_path),
+        session_cache_assignments,
+    )
+    quic_probe = _quic_probe(routing_path, session_id, pool_id, hidden_transport)
     prefix_cache_hit: dict[str, Any] = {
         "enabled": PREFIX_CACHE,
         "hit": False,
@@ -4672,6 +5299,41 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "connection_transport": result.get("connection_transport"),
             "quic_used": bool(result.get("quic_used")),
         })
+        hop_traces = list(batch_trace.get("hop_traces") or [])
+        hop0 = hop_traces[0] if len(hop_traces) >= 1 else {}
+        hop_last = hop_traces[-1] if len(hop_traces) >= 2 else hop0
+        serialization_step_ms = sum(int(h.get("serialization_ms") or 0) for h in hop_traces)
+        relay_step_ms = sum(int(h.get("relay_ms") or 0) for h in hop_traces)
+        compute_step_ms = sum(int(h.get("worker_compute_ms") or h.get("compute_time_ms") or 0) for h in hop_traces)
+        trace_ctx.phase_trace["tokens"].append({
+            "step": step,
+            "decode_mode": str(current_payload.get("decode_mode") or ""),
+            "microbatch_actual": max(1, int(batch_trace.get("pipeline_micro_tokens") or 1)),
+            "m1_peer": routing_path[0] if routing_path else None,
+            "m1_relay_ms": int(hop0.get("relay_ms") or 0),
+            "m1_transport_only_ms": max(0, int(hop0.get("relay_ms") or 0) - int(hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0)),
+            "m1_compute_ms": int(hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0),
+            "m1_request_payload_bytes": int(hop0.get("request_payload_bytes") or 0),
+            "m4_peer": routing_path[-1] if routing_path else None,
+            "m4_relay_ms": int(hop_last.get("relay_ms") or 0),
+            "m4_transport_only_ms": max(0, int(hop_last.get("relay_ms") or 0) - int(hop_last.get("worker_compute_ms") or hop_last.get("compute_time_ms") or 0)),
+            "m4_compute_ms": int(hop_last.get("worker_compute_ms") or hop_last.get("compute_time_ms") or 0),
+            "m4_request_payload_bytes": int(hop_last.get("request_payload_bytes") or 0),
+            "prefill_payload_bytes_m1_to_m4": int(hop0.get("next_hop_payload_bytes") or 0) if step == 0 else 0,
+            "decode_payload_bytes_m1_to_m4": int(hop0.get("next_hop_payload_bytes") or 0) if step > 0 else 0,
+            "hidden_transport_requested": current_payload.get("hidden_transport"),
+            "hidden_transport_effective": hop0.get("payload_hidden_transport_effective") or hop_last.get("payload_hidden_transport_effective") or current_payload.get("hidden_transport"),
+            "serialization_ms": serialization_step_ms,
+            "vps_overhead_ms": max(0, step_ms - max(relay_step_ms, compute_step_ms)),
+            "relay_total_ms": relay_step_ms,
+            "compute_total_ms": compute_step_ms,
+            "step_wall_ms": step_ms,
+            "hop_traces": hop_traces,
+        })
+        trace_ctx.phase_trace["microbatch_actual"] = max(
+            int(trace_ctx.phase_trace.get("microbatch_actual") or 1),
+            max(1, int(batch_trace.get("pipeline_micro_tokens") or 1)),
+        )
 
         if not result.get("ok", True):
             err = result.get("error", "erreur inconnue")
@@ -4706,9 +5368,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                     and not generated_ids
                     and _is_unknown_session_error(err)
                 ):
-                    model_key = _model_fingerprint(model_config)
-                    cache_key = _SESSION_CACHE_KEY_VERSION + "|" + pool_class + "|" + model_key + "|" + "|".join(peers)
-                    _invalidate_worker_session_cache(cache_key, pool_id, "relay_reported_unknown_session", session_id)
+                    _invalidate_worker_session_cache(session_cache_key, pool_id, "relay_reported_unknown_session", session_id)
                     retry_options = dict(options)
                     retry_options["_hot_session_retry_done"] = True
                     print(f"[VPS] Relais signale session inconnue, recréation automatique ({session_id[:16]}…).")
@@ -4747,9 +5407,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 and not generated_ids
                 and _is_unknown_session_error(failure_error)
             ):
-                model_key = _model_fingerprint(model_config)
-                cache_key = _SESSION_CACHE_KEY_VERSION + "|" + pool_class + "|" + model_key + "|" + "|".join(peers)
-                _invalidate_worker_session_cache(cache_key, pool_id, "worker_reported_unknown_session", session_id)
+                _invalidate_worker_session_cache(session_cache_key, pool_id, "worker_reported_unknown_session", session_id)
                 retry_options = dict(options)
                 retry_options["_hot_session_retry_done"] = True
                 print(f"[VPS] Session hot inconnue côté worker, recréation automatique ({session_id[:16]}…).")
@@ -4845,14 +5503,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         next_step_val = step + 1
         remaining_gen = max(0, decode_cap - len(generated_ids))
         micro_budget = 1
+        multi_worker_pipeline = len(routing_path) >= 2
         if (
             DECODE_MICROBATCH
-            and len(routing_path) == 1
             and WORKER_KV_CACHE
             and stateful_decode
             and remaining_gen > 1
             and float(SAMPLING_TEMPERATURE) <= 1e-9
             and next_step_val >= 1
+            and (len(routing_path) == 1 or (multi_worker_pipeline and PIPELINE_DECODE_MICROBATCH))
         ):
             micro_budget = max(2, min(dynamic_microbatch_cap, remaining_gen))
 
@@ -4870,6 +5529,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "use_kv_cache": WORKER_KV_CACHE,
             "stateful_required": stateful_decode,
             "stop_token_ids": stop_ids,
+            "eos_token_id": eos_id,
             "sampling": {
                 "temperature": SAMPLING_TEMPERATURE,
                 "top_p": SAMPLING_TOP_P,
@@ -4884,6 +5544,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         current_dtype = "vryx.shard.pipeline"
 
     total_ms = int((time.perf_counter() - t_infer) * 1000)
+    trace_ctx.phase_trace["prefill_ms"] = int(step_latencies[0] if step_latencies else 0)
+    trace_ctx.phase_trace["decode_total_ms"] = max(0, total_ms - int(trace_ctx.phase_trace.get("prefill_ms") or 0))
     stream_close = {"ok": False, "results": []}
     if stream_open.get("ok"):
         stream_close = _stream_control(routing_path, session_id, pool_id, "close", hidden_transport)
@@ -4950,6 +5612,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "routing_path": routing_path,
         "peers": routing_path,
         "session_id": session_id,
+        "session_reused": bool(trace_ctx.session.get("reused") or sess_status == "reused"),
+        "session_reuse_source": trace_ctx.session.get("reuse_source"),
+        "session_reuse_reason": trace_ctx.session.get("reuse_reason") or ("hot_session_ready" if sess_status == "reused" else "fresh_session_init"),
         "pool_id": pool_info.get("pool_id"),
         "pool_class": actual_pool_class,
         "requested_pool_class": pool_info.get("pool_class") or pool_class,
@@ -4993,10 +5658,13 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "worker_kv_cache": WORKER_KV_CACHE,
         "microbatch_tuning": {
             "enabled": DECODE_MICROBATCH,
-            "configured_cap": DECODE_MICROBATCH_CAP,
+            "configured_cap": max(DECODE_MICROBATCH_CAP, DECODE_MICROBATCH_CAP if PIPELINE_DECODE_MICROBATCH else 1),
             "dynamic_cap": dynamic_microbatch_cap,
+            "actual": int(trace_ctx.phase_trace.get("microbatch_actual") or 1),
             "rtt_target_ms": MICROBATCH_RTT_TARGET_MS,
         },
+        "phase_trace": trace_ctx.phase_trace,
+        "call_counts": trace_ctx.call_counts,
         "generation_control": {
             "stop_token_ids": stop_ids,
             "stop_reason": stop_reason,
@@ -5005,6 +5673,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "top_k": SAMPLING_TOP_K,
             "repetition_penalty": REPETITION_PENALTY,
             "repetition_guard": REPETITION_GUARD,
+        },
+        "prefill_token_accounting": {
+            "total_prefill_tokens": len(input_ids),
+            "user_prompt_tokens": raw_prompt_token_count,
+            "template_overhead_tokens": template_overhead_tokens,
+            "minimal_prompt_template": BENCH_MINIMAL_PROMPT_TEMPLATE,
         },
         "quic_enabled": HIDDEN_QUIC,
         "quic_used": bool(quic_probe.get("quic_used")) or relay_quic_used,
@@ -5123,6 +5797,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "chunked_prefill": CHUNKED_PREFILL,
             "ring_attention": RING_ATTENTION,
             "pipeline_step_timeout_sec": PIPELINE_STEP_TIMEOUT,
+            "prefill_pipeline_overlap": PREFILL_PIPELINE_OVERLAP,
         },
         "metrics": {
             "prompt_tokens": len(input_ids),

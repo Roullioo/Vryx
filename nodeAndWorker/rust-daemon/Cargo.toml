@@ -4,7 +4,7 @@ version = "1.0.2"
 edition = "2021"
 
 [dependencies]
-libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "c4efffcf6733b761eae9a2bb69306b34e37a005f", default-features = false, features = [
+libp2p = { package = "libp2p", git = "https://github.com/libp2p/rust-libp2p", rev = "c4efffcf6733b761eae9a2bb69306b34e37a005f", default-features = false, features = [
     "tcp", "noise", "yamux", "tokio", "macros",
     "request-response", "json", "kad", "identify", "autonat", "quic",
     "relay", "dcutr",

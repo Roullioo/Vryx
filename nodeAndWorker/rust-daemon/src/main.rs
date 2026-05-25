@@ -19,6 +19,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{
@@ -233,6 +234,8 @@ struct TensorResponse {
     shard_warmup_sent: u32,
     #[serde(default)]
     compute_time_ms: u64,
+    #[serde(default)]
+    relay_trace_json: String,
 }
 
 /// Tableau `routing_path` pour les réponses HTTP/SSE (aligné sur `pipeline_trace_json`).
@@ -273,6 +276,40 @@ fn env_bool_flag(name: &str) -> Option<bool> {
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         })
+}
+
+fn is_private_or_local_ipv4(ip: &Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+}
+
+fn is_private_or_local_ipv6(ip: &Ipv6Addr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local() || ip.is_unicast_link_local()
+}
+
+fn should_keep_identify_addr(addr: &Multiaddr, filter_private: bool) -> bool {
+    if !filter_private {
+        return true;
+    }
+    let mut saw_ip = false;
+    for proto in addr.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::P2pCircuit => return true,
+            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                saw_ip = true;
+                if is_private_or_local_ipv4(&ip) {
+                    return false;
+                }
+            }
+            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                saw_ip = true;
+                if is_private_or_local_ipv6(&ip) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    saw_ip
 }
 
 fn heartbeat_machine_info_with_network(
@@ -549,6 +586,13 @@ fn response_data_is_error(data: &[u8]) -> bool {
         .ok()
         .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
         == Some(false)
+}
+
+fn extract_transport_trace_from_response_data(data: &[u8]) -> serde_json::Value {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+        return serde_json::Value::Null;
+    };
+    v.get("transport_trace").cloned().unwrap_or(serde_json::Value::Null)
 }
 
 async fn call_local_inference_once(
@@ -1234,6 +1278,9 @@ async fn initiator_pull_workers_from_api_now(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    let filter_private_identify_addrs =
+        env_bool_flag("VRYX_P2P_FILTER_PRIVATE_IDENTIFY_ADDRS").unwrap_or(false);
+    let enable_swarm_quic = env_bool_flag("VRYX_P2P_LISTEN_QUIC").unwrap_or(true);
 
     // Filtre de log : on coupe le spam yamux/noise/autonat sauf si RUST_LOG est positionné.
     if std::env::var("RUST_LOG").is_err() {
@@ -1324,12 +1371,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build();
 
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", args.p2p_port).parse()?)?;
-    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", args.p2p_port).parse()?)?;
+    if enable_swarm_quic {
+        swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", args.p2p_port).parse()?)?;
+    } else {
+        println!(
+            "[P2P] QUIC swarm désactivé par VRYX_P2P_LISTEN_QUIC=0 ; écoute TCP + relay uniquement."
+        );
+    }
     if args.mode == "bootstrap" {
         swarm.add_external_address(format!("/ip4/51.222.26.225/tcp/{}", args.p2p_port).parse()?);
-        swarm.add_external_address(
-            format!("/ip4/51.222.26.225/udp/{}/quic-v1", args.p2p_port).parse()?,
-        );
+        if enable_swarm_quic {
+            swarm.add_external_address(
+                format!("/ip4/51.222.26.225/udp/{}/quic-v1", args.p2p_port).parse()?,
+            );
+        }
     }
 
     let my_peer_id = *swarm.local_peer_id();
@@ -1375,6 +1430,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             hidden_bytes: u64,
             persistent_relay: bool,
             connection_reuse: bool,
+            axum_base64_decode_ms: u64,
+            axum_request_payload_bytes: u64,
+            libp2p_send_request_ms: u64,
         },
         Forwarded {
             original_channel: request_response::ResponseChannel<TensorResponse>,
@@ -1864,6 +1922,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }))
             .route("/api/p2p/relay", post(move |Json(payload): Json<serde_json::Value>| async move {
                 use base64::{Engine as _, engine::general_purpose};
+                let axum_started = Instant::now();
                 if mode_relay != "initiator" {
                     return (
                         axum::http::StatusCode::FORBIDDEN,
@@ -1886,6 +1945,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap_or("")
                     .to_string();
                 let data_b64 = payload.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+                let axum_request_payload_bytes = data_b64.len() as u64;
+                let b64_decode_t0 = Instant::now();
                 let data = match general_purpose::STANDARD.decode(data_b64) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1895,7 +1956,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         );
                     }
                 };
+                let axum_base64_decode_ms = b64_decode_t0.elapsed().as_millis() as u64;
                 let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let persistent_relay = payload
                     .get("persistent_relay")
                     .and_then(|v| v.as_bool())
@@ -1913,6 +1976,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     routing_path,
                     session_id,
                 };
+                let req_dtype = req.dtype.clone();
+                let req_session_id = req.session_id.clone();
+                let req_payload_bytes = req.data.len();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let connection_reuse = active_relay_peers.lock().unwrap().contains(&peer);
                 let connection_transport = relay_peer_transports
@@ -1930,7 +1996,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 match tokio::time::timeout(std::time::Duration::from_secs(3600), rx).await {
                     Ok(Ok(Ok(resp))) => {
+                        let b64_encode_t0 = Instant::now();
                         let data_b64 = general_purpose::STANDARD.encode(&resp.data);
+                        let axum_response_base64_encode_ms = b64_encode_t0.elapsed().as_millis() as u64;
+                        let relay_trace = serde_json::from_str::<serde_json::Value>(&resp.relay_trace_json)
+                            .unwrap_or(serde_json::json!({}));
                         (
                             axum::http::StatusCode::OK,
                             Json(serde_json::json!({
@@ -1951,20 +2021,91 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "worker_compute_ms": resp.worker_compute_ms,
                                 "compute_time_ms": resp.compute_time_ms.max(resp.worker_compute_ms),
                                 "shard_session_id": resp.shard_session_id,
+                                "relay_trace": {
+                                    "method": req_dtype,
+                                    "peer_id": peer.to_string(),
+                                    "request_id": request_id,
+                                    "session_id": req_session_id,
+                                    "timeout_ms": 3600_u64 * 1000,
+                                    "axum_total_ms": axum_started.elapsed().as_millis() as u64,
+                                    "axum_base64_decode_ms": axum_base64_decode_ms,
+                                    "axum_response_base64_encode_ms": axum_response_base64_encode_ms,
+                                    "axum_request_payload_bytes": axum_request_payload_bytes,
+                                    "axum_response_payload_bytes": data_b64.len(),
+                                    "payload_bytes": req_payload_bytes,
+                                    "route_mode": "initiator_http_relay",
+                                    "p2p_transport": connection_transport,
+                                    "connection_transport": connection_transport,
+                                    "connection_reuse": connection_reuse,
+                                    "worker_seen_request": true,
+                                    "quic_used": relay_quic_used,
+                                    "inner": relay_trace,
+                                },
                             })),
                         )
                     }
                     Ok(Ok(Err(e))) => (
                         axum::http::StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({"ok": false, "error": e})),
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": e,
+                            "relay_trace": {
+                                "method": req_dtype,
+                                "peer_id": peer.to_string(),
+                                "request_id": request_id,
+                                "session_id": req_session_id,
+                                "timeout_ms": 3600_u64 * 1000,
+                                "elapsed_ms": axum_started.elapsed().as_millis() as u64,
+                                "payload_bytes": req_payload_bytes,
+                                "route_mode": "initiator_http_relay",
+                                "p2p_transport": connection_transport,
+                                "axum_ms": axum_started.elapsed().as_millis() as u64,
+                                "libp2p_send_ms": serde_json::Value::Null,
+                                "worker_seen_request": false,
+                            },
+                        })),
                     ),
                     Ok(Err(_)) => (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"ok": false, "error": "Réponse relais annulée."})),
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": "Réponse relais annulée.",
+                            "relay_trace": {
+                                "method": req_dtype,
+                                "peer_id": peer.to_string(),
+                                "request_id": request_id,
+                                "session_id": req_session_id,
+                                "timeout_ms": 3600_u64 * 1000,
+                                "elapsed_ms": axum_started.elapsed().as_millis() as u64,
+                                "payload_bytes": req_payload_bytes,
+                                "route_mode": "initiator_http_relay",
+                                "p2p_transport": connection_transport,
+                                "axum_ms": axum_started.elapsed().as_millis() as u64,
+                                "libp2p_send_ms": serde_json::Value::Null,
+                                "worker_seen_request": false,
+                            },
+                        })),
                     ),
                     Err(_) => (
                         axum::http::StatusCode::GATEWAY_TIMEOUT,
-                        Json(serde_json::json!({"ok": false, "error": "Délai relais P2P dépassé."})),
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": "Délai relais P2P dépassé.",
+                            "relay_trace": {
+                                "method": req_dtype,
+                                "peer_id": peer.to_string(),
+                                "request_id": request_id,
+                                "session_id": req_session_id,
+                                "timeout_ms": 3600_u64 * 1000,
+                                "elapsed_ms": axum_started.elapsed().as_millis() as u64,
+                                "payload_bytes": req_payload_bytes,
+                                "route_mode": "initiator_http_relay",
+                                "p2p_transport": connection_transport,
+                                "axum_ms": axum_started.elapsed().as_millis() as u64,
+                                "libp2p_send_ms": serde_json::Value::Null,
+                                "worker_seen_request": false,
+                            },
+                        })),
                     ),
                 }
             }))
@@ -1980,11 +2121,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         });
     }
 
-    if args.mode == "initiator" {
+    let initiator_tty = args.mode == "initiator"
+        && std::env::var("VRYX_INITIATOR_TTY").ok().as_deref() == Some("1");
+    if initiator_tty {
         println!("[Vryx Chat] Tapez votre message et appuyez sur Entrée.");
         println!("[Vryx Chat] Attendez qu'un worker soit découvert avant d'écrire.");
         print!("> Vous : ");
-        tokio::io::stdout().flush().await?;
+        let _ = tokio::io::stdout().flush().await;
+    } else if args.mode == "initiator" {
+        println!(
+            "[*] Initiateur headless — API http://127.0.0.1:{}",
+            args.api_port
+        );
     }
 
     // ── Timers ────────────────────────────────────────────────────────────
@@ -2183,16 +2331,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let connected_now = active_peers.lock().unwrap().contains(&peer);
                 let connection_reuse = connected_now;
                 if connected_now {
+                    let send_started = Instant::now();
                     let req_id = swarm
                         .behaviour_mut()
                         .request_response
                         .send_request(&peer, req);
+                    let libp2p_send_request_ms = send_started.elapsed().as_millis() as u64;
                     pending_requests.insert(req_id, (req_clone, PendingMeta::P2pRelayReply {
                         reply_tx,
                         relay_started,
                         hidden_bytes,
                         persistent_relay,
                         connection_reuse,
+                        axum_base64_decode_ms: 0,
+                        axum_request_payload_bytes: 0,
+                        libp2p_send_request_ms,
                     }));
                 } else {
                     eprintln!(
@@ -2216,16 +2369,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
+                    let send_started = Instant::now();
                     let req_id = swarm
                         .behaviour_mut()
                         .request_response
                         .send_request(&peer, req);
+                    let libp2p_send_request_ms = send_started.elapsed().as_millis() as u64;
                     pending_requests.insert(req_id, (req_clone, PendingMeta::P2pRelayReply {
                         reply_tx,
                         relay_started,
                         hidden_bytes,
                         persistent_relay,
                         connection_reuse,
+                        axum_base64_decode_ms: 0,
+                        axum_request_payload_bytes: 0,
+                        libp2p_send_request_ms,
                     }));
                 }
             }
@@ -2789,10 +2947,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             let r_clone = r.clone();
                                             let relay_started_i = Instant::now();
                                             let hidden_b = r_clone.data.len() as u64;
+                                            let send_started = Instant::now();
                                             let req_id_i = swarm
                                                 .behaviour_mut()
                                                 .request_response
                                                 .send_request(&peer_id, r);
+                                            let libp2p_send_request_ms =
+                                                send_started.elapsed().as_millis() as u64;
                                             pending_requests.insert(
                                                 req_id_i,
                                                 (
@@ -2803,6 +2964,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                         hidden_bytes: hidden_b,
                                                         persistent_relay: true,
                                                         connection_reuse: false,
+                                                        axum_base64_decode_ms: 0,
+                                                        axum_request_payload_bytes: 0,
+                                                        libp2p_send_request_ms,
                                                     },
                                                 ),
                                             );
@@ -2860,6 +3024,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("[P2P] Identify reçu de {} : addrs={:?} (observed={:?})", peer_id, info.listen_addrs, info.observed_addr);
                     let is_bootstrap = bootstrap_peer_id == Some(peer_id);
                     for addr in info.listen_addrs {
+                        if !should_keep_identify_addr(&addr, filter_private_identify_addrs) {
+                            if !is_bootstrap {
+                                println!(
+                                    "[P2P] Adresse filtrée pour {} : {}",
+                                    peer_id, addr
+                                );
+                            }
+                            continue;
+                        }
                         swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                         swarm.add_peer_address(peer_id, addr.clone());
                         if !is_bootstrap {
@@ -2882,10 +3055,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         let r_clone = r.clone();
                                         let relay_started_i = Instant::now();
                                         let hidden_b = r_clone.data.len() as u64;
+                                        let send_started = Instant::now();
                                         let req_id_i = swarm
                                             .behaviour_mut()
                                             .request_response
                                             .send_request(&peer_id, r);
+                                        let libp2p_send_request_ms =
+                                            send_started.elapsed().as_millis() as u64;
                                         pending_requests.insert(
                                             req_id_i,
                                             (
@@ -2896,6 +3072,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                                     hidden_bytes: hidden_b,
                                                     persistent_relay: true,
                                                     connection_reuse: false,
+                                                    axum_base64_decode_ms: 0,
+                                                    axum_request_payload_bytes: 0,
+                                                    libp2p_send_request_ms,
                                                 },
                                             ),
                                         );
@@ -3105,6 +3284,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             hidden_bytes,
                             persistent_relay: _persistent_relay,
                             connection_reuse: _connection_reuse,
+                            axum_base64_decode_ms,
+                            axum_request_payload_bytes,
+                            libp2p_send_request_ms,
                         })) => {
                             let mut response_with_metrics = response.clone();
                             response_with_metrics.vps_delegate_ms = relay_started.elapsed().as_millis() as u64;
@@ -3112,6 +3294,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             if response_with_metrics.serialization_time_ns == 0 {
                                 response_with_metrics.serialization_time_ns = response.serialization_time_ns;
                             }
+                            let worker_transport_trace =
+                                extract_transport_trace_from_response_data(&response.data);
+                            response_with_metrics.relay_trace_json = serde_json::json!({
+                                "libp2p_roundtrip_ms": response_with_metrics.vps_delegate_ms,
+                                "libp2p_send_request_ms": libp2p_send_request_ms,
+                                "axum_base64_decode_ms": axum_base64_decode_ms,
+                                "axum_request_payload_bytes": axum_request_payload_bytes,
+                                "hidden_payload_bytes": hidden_bytes,
+                                "worker_transport_trace": worker_transport_trace,
+                            })
+                            .to_string();
                             let _ = reply_tx.send(Ok(response_with_metrics));
                         }
                         Some((_, PendingMeta::Forwarded { original_channel })) => {

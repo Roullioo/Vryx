@@ -46,6 +46,28 @@ def _mx_weight_dtype(mx: Any) -> Any:
     return mx.float16
 
 
+def _mx_compute_dtype(mx: Any) -> Any:
+    """dtype activations internes (fp16 par défaut pour le débit Metal)."""
+    dtype = os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16").strip().lower()
+    if dtype in ("fp32", "float32"):
+        return mx.float32
+    return mx.float16
+
+
+def _default_scan_backend() -> str:
+    requested = os.environ.get(_SCAN_BACKEND_ENV, "").strip().lower()
+    if requested in _SCAN_BACKENDS:
+        return requested
+    try:
+        import mlx.core as mx
+
+        if mx.metal.is_available():
+            return "metal"
+    except Exception:
+        pass
+    return "chunked"
+
+
 def _mlx_clear_cache(mx: Any) -> None:
     gc.collect()
     try:
@@ -233,22 +255,30 @@ def _mx_sigmoid(mx, x: Any) -> Any:
 
 
 def _causal_conv1d_mlx(mx, x_bcl: Any, weight: Any, bias: Any | None = None) -> Any:
-    """Depthwise causal Conv1d vectorielle — évite la boucle Python."""
+    """Depthwise causal Conv1d via mx.conv1d (évite la boucle Python sur le kernel)."""
     bsz, channels, seq_len = x_bcl.shape
-    weight_ck = weight.squeeze(1) if getattr(weight, "ndim", 0) == 3 else weight
+    weight_ndim = getattr(weight, "ndim", 0)
+    if weight_ndim == 3:
+        if int(weight.shape[1]) == 1:
+            weight_ck = weight.squeeze(1)
+        elif int(weight.shape[-1]) == 1:
+            weight_ck = weight.squeeze(-1)
+        else:
+            weight_ck = weight.reshape(channels, -1)
+    else:
+        weight_ck = weight
+    if int(weight_ck.shape[0]) != int(channels) and int(weight_ck.shape[-1]) == int(channels):
+        weight_ck = weight_ck.T
     kernel = int(weight_ck.shape[-1])
-    # Padder causalement à gauche (kernel-1 zéros)
-    pad = mx.zeros((bsz, channels, kernel - 1), dtype=x_bcl.dtype)
-    padded = mx.concatenate([pad, x_bcl], axis=2)  # [B, C, L+K-1]
-    # Extraire toutes les fenêtres en une opération vectorielle
-    # windows[t] = padded[:, :, t:t+kernel] → [B, C, K]
-    # Empiler les K positions → [B, C, L, K]
-    windows = mx.stack([padded[:, :, t:t + seq_len] for t in range(kernel)], axis=-1)  # [B, C, L, K]
-    # Appliquer la convolution: sum over K avec les poids
-    # weight_ck: [C, K] → weight_ck[None, :, None, :] broadcast over B and L
-    out = mx.sum(windows * mx.expand_dims(mx.expand_dims(weight_ck, axis=0), axis=2), axis=-1)  # [B, C, L]
+    x_blc = x_bcl.transpose(0, 2, 1).astype(_mx_compute_dtype(mx))
+    left = mx.zeros((bsz, max(0, kernel - 1), channels), dtype=x_blc.dtype)
+    x_pad = mx.concatenate([left, x_blc], axis=1)
+    w_dw = weight_ck.reshape(channels, kernel, 1).astype(x_blc.dtype)
+    out_blc = mx.conv1d(x_pad, w_dw, stride=1, padding=0, groups=channels)
+    out_blc = out_blc[:, :seq_len, :]
+    out = out_blc.transpose(0, 2, 1)
     if bias is not None:
-        out = out + mx.expand_dims(mx.expand_dims(bias, axis=0), axis=2)
+        out = out + mx.expand_dims(bias.astype(out.dtype), axis=(0, 2))
     return _mx_silu(mx, out)
 
 
@@ -292,7 +322,7 @@ class MLXBackend:
         self.state_page = None
         self._cos: Any = None
         self._sin: Any = None
-        self.scan_backend_requested = _normalize_scan_backend(os.environ.get(_SCAN_BACKEND_ENV))
+        self.scan_backend_requested = _normalize_scan_backend(_default_scan_backend())
         self.scan_backend_effective = self.scan_backend_requested
 
         runtime_requested = str(os.environ.get("VRYX_RUNTIME_BACKEND") or "").strip().lower() == "mlx"
@@ -506,31 +536,96 @@ class MLXBackend:
         switch_prefix = f"{prefix}.mlp.switch_mlp"
         shared_prefix = f"{prefix}.mlp.shared_expert"
         flat = x.reshape(-1, int(x.shape[-1]))
-        logits = self._linear(flat, gate_prefix).astype(mx.float32)
+        compute_dtype = _mx_compute_dtype(mx)
+        logits = self._linear(flat, gate_prefix).astype(compute_dtype)
         top_k = max(1, min(int(self.shard.model_config.get("num_experts_per_tok") or 8), int(logits.shape[-1])))
-        probs = mx.softmax(logits, axis=-1)
+        probs = mx.softmax(logits.astype(mx.float32), axis=-1)
         idxs = mx.argsort(probs, axis=-1)[:, -top_k:]
         vals = mx.take_along_axis(probs, idxs, axis=-1)
         vals = vals / mx.sum(vals, axis=-1, keepdims=True)
+        gate_w = self._w(f"{switch_prefix}.gate_proj.weight")
+        up_w = self._w(f"{switch_prefix}.up_proj.weight")
+        down_w = self._w(f"{switch_prefix}.down_proj.weight")
+        expert_batched = (
+            gate_w is not None
+            and up_w is not None
+            and down_w is not None
+            and getattr(gate_w, "ndim", 0) >= 3
+            and getattr(up_w, "ndim", 0) >= 3
+            and getattr(down_w, "ndim", 0) >= 3
+        )
+        if expert_batched and os.environ.get("VRYX_MLX_MOE_EXPERT_BATCH", "1").strip().lower() not in ("0", "false", "no", "off"):
+            n_tokens = int(flat.shape[0])
+            chunk_size = max(1, int(os.environ.get("VRYX_MLX_MOE_TOKEN_CHUNK", "1") or "1"))
+            chunks = []
+
+            def qlinear_many(x_many: Any, proj: str, w_many: Any, idx_chunk: Any) -> Any:
+                scales = self.weights.get(f"{proj}.scales")
+                if scales is None:
+                    return mx.matmul(x_many, w_many.transpose(0, 1, 3, 2))
+                cfg = self._quant_cfg(proj)
+                biases = self.weights.get(f"{proj}.biases")
+                return mx.quantized_matmul(
+                    x_many,
+                    w_many,
+                    scales=scales[idx_chunk],
+                    biases=(biases[idx_chunk] if biases is not None else None),
+                    transpose=True,
+                    group_size=int(cfg.get("group_size") or 64),
+                    bits=int(cfg.get("bits") or 4),
+                    mode=str(cfg.get("mode") or "affine"),
+                )
+
+            for start in range(0, n_tokens, chunk_size):
+                end = min(n_tokens, start + chunk_size)
+                token_chunk = flat[start:end].astype(compute_dtype)
+                idx_chunk = idxs[start:end]
+                val_chunk = vals[start:end].astype(compute_dtype)
+
+                x_many = mx.broadcast_to(
+                    token_chunk.reshape(end - start, 1, 1, int(flat.shape[-1])),
+                    (end - start, top_k, 1, int(flat.shape[-1])),
+                )
+                gate_up = qlinear_many(x_many, f"{switch_prefix}.gate_proj", gate_w[idx_chunk], idx_chunk).astype(compute_dtype)
+                up = qlinear_many(x_many, f"{switch_prefix}.up_proj", up_w[idx_chunk], idx_chunk).astype(compute_dtype)
+                mid = _mx_silu(mx, gate_up) * up
+                down = qlinear_many(mid, f"{switch_prefix}.down_proj", down_w[idx_chunk], idx_chunk).astype(compute_dtype)
+                mixed = mx.sum(down * val_chunk.reshape(end - start, top_k, 1, 1), axis=1).reshape(end - start, int(x.shape[-1]))
+
+                if f"{shared_prefix}.gate_proj.weight" in self.weights:
+                    shared = self._linear(
+                        _mx_silu(mx, self._linear(token_chunk, f"{shared_prefix}.gate_proj"))
+                        * self._linear(token_chunk, f"{shared_prefix}.up_proj"),
+                        f"{shared_prefix}.down_proj",
+                    )
+                    shared_gate = mx.sigmoid(self._linear(token_chunk, f"{prefix}.mlp.shared_expert_gate"))
+                    mixed = mixed + shared_gate * shared
+                chunks.append(mixed)
+            return mx.concatenate(chunks, axis=0).reshape(x.shape)
+
         mx.eval(vals, idxs)
         idx_np = np.asarray(idxs, dtype=np.int64)
         vals_np = np.asarray(vals, dtype=np.float32)
         rows = []
         for token_i in range(idx_np.shape[0]):
-            token = flat[token_i:token_i + 1]
+            token = flat[token_i:token_i + 1].astype(compute_dtype)
+            experts = [int(idx_np[token_i, pos]) for pos in range(idx_np.shape[1])]
             acc = None
-            for pos in range(idx_np.shape[1]):
-                expert_idx = int(idx_np[token_i, pos])
+            for pos, expert_idx in enumerate(experts):
                 gate_up = self._linear(token, f"{switch_prefix}.gate_proj", expert_idx=expert_idx)
                 up = self._linear(token, f"{switch_prefix}.up_proj", expert_idx=expert_idx)
                 down = self._linear(_mx_silu(mx, gate_up) * up, f"{switch_prefix}.down_proj", expert_idx=expert_idx)
                 contrib = down * float(vals_np[token_i, pos])
                 acc = contrib if acc is None else acc + contrib
             if f"{shared_prefix}.gate_proj.weight" in self.weights:
-                shared = self._linear(_mx_silu(mx, self._linear(token, f"{shared_prefix}.gate_proj")) * self._linear(token, f"{shared_prefix}.up_proj"), f"{shared_prefix}.down_proj")
+                shared = self._linear(
+                    _mx_silu(mx, self._linear(token, f"{shared_prefix}.gate_proj"))
+                    * self._linear(token, f"{shared_prefix}.up_proj"),
+                    f"{shared_prefix}.down_proj",
+                )
                 shared_gate = mx.sigmoid(self._linear(token, f"{prefix}.mlp.shared_expert_gate"))
                 acc = (acc if acc is not None else mx.zeros_like(shared)) + shared_gate * shared
-            rows.append(acc[0])
+            rows.append(acc[0] if acc is not None else mx.zeros((int(x.shape[-1]),), dtype=compute_dtype))
         return mx.stack(rows, axis=0).reshape(x.shape)
 
     def _dense_mlp(self, mx: Any, prefix: str, x: Any) -> Any:
@@ -546,10 +641,12 @@ class MLXBackend:
         mx = self.mx
 
         t0 = time.perf_counter()
+        json_parse_t0 = time.perf_counter()
         try:
             payload = json.loads(data.decode("utf-8", errors="replace"))
         except Exception:
             return json.dumps({"ok": False, "error": "payload JSON invalide"}).encode()
+        json_parse_ms = max(0, int((time.perf_counter() - json_parse_t0) * 1000))
 
         sid = payload.get("session_id", session_id) or session_id
         request_id = str(payload.get("request_id") or "default")
@@ -599,15 +696,23 @@ class MLXBackend:
                 return json.dumps({"ok": False, "error": str(exc)}).encode()
             hidden = mx.expand_dims(hidden, axis=0)  # [1, L, D]
             seq_len = len(token_ids)
+            inbound_hidden_trace = {
+                "hidden_payload_dtype": "token_ids",
+                "hidden_payload_b64_bytes": 0,
+                "hidden_payload_raw_bytes": 0,
+                "hidden_base64_decode_ms": 0,
+                "hidden_deserialize_ms": 0,
+            }
         else:
-            hidden = self._decode_hidden(payload, hidden_size)
+            hidden, inbound_hidden_trace = self._decode_hidden(payload, hidden_size)
             if hidden is None:
                 return json.dumps({"ok": False, "error": "hidden state manquant"}).encode()
             if hidden.ndim == 2:
                 hidden = mx.expand_dims(hidden, axis=0)
             seq_len = int(hidden.shape[1])
 
-        hidden = hidden.astype(mx.float32)
+        compute_dtype = _mx_compute_dtype(mx)
+        hidden = hidden.astype(compute_dtype)
         B = int(hidden.shape[0])
         if step > 0 and use_kv and requested_decode_mode == "single_token_stateful" and seq_len != 1:
             return json.dumps({
@@ -641,15 +746,16 @@ class MLXBackend:
         def mlx_run_transformer(hidden_in: Any, seq_pos_run: int, seq_len_run: int, causal_here: Any) -> Any | None:
             """Passe Transformer (attention + MLP) ; met à jour kv_cache et shard.seq_position."""
             pos_ids_here = mx.arange(seq_pos_run, seq_pos_run + seq_len_run, dtype=mx.int32)
-            h = hidden_in.astype(mx.float32)
+            h = hidden_in.astype(compute_dtype)
             n_layers_here = self.shard.layer_end - self.shard.layer_start + 1
             if self.kv_cache is None:
                 self.kv_cache = [None] * n_layers_here  # type: ignore[assignment]
             n_heads_here = num_heads
             head_dim_here = head_dim  # évite de muter outer scope définitivement
             num_kv_heads_here = num_kv_heads
-            eval_every = max(1, int(os.environ.get("VRYX_MLX_EVAL_EVERY_LAYERS", "1")))
-            progress_every = max(0, int(os.environ.get("VRYX_MLX_PROGRESS_EVERY_LAYERS", "4")))
+            eval_default = str(n_layers_here) if seq_len_run == 1 else "2"
+            eval_every = max(1, int(os.environ.get("VRYX_MLX_EVAL_EVERY_LAYERS", eval_default)))
+            progress_every = max(0, int(os.environ.get("VRYX_MLX_PROGRESS_EVERY_LAYERS", "0")))
             for local_i in range(n_layers_here):
                 prefix = f"layers.{local_i}"
                 layer_t0 = time.perf_counter()
@@ -818,7 +924,7 @@ class MLXBackend:
                     if int(cur_tid) in stop_ids_int:
                         break
                     ids_mx_mic = mx.array([int(cur_tid)], dtype=mx.int32)
-                    h_mic = mx.expand_dims(self._embedding_lookup(mx, ids_mx_mic), axis=0).astype(mx.float32)
+                    h_mic = mx.expand_dims(self._embedding_lookup(mx, ids_mx_mic), axis=0).astype(compute_dtype)
                     sp_mic = int(self.shard.seq_position)
                     hz_mic = mlx_run_transformer(h_mic, sp_mic, 1, None)
                     if hz_mic is None:
@@ -877,11 +983,24 @@ class MLXBackend:
                 "attention_backend": "mlx_metal",
                 "linear_scan_backend": self.scan_backend_effective,
                 "runtime_backend": "mlx",
+                "transport_trace": {
+                    "request_json_parse_ms": json_parse_ms,
+                    "request_payload_bytes": len(data),
+                    "worker_grpc_payload_bytes": len(data),
+                    "hidden_transport_requested": str(payload.get("hidden_transport", HIDDEN_TRANSPORT)).lower(),
+                    "hidden_transport_effective": "lm_head_only",
+                    "python_mlx_pure_compute_ms": compute_ms,
+                    **inbound_hidden_trace,
+                },
             }
             debug_top_logits = _debug_top_logits_mx(mx, logits)
             if debug_top_logits:
                 response["debug_top_logits"] = debug_top_logits
-            return json.dumps(response).encode()
+            response_serialize_t0 = time.perf_counter()
+            raw = json.dumps(response).encode()
+            response["transport_trace"]["response_serialize_ms"] = max(0, int((time.perf_counter() - response_serialize_t0) * 1000))
+            raw = json.dumps(response).encode()
+            return raw
         else:
             if request_id != "default":
                 self._request_states[request_id] = {
@@ -913,10 +1032,24 @@ class MLXBackend:
                 "attention_backend": "mlx_metal",
                 "linear_scan_backend": self.scan_backend_effective,
                 "runtime_backend": "mlx",
+                "transport_trace": {
+                    "request_json_parse_ms": json_parse_ms,
+                    "request_payload_bytes": len(data),
+                    "worker_grpc_payload_bytes": len(data),
+                    "hidden_transport_requested": str(payload.get("hidden_transport", HIDDEN_TRANSPORT)).lower(),
+                    "hidden_transport_effective": transport,
+                    "python_mlx_pure_compute_ms": compute_ms,
+                    **inbound_hidden_trace,
+                    **hidden_metrics,
+                },
             }
             out.update(hidden_payload)
             out.update(hidden_metrics)
-            return json.dumps(out).encode()
+            response_serialize_t0 = time.perf_counter()
+            raw = json.dumps(out).encode()
+            out["transport_trace"]["response_serialize_ms"] = max(0, int((time.perf_counter() - response_serialize_t0) * 1000))
+            raw = json.dumps(out).encode()
+            return raw
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1106,13 +1239,18 @@ class MLXBackend:
             q_mx = mx.clip(mx.round(hidden_f16 / scale), -127, 127).astype(mx.int8)
             mx.eval(q_mx)
             q = np.array(q_mx, copy=False)
+            b64_t0 = time.perf_counter()
+            q_b64 = base64.b64encode(q.tobytes()).decode()
+            b64_ms = max(0, int((time.perf_counter() - b64_t0) * 1000))
             metrics.update({
                 "hidden_bytes": int(q.nbytes),
+                "hidden_b64_bytes": len(q_b64),
+                "hidden_base64_encode_ms": b64_ms,
                 "hidden_source_dtype": "fp16",
                 "hidden_transfer_dtype": "int8",
             })
             return {
-                "hidden_q_b64": base64.b64encode(q.tobytes()).decode(),
+                "hidden_q_b64": q_b64,
                 "hidden_scale": scale,
                 "hidden_zero_point": 0,
                 "hidden_shape": hidden_shape,
@@ -1132,13 +1270,18 @@ class MLXBackend:
                 q4 = np.pad(q4, (0, 1), mode="constant")
             nib = (q4.astype(np.int16) + 8).astype(np.uint8)
             packed = (nib[0::2] & 0x0F) | ((nib[1::2] & 0x0F) << 4)
+            b64_t0 = time.perf_counter()
+            packed_b64 = base64.b64encode(packed.tobytes()).decode()
+            b64_ms = max(0, int((time.perf_counter() - b64_t0) * 1000))
             metrics.update({
                 "hidden_bytes": int(packed.nbytes),
+                "hidden_b64_bytes": len(packed_b64),
+                "hidden_base64_encode_ms": b64_ms,
                 "hidden_source_dtype": "fp16",
                 "hidden_transfer_dtype": "q4",
             })
             return {
-                "hidden_q4_b64": base64.b64encode(packed.tobytes()).decode(),
+                "hidden_q4_b64": packed_b64,
                 "hidden_scale": scale,
                 "hidden_zero_point": 0,
                 "hidden_shape": hidden_shape,
@@ -1148,21 +1291,41 @@ class MLXBackend:
 
         mx.eval(hidden_f16)
         hs_np = np.array(hidden_f16, copy=False)
+        b64_t0 = time.perf_counter()
+        fp16_b64 = base64.b64encode(hs_np.tobytes()).decode()
+        b64_ms = max(0, int((time.perf_counter() - b64_t0) * 1000))
         metrics.update({
             "hidden_bytes": int(hs_np.nbytes),
+            "hidden_b64_bytes": len(fp16_b64),
+            "hidden_base64_encode_ms": b64_ms,
             "hidden_source_dtype": "fp16",
             "hidden_transfer_dtype": "fp16",
         })
         return {
-            "hidden_fp16_b64": base64.b64encode(hs_np.tobytes()).decode(),
+            "hidden_fp16_b64": fp16_b64,
             "hidden_shape": hidden_shape,
             "hidden_dtype": "fp16",
         }, metrics
 
-    def _decode_hidden(self, payload: dict, hidden_size: int) -> Any | None:
+    def _decode_hidden(self, payload: dict, hidden_size: int) -> tuple[Any | None, dict[str, Any]]:
         mx = self.mx
+        trace: dict[str, Any] = {
+            "hidden_decode_path": "mlx",
+            "hidden_payload_dtype": None,
+            "hidden_payload_b64_bytes": 0,
+            "hidden_payload_raw_bytes": 0,
+            "hidden_base64_decode_ms": 0,
+            "hidden_deserialize_ms": 0,
+        }
         if payload.get("hidden_q4_b64"):
-            raw = base64.b64decode(payload["hidden_q4_b64"])
+            b64 = payload["hidden_q4_b64"]
+            t_b64 = time.perf_counter()
+            raw = base64.b64decode(b64)
+            trace["hidden_base64_decode_ms"] = max(0, int((time.perf_counter() - t_b64) * 1000))
+            trace["hidden_payload_dtype"] = "q4"
+            trace["hidden_payload_b64_bytes"] = len(b64)
+            trace["hidden_payload_raw_bytes"] = len(raw)
+            t_deser = time.perf_counter()
             shape = tuple(int(x) for x in payload["hidden_shape"])
             scale = float(payload.get("hidden_scale") or 1.0)
             total = int(payload.get("hidden_q4_len") or np.prod(shape))
@@ -1172,28 +1335,57 @@ class MLXBackend:
             q = np.empty(packed.size * 2, dtype=np.int8)
             q[0::2] = lo; q[1::2] = hi
             q = q[:total].reshape(shape)
-            return mx.array(q, dtype=mx.int8).astype(mx.float32) * scale
+            out = mx.array(q, dtype=mx.int8).astype(mx.float32) * scale
+            trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
+            return out, trace
 
         if payload.get("hidden_q_b64"):
-            raw = base64.b64decode(payload["hidden_q_b64"])
+            b64 = payload["hidden_q_b64"]
+            t_b64 = time.perf_counter()
+            raw = base64.b64decode(b64)
+            trace["hidden_base64_decode_ms"] = max(0, int((time.perf_counter() - t_b64) * 1000))
+            trace["hidden_payload_dtype"] = "int8"
+            trace["hidden_payload_b64_bytes"] = len(b64)
+            trace["hidden_payload_raw_bytes"] = len(raw)
+            t_deser = time.perf_counter()
             shape = tuple(int(x) for x in payload["hidden_shape"])
             scale = float(payload.get("hidden_scale") or 1.0)
             q = np.frombuffer(raw, dtype=np.int8).reshape(shape)
-            return mx.array(q, dtype=mx.int8).astype(mx.float32) * scale
+            out = mx.array(q, dtype=mx.int8).astype(mx.float32) * scale
+            trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
+            return out, trace
 
         if payload.get("hidden_fp16_b64"):
-            raw = base64.b64decode(payload["hidden_fp16_b64"])
+            b64 = payload["hidden_fp16_b64"]
+            t_b64 = time.perf_counter()
+            raw = base64.b64decode(b64)
+            trace["hidden_base64_decode_ms"] = max(0, int((time.perf_counter() - t_b64) * 1000))
+            trace["hidden_payload_dtype"] = "fp16"
+            trace["hidden_payload_b64_bytes"] = len(b64)
+            trace["hidden_payload_raw_bytes"] = len(raw)
+            t_deser = time.perf_counter()
             shape = tuple(int(x) for x in payload["hidden_shape"])
             hs = np.frombuffer(raw, dtype=np.float16).reshape(shape)
-            return mx.array(hs, dtype=mx.float16)
+            out = mx.array(hs, dtype=mx.float16)
+            trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
+            return out, trace
 
         if payload.get("hidden_b64"):
-            raw = base64.b64decode(payload["hidden_b64"])
+            b64 = payload["hidden_b64"]
+            t_b64 = time.perf_counter()
+            raw = base64.b64decode(b64)
+            trace["hidden_base64_decode_ms"] = max(0, int((time.perf_counter() - t_b64) * 1000))
+            trace["hidden_payload_dtype"] = "fp32_legacy"
+            trace["hidden_payload_b64_bytes"] = len(b64)
+            trace["hidden_payload_raw_bytes"] = len(raw)
+            t_deser = time.perf_counter()
             flat = np.frombuffer(raw, dtype=np.float32)
             seq_len = len(flat) // hidden_size
-            return mx.array(flat.reshape(1, seq_len, hidden_size), dtype=mx.float32)
+            out = mx.array(flat.reshape(1, seq_len, hidden_size), dtype=mx.float32)
+            trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
+            return out, trace
 
-        return None
+        return None, trace
 
     def _topk_logits_cpu(self, mx: Any, logits: Any, k: int) -> tuple[np.ndarray, np.ndarray] | None:
         try:
