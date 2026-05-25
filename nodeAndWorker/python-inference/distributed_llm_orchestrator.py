@@ -395,6 +395,7 @@ SHARD_READY_TIMEOUT = _timeout_sec("VRYX_SHARD_READY_TIMEOUT_SEC", min(180.0, SH
 SHARD_STATUS_TIMEOUT = _timeout_sec("VRYX_SHARD_STATUS_TIMEOUT_SEC", 120.0, floor=20.0)
 MLX_DIRECT_RELAY_TIMEOUT = _timeout_sec("VRYX_MLX_DIRECT_RELAY_TIMEOUT_SEC", 30.0, floor=5.0)
 RELAY_TIMEOUT_BY_METHOD: dict[str, float] = {
+    "vryx.ping.peer": _timeout_sec("VRYX_RELAY_TIMEOUT_PING_PEER_SEC", 10.0, floor=1.0),
     "vryx.shard.status": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_STATUS_SEC", 15.0, floor=5.0),
     "vryx.shard.init": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_INIT_SEC", 120.0, floor=15.0),
     "vryx.shard.load": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_LOAD_SEC", 900.0, floor=30.0),
@@ -404,6 +405,20 @@ RELAY_TIMEOUT_BY_METHOD: dict[str, float] = {
     "vryx.shard.pipeline": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_PIPELINE_SEC", 300.0, floor=30.0),
     "vryx.pipeline.forward": _timeout_sec("VRYX_RELAY_TIMEOUT_PIPELINE_FORWARD_SEC", 300.0, floor=30.0),
 }
+
+
+def timeout_for_dtype(dtype: str, default: float = TIMEOUT) -> float:
+    normalized = str(dtype or "").strip()
+    if normalized in RELAY_TIMEOUT_BY_METHOD:
+        return float(RELAY_TIMEOUT_BY_METHOD[normalized])
+    lower = normalized.lower()
+    if "load" in lower or "build" in lower:
+        return _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_LOAD_SEC", 900.0, floor=30.0)
+    if "prefill" in lower or "forward" in lower or "pipeline" in lower:
+        return _timeout_sec("VRYX_RELAY_TIMEOUT_PIPELINE_FORWARD_SEC", 300.0, floor=30.0)
+    if "decode" in lower:
+        return _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_DECODE_SEC", 120.0, floor=15.0)
+    return float(default)
 SHARD_TTL = int(os.environ.get("VRYX_DIST_SHARD_TTL", "1800"))
 POOL_TTL = int(os.environ.get("VRYX_POOL_TTL_SEC", str(max(SHARD_TTL, 24 * 3600))))
 KEEP_POOL_SHARDS = os.environ.get("VRYX_POOL_KEEP_SHARDS", "true").lower() not in ("0", "false", "no")
@@ -776,9 +791,10 @@ def _public_api_base() -> str:
 
 def _worker_registry_headers(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
     headers = dict(extra or {})
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
     if secret_token:
         headers["Authorization"] = f"Bearer {secret_token}"
+        headers["x-worker-secret"] = secret_token
     return headers
 
 
@@ -1102,6 +1118,7 @@ def _relay_timeout_payload(
         "request_id": request_id,
         "persistent_relay": PERSISTENT_RELAY,
         "relay_trace": {
+            "dtype": dtype,
             "method": dtype,
             "peer_id": peer_id,
             "timeout_ms": int(timeout * 1000),
@@ -1110,6 +1127,7 @@ def _relay_timeout_payload(
             "session_id": relay_session_id,
             "payload_bytes": payload_size,
             "route_mode": route_mode,
+            "transport": p2p_transport,
             "p2p_transport": p2p_transport,
             "axum_ms": axum_ms,
             "libp2p_send_ms": libp2p_send_ms,
@@ -2148,7 +2166,7 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
     relay_request_id = hashlib.sha1(
         f"{peer_id}:{dtype}:{time.time_ns()}:{len(payload)}".encode("utf-8")
     ).hexdigest()[:16]
-    timeout = float(RELAY_TIMEOUT_BY_METHOD.get(dtype, timeout))
+    timeout = timeout_for_dtype(dtype, timeout)
     try:
         payload_obj = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
         if isinstance(payload_obj, dict):
@@ -2683,7 +2701,7 @@ def _save_shard_to_disk(
 
     # Manifeste JSON pour le worker (URL joignables depuis les workers distants ; pas forcément localhost)
     api_base = _worker_shard_download_base_url()
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
     token_suffix = f"?token={secret_token}" if secret_token else ""
     bin_url = f"{api_base}/api/internal/shard-serve/{session_id}/{bin_filename}{token_suffix}"
     manifest = {
@@ -2818,7 +2836,7 @@ def _save_shard_to_disk_from_safetensors(
     weight_map = dict(model_manifest["weight_map"])
     selected = _selected_tensor_names(model_config, weight_map, layer_start, layer_end, has_embedding, has_lm_head)
 
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
     token_suffix = f"?token={secret_token}" if secret_token else ""
 
     if SHARD_TRANSFER_MODE not in ("packed", "bin", "binary"):
@@ -3002,7 +3020,7 @@ def _save_shard_to_disk_from_prepared_gguf(
     with open(out_path, "w", encoding="utf-8") as fp:
         json.dump(out, fp, ensure_ascii=False)
     api_base = _worker_shard_download_base_url()
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
     token_suffix = f"?token={secret_token}" if secret_token else ""
     print(
         f"[VPS] Shard GGUF préparé worker-{peer_idx}: peer={peer_id[:16]} "

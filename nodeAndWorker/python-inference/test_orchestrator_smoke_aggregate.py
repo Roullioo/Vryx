@@ -86,6 +86,8 @@ class OrchestratorPatternTests(unittest.TestCase):
             "while len(generated_ids) < decode_cap:",
             '"micro_decode_budget"',
             "_relay_try_http_keepalive",
+            "timeout_for_dtype",
+            '"vryx.shard.init": _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_INIT_SEC", 120.0',
             'decode_microbatch") is True',
             "relay_iteration_guard",
         )
@@ -131,6 +133,17 @@ class ImportSmoke(unittest.TestCase):
         import distributed_llm_orchestrator as m
 
         self.assertIsNotNone(getattr(m, "DECODE_MICROBATCH", None))
+
+    def test_relay_timeouts_by_dtype(self) -> None:
+        import distributed_llm_orchestrator as m
+
+        self.assertEqual(m.timeout_for_dtype("vryx.ping.peer"), 10.0)
+        self.assertEqual(m.timeout_for_dtype("vryx.shard.status"), 15.0)
+        self.assertEqual(m.timeout_for_dtype("vryx.shard.init"), 120.0)
+        self.assertEqual(m.timeout_for_dtype("vryx.shard.load"), 900.0)
+        self.assertEqual(m.timeout_for_dtype("vryx.shard.build"), 900.0)
+        self.assertEqual(m.timeout_for_dtype("vryx.pipeline.forward"), 300.0)
+        self.assertEqual(m.timeout_for_dtype("vryx.shard.decode"), 120.0)
 
 
 if __name__ == "__main__":

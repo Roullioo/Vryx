@@ -233,7 +233,11 @@ function isUserPipelineChatActive(userId) {
   return userId ? activeUserChatSessions.has(String(userId)) : false
 }
 
-const WORKER_SECRET = String(process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET || '').trim()
+const WORKER_SECRET = String(
+  process.env.VRYX_WORKER_SECRET ||
+  process.env.WORKER_SECRET ||
+  '',
+).trim()
 const INTERNAL_TOKEN = String(process.env.VRYX_INTERNAL_TOKEN || (IS_PRODUCTION ? '' : 'vryx-internal-localhost')).trim()
 const RAW_ALLOW_UNSECURE_WORKERS = process.env.ALLOW_UNSECURE_WORKERS === '1'
 const ALLOW_UNSECURE_WORKERS = RAW_ALLOW_UNSECURE_WORKERS && !IS_PRODUCTION
@@ -241,11 +245,12 @@ const ALLOW_UNSECURE_WORKERS = RAW_ALLOW_UNSECURE_WORKERS && !IS_PRODUCTION
 async function requireWorkerSecret(req, res, next) {
   const authHeader = req.headers['authorization'] || ''
   let token = ''
-  if (authHeader.startsWith('Bearer ')) {
-    token = authHeader.substring(7)
+  if (/^Bearer\s+/i.test(authHeader)) {
+    token = authHeader.replace(/^Bearer\s+/i, '').trim()
   } else {
-    token = req.query.token || req.headers['x-worker-token'] || ''
+    token = req.headers['x-worker-secret'] || req.headers['x-worker-token'] || req.query.token || ''
   }
+  token = String(token || '').trim()
   if (ALLOW_UNSECURE_WORKERS) return next()
   if (WORKER_SECRET && timingSafeTokenMatches(token, WORKER_SECRET)) return next()
   const peerId = String(req.body?.peer_id || req.query.peer_id || '').trim()
@@ -270,7 +275,14 @@ async function requireWorkerSecret(req, res, next) {
       console.warn('worker secret lookup failed', e?.code || e?.message || e)
     }
   }
-  return res.status(401).json({ error: 'Unauthorized: Invalid worker secret token.' })
+  const code = token ? 'invalid_worker_secret' : 'missing_worker_secret'
+  return res.status(401).json({
+    ok: false,
+    error: code,
+    message: token
+      ? 'Worker secret invalid. Send VRYX_WORKER_SECRET as Authorization Bearer or x-worker-secret.'
+      : 'Worker secret missing. Set VRYX_WORKER_SECRET and send it as Authorization Bearer or x-worker-secret.',
+  })
 }
 
 const p2pTokenStreams = new Map()
@@ -1174,7 +1186,7 @@ function validateSecurityConfig() {
   }
   if (IS_PRODUCTION) {
     if (!WORKER_SECRET || WORKER_SECRET.length < 32) {
-      fatal.push('VRYX_WORKER_SECRET ou WORKER_INFERENCE_DELEGATE_SECRET est obligatoire en production.')
+      fatal.push('VRYX_WORKER_SECRET est obligatoire en production.')
     }
     if (!INTERNAL_TOKEN || INTERNAL_TOKEN.length < 32) {
       fatal.push('VRYX_INTERNAL_TOKEN est obligatoire en production pour les endpoints internes localhost.')
@@ -9825,7 +9837,7 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
             fetch(`http://127.0.0.1:${PORT}/api/workers/status`, {
               headers: {
                 Accept: 'application/json',
-                ...(WORKER_SECRET ? { Authorization: `Bearer ${WORKER_SECRET}` } : {}),
+                ...(WORKER_SECRET ? { Authorization: `Bearer ${WORKER_SECRET}`, 'x-worker-secret': WORKER_SECRET } : {}),
               },
             }),
             fetch('http://127.0.0.1:3031/api/status', { headers: { Accept: 'application/json' } }),

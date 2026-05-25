@@ -32,6 +32,10 @@ goto parse_args
 :done_args
 
 if "%VRYX_WORKER_SHARD_ONLY%"=="1" if "%VRYX_RUNTIME_BACKEND%"=="" set "VRYX_RUNTIME_BACKEND=cpu"
+if "%VRYX_API_URL%"=="" set "VRYX_API_URL=%API_URL%"
+if "%VRYX_USER_ID%"=="" set "VRYX_USER_ID=%USER_ID%"
+if "%VRYX_WORKER_OS%"=="" set "VRYX_WORKER_OS=win32"
+if "%VRYX_WORKER_SECRET%"=="" if not "%WORKER_SECRET%"=="" set "VRYX_WORKER_SECRET=%WORKER_SECRET%"
 
 echo [*] Modele : %MODEL_ID%
 echo [*] Ports  : gRPC %GRPC_PORT% / API %API_PORT% / P2P %P2P_PORT%

@@ -210,6 +210,10 @@ let lastWorkerMetrics = {
   uptimeSec: 0,
   estimatedToday: 0,
   lastHeartbeatAt: '',
+  lastHeartbeatStatus: 0,
+  lastHeartbeatError: '',
+  apiUrl: DEFAULT_API_URL,
+  workerSecretPresent: false,
   lastError: '',
   shardCount: 0,
   shardLayers: 0,
@@ -623,7 +627,7 @@ async function acknowledgeRemoteCommand(config, command, status = 'acknowledged'
 
 function workerAuthHeaders(config = readConfig()) {
   const secret = String(config?.workerSecret || '').trim();
-  return secret ? { Authorization: `Bearer ${secret}` } : {};
+  return secret ? { Authorization: `Bearer ${secret}`, 'x-worker-secret': secret } : {};
 }
 
 async function handleRemoteWorkerCommand(commandEvent) {
@@ -905,7 +909,11 @@ async function readWorkerMetrics() {
     uptimeSec,
     estimatedToday: tokensGenerated * rewardPerToken,
     lastHeartbeatAt: String(remoteWorker?.lastHeartbeatAt || ''),
-    lastError: local.ok || onlineGrace ? '' : String(local.error || remote.error || ''),
+    lastHeartbeatStatus: remote.status || 0,
+    lastHeartbeatError: remote.ok ? '' : String(remote.data?.error || remote.error || ''),
+    apiUrl: config.apiUrl || DEFAULT_API_URL,
+    workerSecretPresent: Boolean(String(config.workerSecret || '').trim()),
+    lastError: local.ok || onlineGrace ? '' : String(local.error || remote.data?.error || remote.error || ''),
     ...shardSummary,
   };
 
@@ -1220,6 +1228,10 @@ function spawnWorker(config, hardware) {
   const env = { ...process.env };
   env.VELOCITY_ROLE = 'worker';
   env.VRYX_WORKER_VERSION = currentWorkerVersion(config);
+  env.VRYX_API_URL = config.apiUrl || DEFAULT_API_URL;
+  env.VRYX_AUTH_TOKEN = String(config.authToken || '');
+  env.VRYX_USER_ID = String(config.userId || '');
+  env.VRYX_WORKER_OS = process.platform === 'win32' ? 'win32' : process.platform;
   if (config.workerSecret) env.VRYX_WORKER_SECRET = String(config.workerSecret);
   env.VRYX_RUNTIME_BACKEND = validation.backend;
   env.VRYX_WORKER_MODEL = config.modelId;

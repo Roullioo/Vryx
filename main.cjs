@@ -174,6 +174,10 @@ let lastWorkerMetrics = {
   uptimeSec: 0,
   estimatedToday: 0,
   lastHeartbeatAt: '',
+  lastHeartbeatStatus: 0,
+  lastHeartbeatError: '',
+  apiUrl: DEFAULT_API_URL,
+  workerSecretPresent: false,
   lastError: '',
 };
 
@@ -204,9 +208,9 @@ function writeConfig(config) {
 
 function workerAuthHeaders(config = readConfig()) {
   const secret = String(
-    config?.workerSecret || process.env.VRYX_WORKER_SECRET || process.env.WORKER_INFERENCE_DELEGATE_SECRET || ''
+    config?.workerSecret || process.env.VRYX_WORKER_SECRET || process.env.WORKER_SECRET || ''
   ).trim();
-  return secret ? { Authorization: `Bearer ${secret}` } : {};
+  return secret ? { Authorization: `Bearer ${secret}`, 'x-worker-secret': secret } : {};
 }
 
 function handleProtocolUrl(rawUrl) {
@@ -441,7 +445,11 @@ async function readWorkerMetrics() {
     uptimeSec,
     estimatedToday: tokensGenerated * rewardPerToken,
     lastHeartbeatAt: String(remoteWorker?.lastHeartbeatAt || ''),
-    lastError: local.ok || onlineGrace ? '' : String(local.error || remote.error || ''),
+    lastHeartbeatStatus: remote.status || 0,
+    lastHeartbeatError: remote.ok ? '' : String(remote.data?.error || remote.error || ''),
+    apiUrl: config.apiUrl || DEFAULT_API_URL,
+    workerSecretPresent: Boolean(String(config.workerSecret || '').trim()),
+    lastError: local.ok || onlineGrace ? '' : String(local.error || remote.data?.error || remote.error || ''),
   };
 
   if (lastWorkerMetrics.p2pReady && workerState.state !== 'working') {
@@ -657,6 +665,11 @@ function spawnWorker(config, hardware) {
   killPortUnixSync(config.p2pPort);
   const env = { ...process.env };
   env.VELOCITY_ROLE = 'worker';
+  env.VRYX_API_URL = config.apiUrl || DEFAULT_API_URL;
+  env.VRYX_AUTH_TOKEN = String(config.authToken || '');
+  env.VRYX_USER_ID = String(config.userId || '');
+  env.VRYX_WORKER_OS = process.platform === 'win32' ? 'win32' : process.platform;
+  if (config.workerSecret) env.VRYX_WORKER_SECRET = String(config.workerSecret);
   env.VRYX_RUNTIME_BACKEND = validation.backend;
   env.VRYX_WORKER_MODEL = config.modelId;
   env.VRYX_WORKER_MODEL_TOTAL_GB = String(validation.model.totalModelGb || validation.model.diskGb || '');

@@ -78,7 +78,7 @@ def _read_json_arg(value: str) -> object:
 
 def _fetch_json(url: str, timeout: float = 10.0) -> object:
     headers = {}
-    secret = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_INFERENCE_DELEGATE_SECRET") or ""
+    secret = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
     if secret:
         headers["Authorization"] = f"Bearer {secret}"
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method="GET"), timeout=timeout) as resp:

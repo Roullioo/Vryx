@@ -24,7 +24,7 @@ const patterns = [
   { name: 'Private key block', re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
   {
     name: 'Hardcoded production secret env',
-    re: /^\s*(?:JWT_SECRET|DB_PASSWORD|STRIPE_SECRET_KEY|STRIPE_WEBHOOK_SECRET|VRYX_BENCH_TOKEN|VRYX_WORKER_SECRET)\s*=\s*['"]?([^'"\s#][^#\n]*)/gm,
+    re: /^[ \t]*(?:JWT_SECRET|DB_PASSWORD|STRIPE_SECRET_KEY|STRIPE_WEBHOOK_SECRET|VRYX_BENCH_TOKEN|VRYX_WORKER_SECRET)[ \t]*=[ \t]*['"]?([^'"\s#][^#\n]*)/gm,
     validate: (match) => {
       const value = String(match[1] || '').trim()
       if (!value) return false

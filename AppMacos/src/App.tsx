@@ -153,6 +153,10 @@ type WorkerMetrics = {
   uptimeSec: number
   estimatedToday: number
   lastHeartbeatAt: string
+  lastHeartbeatStatus: number
+  lastHeartbeatError: string
+  apiUrl: string
+  workerSecretPresent: boolean
   lastError: string
   shardCount: number
   shardLayers: number
@@ -691,6 +695,26 @@ function computeWorkerReputation(metrics: WorkerMetrics | null, revenue: ReturnT
 
 function networkDiagnostics(config: WorkerConfig, metrics: WorkerMetrics | null, networkStats: NetworkStats | null) {
   return [
+    {
+      label: 'API URL',
+      value: metrics?.apiUrl || config.apiUrl,
+      ok: Boolean(metrics?.apiUrl || config.apiUrl),
+    },
+    {
+      label: 'Secret worker',
+      value: metrics?.workerSecretPresent ? 'présent' : 'absent',
+      ok: Boolean(metrics?.workerSecretPresent),
+    },
+    {
+      label: 'Heartbeat API',
+      value: metrics?.lastHeartbeatStatus ? `HTTP ${metrics.lastHeartbeatStatus}` : 'en attente',
+      ok: Boolean(recentIso(metrics?.lastHeartbeatAt)),
+    },
+    {
+      label: 'Erreur heartbeat',
+      value: metrics?.lastHeartbeatError || 'aucune',
+      ok: !metrics?.lastHeartbeatError,
+    },
     {
       label: 'TCP local',
       value: `127.0.0.1:${config.apiPort}`,

@@ -42,7 +42,7 @@ WORKER_HIDDEN_QUIC="${VRYX_WORKER_HIDDEN_QUIC:-0}"
 WORKER_FILTER_PRIVATE_IDENTIFY_ADDRS="${VRYX_P2P_FILTER_PRIVATE_IDENTIFY_ADDRS:-1}"
 # Bench WAN stable : éviter les doubles chemins TCP/QUIC qui font churner le relay.
 WORKER_P2P_LISTEN_QUIC="${VRYX_P2P_LISTEN_QUIC:-0}"
-WORKER_SECRET="${VRYX_WORKER_SECRET:-${WORKER_INFERENCE_DELEGATE_SECRET:-${VRYX_API_WORKER_SECRET:-}}}"
+WORKER_SECRET="${VRYX_WORKER_SECRET:-${WORKER_SECRET:-}}"
 # Démarrage direct par défaut : le double-fork reste disponible, mais il a créé
 # des états UE persistants sur certains shells macOS.
 USE_SETSID="${VRYX_USE_SETSID:-0}"
@@ -276,12 +276,10 @@ start_one() {
     daemon_cmd=(perl "${SCRIPT_DIR}/scripts/exec-setsid.pl" "${daemon_cmd[@]}")
   fi
   nohup env \
+    "VRYX_WORKER_SECRET=${WORKER_SECRET}" \
     VRYX_RUNTIME_BACKEND=mlx \
     VRYX_SUPPORTS_MLX=1 \
     VRYX_SUPPORTS_Q4_WEIGHTS=1 \
-    VRYX_WORKER_SECRET="${WORKER_SECRET}" \
-    WORKER_INFERENCE_DELEGATE_SECRET="${WORKER_SECRET}" \
-    VRYX_API_WORKER_SECRET="${WORKER_SECRET}" \
     VRYX_MLX_WEIGHT_DTYPE="${VRYX_MLX_WEIGHT_DTYPE:-fp16}" \
     VRYX_MLX_MAX_SHARD_GB="${MLX_MAX_SHARD_GB}" \
     VRYX_MLX_SCAN_BACKEND="${VRYX_MLX_SCAN_BACKEND:-chunked}" \

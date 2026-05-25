@@ -978,16 +978,28 @@ struct HeartbeatPayload {
     machine_info: Option<serde_json::Value>,
 }
 
+fn resolve_worker_secret() -> String {
+    std::env::var("VRYX_WORKER_SECRET")
+        .or_else(|_| std::env::var("WORKER_SECRET"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn apply_worker_secret_headers(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    if token.is_empty() {
+        req
+    } else {
+        req.header("Authorization", format!("Bearer {}", token))
+            .header("x-worker-secret", token.to_string())
+    }
+}
+
 async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &HeartbeatPayload) {
     let url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
-    let token = std::env::var("VRYX_WORKER_SECRET")
-        .or_else(|_| std::env::var("WORKER_INFERENCE_DELEGATE_SECRET"))
-        .unwrap_or_default();
+    let token = resolve_worker_secret();
 
-    let mut req = client.post(&url).json(payload);
-    if !token.is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", token));
-    }
+    let req = apply_worker_secret_headers(client.post(&url).json(payload), &token);
 
     match req.send().await {
         Ok(r) if r.status().is_success() => {
@@ -1028,11 +1040,7 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                                     "mode": payload.mode,
                                     "command_ack": { "id": cmd_id, "status": "acknowledged" }
                                 });
-                                let mut ack_req = client.post(&ack_url).json(&ack_payload);
-                                if !token.is_empty() {
-                                    ack_req = ack_req
-                                        .header("Authorization", format!("Bearer {}", token));
-                                }
+                                let ack_req = apply_worker_secret_headers(client.post(&ack_url).json(&ack_payload), &token);
                                 let _ = ack_req.send().await;
                                 std::process::exit(0);
                             }
@@ -1050,11 +1058,7 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                                     "mode": payload.mode,
                                     "command_ack": { "id": cmd_id, "status": "acknowledged" }
                                 });
-                                let mut ack_req = client.post(&ack_url).json(&ack_payload);
-                                if !token.is_empty() {
-                                    ack_req = ack_req
-                                        .header("Authorization", format!("Bearer {}", token));
-                                }
+                                let ack_req = apply_worker_secret_headers(client.post(&ack_url).json(&ack_payload), &token);
                                 let _ = ack_req.send().await;
                             }
                             "hot_reload_python" => {
@@ -1129,11 +1133,7 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                                         "error": ack_error,
                                     }
                                 });
-                                let mut ack_req = client.post(&ack_url).json(&ack_payload);
-                                if !token.is_empty() {
-                                    ack_req = ack_req
-                                        .header("Authorization", format!("Bearer {}", token));
-                                }
+                                let ack_req = apply_worker_secret_headers(client.post(&ack_url).json(&ack_payload), &token);
                                 let _ = ack_req.send().await;
                             }
                             _ => {
@@ -1148,7 +1148,10 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
             }
         }
         Ok(r) => {
-            eprintln!("[!] Heartbeat HTTP {} → {}", r.status(), url);
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            let detail = body.chars().take(240).collect::<String>();
+            eprintln!("[!] Heartbeat HTTP {} → {} {}", status, url, detail);
         }
         Err(e) => {
             eprintln!("[!] Heartbeat erreur : {}", e);
@@ -1183,14 +1186,9 @@ async fn initiator_pull_workers_from_api_now(
         api_url.trim_end_matches('/'),
         my_peer_id
     );
-    let token = std::env::var("VRYX_WORKER_SECRET")
-        .or_else(|_| std::env::var("WORKER_INFERENCE_DELEGATE_SECRET"))
-        .unwrap_or_default();
+    let token = resolve_worker_secret();
     let fetch = async {
-        let mut req = http_client.get(&url);
-        if !token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", token));
-        }
+        let req = apply_worker_secret_headers(http_client.get(&url), &token);
         let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
@@ -2022,6 +2020,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "compute_time_ms": resp.compute_time_ms.max(resp.worker_compute_ms),
                                 "shard_session_id": resp.shard_session_id,
                                 "relay_trace": {
+                                    "dtype": req_dtype,
                                     "method": req_dtype,
                                     "peer_id": peer.to_string(),
                                     "request_id": request_id,
@@ -2034,6 +2033,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "axum_response_payload_bytes": data_b64.len(),
                                     "payload_bytes": req_payload_bytes,
                                     "route_mode": "initiator_http_relay",
+                                    "transport": connection_transport,
                                     "p2p_transport": connection_transport,
                                     "connection_transport": connection_transport,
                                     "connection_reuse": connection_reuse,
@@ -2050,6 +2050,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "ok": false,
                             "error": e,
                             "relay_trace": {
+                                "dtype": req_dtype,
                                 "method": req_dtype,
                                 "peer_id": peer.to_string(),
                                 "request_id": request_id,
@@ -2058,6 +2059,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "elapsed_ms": axum_started.elapsed().as_millis() as u64,
                                 "payload_bytes": req_payload_bytes,
                                 "route_mode": "initiator_http_relay",
+                                "transport": connection_transport,
                                 "p2p_transport": connection_transport,
                                 "axum_ms": axum_started.elapsed().as_millis() as u64,
                                 "libp2p_send_ms": serde_json::Value::Null,
@@ -2071,6 +2073,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "ok": false,
                             "error": "Réponse relais annulée.",
                             "relay_trace": {
+                                "dtype": req_dtype,
                                 "method": req_dtype,
                                 "peer_id": peer.to_string(),
                                 "request_id": request_id,
@@ -2079,6 +2082,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "elapsed_ms": axum_started.elapsed().as_millis() as u64,
                                 "payload_bytes": req_payload_bytes,
                                 "route_mode": "initiator_http_relay",
+                                "transport": connection_transport,
                                 "p2p_transport": connection_transport,
                                 "axum_ms": axum_started.elapsed().as_millis() as u64,
                                 "libp2p_send_ms": serde_json::Value::Null,
@@ -2092,6 +2096,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "ok": false,
                             "error": "Délai relais P2P dépassé.",
                             "relay_trace": {
+                                "dtype": req_dtype,
                                 "method": req_dtype,
                                 "peer_id": peer.to_string(),
                                 "request_id": request_id,
@@ -2100,6 +2105,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "elapsed_ms": axum_started.elapsed().as_millis() as u64,
                                 "payload_bytes": req_payload_bytes,
                                 "route_mode": "initiator_http_relay",
+                                "transport": connection_transport,
                                 "p2p_transport": connection_transport,
                                 "axum_ms": axum_started.elapsed().as_millis() as u64,
                                 "libp2p_send_ms": serde_json::Value::Null,

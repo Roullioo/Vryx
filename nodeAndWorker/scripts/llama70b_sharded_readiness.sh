@@ -33,7 +33,7 @@ fi
 REMOTE
 
 echo "[2/5] Workers live et VRAM allouée"
-"${SSH[@]}" "SECRET=\$(awk -F= '/^(VRYX_WORKER_SECRET|WORKER_INFERENCE_DELEGATE_SECRET)=/ && length(\$2) > 0 { print \$2; exit }' /var/www/vryx/server/.env); DATA=\$(curl -fsS -H \"Authorization: Bearer \$SECRET\" http://127.0.0.1:4000/api/workers/status) python3 - <<'PY'
+"${SSH[@]}" "SECRET=\$(awk -F= '/^(VRYX_WORKER_SECRET|WORKER_SECRET)=/ && length(\$2) > 0 { print \$2; exit }' /var/www/vryx/server/.env); DATA=\$(curl -fsS -H \"Authorization: Bearer \$SECRET\" -H \"x-worker-secret: \$SECRET\" http://127.0.0.1:4000/api/workers/status) python3 - <<'PY'
 import json, os
 data = json.loads(os.environ.get('DATA') or '{}')
 workers = [w for w in data.get('workers', []) if w.get('mode') == 'worker']
