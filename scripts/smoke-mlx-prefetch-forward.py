@@ -67,6 +67,9 @@ def _worker_rows(trace: dict[str, Any]) -> list[dict[str, Any]]:
             "first_forward_lazy_read_ms": shard.get("first_forward_lazy_read_ms"),
             "first_forward_dequant_ms": shard.get("first_forward_dequant_ms"),
             "local_cache_hit_rate": shard.get("local_cache_hit_rate"),
+            "local_source_path_present": shard.get("local_source_path_present"),
+            "local_source_required": shard.get("local_source_required"),
+            "local_source_error": shard.get("local_source_error"),
         })
     return rows
 
@@ -130,6 +133,7 @@ def main() -> int:
         failures.append(f"second_failed:{second.get('error') or second_status}")
     if second.get("session_reused") is not True:
         failures.append("second_not_hot_path")
+    require_local = os.environ.get("VRYX_MLX_PREFETCH_SMOKE_REQUIRE_LOCAL_SOURCE", "0").strip().lower() in ("1", "true", "yes", "on")
     for row in second.get("workers") or []:
         if row.get("runtime_backend") != "mlx":
             failures.append(f"{row.get('peer_id')}:runtime={row.get('runtime_backend')}")
@@ -137,6 +141,8 @@ def main() -> int:
             failures.append(f"{row.get('peer_id')}:attention={row.get('attention_backend')}")
         if row.get("linear_attn_ready") is not True:
             failures.append(f"{row.get('peer_id')}:linear_attn_ready={row.get('linear_attn_ready')}")
+        if require_local and row.get("local_source_path_present") is not True:
+            failures.append(f"{row.get('peer_id')}:local_source_missing:{row.get('local_source_error')}")
     result = {"ok": not failures, "first": first, "second": second, "failures": failures}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     return 0 if result["ok"] else 1

@@ -1309,6 +1309,7 @@ function spawnWorker(config, hardware) {
     const localQwen36Gguf = path.join(env.VRYX_MODEL_CACHE_DIR, 'gguf', 'qwen36-35b-iq4-xs.gguf');
     if (!env.VRYX_GGUF_LOCAL_SOURCE_PATH && fs.existsSync(localQwen36Gguf)) {
       env.VRYX_GGUF_LOCAL_SOURCE_PATH = localQwen36Gguf;
+      env.VRYX_GGUF_PERF_MODE = env.VRYX_GGUF_PERF_MODE || '1';
     }
     env.VRYX_MLX_STRICT = '1';
     env.VRYX_DISABLE_PYTORCH_FALLBACK = '1';

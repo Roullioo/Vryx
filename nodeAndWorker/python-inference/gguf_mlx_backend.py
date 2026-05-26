@@ -38,6 +38,14 @@ def _truthy_env(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _gguf_perf_path_required() -> bool:
+    return (
+        _truthy_env("VRYX_GGUF_REQUIRE_LOCAL_SOURCE")
+        or _truthy_env("VRYX_GGUF_PERF_MODE")
+        or _truthy_env("VRYX_MLX_REQUIRE_LOCAL_GGUF")
+    )
+
+
 def _int_env(name: str, default: int = 0) -> int:
     try:
         return int(float(os.environ.get(name, str(default)) or default))
@@ -227,6 +235,8 @@ class LazyGgufWeights:
             "local_cache_write_errors": 0,
         }
         self.local_source_path = self.path if self.path and os.path.isfile(self.path) else ""
+        self.local_source_required = _gguf_perf_path_required()
+        self.local_source_error = ""
         self.forward_count = 0
         self._active_forward: dict[str, Any] | None = None
         self.first_forward_stats: dict[str, Any] = {}
@@ -285,15 +295,19 @@ class LazyGgufWeights:
                     for entry in self.entries.values()
                 )
                 if os.path.getsize(self.local_source_path) < required_size:
-                    self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append("local_source_incomplete")
+                    self.local_source_error = "local_source_incomplete"
+                    self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append(self.local_source_error)
                     self.path = ""
                     self.local_source_path = ""
             except ValueError:
                 pass
             except Exception as exc:
-                self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append(f"local_source_check:{exc}")
+                self.local_source_error = f"local_source_check:{exc}"
+                self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append(self.local_source_error)
                 self.path = ""
                 self.local_source_path = ""
+        elif self.local_source_required:
+            self.local_source_error = "gguf_local_source_required"
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -458,6 +472,8 @@ class LazyGgufWeights:
             offset = int(entry.get("offset") if entry.get("offset") is not None else entry.get("source_offset") or 0)
             raw = np.memmap(self.path, dtype=np.uint8, mode="r", offset=offset, shape=(nbytes,))
         else:
+            if self.local_source_required:
+                raise RuntimeError(self.local_source_error or "gguf_local_source_required")
             source_url = str(entry.get("source_url") or "")
             source_offset = int(entry.get("source_offset") or 0)
             if not source_url or nbytes <= 0:
@@ -567,6 +583,8 @@ class LazyGgufWeights:
             "lazy_total_dequant_ms": int(self.stats.get("lazy_dequant_ms") or 0),
             "local_cache_enabled": bool(self.local_cache_enabled),
             "local_source_path_present": bool(self.local_source_path),
+            "local_source_required": bool(self.local_source_required),
+            "local_source_error": self.local_source_error or None,
             "local_cache_hit_rate": round((local_hits / local_total), 4) if local_total else 0.0,
             "local_cache_hits": local_hits,
             "local_cache_misses": local_misses,
@@ -643,6 +661,18 @@ class GGUFLazyMLXBackend(MLXBackend):
         t0 = time.perf_counter()
         cache_gb = float(os.environ.get("VRYX_GGUF_MLX_CACHE_GB", "4"))
         self.weights = LazyGgufWeights(self.shard, self.mx, max_cache_bytes=int(cache_gb * 1024**3))
+        if getattr(self.weights, "local_source_required", False) and not getattr(self.weights, "local_source_path", ""):
+            return {
+                "ok": False,
+                "runtime_backend": "mlx",
+                "runtime_backend_detail": self.name,
+                "error": getattr(self.weights, "local_source_error", "") or "gguf_local_source_required",
+                "gguf_local_source_required": True,
+                "local_source_path_present": False,
+                "weight_load_mode": "gguf_ranges",
+                "fallback_allowed": False,
+                "hint": "Set VRYX_GGUF_LOCAL_SOURCE_PATH to the complete local GGUF file for perf-path MLX shards.",
+            }
         dense_gb = float(getattr(self.weights, "estimated_dense_bytes", 0) or 0) / 1024**3
         default_budget_gb = max(
             1.0,

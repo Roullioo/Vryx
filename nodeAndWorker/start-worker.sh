@@ -48,6 +48,7 @@ if [ "${VRYX_WORKER_SHARD_ONLY:-0}" = "1" ] && [ "${VRYX_RUNTIME_BACKEND:-}" = "
     export VRYX_GGUF_LOCAL_CACHE_DIR="${VRYX_GGUF_LOCAL_CACHE_DIR:-${VRYX_WORKER_SHARD_CACHE_DIR:-${HOME}/.cache/vryx/shards}/gguf-cache}"
     if [ -z "${VRYX_GGUF_LOCAL_SOURCE_PATH:-}" ] && [ -n "${VRYX_MODEL_CACHE_DIR:-}" ] && [ -f "${VRYX_MODEL_CACHE_DIR}/gguf/qwen36-35b-iq4-xs.gguf" ]; then
         export VRYX_GGUF_LOCAL_SOURCE_PATH="${VRYX_MODEL_CACHE_DIR}/gguf/qwen36-35b-iq4-xs.gguf"
+        export VRYX_GGUF_PERF_MODE="${VRYX_GGUF_PERF_MODE:-1}"
     fi
     case "$(printf '%s' "$MODEL_ID" | tr '[:upper:]' '[:lower:]')" in
         *llama*70b*)
