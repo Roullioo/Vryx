@@ -2462,6 +2462,14 @@ def _relay_pipeline_chain_once(
             "ok": result.get("ok", True) is not False,
             "error": result.get("error"),
         })
+        relay_trace = result.get("relay_trace") if isinstance(result.get("relay_trace"), dict) else {}
+        if relay_trace:
+            hop_traces[-1]["relay_trace"] = relay_trace
+            hop_traces[-1]["base64_decode_ms"] = relay_trace.get("axum_base64_decode_ms")
+            hop_traces[-1]["base64_encode_ms"] = relay_trace.get("axum_response_base64_encode_ms")
+            hop_traces[-1]["relay_request_payload_bytes"] = relay_trace.get("axum_request_payload_bytes")
+            hop_traces[-1]["relay_response_payload_bytes"] = relay_trace.get("axum_response_payload_bytes")
+            hop_traces[-1]["direct_vs_relay"] = "relay"
         if not result.get("ok", True):
             break
         decode_t0 = time.perf_counter()
@@ -5625,6 +5633,75 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         if post_prefill_modes and all(m == "single_token_stateful" for m in post_prefill_modes)
         else ("prefill_only" if not post_prefill_modes else "full_context_fallback")
     )
+    token_timings = list(trace_ctx.phase_trace.get("tokens") or [])
+    prefill_ms = int(trace_ctx.phase_trace.get("prefill_ms") or (step_latencies[0] if step_latencies else 0))
+    decode_total_ms = max(0, int(trace_ctx.phase_trace.get("decode_total_ms") or max(0, total_ms - prefill_ms)))
+    decode_token_count = max(0, len(generated_ids) - (1 if generated_ids else 0))
+    decode_tps = round((decode_token_count * 1000.0 / decode_total_ms), 3) if decode_total_ms > 0 else 0.0
+    global_tps = round((len(generated_ids) * 1000.0 / total_ms), 3) if total_ms > 0 else 0.0
+
+    def _sum_token_int(*keys: str) -> int:
+        total = 0
+        for tok in token_timings:
+            if not isinstance(tok, dict):
+                continue
+            for key in keys:
+                try:
+                    total += int(tok.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+        return total
+
+    def _sum_hop_int(*keys: str) -> int:
+        total = 0
+        for tok in token_timings:
+            if not isinstance(tok, dict):
+                continue
+            for hop in tok.get("hop_traces") or []:
+                if not isinstance(hop, dict):
+                    continue
+                worker_trace = hop.get("worker_transport_trace") if isinstance(hop.get("worker_transport_trace"), dict) else {}
+                for key in keys:
+                    value = hop.get(key)
+                    if value is None and worker_trace:
+                        value = worker_trace.get(key)
+                    try:
+                        total += int(value or 0)
+                    except (TypeError, ValueError):
+                        pass
+        return total
+
+    m1_compute_total_ms = _sum_token_int("m1_compute_ms")
+    m4_compute_total_ms = _sum_token_int("m4_compute_ms")
+    relay_total_ms_detailed = _sum_token_int("relay_total_ms") or relay_ms_total
+    serialization_total_ms_detailed = _sum_token_int("serialization_ms") or serialization_ms_total
+    base64_encode_ms_total = _sum_hop_int("base64_encode_ms", "hidden_base64_encode_ms")
+    base64_decode_ms_total = _sum_hop_int("base64_decode_ms", "hidden_base64_decode_ms")
+    deserialization_ms_total = _sum_hop_int("hidden_deserialize_ms", "response_json_decode_ms", "request_json_parse_ms")
+    payload_bytes_by_hop = [
+        {
+            "step": int(tok.get("step") or 0),
+            "microbatch_actual": int(tok.get("microbatch_actual") or 1),
+            "m1_request_payload_bytes": int(tok.get("m1_request_payload_bytes") or 0),
+            "m1_to_m4_payload_bytes": int((tok.get("prefill_payload_bytes_m1_to_m4") or 0) or (tok.get("decode_payload_bytes_m1_to_m4") or 0)),
+            "m4_request_payload_bytes": int(tok.get("m4_request_payload_bytes") or 0),
+            "hidden_transport": tok.get("hidden_transport_effective") or tok.get("hidden_transport_requested"),
+        }
+        for tok in token_timings
+        if isinstance(tok, dict)
+    ]
+    bottleneck_candidates = {
+        "prefill_ms": prefill_ms,
+        "decode_total_ms": decode_total_ms,
+        "relay_ms": relay_total_ms_detailed,
+        "serialization_ms": serialization_total_ms_detailed,
+        "base64_ms": base64_encode_ms_total + base64_decode_ms_total,
+        "deserialization_ms": deserialization_ms_total,
+        "m1_compute_ms": m1_compute_total_ms,
+        "m4_compute_ms": m4_compute_total_ms,
+        "vps_overhead_ms": _sum_token_int("vps_overhead_ms"),
+    }
+    primary_bottleneck = max(bottleneck_candidates.items(), key=lambda item: item[1])[0] if bottleneck_candidates else "unknown"
 
     base_trace: dict[str, Any] = {
         "layout": "pipeline_relay_daisy_chain",
@@ -5787,14 +5864,44 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         },
         "tokens_generated": len(generated_ids),
         "avg_ms_per_token": avg_ms,
-        "hot_path_tps": round((len(generated_ids) * 1000.0 / total_ms), 3) if total_ms > 0 else 0,
+        "hot_path_tps": global_tps,
+        "perf_trace": {
+            "ttft_ms": prefill_ms,
+            "prefill_ms": prefill_ms,
+            "decode_total_ms": decode_total_ms,
+            "decode_token_count_excluding_ttft": decode_token_count,
+            "decode_tps": decode_tps,
+            "global_tps": global_tps,
+            "microbatch_actual": int(trace_ctx.phase_trace.get("microbatch_actual") or 1),
+            "payload_bytes_by_hop": payload_bytes_by_hop,
+            "serialization_ms": serialization_total_ms_detailed,
+            "deserialization_ms": deserialization_ms_total,
+            "base64_encode_ms": base64_encode_ms_total,
+            "base64_decode_ms": base64_decode_ms_total,
+            "relay_ms": relay_total_ms_detailed,
+            "direct_vs_relay": "relay",
+            "m1_compute_ms": m1_compute_total_ms,
+            "m4_compute_ms": m4_compute_total_ms,
+            "per_token": token_timings,
+            "session_reused": bool(trace_ctx.session.get("reused") or sess_status == "reused"),
+            "shard_init_calls": int(trace_ctx.call_counts.get("vryx.shard.init") or 0),
+            "shard_load_calls": int(trace_ctx.call_counts.get("vryx.shard.load") or 0),
+            "shard_build_calls": int(trace_ctx.call_counts.get("vryx.shard.build") or 0),
+            "primary_bottleneck": primary_bottleneck,
+            "bottleneck_candidates": bottleneck_candidates,
+        },
         "setup_ms": setup_ms,
         "benchmark": {
             "target_tps": 15,
             "target_ms_per_token": 66,
             "intermediate_target_ms_per_token": 250,
             "actual_ms_per_token": avg_ms,
-            "actual_tps": round((len(generated_ids) * 1000.0 / total_ms), 3) if total_ms > 0 else 0,
+            "actual_tps": global_tps,
+            "decode_tps": decode_tps,
+            "ttft_ms": prefill_ms,
+            "decode_total_ms": decode_total_ms,
+            "microbatch_actual": int(trace_ctx.phase_trace.get("microbatch_actual") or 1),
+            "primary_bottleneck": primary_bottleneck,
             "decode_mode": effective_decode_mode,
             "routing_hops": len(routing_path),
             "stream_session_hot": bool(stream_open.get("ok")),
