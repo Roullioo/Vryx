@@ -2654,7 +2654,7 @@ def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str
     if payload.get("__disable_chain_stream"):
         return False
     try:
-        if int(payload.get("step") or 0) < 1:
+        if int(payload.get("step") or 0) < 1 and not CHAIN_MODEL_STEP_SMOKE:
             return False
     except (TypeError, ValueError):
         return False
@@ -2713,6 +2713,7 @@ def _relay_pipeline_chain_once(
             "m1_chain_received_ms": relay_trace.get("m1_chain_received_ms"),
             "m1_grpc_compute_start_ms": relay_trace.get("m1_grpc_compute_start_ms"),
             "m1_grpc_compute_end_ms": relay_trace.get("m1_grpc_compute_end_ms"),
+            "m1_forward_to_m4_ms": relay_trace.get("m1_forward_to_m4_ms"),
             "m1_forward_to_m4_start_ms": relay_trace.get("m1_forward_to_m4_start_ms"),
             "m4_chain_received_ms": relay_trace.get("m4_chain_received_ms"),
             "m4_grpc_compute_start_ms": relay_trace.get("m4_grpc_compute_start_ms"),
@@ -6073,6 +6074,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     m1_chain_received_ms_total = _sum_hop_int("m1_chain_received_ms")
     m1_grpc_compute_start_ms_total = _sum_hop_int("m1_grpc_compute_start_ms")
     m1_grpc_compute_end_ms_total = _sum_hop_int("m1_grpc_compute_end_ms")
+    m1_forward_to_m4_ms_total = _sum_hop_int("m1_forward_to_m4_ms")
     m1_forward_to_m4_start_ms_total = _sum_hop_int("m1_forward_to_m4_start_ms")
     m4_chain_received_ms_total = _sum_hop_int("m4_chain_received_ms")
     m4_grpc_compute_start_ms_total = _sum_hop_int("m4_grpc_compute_start_ms")
@@ -6339,6 +6341,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "m1_chain_received_ms": m1_chain_received_ms_total,
             "m1_grpc_compute_start_ms": m1_grpc_compute_start_ms_total,
             "m1_grpc_compute_end_ms": m1_grpc_compute_end_ms_total,
+            "m1_forward_to_m4_ms": m1_forward_to_m4_ms_total,
             "m1_forward_to_m4_start_ms": m1_forward_to_m4_start_ms_total,
             "m4_chain_received_ms": m4_chain_received_ms_total,
             "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms_total,
