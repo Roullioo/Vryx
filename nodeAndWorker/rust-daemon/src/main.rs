@@ -895,6 +895,7 @@ async fn handle_chain_control_frame(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_pipeline_stream(
     peer: PeerId,
     my_peer_id: PeerId,
