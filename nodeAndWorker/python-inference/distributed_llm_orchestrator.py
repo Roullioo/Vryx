@@ -2649,6 +2649,8 @@ def _pipeline_micro_decode_enabled(payload: dict[str, Any], peers: list[str]) ->
 def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str, Any]) -> bool:
     if not (PIPELINE_STREAM and CHAIN_STREAM):
         return False
+    if payload.get("chain_stream_request") is False:
+        return False
     if dtype != "vryx.shard.pipeline" or len(peers) < 2:
         return False
     if payload.get("__disable_chain_stream"):
@@ -2681,7 +2683,7 @@ def _relay_pipeline_chain_once(
                 current_payload_bytes,
                 timeout=PIPELINE_STEP_TIMEOUT,
             )
-            if CHAIN_RESULT_DIRECT and len(peers) == 2
+            if CHAIN_RESULT_DIRECT and current_payload.get("chain_result_direct_request") is not False and len(peers) == 2
             else _pipeline_stream_raw(
                 peers[0],
                 dtype,
@@ -2706,14 +2708,24 @@ def _relay_pipeline_chain_once(
             "chain_payload_bytes": len(current_payload_bytes),
             "chain_result_direct": bool(result.get("chain_result_direct")),
             "chain_result_from_peer": relay_trace.get("chain_result_from_peer"),
+            "pending_key": relay_trace.get("pending_key"),
+            "pending_count_before": relay_trace.get("pending_count_before"),
+            "pending_count_after": relay_trace.get("pending_count_after"),
             "chain_forward_ms": relay_trace.get("chain_forward_ms"),
             "chain_ack_ms": relay_trace.get("chain_ack_ms"),
             "chain_result_wait_ms": relay_trace.get("chain_result_wait_ms"),
             "chain_pending_count": relay_trace.get("chain_pending_count"),
+            "stream_closed": relay_trace.get("stream_closed"),
+            "failed_step_id": relay_trace.get("failed_step_id"),
+            "failed_stage": relay_trace.get("failed_stage"),
+            "failed_peer": relay_trace.get("failed_peer"),
+            "transport_error_detail": relay_trace.get("transport_error_detail"),
             "m1_chain_received_ms": relay_trace.get("m1_chain_received_ms"),
             "m1_grpc_compute_start_ms": relay_trace.get("m1_grpc_compute_start_ms"),
             "m1_grpc_compute_end_ms": relay_trace.get("m1_grpc_compute_end_ms"),
             "m1_forward_to_m4_ms": relay_trace.get("m1_forward_to_m4_ms"),
+            "m1_compute_ms": relay_trace.get("m1_compute_ms"),
+            "m4_compute_ms": relay_trace.get("m4_compute_ms"),
             "m1_forward_to_m4_start_ms": relay_trace.get("m1_forward_to_m4_start_ms"),
             "m4_chain_received_ms": relay_trace.get("m4_chain_received_ms"),
             "m4_grpc_compute_start_ms": relay_trace.get("m4_grpc_compute_start_ms"),
@@ -5129,6 +5141,17 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     preferred_workers_applied: list[str] = []
     preferred_workers_missing: list[str] = []
 
+    def _option_bool(name: str, default: bool) -> bool:
+        if name not in options:
+            return default
+        raw = options.get(name)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    request_chain_stream = _option_bool("chain_stream", CHAIN_STREAM)
+    request_chain_result_direct = _option_bool("chain_result_direct", CHAIN_RESULT_DIRECT)
+
     decode_cap = MAX_NEW_TOKENS
     _mnt = options.get("max_new_tokens")
     if _mnt is not None:
@@ -5674,6 +5697,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "repetition_penalty": REPETITION_PENALTY,
         },
         "hidden_quic": HIDDEN_QUIC,
+        "chain_stream_request": request_chain_stream,
+        "chain_result_direct_request": request_chain_result_direct,
         "prefix_cache_key": prefix_cache_hit.get("cache_key"),
         "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
         "speculative_heads": SPECULATIVE_HEADS,
@@ -5720,12 +5745,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "m1_peer": routing_path[0] if routing_path else None,
             "m1_relay_ms": int(hop0.get("relay_ms") or 0),
             "m1_transport_only_ms": max(0, int(hop0.get("relay_ms") or 0) - int(hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0)),
-            "m1_compute_ms": int(hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0),
+            "m1_compute_ms": int(hop0.get("m1_compute_ms") or hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0),
             "m1_request_payload_bytes": int(hop0.get("request_payload_bytes") or 0),
             "m4_peer": routing_path[-1] if routing_path else None,
             "m4_relay_ms": int(hop_last.get("relay_ms") or 0),
             "m4_transport_only_ms": max(0, int(hop_last.get("relay_ms") or 0) - int(hop_last.get("worker_compute_ms") or hop_last.get("compute_time_ms") or 0)),
-            "m4_compute_ms": int(hop_last.get("worker_compute_ms") or hop_last.get("compute_time_ms") or 0),
+            "m4_compute_ms": int(hop_last.get("m4_compute_ms") or hop_last.get("worker_compute_ms") or hop_last.get("compute_time_ms") or 0),
             "m4_request_payload_bytes": int(hop_last.get("request_payload_bytes") or 0),
             "prefill_payload_bytes_m1_to_m4": int(hop0.get("next_hop_payload_bytes") or 0) if step == 0 else 0,
             "decode_payload_bytes_m1_to_m4": int(hop0.get("next_hop_payload_bytes") or 0) if step > 0 else 0,
@@ -6094,6 +6119,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     stream_used_seen = False
     chain_stream_used_seen = False
     chain_fallback_reasons: list[str] = []
+    first_failed_chain_step: dict[str, Any] | None = None
     for tok in token_timings:
         if not isinstance(tok, dict):
             continue
@@ -6109,6 +6135,17 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 chain_fallback_count += 1
                 if hop.get("fallback_reason"):
                     chain_fallback_reasons.append(str(hop.get("fallback_reason")))
+            if first_failed_chain_step is None and (
+                hop.get("failed_stage") or hop.get("transport_error_detail") or hop.get("ok") is False
+            ):
+                first_failed_chain_step = {
+                    "failed_step_id": hop.get("failed_step_id", tok.get("step")),
+                    "failed_stage": hop.get("failed_stage") or ("chain_stream_failed" if hop.get("chain_stream_used") is False else "unknown"),
+                    "failed_peer": hop.get("failed_peer") or hop.get("peer"),
+                    "transport_error_detail": hop.get("transport_error_detail") or hop.get("error"),
+                    "request_id": hop.get("relay_trace", {}).get("request_id") if isinstance(hop.get("relay_trace"), dict) else None,
+                    "pending_key": hop.get("pending_key"),
+                }
     payload_bytes_by_hop = [
         {
             "step": int(tok.get("step") or 0),
@@ -6176,9 +6213,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "stream_close": stream_close,
         "pipeline_stream": PIPELINE_STREAM,
         "pipeline_stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
-        "chain_stream": CHAIN_STREAM,
-        "chain_result_direct": CHAIN_RESULT_DIRECT,
-        "chain_model_step_smoke": CHAIN_MODEL_STEP_SMOKE,
+            "chain_stream": CHAIN_STREAM,
+            "chain_result_direct": CHAIN_RESULT_DIRECT,
+            "request_chain_stream": request_chain_stream,
+            "request_chain_result_direct": request_chain_result_direct,
+            "chain_model_step_smoke": CHAIN_MODEL_STEP_SMOKE,
         "chain_stream_fallback_initiator": CHAIN_STREAM_FALLBACK_INITIATOR,
         "stream_fallback": (
             "request_response_on_stream_failure"
@@ -6328,6 +6367,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "stream_wait_response_ms": stream_wait_response_ms_total,
             "stream_roundtrip_ms": stream_roundtrip_ms_total,
             "chain_stream_enabled": CHAIN_STREAM,
+            "request_chain_stream": request_chain_stream,
             "chain_stream_used": chain_stream_used_seen,
             "chain_open_ms": chain_open_ms_total,
             "chain_handshake_ms": chain_handshake_ms_total,
@@ -6338,6 +6378,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "chain_ack_ms": chain_ack_ms_total,
             "chain_result_wait_ms": chain_result_wait_ms_total,
             "chain_result_direct": CHAIN_RESULT_DIRECT and chain_stream_used_seen,
+            "request_chain_result_direct": request_chain_result_direct,
             "m1_chain_received_ms": m1_chain_received_ms_total,
             "m1_grpc_compute_start_ms": m1_grpc_compute_start_ms_total,
             "m1_grpc_compute_end_ms": m1_grpc_compute_end_ms_total,
@@ -6353,6 +6394,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "fallback_used": chain_fallback_count > 0,
             "fallback_reason": chain_fallback_reasons[0] if chain_fallback_reasons else None,
             "fallback_count": chain_fallback_count,
+            "first_failed_chain_step": first_failed_chain_step,
+            "failed_step_id": (first_failed_chain_step or {}).get("failed_step_id"),
+            "failed_stage": (first_failed_chain_step or {}).get("failed_stage"),
+            "failed_peer": (first_failed_chain_step or {}).get("failed_peer"),
+            "transport_error_detail": (first_failed_chain_step or {}).get("transport_error_detail"),
             "request_response_fallback": stream_fallback_count > 0,
             "request_response_fallback_count": stream_fallback_count,
             "frames_sent": frames_sent_total,

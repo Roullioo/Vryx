@@ -3403,12 +3403,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap_or(0);
                     let key = chain_pending_key(&session_id, &request_id, step_id);
                     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
-                    let pending_count = {
+                    let (pending_count_before, pending_count_after_insert) = {
                         let mut guard = pending_results.lock().await;
+                        let before = guard.len();
                         if guard.insert(key.clone(), tx).is_some() {
                             eprintln!("[CHAIN_FORWARD] pending remplacé key={}", key);
                         }
-                        guard.len()
+                        (before, guard.len())
                     };
                     let body = serde_json::json!({
                         "routing_path": [final_str],
@@ -3440,7 +3441,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let ack_json = serde_json::from_slice::<serde_json::Value>(&ack_frame.payload)
                                 .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "bad_chain_forward_ack_json"}));
                             if ack_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                                pending_results.lock().await.remove(&key);
+                                let pending_count_after = {
+                                    let mut guard = pending_results.lock().await;
+                                    guard.remove(&key);
+                                    guard.len()
+                                };
                                 return (
                                     axum::http::StatusCode::BAD_GATEWAY,
                                     Json(serde_json::json!({
@@ -3448,13 +3453,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "error": ack_json.get("error").and_then(|v| v.as_str()).unwrap_or("chain_forward_ack_error"),
                                         "chain_fallback_reason": "chain_forward_ack_error",
                                         "request_response_fallback": true,
-                                        "relay_trace": {"chain_ack_ms": chain_ack_ms, "chain_pending_count": pending_count},
+                                        "relay_trace": {
+                                            "request_id": request_id,
+                                            "session_id": session_id,
+                                            "step_id": step_id,
+                                            "pending_key": key,
+                                            "pending_count_before": pending_count_before,
+                                            "pending_count_after": pending_count_after,
+                                            "chain_pending_count": pending_count_after_insert,
+                                            "chain_ack_ms": chain_ack_ms,
+                                            "failed_step_id": step_id,
+                                            "failed_stage": "chain_forward_ack_error",
+                                            "failed_peer": target_peer.to_string(),
+                                            "transport_error_detail": ack_json.get("error").and_then(|v| v.as_str()).unwrap_or("chain_forward_ack_error"),
+                                            "stream_closed": true
+                                        },
                                     })),
                                 );
                             }
                         }
                         Ok(Err(e)) => {
-                            pending_results.lock().await.remove(&key);
+                            let pending_count_after = {
+                                let mut guard = pending_results.lock().await;
+                                guard.remove(&key);
+                                guard.len()
+                            };
                             return (
                                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                                 Json(serde_json::json!({
@@ -3462,12 +3485,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "error": e,
                                     "chain_fallback_reason": "chain_forward_failed",
                                     "request_response_fallback": true,
-                                    "relay_trace": {"chain_ack_ms": chain_ack_ms, "chain_pending_count": pending_count},
+                                    "relay_trace": {
+                                        "request_id": request_id,
+                                        "session_id": session_id,
+                                        "step_id": step_id,
+                                        "pending_key": key,
+                                        "pending_count_before": pending_count_before,
+                                        "pending_count_after": pending_count_after,
+                                        "chain_pending_count": pending_count_after_insert,
+                                        "chain_ack_ms": chain_ack_ms,
+                                        "failed_step_id": step_id,
+                                        "failed_stage": "chain_forward_send",
+                                        "failed_peer": target_peer.to_string(),
+                                        "transport_error_detail": e,
+                                        "stream_closed": true
+                                    },
                                 })),
                             );
                         }
                         Err(_) => {
-                            pending_results.lock().await.remove(&key);
+                            let pending_count_after = {
+                                let mut guard = pending_results.lock().await;
+                                guard.remove(&key);
+                                guard.len()
+                            };
                             return (
                                 axum::http::StatusCode::GATEWAY_TIMEOUT,
                                 Json(serde_json::json!({
@@ -3475,7 +3516,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "error": "chain_forward_ack_timeout",
                                     "chain_fallback_reason": "chain_forward_ack_timeout",
                                     "request_response_fallback": true,
-                                    "relay_trace": {"chain_ack_ms": chain_ack_ms, "chain_pending_count": pending_count},
+                                    "relay_trace": {
+                                        "request_id": request_id,
+                                        "session_id": session_id,
+                                        "step_id": step_id,
+                                        "pending_key": key,
+                                        "pending_count_before": pending_count_before,
+                                        "pending_count_after": pending_count_after,
+                                        "chain_pending_count": pending_count_after_insert,
+                                        "chain_ack_ms": chain_ack_ms,
+                                        "failed_step_id": step_id,
+                                        "failed_stage": "chain_forward_ack_timeout",
+                                        "failed_peer": target_peer.to_string(),
+                                        "transport_error_detail": "chain_forward_ack_timeout",
+                                        "stream_closed": true
+                                    },
                                 })),
                             );
                         }
@@ -3485,7 +3540,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let result_json = match tokio::time::timeout(result_timeout, rx).await {
                         Ok(Ok(value)) => value,
                         Ok(Err(_)) => {
-                            pending_results.lock().await.remove(&key);
+                            let pending_count_after = {
+                                let mut guard = pending_results.lock().await;
+                                guard.remove(&key);
+                                guard.len()
+                            };
                             return (
                                 axum::http::StatusCode::GATEWAY_TIMEOUT,
                                 Json(serde_json::json!({
@@ -3493,11 +3552,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "error": "chain_result_waiter_closed",
                                     "chain_fallback_reason": "chain_result_waiter_closed",
                                     "request_response_fallback": true,
+                                    "relay_trace": {
+                                        "request_id": request_id,
+                                        "session_id": session_id,
+                                        "step_id": step_id,
+                                        "pending_key": key,
+                                        "pending_count_before": pending_count_before,
+                                        "pending_count_after": pending_count_after,
+                                        "chain_pending_count": pending_count_after_insert,
+                                        "chain_ack_ms": chain_ack_ms,
+                                        "chain_result_wait_ms": wait_started.elapsed().as_millis() as u64,
+                                        "failed_step_id": step_id,
+                                        "failed_stage": "chain_result_waiter_closed",
+                                        "failed_peer": final_str,
+                                        "transport_error_detail": "chain_result_waiter_closed",
+                                        "stream_closed": true
+                                    },
                                 })),
                             );
                         }
                         Err(_) => {
-                            pending_results.lock().await.remove(&key);
+                            let pending_count_after = {
+                                let mut guard = pending_results.lock().await;
+                                guard.remove(&key);
+                                guard.len()
+                            };
                             return (
                                 axum::http::StatusCode::GATEWAY_TIMEOUT,
                                 Json(serde_json::json!({
@@ -3508,13 +3587,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "relay_trace": {
                                         "chain_ack_ms": chain_ack_ms,
                                         "chain_result_wait_ms": wait_started.elapsed().as_millis() as u64,
-                                        "chain_pending_count": pending_count,
+                                        "pending_key": key,
+                                        "pending_count_before": pending_count_before,
+                                        "pending_count_after": pending_count_after,
+                                        "chain_pending_count": pending_count_after_insert,
+                                        "failed_step_id": step_id,
+                                        "failed_stage": "chain_result_timeout",
+                                        "failed_peer": final_str,
+                                        "transport_error_detail": "chain_result_timeout",
+                                        "stream_closed": true
                                     },
                                 })),
                             );
                         }
                     };
                     let chain_result_wait_ms = wait_started.elapsed().as_millis() as u64;
+                    let pending_count_after_result = pending_results.lock().await.len();
                     if result_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
                         return (
                             axum::http::StatusCode::BAD_GATEWAY,
@@ -3524,6 +3612,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "chain_fallback_reason": "chain_result_error",
                                 "request_response_fallback": true,
                                 "chain_result": result_json,
+                                "relay_trace": {
+                                    "request_id": request_id,
+                                    "session_id": session_id,
+                                    "step_id": step_id,
+                                    "pending_key": key,
+                                    "pending_count_before": pending_count_before,
+                                    "pending_count_after": pending_count_after_result,
+                                    "chain_pending_count": pending_count_after_insert,
+                                    "chain_ack_ms": chain_ack_ms,
+                                    "chain_result_wait_ms": chain_result_wait_ms,
+                                    "failed_step_id": step_id,
+                                    "failed_stage": "chain_result_error",
+                                    "failed_peer": result_json.get("from_peer").and_then(|v| v.as_str()).unwrap_or(final_str),
+                                    "transport_error_detail": result_json.get("error").and_then(|v| v.as_str()).unwrap_or("chain_result_error"),
+                                    "stream_closed": false
+                                },
                             })),
                         );
                     }
@@ -3542,17 +3646,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "chain_ack_ms": chain_ack_ms,
                             "chain_result_wait_ms": chain_result_wait_ms,
                             "vps_chain_result_received_ms": unix_ms(),
+                            "pending_key": key,
+                            "pending_count_before": pending_count_before,
+                            "pending_count_after": pending_count_after_result,
                             "m1_chain_received_ms": result_json.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m1_grpc_compute_start_ms": result_json.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m1_grpc_compute_end_ms": result_json.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m1_forward_to_m4_start_ms": result_json.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_compute_ms": result_json.get("m1_grpc_compute_end_ms").and_then(|v| v.as_u64()).unwrap_or(0).saturating_sub(result_json.get("m1_grpc_compute_start_ms").and_then(|v| v.as_u64()).unwrap_or(0)),
+                            "m4_compute_ms": result_json.get("compute_ms").and_then(|v| v.as_u64()).unwrap_or(0),
                             "m4_chain_received_ms": result_json.get("m4_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m4_grpc_compute_start_ms": result_json.get("m4_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m4_grpc_compute_end_ms": result_json.get("m4_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m4_chain_result_send_ms": result_json.get("m4_chain_result_send_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "chain_result_direct": true,
                             "chain_result_from_peer": result_json.get("from_peer").and_then(|v| v.as_str()),
-                            "chain_pending_count": pending_count,
+                            "chain_pending_count": pending_count_after_insert,
                             "stream_open_ms": ack_trace.stream_open_ms,
                             "stream_reused": ack_trace.stream_reused,
                             "stream_send_ms": ack_trace.stream_send_ms,
@@ -3561,6 +3670,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "request_response_fallback": false,
                             "frames_sent": ack_trace.frames_sent + 1,
                             "frames_received": ack_trace.frames_received + 1,
+                            "stream_closed": false,
                         });
                         return (
                             axum::http::StatusCode::OK,
@@ -3582,7 +3692,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Err(e) => {
                             return (
                                 axum::http::StatusCode::BAD_GATEWAY,
-                                Json(serde_json::json!({"ok": false, "error": format!("chain_result_payload_b64: {}", e)})),
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("chain_result_payload_b64: {}", e),
+                                    "relay_trace": {
+                                        "request_id": request_id,
+                                        "session_id": session_id,
+                                        "step_id": step_id,
+                                        "pending_key": key,
+                                        "pending_count_before": pending_count_before,
+                                        "pending_count_after": pending_count_after_result,
+                                        "failed_step_id": step_id,
+                                        "failed_stage": "chain_result_payload_decode",
+                                        "failed_peer": result_json.get("from_peer").and_then(|v| v.as_str()).unwrap_or(final_str),
+                                        "transport_error_detail": format!("chain_result_payload_b64: {}", e),
+                                        "stream_closed": false
+                                    }
+                                })),
                             );
                         }
                     };
@@ -3591,7 +3717,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Err(e) => {
                             return (
                                 axum::http::StatusCode::BAD_GATEWAY,
-                                Json(serde_json::json!({"ok": false, "error": format!("chain_result_tensor_decode_failed: {}", e)})),
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("chain_result_tensor_decode_failed: {}", e),
+                                    "relay_trace": {
+                                        "request_id": request_id,
+                                        "session_id": session_id,
+                                        "step_id": step_id,
+                                        "pending_key": key,
+                                        "pending_count_before": pending_count_before,
+                                        "pending_count_after": pending_count_after_result,
+                                        "failed_step_id": step_id,
+                                        "failed_stage": "chain_result_tensor_decode",
+                                        "failed_peer": result_json.get("from_peer").and_then(|v| v.as_str()).unwrap_or(final_str),
+                                        "transport_error_detail": format!("chain_result_tensor_decode_failed: {}", e),
+                                        "stream_closed": false
+                                    }
+                                })),
                             );
                         }
                     };
@@ -3615,7 +3757,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "chain_result_wait_ms": chain_result_wait_ms,
                         "chain_result_direct": true,
                         "chain_result_from_peer": result_json.get("from_peer").and_then(|v| v.as_str()),
-                        "chain_pending_count": pending_count,
+                        "pending_key": key,
+                        "pending_count_before": pending_count_before,
+                        "pending_count_after": pending_count_after_result,
+                        "chain_pending_count": pending_count_after_insert,
+                        "m1_compute_ms": result_json.get("m1_grpc_compute_end_ms").and_then(|v| v.as_u64()).unwrap_or(0).saturating_sub(result_json.get("m1_grpc_compute_start_ms").and_then(|v| v.as_u64()).unwrap_or(0)),
+                        "m4_compute_ms": resp.worker_compute_ms,
                         "stream_open_ms": ack_trace.stream_open_ms,
                         "stream_reused": ack_trace.stream_reused,
                         "stream_send_ms": ack_trace.stream_send_ms,
@@ -3624,6 +3771,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "request_response_fallback": false,
                         "frames_sent": ack_trace.frames_sent + 1,
                         "frames_received": ack_trace.frames_received + 1,
+                        "stream_closed": false,
                         "worker_seen_request": true,
                         "worker_transport_trace": worker_trace,
                     });
