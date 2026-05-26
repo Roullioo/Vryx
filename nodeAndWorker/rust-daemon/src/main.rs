@@ -9,7 +9,9 @@ use axum::{
 };
 use base64::Engine as _;
 use clap::Parser;
-use futures::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt, StreamExt};
+use futures::{
+    AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt, StreamExt,
+};
 use libp2p::{
     autonat, dcutr, identify, kad, noise, relay,
     request_response::{self, ProtocolSupport},
@@ -337,7 +339,11 @@ fn encode_pipeline_frame(frame: &PipelineFrame) -> std::io::Result<Vec<u8>> {
         ));
     }
     let mut out = Vec::with_capacity(
-        PIPELINE_FRAME_HEADER_LEN + request_id.len() + session_id.len() + dtype.len() + frame.payload.len(),
+        PIPELINE_FRAME_HEADER_LEN
+            + request_id.len()
+            + session_id.len()
+            + dtype.len()
+            + frame.payload.len(),
     );
     out.extend_from_slice(PIPELINE_FRAME_MAGIC);
     put_u16(&mut out, PIPELINE_FRAME_VERSION);
@@ -369,11 +375,17 @@ async fn read_pipeline_frame(stream: &mut libp2p::Stream) -> std::io::Result<Pip
     let mut header = [0u8; PIPELINE_FRAME_HEADER_LEN];
     stream.read_exact(&mut header).await?;
     if &header[0..4] != PIPELINE_FRAME_MAGIC {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pipeline frame magic"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad pipeline frame magic",
+        ));
     }
     let version = read_u16(&header, 4);
     if version != PIPELINE_FRAME_VERSION {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pipeline frame version"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad pipeline frame version",
+        ));
     }
     let frame_type = header[6];
     let step_id = read_u64(&header, 8);
@@ -382,12 +394,20 @@ async fn read_pipeline_frame(stream: &mut libp2p::Stream) -> std::io::Result<Pip
     let dtype_len = read_u16(&header, 20) as usize;
     let payload_len = read_u64(&header, 24);
     if payload_len > PIPELINE_FRAME_MAX_PAYLOAD {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "pipeline frame payload too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pipeline frame payload too large",
+        ));
     }
     let meta_len = request_len
         .checked_add(session_len)
         .and_then(|v| v.checked_add(dtype_len))
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "pipeline frame metadata overflow"))?;
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pipeline frame metadata overflow",
+            )
+        })?;
     let mut meta = vec![0u8; meta_len];
     if meta_len > 0 {
         stream.read_exact(&mut meta).await?;
@@ -430,7 +450,10 @@ async fn handle_pipeline_stream(
             }
         };
         if frame.frame_type != PIPELINE_FRAME_REQUEST {
-            eprintln!("[PIPELINE_STREAM] frame ignorée de {} : type={}", peer, frame.frame_type);
+            eprintln!(
+                "[PIPELINE_STREAM] frame ignorée de {} : type={}",
+                peer, frame.frame_type
+            );
             continue;
         }
         let dtype_in = frame.dtype.clone();
@@ -483,7 +506,8 @@ async fn handle_pipeline_stream(
                         "worker_seen_request": true,
                         "worker_compute_ms": c_ms,
                         "pipeline_stream_worker_ms": compute_started.elapsed().as_millis() as u64,
-                    }).to_string(),
+                    })
+                    .to_string(),
                 }
             }
             Err(e) => TensorResponse {
@@ -505,7 +529,10 @@ async fn handle_pipeline_stream(
         let payload = match serde_json::to_vec(&response) {
             Ok(payload) => payload,
             Err(e) => {
-                eprintln!("[PIPELINE_STREAM] sérialisation réponse impossible {} : {}", peer, e);
+                eprintln!(
+                    "[PIPELINE_STREAM] sérialisation réponse impossible {} : {}",
+                    peer, e
+                );
                 break;
             }
         };
