@@ -484,6 +484,7 @@ CHAIN_STREAM_FALLBACK_INITIATOR = os.environ.get(
     "VRYX_CHAIN_STREAM_FALLBACK_INITIATOR", "1"
 ).lower() not in ("0", "false", "no", "off")
 CHAIN_RESULT_DIRECT = os.environ.get("VRYX_CHAIN_RESULT_DIRECT", "0").lower() in ("1", "true", "yes", "on")
+CHAIN_MODEL_STEP_SMOKE = os.environ.get("VRYX_CHAIN_MODEL_STEP_SMOKE", "0").lower() in ("1", "true", "yes", "on")
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
 POOL_PREFERENCE_DEFAULT = os.environ.get("VRYX_POOL_PREFERENCE", "auto").lower()
@@ -2709,6 +2710,15 @@ def _relay_pipeline_chain_once(
             "chain_ack_ms": relay_trace.get("chain_ack_ms"),
             "chain_result_wait_ms": relay_trace.get("chain_result_wait_ms"),
             "chain_pending_count": relay_trace.get("chain_pending_count"),
+            "m1_chain_received_ms": relay_trace.get("m1_chain_received_ms"),
+            "m1_grpc_compute_start_ms": relay_trace.get("m1_grpc_compute_start_ms"),
+            "m1_grpc_compute_end_ms": relay_trace.get("m1_grpc_compute_end_ms"),
+            "m1_forward_to_m4_start_ms": relay_trace.get("m1_forward_to_m4_start_ms"),
+            "m4_chain_received_ms": relay_trace.get("m4_chain_received_ms"),
+            "m4_grpc_compute_start_ms": relay_trace.get("m4_grpc_compute_start_ms"),
+            "m4_grpc_compute_end_ms": relay_trace.get("m4_grpc_compute_end_ms"),
+            "m4_chain_result_send_ms": relay_trace.get("m4_chain_result_send_ms"),
+            "vps_chain_result_received_ms": relay_trace.get("vps_chain_result_received_ms"),
             "chain_deadlock_guard_ms": int(PIPELINE_STEP_TIMEOUT * 1000),
             "chain_open_ms": relay_trace.get("stream_open_ms"),
             "chain_handshake_ms": relay_trace.get("stream_open_ms"),
@@ -6060,6 +6070,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     chain_forward_ms_total = _sum_hop_int("chain_forward_ms")
     chain_ack_ms_total = _sum_hop_int("chain_ack_ms")
     chain_result_wait_ms_total = _sum_hop_int("chain_result_wait_ms")
+    m1_chain_received_ms_total = _sum_hop_int("m1_chain_received_ms")
+    m1_grpc_compute_start_ms_total = _sum_hop_int("m1_grpc_compute_start_ms")
+    m1_grpc_compute_end_ms_total = _sum_hop_int("m1_grpc_compute_end_ms")
+    m1_forward_to_m4_start_ms_total = _sum_hop_int("m1_forward_to_m4_start_ms")
+    m4_chain_received_ms_total = _sum_hop_int("m4_chain_received_ms")
+    m4_grpc_compute_start_ms_total = _sum_hop_int("m4_grpc_compute_start_ms")
+    m4_grpc_compute_end_ms_total = _sum_hop_int("m4_grpc_compute_end_ms")
+    m4_chain_result_send_ms_total = _sum_hop_int("m4_chain_result_send_ms")
+    vps_chain_result_received_ms_total = _sum_hop_int("vps_chain_result_received_ms")
     chain_payload_bytes_total = _sum_hop_int("chain_payload_bytes")
     chain_deadlock_guard_ms_max = max(
         [int(hop.get("chain_deadlock_guard_ms") or 0) for tok in token_timings if isinstance(tok, dict) for hop in (tok.get("hop_traces") or []) if isinstance(hop, dict)]
@@ -6157,6 +6176,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "pipeline_stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
         "chain_stream": CHAIN_STREAM,
         "chain_result_direct": CHAIN_RESULT_DIRECT,
+        "chain_model_step_smoke": CHAIN_MODEL_STEP_SMOKE,
         "chain_stream_fallback_initiator": CHAIN_STREAM_FALLBACK_INITIATOR,
         "stream_fallback": (
             "request_response_on_stream_failure"
@@ -6316,6 +6336,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "chain_ack_ms": chain_ack_ms_total,
             "chain_result_wait_ms": chain_result_wait_ms_total,
             "chain_result_direct": CHAIN_RESULT_DIRECT and chain_stream_used_seen,
+            "m1_chain_received_ms": m1_chain_received_ms_total,
+            "m1_grpc_compute_start_ms": m1_grpc_compute_start_ms_total,
+            "m1_grpc_compute_end_ms": m1_grpc_compute_end_ms_total,
+            "m1_forward_to_m4_start_ms": m1_forward_to_m4_start_ms_total,
+            "m4_chain_received_ms": m4_chain_received_ms_total,
+            "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms_total,
+            "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms_total,
+            "m4_chain_result_send_ms": m4_chain_result_send_ms_total,
+            "vps_chain_result_received_ms": vps_chain_result_received_ms_total,
             "chain_payload_bytes": chain_payload_bytes_total,
             "chain_deadlock_guard_ms": chain_deadlock_guard_ms_max,
             "fallback_used": chain_fallback_count > 0,

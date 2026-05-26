@@ -319,6 +319,25 @@ fn chain_total_step_timeout() -> Duration {
     env_duration_ms("VRYX_CHAIN_TOTAL_STEP_TIMEOUT_MS", 60_000, 1_000, 600_000)
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn env_bool_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn pipeline_stream_cache_key(session_id: &str, peer: &PeerId) -> String {
     format!("{}|{}", session_id, peer)
 }
@@ -490,6 +509,7 @@ async fn handle_chain_control_frame(
 ) -> (bool, Vec<u8>) {
     use base64::{engine::general_purpose, Engine as _};
     let started = Instant::now();
+    let chain_received_ms = unix_ms();
     let mut body = serde_json::from_slice::<serde_json::Value>(&frame.payload)
         .unwrap_or_else(|_| serde_json::json!({}));
     let routing_path: Vec<String> = body
@@ -540,10 +560,13 @@ async fn handle_chain_control_frame(
                 .and_then(|v| v.as_str())
                 .and_then(|s| general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
+            let mut m1_grpc_compute_start_ms = 0u64;
+            let mut m1_grpc_compute_end_ms = 0u64;
             let next_payload = if forward_dtype.starts_with("vryx.chain.fake_tensor") {
                 current_payload
             } else {
-                match tokio::time::timeout(
+                m1_grpc_compute_start_ms = unix_ms();
+                let compute_result = tokio::time::timeout(
                     chain_total_step_timeout(),
                     call_local_inference(
                         grpc_port,
@@ -553,8 +576,9 @@ async fn handle_chain_control_frame(
                         frame.session_id.clone(),
                     ),
                 )
-                .await
-                {
+                .await;
+                m1_grpc_compute_end_ms = unix_ms();
+                match compute_result {
                     Ok(Ok((data, _c, _s, _metrics, _c_ms))) => data,
                     Ok(Err(e)) => {
                         return (
@@ -584,6 +608,42 @@ async fn handle_chain_control_frame(
                     }
                 }
             };
+            if env_bool_enabled("VRYX_CHAIN_CAPTURE_M1_OUTPUT") {
+                let capture_dir =
+                    std::env::var("VRYX_CHAIN_CAPTURE_DIR").unwrap_or_else(|_| "/tmp".to_string());
+                let safe_key = format!(
+                    "{}-{}-{}",
+                    frame.session_id.replace('/', "_"),
+                    frame.request_id.replace('/', "_"),
+                    frame.step_id
+                );
+                let capture_path = std::path::Path::new(&capture_dir)
+                    .join(format!("vryx-chain-m1-output-{}.json", safe_key));
+                let capture = serde_json::json!({
+                    "ok": true,
+                    "session_id": frame.session_id,
+                    "request_id": frame.request_id,
+                    "step_id": frame.step_id,
+                    "forward_dtype": forward_dtype,
+                    "source_peer": my_peer_id.to_string(),
+                    "target_peer": next_peer.to_string(),
+                    "payload_len": next_payload.len(),
+                    "payload_b64": general_purpose::STANDARD.encode(&next_payload),
+                    "m1_chain_received_ms": chain_received_ms,
+                    "m1_grpc_compute_start_ms": m1_grpc_compute_start_ms,
+                    "m1_grpc_compute_end_ms": m1_grpc_compute_end_ms,
+                });
+                if let Err(e) = std::fs::write(&capture_path, capture.to_string()) {
+                    eprintln!(
+                        "[CHAIN_CAPTURE] écriture impossible {} : {}",
+                        capture_path.display(),
+                        e
+                    );
+                } else {
+                    println!("[CHAIN_CAPTURE] M1 output saved {}", capture_path.display());
+                }
+            }
+            let m1_forward_to_m4_start_ms = unix_ms();
             if let Some(obj) = body.as_object_mut() {
                 obj.insert(
                     "routing_path".to_string(),
@@ -604,6 +664,22 @@ async fn handle_chain_control_frame(
                 obj.insert(
                     "upstream_compute_ms".to_string(),
                     serde_json::json!(started.elapsed().as_millis() as u64),
+                );
+                obj.insert(
+                    "m1_chain_received_ms".to_string(),
+                    serde_json::json!(chain_received_ms),
+                );
+                obj.insert(
+                    "m1_grpc_compute_start_ms".to_string(),
+                    serde_json::json!(m1_grpc_compute_start_ms),
+                );
+                obj.insert(
+                    "m1_grpc_compute_end_ms".to_string(),
+                    serde_json::json!(m1_grpc_compute_end_ms),
+                );
+                obj.insert(
+                    "m1_forward_to_m4_start_ms".to_string(),
+                    serde_json::json!(m1_forward_to_m4_start_ms),
                 );
             }
             let payload = serde_json::to_vec(&body).unwrap_or_else(|_| frame.payload.clone());
@@ -635,6 +711,22 @@ async fn handle_chain_control_frame(
                         obj.insert(
                             "chain_ack_ms".to_string(),
                             serde_json::json!(trace.stream_roundtrip_ms),
+                        );
+                        obj.insert(
+                            "m1_chain_received_ms".to_string(),
+                            serde_json::json!(chain_received_ms),
+                        );
+                        obj.insert(
+                            "m1_grpc_compute_start_ms".to_string(),
+                            serde_json::json!(m1_grpc_compute_start_ms),
+                        );
+                        obj.insert(
+                            "m1_grpc_compute_end_ms".to_string(),
+                            serde_json::json!(m1_grpc_compute_end_ms),
+                        );
+                        obj.insert(
+                            "m1_forward_to_m4_ms".to_string(),
+                            serde_json::json!(unix_ms().saturating_sub(m1_forward_to_m4_start_ms)),
                         );
                         obj.insert(
                             "chain_reused".to_string(),
@@ -708,8 +800,12 @@ async fn handle_chain_control_frame(
         let cache_for_result = Arc::clone(&stream_cache);
         let forward_dtype_for_ack = forward_dtype.clone();
         let final_peer_for_ack = final_peer.clone();
+        let m4_chain_received_ms = chain_received_ms;
+        let inbound_trace = body.clone();
         tokio::spawn(async move {
             let compute_started = Instant::now();
+            let mut m4_grpc_compute_start_ms = 0u64;
+            let mut m4_grpc_compute_end_ms = 0u64;
             let result_body = if forward_dtype.starts_with("vryx.chain.fake_tensor") {
                 serde_json::json!({
                     "ok": true,
@@ -725,17 +821,75 @@ async fn handle_chain_control_frame(
                     "checksum": bytes_checksum(&payload_bytes),
                     "is_fake_tensor": true,
                     "compute_ms": compute_started.elapsed().as_millis() as u64,
+                    "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m4_chain_received_ms": m4_chain_received_ms,
+                    "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                    "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                    "m4_chain_result_send_ms": unix_ms(),
+                })
+            } else if env_bool_enabled("VRYX_CHAIN_M4_FAKE_COMPUTE") {
+                let fake_response = TensorResponse {
+                    data: serde_json::json!({
+                        "ok": true,
+                        "chain_m4_fake_compute": true,
+                        "decode_mode": "chain_m4_fake_compute",
+                        "next_token_id": 0,
+                        "candidate_token_ids": [0],
+                        "accepted_token_count": 1,
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    compute_time_ms: 0,
+                    worker_compute_ms: 0,
+                    relay_trace_json: serde_json::json!({
+                        "transport": "pipeline_stream_chain_result_direct",
+                        "worker_seen_request": true,
+                        "worker_compute_ms": 0,
+                        "chain_result_direct": true,
+                        "chain_result_from_peer": final_peer,
+                        "chain_m4_fake_compute": true,
+                    })
+                    .to_string(),
+                    ..Default::default()
+                };
+                let payload = serde_json::to_vec(&fake_response).unwrap_or_default();
+                serde_json::json!({
+                    "ok": true,
+                    "chain_type": "CHAIN_RESULT",
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "step_id": step_id,
+                    "from_peer": final_peer,
+                    "final_peer": final_peer,
+                    "dtype": forward_dtype,
+                    "payload_len": payload.len(),
+                    "payload_b64": general_purpose::STANDARD.encode(&payload),
+                    "compute_ms": 0,
+                    "chain_m4_fake_compute": true,
+                    "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                    "m4_chain_received_ms": m4_chain_received_ms,
+                    "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                    "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                    "m4_chain_result_send_ms": unix_ms(),
                 })
             } else {
-                match call_local_inference(
+                m4_grpc_compute_start_ms = unix_ms();
+                let compute_result = call_local_inference(
                     grpc_port,
                     payload_bytes,
                     forward_dtype.clone(),
                     Vec::new(),
                     session_id.clone(),
                 )
-                .await
-                {
+                .await;
+                m4_grpc_compute_end_ms = unix_ms();
+                match compute_result {
                     Ok((data, c, s, metrics, c_ms)) => {
                         let response = TensorResponse {
                             data,
@@ -758,6 +912,13 @@ async fn handle_chain_control_frame(
                                 "worker_compute_ms": c_ms,
                                 "chain_result_direct": true,
                                 "chain_result_from_peer": final_peer,
+                                "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                                "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                                "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                                "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                                "m4_chain_received_ms": m4_chain_received_ms,
+                                "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                                "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
                             })
                             .to_string(),
                         };
@@ -774,6 +935,14 @@ async fn handle_chain_control_frame(
                             "payload_len": payload.len(),
                             "payload_b64": general_purpose::STANDARD.encode(&payload),
                             "compute_ms": c_ms,
+                            "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m4_chain_received_ms": m4_chain_received_ms,
+                            "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                            "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                            "m4_chain_result_send_ms": unix_ms(),
                         })
                     }
                     Err(e) => serde_json::json!({
@@ -787,6 +956,13 @@ async fn handle_chain_control_frame(
                         "dtype": forward_dtype,
                         "payload_len": 0,
                         "error": format!("chain_result_compute_failed: {}", e),
+                        "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m4_chain_received_ms": m4_chain_received_ms,
+                        "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                        "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                        "m4_chain_result_send_ms": unix_ms(),
                     }),
                 }
             };
@@ -3365,6 +3541,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "chain_forward_ms": started.elapsed().as_millis() as u64,
                             "chain_ack_ms": chain_ack_ms,
                             "chain_result_wait_ms": chain_result_wait_ms,
+                            "vps_chain_result_received_ms": unix_ms(),
+                            "m1_chain_received_ms": result_json.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_grpc_compute_start_ms": result_json.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_grpc_compute_end_ms": result_json.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m1_forward_to_m4_start_ms": result_json.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m4_chain_received_ms": result_json.get("m4_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m4_grpc_compute_start_ms": result_json.get("m4_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m4_grpc_compute_end_ms": result_json.get("m4_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                            "m4_chain_result_send_ms": result_json.get("m4_chain_result_send_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "chain_result_direct": true,
                             "chain_result_from_peer": result_json.get("from_peer").and_then(|v| v.as_str()),
                             "chain_pending_count": pending_count,
