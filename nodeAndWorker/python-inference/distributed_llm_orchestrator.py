@@ -880,7 +880,9 @@ def _select_pool_peers(
         return by_class["velocity_vllm"], "velocity_vllm", None
     if len(by_class["velocity_mlx"]) >= min_workers:
         return by_class["velocity_mlx"], "velocity_mlx", None
-    return by_class["legacy_pytorch"] or peers, "legacy_pytorch", "velocity_pool_unavailable"
+    if len(by_class["legacy_pytorch"]) >= min_workers:
+        return by_class["legacy_pytorch"], "legacy_pytorch", "velocity_pool_unavailable"
+    return peers, "mixed_pool", "single_pool_insufficient_workers"
 
 
 def _normalize_preferred_worker_peer_ids(value: Any) -> list[str]:
