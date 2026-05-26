@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import socket
 from typing import Any
 
 
@@ -47,6 +48,10 @@ def _post_chat(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, 
         except Exception:
             parsed = {"ok": False, "error": raw[:2000]}
         return exc.code, parsed, int((time.perf_counter() - started) * 1000)
+    except (TimeoutError, socket.timeout) as exc:
+        return 599, {"ok": False, "error": f"http_timeout:{exc}"}, int((time.perf_counter() - started) * 1000)
+    except Exception as exc:
+        return 598, {"ok": False, "error": f"http_error:{type(exc).__name__}:{exc}"}, int((time.perf_counter() - started) * 1000)
 
 
 def _trace(data: dict[str, Any]) -> dict[str, Any]:
