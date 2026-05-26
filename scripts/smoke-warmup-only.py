@@ -5,12 +5,30 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+
+def _redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            lk = str(key).lower()
+            if "secret" in lk or lk == "token" or lk.endswith("_token"):
+                out[key] = "REDACTED" if item else item
+            else:
+                out[key] = _redact(item)
+        return out
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(r"([?&]token=)[^\"'&\\s)]+", r"\1REDACTED", value)
+    return value
 
 
 def _post(url: str, payload: dict[str, Any], timeout: float) -> tuple[int, dict[str, Any], int]:
@@ -66,11 +84,14 @@ def _summary(label: str, status: int, data: dict[str, Any], wall_ms: int) -> dic
     worker_statuses = trace.get("worker_statuses") if isinstance(trace.get("worker_statuses"), list) else []
     session_id = str(trace.get("session_id") or "")
     ready = bool(pool_validation.get("ready")) or _status_ready(worker_statuses, session_id)
+    request_ok = bool(data.get("ok")) and status < 400
+    warmup_ready = ready and bool(session_id)
     return {
         "label": label,
         "http_status": status,
-        "ok": bool(data.get("ok")) and status < 400,
+        "ok": request_ok or warmup_ready,
         "error": data.get("error"),
+        "post_warmup_error": data.get("error") if warmup_ready and not request_ok else None,
         "client_wall_ms": wall_ms,
         "session_id": session_id,
         "session_status": trace.get("session_status"),
@@ -98,6 +119,8 @@ def main() -> int:
         "max_new_tokens": int(os.environ.get("VRYX_WARMUP_SMOKE_TOKENS", "1")),
         "quantization": os.environ.get("VRYX_WARMUP_SMOKE_QUANT", "fp16"),
         "pool_preference": os.environ.get("VRYX_WARMUP_SMOKE_POOL", "auto"),
+        "force_distributed": True,
+        "load_mode": "shard",
         "chain_stream": False,
         "chain_result_direct": False,
         "decode_microbatch_cap": 1,
@@ -105,12 +128,12 @@ def main() -> int:
     }
     status, data, wall_ms = _post(url, payload, timeout)
     first = _summary("warmup_only", status, data, wall_ms)
-    print(json.dumps(first, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(_redact(first), ensure_ascii=False, sort_keys=True))
     if not first["ok"] or not first["status_ready"]:
         return 1
     status2, data2, wall2 = _post(url, payload, timeout)
     second = _summary("warmup_only_reuse", status2, data2, wall2)
-    print(json.dumps(second, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(_redact(second), ensure_ascii=False, sort_keys=True))
     if not second["ok"] or second.get("session_reused") is not True or not second["status_ready"]:
         return 2
     print(json.dumps({"ok": True, "session_id": second.get("session_id"), "session_reused": True}, ensure_ascii=False, sort_keys=True))

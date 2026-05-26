@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
 
 import urllib.parse
+import urllib.error
 import urllib.request
 import numpy as np
 import torch
@@ -44,6 +45,62 @@ warnings.filterwarnings("ignore")
 # Téléchargement du manifeste shard depuis le VPS (HTTPS) : éviter 120 s trop court sur lien lent.
 MANIFEST_FETCH_TIMEOUT_SEC = max(600.0, float(os.environ.get("VRYX_SHARD_MANIFEST_FETCH_TIMEOUT_SEC", "600")))
 SHARD_BINARY_FETCH_TIMEOUT_SEC = max(600.0, float(os.environ.get("VRYX_SHARD_BINARY_FETCH_TIMEOUT_SEC", "600")))
+
+
+def _is_download_dns_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "nodename nor servname" in text
+        or "name or service not known" in text
+        or "temporary failure in name resolution" in text
+        or "no address associated with hostname" in text
+    )
+
+
+def _download_dns_fallback_ips() -> list[str]:
+    raw = os.environ.get("VRYX_SHARD_DOWNLOAD_DNS_FALLBACK_IPS", "51.222.26.225")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _download_dns_fallback_hosts() -> set[str]:
+    raw = os.environ.get("VRYX_SHARD_DOWNLOAD_DNS_FALLBACK_HOSTS", "vryx.eu")
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _clone_request_for_url(req: urllib.request.Request, url: str, host_header: str) -> urllib.request.Request:
+    headers = {k: v for k, v in req.header_items()}
+    headers["Host"] = host_header
+    return urllib.request.Request(url, headers=headers, method=req.get_method())
+
+
+def _urlopen_worker_download(req: urllib.request.Request, timeout: float, context: Any):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=context)
+    except urllib.error.URLError as exc:
+        if not _is_download_dns_error(exc):
+            raise
+        parsed = urllib.parse.urlparse(req.full_url)
+        host = str(parsed.hostname or "").lower()
+        if host not in _download_dns_fallback_hosts():
+            raise
+        for ip in _download_dns_fallback_ips():
+            netloc = f"{ip}:{parsed.port}" if parsed.port else ip
+            fallback_url = urllib.parse.urlunparse((
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            ))
+            retry_req = _clone_request_for_url(req, fallback_url, parsed.netloc)
+            try:
+                print(f"[shard] DNS fallback download {host} -> {ip}")
+                return urllib.request.urlopen(retry_req, timeout=timeout, context=context)
+            except urllib.error.URLError as retry_exc:
+                if ip == _download_dns_fallback_ips()[-1] or not _is_download_dns_error(retry_exc):
+                    raise
+        raise
 
 # ── Imports transformers (architecture uniquement, pas de poids HF) ────────────
 try:
@@ -1796,7 +1853,7 @@ def _copy_http_range_to_file(url: str, start: int, nbytes: int, out_file: Any, s
         return
     req = urllib.request.Request(url, method="GET")
     req.add_header("Range", f"bytes={start}-{start + nbytes - 1}")
-    with urllib.request.urlopen(req, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=ssl_context) as resp:
+    with _urlopen_worker_download(req, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=ssl_context) as resp:
         status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
         if status != 206:
             raise RuntimeError(f"range_non_supporte:{status}:{url}")
@@ -1817,7 +1874,7 @@ def _copy_http_range_to_path_at(url: str, source_start: int, nbytes: int, path: 
         return
     req = urllib.request.Request(url, method="GET")
     req.add_header("Range", f"bytes={source_start}-{source_start + nbytes - 1}")
-    with urllib.request.urlopen(req, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=ssl_context) as resp:
+    with _urlopen_worker_download(req, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=ssl_context) as resp:
         status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
         if status != 206:
             raise RuntimeError(f"range_non_supporte:{status}:{url}")
@@ -1929,7 +1986,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
             print(f"[shard] Téléchargement manifeste depuis {_redact_url_secret(download_url)}")
             t0 = time.perf_counter()
             req = urllib.request.Request(download_url, method="GET")
-            with urllib.request.urlopen(req, timeout=MANIFEST_FETCH_TIMEOUT_SEC, context=_ctx) as resp:
+            with _urlopen_worker_download(req, timeout=MANIFEST_FETCH_TIMEOUT_SEC, context=_ctx) as resp:
                 raw = resp.read()
             shard_data = json.loads(raw.decode("utf-8", errors="replace"))
 
@@ -2098,7 +2155,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                             req_bin = urllib.request.Request(bin_url, method="GET")
                             if bytes_read > 0:
                                 req_bin.add_header("Range", f"bytes={bytes_read}-")
-                            with urllib.request.urlopen(req_bin, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=_ctx) as resp_bin:
+                            with _urlopen_worker_download(req_bin, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=_ctx) as resp_bin:
                                 mode = "ab" if bytes_read > 0 else "wb"
                                 with open(bin_local_path, mode) as out_bin:
                                     while True:

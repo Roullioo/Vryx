@@ -3669,6 +3669,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     {
                         request_obj["force_distributed"] = serde_json::json!(true);
                     }
+                    if let Some(value) = payload
+                        .get("warmup_only")
+                        .or_else(|| payload.get("warmupOnly"))
+                        .and_then(|v| v.as_bool())
+                    {
+                        request_obj["warmup_only"] = serde_json::json!(value);
+                    }
                     for (snake, camel) in [
                         ("chain_stream", "chainStream"),
                         ("chain_result_direct", "chainResultDirect"),
@@ -3816,6 +3823,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     == Some(true)
                 {
                     request_obj["force_distributed"] = serde_json::json!(true);
+                }
+                if let Some(value) = payload
+                    .get("warmup_only")
+                    .or_else(|| payload.get("warmupOnly"))
+                    .and_then(|v| v.as_bool())
+                {
+                    request_obj["warmup_only"] = serde_json::json!(value);
                 }
                 for (snake, camel) in [
                     ("chain_stream", "chainStream"),

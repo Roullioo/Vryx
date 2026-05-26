@@ -560,6 +560,41 @@ def _worker_shard_download_base_url() -> str:
     return cand
 
 
+def _worker_secret_token_suffix() -> str:
+    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
+    return f"?token={quote(secret_token, safe='')}" if secret_token else ""
+
+
+def _append_worker_secret_token(url: str) -> str:
+    token_suffix = _worker_secret_token_suffix()
+    if not token_suffix:
+        return url
+    parsed = urlparse(url)
+    query = str(parsed.query or "")
+    if any(part.split("=", 1)[0] == "token" for part in query.split("&") if part):
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{token_suffix.lstrip('?')}"
+
+
+def _normalize_worker_shard_url(url: str, api_base: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return raw
+    parsed = urlparse(raw)
+    path = parsed.path or raw
+    if path.startswith("/api/internal/shard-serve/"):
+        query_parts = [
+            part for part in str(parsed.query or "").split("&")
+            if part and part.split("=", 1)[0] != "token"
+        ]
+        rebuilt = f"{api_base}{path}"
+        if query_parts:
+            rebuilt = f"{rebuilt}?{'&'.join(query_parts)}"
+        return _append_worker_secret_token(rebuilt)
+    return _append_worker_secret_token(raw)
+
+
 def _shard_ready_sleep_sec(poll_n: int) -> float:
     return (
         _SHARD_READY_POLL_SLOW
@@ -745,6 +780,8 @@ def _requires_distributed_shards(model_id: Optional[str] = None) -> bool:
         or tail in {"llama-2-70b-hf", "llama-2-70b-chat-hf"}
         or "70b" in tail
     ):
+        return True
+    if any(marker in tail for marker in ("30b", "32b", "35b", "40b", "65b", "72b")):
         return True
     return (
         _env_bool("VRYX_WORKER_SHARD_ONLY", "0")
@@ -3401,8 +3438,7 @@ def _save_shard_to_disk(
 
     # Manifeste JSON pour le worker (URL joignables depuis les workers distants ; pas forcément localhost)
     api_base = _worker_shard_download_base_url()
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
-    token_suffix = f"?token={secret_token}" if secret_token else ""
+    token_suffix = _worker_secret_token_suffix()
     bin_url = f"{api_base}/api/internal/shard-serve/{session_id}/{bin_filename}{token_suffix}"
     manifest = {
         "session_id": session_id,
@@ -3536,8 +3572,7 @@ def _save_shard_to_disk_from_safetensors(
     weight_map = dict(model_manifest["weight_map"])
     selected = _selected_tensor_names(model_config, weight_map, layer_start, layer_end, has_embedding, has_lm_head)
 
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
-    token_suffix = f"?token={secret_token}" if secret_token else ""
+    token_suffix = _worker_secret_token_suffix()
 
     if SHARD_TRANSFER_MODE not in ("packed", "bin", "binary"):
         api_base = _worker_shard_download_base_url()
@@ -3717,11 +3752,22 @@ def _save_shard_to_disk_from_prepared_gguf(
     layer_end = int(out.get("layer_end") or layer_start)
     has_embedding = bool(out.get("has_embedding"))
     has_lm_head = bool(out.get("has_lm_head"))
+    api_base = _worker_shard_download_base_url()
+    token_suffix = _worker_secret_token_suffix()
+    if out.get("binary_url"):
+        out["binary_url"] = _normalize_worker_shard_url(str(out.get("binary_url") or ""), api_base)
+    normalized_sources = []
+    for source in out.get("tensor_sources") or []:
+        if isinstance(source, dict):
+            entry = dict(source)
+            entry["source_url"] = _normalize_worker_shard_url(str(entry.get("source_url") or ""), api_base)
+            normalized_sources.append(entry)
+        else:
+            normalized_sources.append(source)
+    if normalized_sources:
+        out["tensor_sources"] = normalized_sources
     with open(out_path, "w", encoding="utf-8") as fp:
         json.dump(out, fp, ensure_ascii=False)
-    api_base = _worker_shard_download_base_url()
-    secret_token = os.environ.get("VRYX_WORKER_SECRET") or os.environ.get("WORKER_SECRET") or ""
-    token_suffix = f"?token={secret_token}" if secret_token else ""
     print(
         f"[VPS] Shard GGUF préparé worker-{peer_idx}: peer={peer_id[:16]} "
         f"layers {layer_start}-{layer_end}, {int(out.get('binary_total_bytes') or 0) / 1e9:.2f}GB"
@@ -3778,6 +3824,8 @@ def _prepared_gguf_assignments_for_peers(peers: list[str]) -> list[tuple[str, in
 
 
 def _delete_temp_shard_files(session_id: str, peer_idx: Any) -> None:
+    if os.environ.get("VRYX_DELETE_SHARD_MANIFEST_AFTER_INIT", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return
     shard_dir = os.path.join(SHARD_BASE_DIR, session_id)
     for suffix in ("bin", "json"):
         path = os.path.join(shard_dir, f"worker-{peer_idx}.{suffix}")
