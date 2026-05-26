@@ -3,7 +3,7 @@
 
 Sequence:
   warmup stable (chain disabled per request)
-  direct1, direct2, direct4, direct8, direct12 (chain direct enabled per request)
+  then configurable stable/direct runs.
 
 The script stops with ``not_hot_path`` as soon as a direct run is not backed by a
 reused session or if shard init/load/build appears on the hot path.
@@ -76,6 +76,10 @@ def _chain_hops(data: dict[str, Any]) -> list[dict[str, Any]]:
             rows.append(
                 {
                     "step_id": relay_trace.get("step_id", token.get("step")),
+                    "microbatch_id": hop.get("microbatch_id"),
+                    "microbatch_round": hop.get("micro_round"),
+                    "token_start": hop.get("token_start"),
+                    "token_count": hop.get("token_count"),
                     "request_id": relay_trace.get("request_id"),
                     "pending_key": hop.get("pending_key") or relay_trace.get("pending_key"),
                     "pending_count_before": hop.get("pending_count_before") or relay_trace.get("pending_count_before"),
@@ -85,6 +89,7 @@ def _chain_hops(data: dict[str, Any]) -> list[dict[str, Any]]:
                     "chain_forward_ms": hop.get("chain_forward_ms"),
                     "chain_ack_ms": hop.get("chain_ack_ms"),
                     "chain_result_wait_ms": hop.get("chain_result_wait_ms"),
+                    "payload_bytes": hop.get("chain_payload_bytes") or hop.get("request_payload_bytes") or relay_trace.get("payload_bytes"),
                     "chain_result_from_peer": hop.get("chain_result_from_peer"),
                     "m1_compute_ms": hop.get("m1_compute_ms"),
                     "m4_compute_ms": hop.get("m4_compute_ms"),
@@ -103,6 +108,10 @@ def _summary(label: str, tokens: int, status: int, data: dict[str, Any], wall_ms
     trace = _trace(data)
     perf = _perf(data)
     chain_hops = _chain_hops(data)
+    pending_keys = [str(h.get("pending_key") or "") for h in chain_hops if h.get("pending_key")]
+    microbatch_ids = [str(h.get("microbatch_id") or "") for h in chain_hops if h.get("microbatch_id")]
+    m1_compute = int(perf.get("m1_compute_ms") or 0)
+    m4_compute = int(perf.get("m4_compute_ms") or 0)
     return {
         "label": label,
         "tokens_requested": tokens,
@@ -129,10 +138,14 @@ def _summary(label: str, tokens: int, status: int, data: dict[str, Any], wall_ms
         "decode_tps": perf.get("decode_tps"),
         "m1_compute_ms": perf.get("m1_compute_ms"),
         "m4_compute_ms": perf.get("m4_compute_ms"),
+        "m1_bottleneck": bool(m1_compute > max(m4_compute, 0) * 1.15 and m1_compute > 0),
         "chain_forward_ms": perf.get("chain_forward_ms"),
         "chain_ack_ms": perf.get("chain_ack_ms"),
         "chain_result_wait_ms": perf.get("chain_result_wait_ms"),
         "chain_hops": chain_hops,
+        "chain_hop_count": len(chain_hops),
+        "duplicate_pending": len(pending_keys) != len(set(pending_keys)),
+        "duplicate_microbatch": len(microbatch_ids) != len(set(microbatch_ids)),
         "error": data.get("error"),
     }
 
@@ -153,7 +166,9 @@ def main() -> int:
         "VRYX_CHAIN_BENCH_PROMPT",
         "Print a long stream of the word alpha separated by spaces. Do not use punctuation. alpha alpha alpha alpha",
     )
-    sequence = [int(x) for x in os.environ.get("VRYX_CHAIN_BENCH_SEQUENCE", "1,2,4,8,12").split(",") if x.strip()]
+    sequence = [int(x) for x in os.environ.get("VRYX_CHAIN_BENCH_SEQUENCE", "24,48,128").split(",") if x.strip()]
+    caps = [int(x) for x in os.environ.get("VRYX_CHAIN_BENCH_CAPS", "8,16,32").split(",") if x.strip()]
+    compare_stable = os.environ.get("VRYX_CHAIN_BENCH_COMPARE_STABLE", "1").strip().lower() not in ("0", "false", "no", "off")
     common = {
         "prompt": prompt,
         "temperature": 0,
@@ -174,15 +189,50 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": "warmup_failed", "warmup": warmup}, ensure_ascii=False, sort_keys=True), flush=True)
         return 1
 
-    for tokens in sequence:
-        label = f"direct{tokens}"
+    plan: list[dict[str, Any]] = []
+    if compare_stable:
+        for tokens in sequence:
+            plan.append({
+                "label": f"stable{tokens}",
+                "tokens": tokens,
+                "chain_stream": False,
+                "chain_result_direct": False,
+                "cap": None,
+                "expect_chain": False,
+            })
+    for cap in caps:
+        for tokens in sequence:
+            plan.append({
+                "label": f"direct{tokens}_cap{cap}",
+                "tokens": tokens,
+                "chain_stream": True,
+                "chain_result_direct": True,
+                "cap": cap,
+                "expect_chain": tokens >= 2,
+            })
+
+    results: list[dict[str, Any]] = []
+    for item in plan:
+        tokens = int(item["tokens"])
+        label = str(item["label"])
+        payload = {
+            **common,
+            "max_new_tokens": tokens,
+            "chain_stream": bool(item["chain_stream"]),
+            "chain_result_direct": bool(item["chain_result_direct"]),
+        }
+        if item.get("cap") is not None:
+            payload["decode_microbatch_cap"] = int(item["cap"])
         status, data, wall_ms = _post_chat(
             url,
-            {**common, "max_new_tokens": tokens, "chain_stream": True, "chain_result_direct": True},
+            payload,
             timeout,
         )
         summary = _summary(label, tokens, status, data, wall_ms)
+        summary["mode"] = "direct_chain_decode_only" if item["chain_stream"] else "stable_stream"
+        summary["decode_microbatch_cap"] = item.get("cap")
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
+        results.append(summary)
 
         if not _is_hot(summary):
             print(json.dumps({"ok": False, "error": "not_hot_path", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
@@ -194,15 +244,43 @@ def main() -> int:
             if int(summary.get("completion_tokens") or 0) < tokens:
                 print(json.dumps({"ok": False, "error": "short_completion", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
                 return 6
-        if tokens >= 2:
+        if summary.get("duplicate_pending"):
+            print(json.dumps({"ok": False, "error": "duplicate_pending", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+            return 7
+        if summary.get("duplicate_microbatch"):
+            print(json.dumps({"ok": False, "error": "duplicate_microbatch", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+            return 8
+        if bool(item["expect_chain"]):
             if summary.get("chain_stream_used") is not True or summary.get("chain_result_direct") is not True:
                 print(json.dumps({"ok": False, "error": "chain_not_used", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
                 return 4
             if summary.get("fallback_used") or summary.get("request_response_fallback"):
                 print(json.dumps({"ok": False, "error": "fallback_used", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
                 return 5
+        else:
+            if summary.get("chain_stream_used") or summary.get("chain_result_direct"):
+                print(json.dumps({"ok": False, "error": "stable_used_chain", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+                return 9
 
-    print(json.dumps({"ok": True, "sequence": sequence}, ensure_ascii=False, sort_keys=True), flush=True)
+    direct_decode = [
+        float(r.get("decode_tps") or 0.0)
+        for r in results
+        if r.get("mode") == "direct_chain_decode_only" and r.get("tokens_requested") in (24, 48, 128)
+    ]
+    summary = {
+        "ok": True,
+        "sequence": sequence,
+        "caps": caps,
+        "runs": len(results),
+        "min_direct_decode_tps": round(min(direct_decode), 3) if direct_decode else 0.0,
+        "m1_bottleneck_runs": [r.get("label") for r in results if r.get("m1_bottleneck")],
+    }
+    if direct_decode and min(direct_decode) < float(os.environ.get("VRYX_CHAIN_BENCH_MIN_DECODE_TPS", "3")):
+        summary["ok"] = False
+        summary["error"] = "decode_tps_below_target"
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
+        return 10
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
     return 0
 
 

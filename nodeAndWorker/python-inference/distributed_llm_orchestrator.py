@@ -2629,7 +2629,11 @@ def _pipeline_micro_budget_from_payload(payload: dict[str, Any]) -> int:
         budget = max(1, int(payload.get("micro_decode_budget") or 1))
     except (TypeError, ValueError):
         budget = 1
-    return max(1, min(budget, DECODE_MICROBATCH_CAP))
+    try:
+        cap = max(1, int(payload.get("decode_microbatch_cap") or DECODE_MICROBATCH_CAP))
+    except (TypeError, ValueError):
+        cap = DECODE_MICROBATCH_CAP
+    return max(1, min(budget, cap, DECODE_MICROBATCH_CAP))
 
 
 def _pipeline_micro_decode_enabled(payload: dict[str, Any], peers: list[str]) -> bool:
@@ -2921,9 +2925,15 @@ def _relay_pipeline_step(
             for micro_i in range(micro_budget):
                 current_payload["micro_decode_budget"] = 1
                 current_payload["pipeline_micro_round"] = micro_i
+                current_payload["pipeline_microbatch_id"] = f"{current_payload.get('request_id') or ''}:{base_step}:{micro_i}"
+                current_payload["pipeline_token_start"] = len(all_ids_seed) + len(emitted)
+                current_payload["pipeline_token_count"] = 1
                 result, round_traces = _relay_pipeline_chain_once(peers, dtype, current_payload)
                 for trace in round_traces:
                     trace["micro_round"] = micro_i
+                    trace["microbatch_id"] = current_payload.get("pipeline_microbatch_id")
+                    trace["token_start"] = current_payload.get("pipeline_token_start")
+                    trace["token_count"] = 1
                 hop_traces.extend(round_traces)
                 if not result.get("ok", True):
                     break
@@ -2955,6 +2965,7 @@ def _relay_pipeline_step(
                     "stateful_required": True,
                     "use_kv_cache": True,
                     "micro_decode_budget": 1,
+                    "decode_microbatch_cap": payload.get("decode_microbatch_cap"),
                 }
             if emitted and isinstance(last_response, dict):
                 final = dict(last_response)
@@ -5151,6 +5162,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
     request_chain_stream = _option_bool("chain_stream", CHAIN_STREAM)
     request_chain_result_direct = _option_bool("chain_result_direct", CHAIN_RESULT_DIRECT)
+    request_decode_microbatch_cap: int | None = None
+    if options.get("decode_microbatch_cap") is not None or options.get("decodeMicrobatchCap") is not None:
+        try:
+            request_decode_microbatch_cap = max(
+                1,
+                min(64, int(options.get("decode_microbatch_cap") or options.get("decodeMicrobatchCap"))),
+            )
+        except (TypeError, ValueError):
+            request_decode_microbatch_cap = None
 
     decode_cap = MAX_NEW_TOKENS
     _mnt = options.get("max_new_tokens")
@@ -5551,6 +5571,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     pool_info = _pool_for_session(session_id)
     latency_matrix_for_decode = pool_info.get("peer_latency_matrix") or selection_latency_matrix
     dynamic_microbatch_cap = _microbatch_cap_for_rtt(peers, latency_matrix_for_decode)
+    if request_decode_microbatch_cap is not None:
+        dynamic_microbatch_cap = max(1, min(dynamic_microbatch_cap, request_decode_microbatch_cap))
     trace_ctx.phase_trace["microbatch_enabled"] = bool(DECODE_MICROBATCH and PIPELINE_DECODE_MICROBATCH)
     trace_ctx.phase_trace["microbatch_cap"] = int(dynamic_microbatch_cap)
     stream_open = {"ok": False, "results": []}
@@ -5699,6 +5721,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "hidden_quic": HIDDEN_QUIC,
         "chain_stream_request": request_chain_stream,
         "chain_result_direct_request": request_chain_result_direct,
+        "decode_microbatch_cap": dynamic_microbatch_cap,
         "prefix_cache_key": prefix_cache_hit.get("cache_key"),
         "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
         "speculative_heads": SPECULATIVE_HEADS,
@@ -5743,6 +5766,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "decode_mode": str(current_payload.get("decode_mode") or ""),
             "microbatch_actual": max(1, int(batch_trace.get("pipeline_micro_tokens") or 1)),
             "m1_peer": routing_path[0] if routing_path else None,
+            "microbatch_id": hop0.get("microbatch_id"),
+            "token_start": hop0.get("token_start"),
+            "token_count": int(batch_trace.get("pipeline_micro_tokens") or hop0.get("token_count") or 1),
             "m1_relay_ms": int(hop0.get("relay_ms") or 0),
             "m1_transport_only_ms": max(0, int(hop0.get("relay_ms") or 0) - int(hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0)),
             "m1_compute_ms": int(hop0.get("m1_compute_ms") or hop0.get("worker_compute_ms") or hop0.get("compute_time_ms") or 0),
@@ -5933,7 +5959,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             next_input_ids = all_ids
             next_seq_pos = 0
             next_decode_mode = "full_context_fallback"
-        next_step_val = step + 1
+        next_step_val = max(step + 1, len(generated_ids))
         remaining_gen = max(0, decode_cap - len(generated_ids))
         micro_budget = 1
         multi_worker_pipeline = len(routing_path) >= 2
@@ -5972,6 +5998,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "hidden_quic": HIDDEN_QUIC,
             "chain_stream_request": request_chain_stream,
             "chain_result_direct_request": request_chain_result_direct,
+            "decode_microbatch_cap": dynamic_microbatch_cap,
             "prefix_cache_key": prefix_cache_hit.get("cache_key"),
             "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
             "speculative_heads": SPECULATIVE_HEADS,
@@ -6238,6 +6265,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "enabled": DECODE_MICROBATCH,
             "configured_cap": max(DECODE_MICROBATCH_CAP, DECODE_MICROBATCH_CAP if PIPELINE_DECODE_MICROBATCH else 1),
             "dynamic_cap": dynamic_microbatch_cap,
+            "request_cap": request_decode_microbatch_cap,
             "actual": int(trace_ctx.phase_trace.get("microbatch_actual") or 1),
             "rtt_target_ms": MICROBATCH_RTT_TARGET_MS,
         },

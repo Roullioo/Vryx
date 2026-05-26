@@ -489,6 +489,12 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("chain_result_direct") is not None
                             else maybe_payload.get("chainResultDirect")
                         )
+                    if maybe_payload.get("decode_microbatch_cap") is not None or maybe_payload.get("decodeMicrobatchCap") is not None:
+                        request_options["decode_microbatch_cap"] = (
+                            maybe_payload.get("decode_microbatch_cap")
+                            if maybe_payload.get("decode_microbatch_cap") is not None
+                            else maybe_payload.get("decodeMicrobatchCap")
+                        )
                     if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
                         request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
             except Exception:

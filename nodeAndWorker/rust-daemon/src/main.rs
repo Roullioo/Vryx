@@ -3187,6 +3187,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             request_obj[snake] = serde_json::json!(value);
                         }
                     }
+                    if let Some(value) = payload
+                        .get("decode_microbatch_cap")
+                        .or_else(|| payload.get("decodeMicrobatchCap"))
+                        .and_then(|v| {
+                            v.as_u64().or_else(|| {
+                                v.as_i64().and_then(|i| {
+                                    if i >= 1 {
+                                        Some(i as u64)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                        })
+                        .filter(|&v| (1..=64).contains(&v))
+                    {
+                        request_obj["decode_microbatch_cap"] = serde_json::json!(value);
+                    }
                     for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                         if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                             request_obj[key] = serde_json::json!(value);
@@ -3316,6 +3334,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     {
                         request_obj[snake] = serde_json::json!(value);
                     }
+                }
+                if let Some(value) = payload
+                    .get("decode_microbatch_cap")
+                    .or_else(|| payload.get("decodeMicrobatchCap"))
+                    .and_then(|v| {
+                        v.as_u64().or_else(|| {
+                            v.as_i64().and_then(|i| {
+                                if i >= 1 {
+                                    Some(i as u64)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                    .filter(|&v| (1..=64).contains(&v))
+                {
+                    request_obj["decode_microbatch_cap"] = serde_json::json!(value);
                 }
                 for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                     if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
