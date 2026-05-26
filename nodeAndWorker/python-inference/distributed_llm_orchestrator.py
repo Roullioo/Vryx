@@ -2810,7 +2810,8 @@ def _pipeline_micro_decode_enabled(payload: dict[str, Any], peers: list[str]) ->
 
 
 def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str, Any]) -> bool:
-    if not (PIPELINE_STREAM and CHAIN_STREAM):
+    chain_requested = CHAIN_STREAM or payload.get("chain_stream_request") is True
+    if not (PIPELINE_STREAM and chain_requested):
         return False
     if payload.get("chain_stream_request") is False:
         return False
@@ -2827,7 +2828,8 @@ def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str
 
 
 def _chain_coalesced_decode_enabled(peers: list[str], dtype: str, payload: dict[str, Any], micro_budget: int) -> bool:
-    if not CHAIN_COALESCED_DECODE:
+    coalesced_requested = CHAIN_COALESCED_DECODE or payload.get("chain_coalesced_decode_request") is True
+    if not coalesced_requested:
         return False
     if micro_budget <= 1:
         return False
@@ -2835,7 +2837,8 @@ def _chain_coalesced_decode_enabled(peers: list[str], dtype: str, payload: dict[
         return False
     if not _chain_stream_decode_enabled(peers, dtype, payload):
         return False
-    if not (CHAIN_RESULT_DIRECT and payload.get("chain_result_direct_request") is not False and len(peers) == 2):
+    direct_requested = CHAIN_RESULT_DIRECT or payload.get("chain_result_direct_request") is True
+    if not (direct_requested and payload.get("chain_result_direct_request") is not False and len(peers) == 2):
         return False
     if payload.get("stream") or payload.get("streaming"):
         return False
@@ -2981,7 +2984,7 @@ def _relay_pipeline_chain_once(
                 current_payload_bytes,
                 timeout=PIPELINE_STEP_TIMEOUT,
             )
-            if CHAIN_RESULT_DIRECT and current_payload.get("chain_result_direct_request") is not False and len(peers) == 2
+            if (CHAIN_RESULT_DIRECT or current_payload.get("chain_result_direct_request") is True) and current_payload.get("chain_result_direct_request") is not False and len(peers) == 2
             else _pipeline_stream_raw(
                 peers[0],
                 dtype,
@@ -5685,6 +5688,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
     request_chain_stream = _option_bool("chain_stream", CHAIN_STREAM)
     request_chain_result_direct = _option_bool("chain_result_direct", CHAIN_RESULT_DIRECT)
+    request_chain_coalesced_decode = _option_bool("chain_coalesced_decode", CHAIN_COALESCED_DECODE)
     request_decode_microbatch_cap: int | None = None
     if options.get("decode_microbatch_cap") is not None or options.get("decodeMicrobatchCap") is not None:
         try:
@@ -6271,6 +6275,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "hidden_quic": HIDDEN_QUIC,
         "chain_stream_request": request_chain_stream,
         "chain_result_direct_request": request_chain_result_direct,
+        "chain_coalesced_decode_request": request_chain_coalesced_decode,
         "decode_microbatch_cap": dynamic_microbatch_cap,
         "prefix_cache_key": prefix_cache_hit.get("cache_key"),
         "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
@@ -6548,6 +6553,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "hidden_quic": HIDDEN_QUIC,
             "chain_stream_request": request_chain_stream,
             "chain_result_direct_request": request_chain_result_direct,
+            "chain_coalesced_decode_request": request_chain_coalesced_decode,
             "decode_microbatch_cap": dynamic_microbatch_cap,
             "prefix_cache_key": prefix_cache_hit.get("cache_key"),
             "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
@@ -6692,6 +6698,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     )
     frames_sent_total = _sum_hop_int("frames_sent")
     frames_received_total = _sum_hop_int("frames_received")
+    batch_hop_count_total = 0
+    chain_hop_count_total = 0
+    batch_token_count_total = 0
+    coalesced_batch_count = 0
+    coalesced_decode_steps = 0
     stream_fallback_count = 0
     chain_fallback_count = 0
     stream_reused_seen = False
@@ -6708,6 +6719,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             stream_used_seen = stream_used_seen or bool(hop.get("pipeline_stream"))
             stream_reused_seen = stream_reused_seen or bool(hop.get("stream_reused"))
             chain_stream_used_seen = chain_stream_used_seen or bool(hop.get("chain_stream_used"))
+            if bool(hop.get("coalesced")):
+                coalesced_batch_count += 1
+                coalesced_decode_steps += max(1, int(hop.get("token_count") or hop.get("accepted_token_count") or 1))
+            batch_hop_count_total += int(hop.get("batch_hop_count") or (1 if hop.get("coalesced") else 0) or 0)
+            chain_hop_count_total += int(hop.get("chain_hop_count") or (1 if hop.get("chain_stream_used") else 0) or 0)
             if bool(hop.get("request_response_fallback")):
                 stream_fallback_count += 1
             if bool(hop.get("fallback_used")):
@@ -6794,8 +6810,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "pipeline_stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
             "chain_stream": CHAIN_STREAM,
             "chain_result_direct": CHAIN_RESULT_DIRECT,
+            "chain_coalesced_decode": CHAIN_COALESCED_DECODE,
             "request_chain_stream": request_chain_stream,
             "request_chain_result_direct": request_chain_result_direct,
+            "request_chain_coalesced_decode": request_chain_coalesced_decode,
             "chain_model_step_smoke": CHAIN_MODEL_STEP_SMOKE,
         "chain_stream_fallback_initiator": CHAIN_STREAM_FALLBACK_INITIATOR,
         "stream_fallback": (
@@ -6949,6 +6967,13 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "chain_stream_enabled": CHAIN_STREAM,
             "request_chain_stream": request_chain_stream,
             "chain_stream_used": chain_stream_used_seen,
+            "chain_coalesced_decode_enabled": CHAIN_COALESCED_DECODE,
+            "request_chain_coalesced_decode": request_chain_coalesced_decode,
+            "coalesced_batch_count": coalesced_batch_count,
+            "coalesced_decode_steps": coalesced_decode_steps,
+            "batch_hop_count": batch_hop_count_total,
+            "chain_hop_count": chain_hop_count_total,
+            "batch_token_count": batch_token_count_total or coalesced_decode_steps,
             "chain_open_ms": chain_open_ms_total,
             "chain_handshake_ms": chain_handshake_ms_total,
             "chain_send_ms": chain_send_ms_total,

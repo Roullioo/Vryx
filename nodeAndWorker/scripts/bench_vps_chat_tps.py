@@ -16,6 +16,10 @@ Variables utiles :
   VRYX_BENCH_LOAD_MODE=full
   VRYX_BENCH_FORCE_DISTRIBUTED=0
   VRYX_BENCH_MIN_COMPUTE_WORKERS=0
+  VRYX_BENCH_CHAIN_STREAM=1
+  VRYX_BENCH_CHAIN_RESULT_DIRECT=1
+  VRYX_BENCH_CHAIN_COALESCED_DECODE=1
+  VRYX_BENCH_DECODE_MICROBATCH_CAP=8
 """
 from __future__ import annotations
 
@@ -70,6 +74,16 @@ def _chat(url: str, max_new_tokens: int, prompt: str, timeout_sec: float) -> dic
         payload["load_mode"] = load_mode
     if os.environ.get("VRYX_BENCH_FORCE_DISTRIBUTED", "").strip().lower() in ("1", "true", "yes", "on"):
         payload["force_distributed"] = True
+    for env_name, payload_name in (
+        ("VRYX_BENCH_CHAIN_STREAM", "chain_stream"),
+        ("VRYX_BENCH_CHAIN_RESULT_DIRECT", "chain_result_direct"),
+        ("VRYX_BENCH_CHAIN_COALESCED_DECODE", "chain_coalesced_decode"),
+    ):
+        raw = os.environ.get(env_name, "").strip().lower()
+        if raw:
+            payload[payload_name] = raw in ("1", "true", "yes", "on")
+    if os.environ.get("VRYX_BENCH_DECODE_MICROBATCH_CAP", "").strip():
+        payload["decode_microbatch_cap"] = int(os.environ["VRYX_BENCH_DECODE_MICROBATCH_CAP"])
     preferred = os.environ.get("VRYX_BENCH_PREFERRED_WORKERS", "").strip()
     if preferred:
         payload["preferred_worker_peer_ids"] = [
@@ -106,6 +120,7 @@ def _metric(data: dict[str, Any], tokens_requested: int) -> dict[str, Any]:
     tps_latency = round((ct * 1000.0 / latency_ms), 3) if latency_ms > 0 and ct > 0 else 0.0
     runtime_by_worker = trace.get("runtime_backend_per_worker")
     runtime_backend = data.get("runtime_backend") or bench.get("runtime_backend")
+    perf = trace.get("perf_trace") if isinstance(trace.get("perf_trace"), dict) else {}
     if not runtime_backend and isinstance(runtime_by_worker, dict) and runtime_by_worker:
         runtime_backend = next(iter(runtime_by_worker.values()))
     return {
@@ -134,6 +149,16 @@ def _metric(data: dict[str, Any], tokens_requested: int) -> dict[str, Any]:
         "prompt_eval_ms": bench.get("prompt_eval_ms"),
         "cache_hit": bench.get("cache_hit"),
         "load_ms": bench.get("load_ms"),
+        "chain_stream_used": perf.get("chain_stream_used"),
+        "chain_result_direct": perf.get("chain_result_direct"),
+        "request_chain_coalesced_decode": perf.get("request_chain_coalesced_decode"),
+        "coalesced_batch_count": perf.get("coalesced_batch_count"),
+        "coalesced_decode_steps": perf.get("coalesced_decode_steps"),
+        "batch_hop_count": perf.get("batch_hop_count"),
+        "chain_hop_count": perf.get("chain_hop_count"),
+        "batch_token_count": perf.get("batch_token_count"),
+        "request_response_fallback": perf.get("request_response_fallback"),
+        "fallback_used": perf.get("fallback_used"),
         "layout": trace.get("layout"),
         "runtime_backend": runtime_backend,
         "model_id": trace.get("model_id") or data.get("model_id"),

@@ -490,6 +490,12 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("chain_result_direct") is not None
                             else maybe_payload.get("chainResultDirect")
                         )
+                    if maybe_payload.get("chain_coalesced_decode") is not None or maybe_payload.get("chainCoalescedDecode") is not None:
+                        request_options["chain_coalesced_decode"] = bool(
+                            maybe_payload.get("chain_coalesced_decode")
+                            if maybe_payload.get("chain_coalesced_decode") is not None
+                            else maybe_payload.get("chainCoalescedDecode")
+                        )
                     if maybe_payload.get("decode_microbatch_cap") is not None or maybe_payload.get("decodeMicrobatchCap") is not None:
                         request_options["decode_microbatch_cap"] = (
                             maybe_payload.get("decode_microbatch_cap")
