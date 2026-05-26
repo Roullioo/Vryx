@@ -477,6 +477,18 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("force_distributed") is not None
                             else maybe_payload.get("forceDistributed")
                         )
+                    if maybe_payload.get("chain_stream") is not None or maybe_payload.get("chainStream") is not None:
+                        request_options["chain_stream"] = bool(
+                            maybe_payload.get("chain_stream")
+                            if maybe_payload.get("chain_stream") is not None
+                            else maybe_payload.get("chainStream")
+                        )
+                    if maybe_payload.get("chain_result_direct") is not None or maybe_payload.get("chainResultDirect") is not None:
+                        request_options["chain_result_direct"] = bool(
+                            maybe_payload.get("chain_result_direct")
+                            if maybe_payload.get("chain_result_direct") is not None
+                            else maybe_payload.get("chainResultDirect")
+                        )
                     if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
                         request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
             except Exception:
