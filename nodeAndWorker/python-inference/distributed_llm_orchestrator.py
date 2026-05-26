@@ -875,7 +875,7 @@ def _select_pool_peers(
             return selected, preference, None
         if preference != "legacy_pytorch" and len(by_class["legacy_pytorch"]) >= min_workers:
             return by_class["legacy_pytorch"], "legacy_pytorch", f"{preference}_insufficient_workers"
-        return selected, preference, f"{preference}_insufficient_workers"
+        return peers, "mixed_pool", f"{preference}_single_pool_insufficient_workers"
     if len(by_class["velocity_vllm"]) >= min_workers:
         return by_class["velocity_vllm"], "velocity_vllm", None
     if len(by_class["velocity_mlx"]) >= min_workers:
