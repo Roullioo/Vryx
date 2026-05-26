@@ -93,6 +93,13 @@ def _chain_hops(data: dict[str, Any]) -> list[dict[str, Any]]:
                     "chain_result_from_peer": hop.get("chain_result_from_peer"),
                     "m1_compute_ms": hop.get("m1_compute_ms"),
                     "m4_compute_ms": hop.get("m4_compute_ms"),
+                    "coalesced": hop.get("coalesced") or relay_trace.get("coalesced"),
+                    "batch_hop_count": hop.get("batch_hop_count") or relay_trace.get("batch_hop_count"),
+                    "batch_m1_compute_ms": hop.get("batch_m1_compute_ms") or relay_trace.get("batch_m1_compute_ms"),
+                    "batch_m4_compute_ms": hop.get("batch_m4_compute_ms") or relay_trace.get("batch_m4_compute_ms"),
+                    "batch_chain_forward_ms": hop.get("batch_chain_forward_ms") or relay_trace.get("batch_chain_forward_ms"),
+                    "batch_result_wait_ms": hop.get("batch_result_wait_ms") or relay_trace.get("batch_result_wait_ms"),
+                    "batch_tokens_per_second": hop.get("batch_tokens_per_second") or relay_trace.get("batch_tokens_per_second"),
                     "fallback_used": hop.get("fallback_used"),
                     "fallback_reason": hop.get("fallback_reason"),
                     "failed_step_id": hop.get("failed_step_id") or relay_trace.get("failed_step_id"),
@@ -112,6 +119,7 @@ def _summary(label: str, tokens: int, status: int, data: dict[str, Any], wall_ms
     microbatch_ids = [str(h.get("microbatch_id") or "") for h in chain_hops if h.get("microbatch_id")]
     m1_compute = int(perf.get("m1_compute_ms") or 0)
     m4_compute = int(perf.get("m4_compute_ms") or 0)
+    effective_chain_hop_count = sum(int(h.get("batch_hop_count") or 1) for h in chain_hops)
     return {
         "label": label,
         "tokens_requested": tokens,
@@ -143,7 +151,9 @@ def _summary(label: str, tokens: int, status: int, data: dict[str, Any], wall_ms
         "chain_ack_ms": perf.get("chain_ack_ms"),
         "chain_result_wait_ms": perf.get("chain_result_wait_ms"),
         "chain_hops": chain_hops,
-        "chain_hop_count": len(chain_hops),
+        "chain_hop_count": effective_chain_hop_count,
+        "raw_chain_frame_count": len(chain_hops),
+        "coalesced": any(bool(h.get("coalesced")) for h in chain_hops),
         "duplicate_pending": len(pending_keys) != len(set(pending_keys)),
         "duplicate_microbatch": len(microbatch_ids) != len(set(microbatch_ids)),
         "error": data.get("error"),

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -521,6 +523,484 @@ async fn handle_chain_control_frame(
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default();
+
+    if frame.dtype == "vryx.chain.forward.batch.step" {
+        let forward_dtype = body
+            .get("forward_dtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("vryx.shard.pipeline")
+            .to_string();
+        let payload_bytes = body
+            .get("payload_b64")
+            .and_then(|v| v.as_str())
+            .and_then(|v| general_purpose::STANDARD.decode(v).ok())
+            .unwrap_or_default();
+        let compute_started = Instant::now();
+        let m4_grpc_compute_start_ms = unix_ms();
+        let compute_result = call_local_inference(
+            grpc_port,
+            payload_bytes,
+            forward_dtype.clone(),
+            Vec::new(),
+            frame.session_id.clone(),
+        )
+        .await;
+        let m4_grpc_compute_end_ms = unix_ms();
+        return match compute_result {
+            Ok((data, c, ser, metrics, c_ms)) => {
+                let response = TensorResponse {
+                    data,
+                    compute_time_ns: c,
+                    serialization_time_ns: ser,
+                    prompt_tokens_llm: metrics.prompt_tokens,
+                    completion_tokens_llm: metrics.completion_tokens,
+                    total_tokens_llm: metrics.total_tokens,
+                    vps_delegate_ms: compute_started.elapsed().as_millis() as u64,
+                    worker_compute_ms: c_ms,
+                    shard_session_id: metrics.shard_session_id,
+                    compute_time_ms: c_ms,
+                    relay_trace_json: serde_json::json!({
+                        "transport": "pipeline_stream_chain_batch_step",
+                        "worker_seen_request": true,
+                        "worker_compute_ms": c_ms,
+                        "chain_type": "CHAIN_BATCH_STEP_RESULT",
+                        "m4_chain_received_ms": chain_received_ms,
+                        "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                        "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                    })
+                    .to_string(),
+                    ..Default::default()
+                };
+                (true, serde_json::to_vec(&response).unwrap_or_default())
+            }
+            Err(e) => (
+                false,
+                serde_json::json!({
+                    "ok": false,
+                    "chain_type": "CHAIN_BATCH_ERROR",
+                    "error": format!("chain_batch_step_compute_failed: {}", e),
+                    "m4_chain_received_ms": chain_received_ms,
+                    "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+                    "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        };
+    }
+
+    if frame.dtype == "vryx.chain.forward.batch" {
+        let result_peer_str = body
+            .get("result_peer")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| peer.to_string());
+        let result_peer = match PeerId::from_str(&result_peer_str) {
+            Ok(peer) => peer,
+            Err(e) => {
+                return (
+                    false,
+                    serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_BATCH_ERROR",
+                        "error": format!("bad_result_peer: {}", e),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                );
+            }
+        };
+        let Some(next_peer_str) = routing_path.first() else {
+            return (
+                false,
+                serde_json::json!({
+                    "ok": false,
+                    "chain_type": "CHAIN_BATCH_ERROR",
+                    "error": "chain_batch_missing_next_peer",
+                })
+                .to_string()
+                .into_bytes(),
+            );
+        };
+        let next_peer = match PeerId::from_str(next_peer_str) {
+            Ok(peer) => peer,
+            Err(e) => {
+                return (
+                    false,
+                    serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_BATCH_ERROR",
+                        "error": format!("bad_next_peer: {}", e),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                );
+            }
+        };
+        let forward_dtype = body
+            .get("forward_dtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("vryx.shard.pipeline")
+            .to_string();
+        let initial_payload_bytes = body
+            .get("payload_b64")
+            .and_then(|v| v.as_str())
+            .and_then(|v| general_purpose::STANDARD.decode(v).ok())
+            .unwrap_or_default();
+        let token_count = body
+            .get("token_count")
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i > 0 { Some(i as u64) } else { None })))
+            .unwrap_or(1)
+            .min(64) as usize;
+        let token_start = body
+            .get("token_start")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let microbatch_id = body
+            .get("microbatch_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let request_id = frame.request_id.clone();
+        let session_id = frame.session_id.clone();
+        let base_step = frame.step_id;
+        let control_for_task = Arc::clone(&stream_control);
+        let cache_for_task = Arc::clone(&stream_cache);
+        let stream_ttl_for_task = stream_ttl;
+        let result_peer_for_task = result_peer.clone();
+        let next_peer_for_task = next_peer.clone();
+        let next_peer_for_ack = next_peer.to_string();
+        let forward_dtype_for_ack = forward_dtype.clone();
+        let microbatch_id_for_ack = microbatch_id.clone();
+        let final_peer_for_task = next_peer.to_string();
+        let my_peer_for_task = my_peer_id.to_string();
+        let body_for_task = body.clone();
+        tokio::spawn(async move {
+            let batch_started = Instant::now();
+            let initial_payload_value = serde_json::from_slice::<serde_json::Value>(&initial_payload_bytes)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let mut seed_ids: Vec<i64> = initial_payload_value
+                .get("history_token_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))).collect())
+                .unwrap_or_default();
+            if seed_ids.is_empty() {
+                seed_ids = initial_payload_value
+                    .get("token_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))).collect())
+                    .unwrap_or_default();
+            }
+            let stop_ids: HashSet<i64> = initial_payload_value
+                .get("stop_token_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))).collect())
+                .unwrap_or_default();
+            let eos_id = initial_payload_value
+                .get("eos_token_id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+            let mut emitted: Vec<i64> = Vec::new();
+            let mut current_payload_bytes = initial_payload_bytes.clone();
+            let mut last_response_value = serde_json::json!({});
+            let mut last_tensor_response: Option<TensorResponse> = None;
+            let mut batch_error: Option<String> = None;
+            let mut batch_m1_compute_ms = 0u64;
+            let mut batch_m4_compute_ms = 0u64;
+            let mut batch_result_wait_ms = 0u64;
+            let mut internal_frames_sent = 0u64;
+            let mut internal_frames_received = 0u64;
+            for token_index in 0..token_count {
+                let m1_started = Instant::now();
+                let m1_result = tokio::time::timeout(
+                    chain_total_step_timeout(),
+                    call_local_inference(
+                        grpc_port,
+                        current_payload_bytes.clone(),
+                        forward_dtype.clone(),
+                        Vec::new(),
+                        session_id.clone(),
+                    ),
+                )
+                .await;
+                let m1_payload = match m1_result {
+                    Ok(Ok((data, _c, _s, _metrics, c_ms))) => {
+                        batch_m1_compute_ms = batch_m1_compute_ms
+                            .saturating_add(c_ms.max(m1_started.elapsed().as_millis() as u64));
+                        data
+                    }
+                    Ok(Err(e)) => {
+                        batch_error = Some(format!("chain_batch_m1_compute_failed: {}", e));
+                        break;
+                    }
+                    Err(_) => {
+                        batch_error = Some("chain_batch_m1_compute_timeout".to_string());
+                        break;
+                    }
+                };
+                let step_body = serde_json::json!({
+                    "chain_type": "CHAIN_FORWARD_BATCH_STEP",
+                    "forward_dtype": forward_dtype,
+                    "payload_b64": general_purpose::STANDARD.encode(&m1_payload),
+                    "payload_len": m1_payload.len(),
+                    "microbatch_id": microbatch_id,
+                    "token_index": token_index,
+                    "token_start": token_start,
+                    "token_count": token_count,
+                    "source_peer": my_peer_for_task,
+                    "final_peer": final_peer_for_task,
+                    "m1_chain_received_ms": chain_received_ms,
+                });
+                let step_frame = PipelineFrame {
+                    frame_type: PIPELINE_FRAME_REQUEST,
+                    request_id: format!("{}:batch:{}", request_id, token_index),
+                    session_id: session_id.clone(),
+                    step_id: base_step + token_index as u64,
+                    dtype: "vryx.chain.forward.batch.step".to_string(),
+                    payload: serde_json::to_vec(&step_body).unwrap_or_default(),
+                };
+                let wait_started = Instant::now();
+                let step_result = tokio::time::timeout(
+                    chain_total_step_timeout(),
+                    pipeline_stream_roundtrip(
+                        Arc::clone(&control_for_task),
+                        Arc::clone(&cache_for_task),
+                        next_peer_for_task.clone(),
+                        step_frame,
+                        stream_ttl_for_task,
+                    ),
+                )
+                .await;
+                batch_result_wait_ms = batch_result_wait_ms.saturating_add(wait_started.elapsed().as_millis() as u64);
+                let step_response_frame = match step_result {
+                    Ok(Ok((response, trace))) => {
+                        internal_frames_sent = internal_frames_sent.saturating_add(trace.frames_sent);
+                        internal_frames_received = internal_frames_received.saturating_add(trace.frames_received);
+                        response
+                    }
+                    Ok(Err(e)) => {
+                        batch_error = Some(format!("chain_batch_m4_step_failed: {}", e));
+                        break;
+                    }
+                    Err(_) => {
+                        batch_error = Some("chain_batch_m4_step_timeout".to_string());
+                        break;
+                    }
+                };
+                let tensor_response = match serde_json::from_slice::<TensorResponse>(&step_response_frame.payload) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        batch_error = Some(format!("chain_batch_m4_tensor_decode_failed: {}", e));
+                        break;
+                    }
+                };
+                batch_m4_compute_ms = batch_m4_compute_ms.saturating_add(tensor_response.worker_compute_ms);
+                let response_value = match serde_json::from_slice::<serde_json::Value>(&tensor_response.data) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        batch_error = Some(format!("chain_batch_m4_payload_decode_failed: {}", e));
+                        break;
+                    }
+                };
+                let Some(token_id) = response_value
+                    .get("next_token_id")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))) else {
+                    batch_error = Some("chain_batch_missing_next_token_id".to_string());
+                    break;
+                };
+                emitted.push(token_id);
+                last_response_value = response_value.clone();
+                last_tensor_response = Some(tensor_response);
+                if eos_id == Some(token_id) || stop_ids.contains(&token_id) {
+                    break;
+                }
+                if token_index + 1 >= token_count {
+                    break;
+                }
+                let mut history_ids = seed_ids.clone();
+                history_ids.extend(emitted.iter().copied());
+                let mut next_payload = initial_payload_value.clone();
+                if let Some(obj) = next_payload.as_object_mut() {
+                    obj.insert("token_ids".to_string(), serde_json::json!([token_id]));
+                    obj.insert("history_token_ids".to_string(), serde_json::json!(history_ids));
+                    obj.insert("step".to_string(), serde_json::json!(base_step + token_index as u64 + 1));
+                    obj.insert("seq_pos".to_string(), serde_json::json!(seed_ids.len() + emitted.len() - 1));
+                    obj.insert("decode_mode".to_string(), serde_json::json!("single_token_stateful"));
+                    obj.insert("stateful_required".to_string(), serde_json::json!(true));
+                    obj.insert("use_kv_cache".to_string(), serde_json::json!(true));
+                    obj.insert("micro_decode_budget".to_string(), serde_json::json!(1));
+                    obj.insert("chain_coalesced_decode".to_string(), serde_json::json!(true));
+                }
+                current_payload_bytes = serde_json::to_vec(&next_payload).unwrap_or_default();
+            }
+            let accepted = emitted.len();
+            let result_body = if let Some(error) = batch_error {
+                serde_json::json!({
+                    "ok": false,
+                    "chain_type": "CHAIN_BATCH_ERROR",
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "step_id": base_step,
+                    "microbatch_id": microbatch_id,
+                    "from_peer": final_peer_for_task,
+                    "final_peer": final_peer_for_task,
+                    "dtype": forward_dtype,
+                    "payload_len": 0,
+                    "error": error,
+                    "token_start": token_start,
+                    "token_count": token_count,
+                    "accepted_token_count": accepted,
+                    "batch_m1_compute_ms": batch_m1_compute_ms,
+                    "batch_m4_compute_ms": batch_m4_compute_ms,
+                    "batch_result_wait_ms": batch_result_wait_ms,
+                    "m1_chain_received_ms": chain_received_ms,
+                    "m4_chain_result_send_ms": unix_ms(),
+                })
+            } else if accepted == 0 {
+                serde_json::json!({
+                    "ok": false,
+                    "chain_type": "CHAIN_BATCH_ERROR",
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "step_id": base_step,
+                    "microbatch_id": microbatch_id,
+                    "from_peer": final_peer_for_task,
+                    "final_peer": final_peer_for_task,
+                    "dtype": forward_dtype,
+                    "payload_len": 0,
+                    "error": "chain_batch_empty_result",
+                    "token_start": token_start,
+                    "token_count": token_count,
+                    "accepted_token_count": 0,
+                    "m4_chain_result_send_ms": unix_ms(),
+                })
+            } else {
+                let mut final_value = last_response_value.clone();
+                if let Some(obj) = final_value.as_object_mut() {
+                    obj.insert("candidate_token_ids".to_string(), serde_json::json!(emitted));
+                    obj.insert("accepted_token_count".to_string(), serde_json::json!(accepted));
+                    obj.insert("next_token_id".to_string(), serde_json::json!(emitted[accepted - 1]));
+                    obj.insert("decode_microbatch".to_string(), serde_json::json!(accepted > 1));
+                    obj.insert("speculative_method".to_string(), serde_json::json!("pipeline_chain_coalesced_greedy"));
+                    obj.insert("speculative_available".to_string(), serde_json::json!(accepted > 1));
+                    obj.insert("transport_trace".to_string(), serde_json::json!({
+                        "transport": "pipeline_stream_chain_batch_direct",
+                        "worker_seen_request": true,
+                        "chain_result_direct": true,
+                        "chain_type": "CHAIN_BATCH_RESULT",
+                        "coalesced": true,
+                        "microbatch_id": microbatch_id,
+                        "token_start": token_start,
+                        "token_count": accepted,
+                        "batch_hop_count": 1,
+                        "chain_hop_count": 1,
+                        "batch_m1_compute_ms": batch_m1_compute_ms,
+                        "batch_m4_compute_ms": batch_m4_compute_ms,
+                        "batch_result_wait_ms": batch_result_wait_ms,
+                        "batch_tokens_per_second": if batch_started.elapsed().as_millis() > 0 { (accepted as f64 * 1000.0) / batch_started.elapsed().as_millis() as f64 } else { 0.0 },
+                    }));
+                }
+                let mut response = last_tensor_response.unwrap_or_default();
+                response.data = serde_json::to_vec(&final_value).unwrap_or_default();
+                response.worker_compute_ms = batch_m4_compute_ms;
+                response.compute_time_ms = batch_m4_compute_ms;
+                response.relay_trace_json = serde_json::json!({
+                    "transport": "pipeline_stream_chain_batch_direct",
+                    "worker_seen_request": true,
+                    "chain_result_direct": true,
+                    "chain_result_from_peer": final_peer_for_task,
+                    "chain_type": "CHAIN_BATCH_RESULT",
+                    "coalesced": true,
+                    "microbatch_id": microbatch_id,
+                    "token_start": token_start,
+                    "token_count": accepted,
+                    "batch_hop_count": 1,
+                    "chain_hop_count": 1,
+                    "batch_m1_compute_ms": batch_m1_compute_ms,
+                    "batch_m4_compute_ms": batch_m4_compute_ms,
+                    "batch_result_wait_ms": batch_result_wait_ms,
+                    "batch_tokens_per_second": if batch_started.elapsed().as_millis() > 0 { (accepted as f64 * 1000.0) / batch_started.elapsed().as_millis() as f64 } else { 0.0 },
+                })
+                .to_string();
+                let payload = serde_json::to_vec(&response).unwrap_or_default();
+                serde_json::json!({
+                    "ok": true,
+                    "chain_type": "CHAIN_BATCH_RESULT",
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "step_id": base_step,
+                    "microbatch_id": microbatch_id,
+                    "from_peer": final_peer_for_task,
+                    "final_peer": final_peer_for_task,
+                    "dtype": forward_dtype,
+                    "payload_len": payload.len(),
+                    "payload_b64": general_purpose::STANDARD.encode(&payload),
+                    "token_start": token_start,
+                    "token_count": accepted,
+                    "accepted_token_count": accepted,
+                    "coalesced": true,
+                    "batch_hop_count": 1,
+                    "chain_hop_count": 1,
+                    "batch_m1_compute_ms": batch_m1_compute_ms,
+                    "batch_m4_compute_ms": batch_m4_compute_ms,
+                    "batch_result_wait_ms": batch_result_wait_ms,
+                    "batch_tokens_per_second": if batch_started.elapsed().as_millis() > 0 { (accepted as f64 * 1000.0) / batch_started.elapsed().as_millis() as f64 } else { 0.0 },
+                    "internal_frames_sent": internal_frames_sent,
+                    "internal_frames_received": internal_frames_received,
+                    "m1_chain_received_ms": chain_received_ms,
+                    "m4_chain_result_send_ms": unix_ms(),
+                })
+            };
+            let result_frame = PipelineFrame {
+                frame_type: PIPELINE_FRAME_REQUEST,
+                request_id: result_body
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                session_id: result_body
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                step_id: base_step,
+                dtype: "vryx.chain.result".to_string(),
+                payload: serde_json::to_vec(&result_body).unwrap_or_default(),
+            };
+            if let Err(e) = pipeline_stream_roundtrip(
+                control_for_task,
+                cache_for_task,
+                result_peer_for_task,
+                result_frame,
+                stream_ttl_for_task,
+            )
+            .await
+            {
+                eprintln!("[CHAIN_BATCH_RESULT] envoi direct échoué : {}", e);
+            }
+            let _ = body_for_task;
+        });
+        return (
+            true,
+            serde_json::json!({
+                "ok": true,
+                "chain_type": "CHAIN_FORWARD_ACK",
+                "chain_batch": true,
+                "request_id": frame.request_id,
+                "session_id": frame.session_id,
+                "step_id": frame.step_id,
+                "microbatch_id": microbatch_id_for_ack,
+                "from_peer": my_peer_id.to_string(),
+                "final_peer": next_peer_for_ack,
+                "result_peer": result_peer_str,
+                "dtype": forward_dtype_for_ack,
+                "token_start": token_start,
+                "token_count": token_count,
+                "latency_ms": started.elapsed().as_millis() as u64,
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
 
     if frame.dtype == "vryx.chain.forward" {
         let result_peer_str = body
@@ -1113,6 +1593,8 @@ async fn handle_chain_control_frame(
                         "vryx.chain.echo",
                         "vryx.chain.fake_tensor",
                         "vryx.chain.forward",
+                        "vryx.chain.forward.batch",
+                        "vryx.chain.forward.batch.step",
                         "vryx.chain.result"
                     ],
                 })
@@ -1190,7 +1672,19 @@ async fn handle_pipeline_stream(
                 .get("step_id")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(frame.step_id);
-            let key = chain_pending_key(session, request, step);
+            let chain_type = result_json
+                .get("chain_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let microbatch_id = result_json
+                .get("microbatch_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let key = if (chain_type == "CHAIN_BATCH_RESULT" || chain_type == "CHAIN_BATCH_ERROR") && !microbatch_id.is_empty() {
+                format!("{}:{}:batch:{}", session, request, microbatch_id)
+            } else {
+                chain_pending_key(session, request, step)
+            };
             let pending = { chain_pending_results.lock().await.remove(&key) };
             let duplicate = pending.is_none();
             if let Some(tx) = pending {
@@ -3461,7 +3955,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .get("step_id")
                         .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None })))
                         .unwrap_or(0);
-                    let key = chain_pending_key(&session_id, &request_id, step_id);
+                    let chain_frame_dtype = payload
+                        .get("chain_frame_dtype")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("vryx.chain.forward")
+                        .to_string();
+                    let microbatch_id = payload
+                        .get("microbatch_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let token_start = payload.get("token_start").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let token_count = payload.get("token_count").and_then(|v| v.as_u64()).unwrap_or(1);
+                    let key = if chain_frame_dtype == "vryx.chain.forward.batch" && !microbatch_id.is_empty() {
+                        format!("{}:{}:batch:{}", session_id, request_id, microbatch_id)
+                    } else {
+                        chain_pending_key(&session_id, &request_id, step_id)
+                    };
                     let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
                     let (pending_count_before, pending_count_after_insert) = {
                         let mut guard = pending_results.lock().await;
@@ -3478,13 +3988,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "forward_dtype": forward_dtype,
                         "payload_b64": general_purpose::STANDARD.encode(&data),
                         "payload_len": data.len(),
+                        "chain_type": payload.get("chain_type").cloned().unwrap_or_else(|| serde_json::json!("CHAIN_FORWARD")),
+                        "microbatch_id": microbatch_id,
+                        "token_start": token_start,
+                        "token_count": token_count,
                     });
                     let frame = PipelineFrame {
                         frame_type: PIPELINE_FRAME_REQUEST,
                         request_id: request_id.clone(),
                         session_id: session_id.clone(),
                         step_id,
-                        dtype: "vryx.chain.forward".to_string(),
+                        dtype: chain_frame_dtype.clone(),
                         payload: serde_json::to_vec(&body).unwrap_or_default(),
                     };
                     let ack_started = Instant::now();
@@ -3720,6 +4234,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "m4_grpc_compute_end_ms": result_json.get("m4_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "m4_chain_result_send_ms": result_json.get("m4_chain_result_send_ms").cloned().unwrap_or(serde_json::Value::Null),
                             "chain_result_direct": true,
+                            "chain_type": result_json.get("chain_type").and_then(|v| v.as_str()).unwrap_or("CHAIN_RESULT"),
+                            "coalesced": result_json.get("coalesced").and_then(|v| v.as_bool()).unwrap_or(false),
+                            "microbatch_id": result_json.get("microbatch_id").and_then(|v| v.as_str()),
+                            "token_start": result_json.get("token_start").and_then(|v| v.as_u64()),
+                            "token_count": result_json.get("token_count").and_then(|v| v.as_u64()),
+                            "accepted_token_count": result_json.get("accepted_token_count").and_then(|v| v.as_u64()),
+                            "chain_hop_count": result_json.get("chain_hop_count").and_then(|v| v.as_u64()).unwrap_or(1),
+                            "batch_hop_count": result_json.get("batch_hop_count").and_then(|v| v.as_u64()).unwrap_or(1),
+                            "batch_m1_compute_ms": result_json.get("batch_m1_compute_ms").and_then(|v| v.as_u64()),
+                            "batch_m4_compute_ms": result_json.get("batch_m4_compute_ms").and_then(|v| v.as_u64()),
+                            "batch_chain_forward_ms": started.elapsed().as_millis() as u64,
+                            "batch_result_wait_ms": result_json.get("batch_result_wait_ms").and_then(|v| v.as_u64()),
+                            "batch_tokens_per_second": result_json.get("batch_tokens_per_second").and_then(|v| v.as_f64()),
                             "chain_result_from_peer": result_json.get("from_peer").and_then(|v| v.as_str()),
                             "chain_pending_count": pending_count_after_insert,
                             "stream_open_ms": ack_trace.stream_open_ms,

@@ -484,6 +484,7 @@ CHAIN_STREAM_FALLBACK_INITIATOR = os.environ.get(
     "VRYX_CHAIN_STREAM_FALLBACK_INITIATOR", "1"
 ).lower() not in ("0", "false", "no", "off")
 CHAIN_RESULT_DIRECT = os.environ.get("VRYX_CHAIN_RESULT_DIRECT", "0").lower() in ("1", "true", "yes", "on")
+CHAIN_COALESCED_DECODE = os.environ.get("VRYX_CHAIN_COALESCED_DECODE", "0").lower() in ("1", "true", "yes", "on")
 CHAIN_MODEL_STEP_SMOKE = os.environ.get("VRYX_CHAIN_MODEL_STEP_SMOKE", "0").lower() in ("1", "true", "yes", "on")
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
@@ -2506,6 +2507,125 @@ def _chain_forward_raw(
         }
 
 
+def _chain_forward_batch_raw(
+    peer_id: str,
+    final_peer: str,
+    dtype: str,
+    payload: bytes,
+    token_count: int,
+    microbatch_id: str,
+    token_start: int,
+    timeout: float = TIMEOUT,
+) -> dict:
+    trace_ctx = _current_trace_ctx()
+    if trace_ctx is not None:
+        trace_ctx.count_call("/api/p2p/chain-forward")
+        trace_ctx.count_call("chain_forward_batch_frames_sent")
+        if dtype in trace_ctx.call_counts:
+            trace_ctx.count_call(dtype)
+    url = f"{RELAY_URL}/api/p2p/chain-forward"
+    t0 = time.perf_counter()
+    serialization_start = time.perf_counter()
+    session_id = ""
+    step_id = 0
+    request_id = hashlib.sha1(
+        f"chain-batch:{peer_id}:{final_peer}:{dtype}:{time.time_ns()}:{len(payload)}:{token_count}".encode("utf-8")
+    ).hexdigest()[:16]
+    timeout = timeout_for_dtype(dtype, timeout)
+    try:
+        payload_obj = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
+        if isinstance(payload_obj, dict):
+            session_id = str(payload_obj.get("session_id") or "")
+            request_id = str(payload_obj.get("request_id") or request_id)
+            step_id = int(payload_obj.get("step") or 0)
+    except Exception:
+        pass
+    body = json.dumps({
+        "target_peer": peer_id,
+        "final_peer": final_peer,
+        "forward_dtype": dtype,
+        "chain_frame_dtype": "vryx.chain.forward.batch",
+        "chain_type": "CHAIN_FORWARD_BATCH",
+        "data_b64": base64.standard_b64encode(payload).decode("ascii"),
+        "session_id": session_id,
+        "request_id": request_id,
+        "step_id": step_id,
+        "microbatch_id": microbatch_id,
+        "token_start": token_start,
+        "token_count": max(1, int(token_count)),
+        "stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+    }).encode("utf-8")
+    serialization_ms = int((time.perf_counter() - serialization_start) * 1000)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if isinstance(result, dict):
+                result.setdefault("relay_ms", int((time.perf_counter() - t0) * 1000))
+                result.setdefault("serialization_ms", serialization_ms)
+                result.setdefault("hidden_bytes", len(payload))
+                result.setdefault("pipeline_stream", True)
+                result.setdefault("chain_result_direct", True)
+                result.setdefault("request_response_fallback", False)
+                result.setdefault("coalesced", True)
+                if trace_ctx is not None and result.get("ok", True) is not False:
+                    trace_ctx.count_call("chain_forward_batch_frames_received")
+            return result
+    except urllib.error.HTTPError as e:
+        body_err = ""
+        parsed_err: dict[str, Any] = {}
+        try:
+            body_err = e.read().decode("utf-8", errors="replace")[:800]
+            parsed_err = json.loads(body_err or "{}")
+        except Exception:
+            parsed_err = {}
+        return {
+            "ok": False,
+            "error": parsed_err.get("error") or f"HTTP {e.code}: {body_err}",
+            "relay_ms": int((time.perf_counter() - t0) * 1000),
+            "serialization_ms": serialization_ms,
+            "hidden_bytes": len(payload),
+            "pipeline_stream": True,
+            "chain_result_direct": True,
+            "request_response_fallback": True,
+            "coalesced": True,
+            "chain_fallback_reason": parsed_err.get("chain_fallback_reason") or "chain_forward_batch_http_error",
+            "relay_trace": parsed_err.get("relay_trace") if isinstance(parsed_err.get("relay_trace"), dict) else {},
+        }
+    except (TimeoutError, socket.timeout) as ex:
+        return _relay_timeout_payload(
+            peer_id,
+            dtype,
+            request_id,
+            session_id,
+            timeout,
+            int((time.perf_counter() - t0) * 1000),
+            len(payload),
+            [final_peer],
+            detail=str(ex) or "chain_forward_batch_socket_timeout",
+            p2p_transport="pipeline_stream_chain_result_direct_batch",
+            route_mode="initiator_chain_forward_batch",
+        )
+    except Exception as ex:
+        return {
+            "ok": False,
+            "error": f"chain_forward_batch:{type(ex).__name__}:{ex}",
+            "relay_ms": int((time.perf_counter() - t0) * 1000),
+            "serialization_ms": serialization_ms,
+            "hidden_bytes": len(payload),
+            "pipeline_stream": True,
+            "chain_result_direct": True,
+            "request_response_fallback": True,
+            "coalesced": True,
+            "chain_fallback_reason": "chain_forward_batch_exception",
+        }
+
+
 _batch_queues: dict[str, BatchQueue] = {}
 _batch_threads: dict[str, threading.Thread] = {}
 _batch_lock = threading.Lock()
@@ -2665,6 +2785,141 @@ def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _chain_coalesced_decode_enabled(peers: list[str], dtype: str, payload: dict[str, Any], micro_budget: int) -> bool:
+    if not CHAIN_COALESCED_DECODE:
+        return False
+    if micro_budget <= 1:
+        return False
+    if not _pipeline_micro_decode_enabled(payload, peers):
+        return False
+    if not _chain_stream_decode_enabled(peers, dtype, payload):
+        return False
+    if not (CHAIN_RESULT_DIRECT and payload.get("chain_result_direct_request") is not False and len(peers) == 2):
+        return False
+    if payload.get("stream") or payload.get("streaming"):
+        return False
+    sampling = payload.get("sampling") if isinstance(payload.get("sampling"), dict) else {}
+    temp = float(sampling.get("temperature", SAMPLING_TEMPERATURE))
+    if temp > 1e-9:
+        return False
+    return True
+
+
+def _relay_pipeline_chain_batch_once(
+    peers: list[str],
+    dtype: str,
+    payload: dict[str, Any],
+    token_count: int,
+    microbatch_id: str,
+    token_start: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    t_chain = time.perf_counter()
+    encode_t0 = time.perf_counter()
+    current_payload = {k: v for k, v in payload.items() if k != "__disable_chain_stream"}
+    current_payload["routing_path"] = list(peers[1:])
+    current_payload["pipeline_microbatch_id"] = microbatch_id
+    current_payload["pipeline_token_start"] = token_start
+    current_payload["pipeline_token_count"] = token_count
+    current_payload["chain_coalesced_decode"] = True
+    current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
+    request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
+    result = _chain_forward_batch_raw(
+        peers[0],
+        peers[1],
+        dtype,
+        current_payload_bytes,
+        token_count=token_count,
+        microbatch_id=microbatch_id,
+        token_start=token_start,
+        timeout=PIPELINE_STEP_TIMEOUT,
+    )
+    relay_trace = result.get("relay_trace") if isinstance(result.get("relay_trace"), dict) else {}
+    chain_error = None if result.get("ok", True) else str(result.get("error") or "chain_batch_failed")
+    hop_trace = {
+        "peer": peers[0],
+        "rank": 0,
+        "request_payload_bytes": len(current_payload_bytes),
+        "request_json_encode_ms": request_json_encode_ms,
+        "payload_dtype": dtype,
+        "payload_hidden_transport": current_payload.get("hidden_transport"),
+        "pipeline_stream": True,
+        "chain_stream_used": result.get("ok", True) is not False,
+        "chain_route": list(peers),
+        "chain_downstream_peer": peers[1],
+        "chain_payload_bytes": len(current_payload_bytes),
+        "chain_result_direct": bool(result.get("chain_result_direct")),
+        "chain_result_from_peer": relay_trace.get("chain_result_from_peer"),
+        "pending_key": relay_trace.get("pending_key"),
+        "pending_count_before": relay_trace.get("pending_count_before"),
+        "pending_count_after": relay_trace.get("pending_count_after"),
+        "chain_forward_ms": relay_trace.get("chain_forward_ms"),
+        "chain_ack_ms": relay_trace.get("chain_ack_ms"),
+        "chain_result_wait_ms": relay_trace.get("chain_result_wait_ms"),
+        "chain_pending_count": relay_trace.get("chain_pending_count"),
+        "stream_closed": relay_trace.get("stream_closed"),
+        "failed_step_id": relay_trace.get("failed_step_id"),
+        "failed_stage": relay_trace.get("failed_stage"),
+        "failed_peer": relay_trace.get("failed_peer"),
+        "transport_error_detail": relay_trace.get("transport_error_detail"),
+        "m1_compute_ms": relay_trace.get("m1_compute_ms"),
+        "m4_compute_ms": relay_trace.get("m4_compute_ms"),
+        "batch_m1_compute_ms": relay_trace.get("batch_m1_compute_ms"),
+        "batch_m4_compute_ms": relay_trace.get("batch_m4_compute_ms"),
+        "batch_chain_forward_ms": relay_trace.get("batch_chain_forward_ms") or relay_trace.get("chain_forward_ms"),
+        "batch_result_wait_ms": relay_trace.get("batch_result_wait_ms") or relay_trace.get("chain_result_wait_ms"),
+        "batch_tokens_per_second": relay_trace.get("batch_tokens_per_second"),
+        "chain_hop_count": relay_trace.get("chain_hop_count") or 1,
+        "batch_hop_count": relay_trace.get("batch_hop_count") or 1,
+        "coalesced": True,
+        "microbatch_id": microbatch_id,
+        "token_start": token_start,
+        "token_count": token_count,
+        "chain_open_ms": relay_trace.get("stream_open_ms"),
+        "chain_handshake_ms": relay_trace.get("stream_open_ms"),
+        "chain_send_ms": relay_trace.get("stream_send_ms"),
+        "chain_wait_ms": relay_trace.get("stream_wait_response_ms"),
+        "chain_roundtrip_ms": relay_trace.get("stream_roundtrip_ms") or result.get("relay_ms"),
+        "stream_open_ms": relay_trace.get("stream_open_ms"),
+        "stream_reused": relay_trace.get("stream_reused"),
+        "stream_send_ms": relay_trace.get("stream_send_ms"),
+        "stream_wait_response_ms": relay_trace.get("stream_wait_response_ms"),
+        "stream_roundtrip_ms": relay_trace.get("stream_roundtrip_ms"),
+        "frames_sent": relay_trace.get("frames_sent"),
+        "frames_received": relay_trace.get("frames_received"),
+        "request_response_fallback": False,
+        "fallback_used": False,
+        "fallback_reason": None,
+        "relay_ms": result.get("relay_ms"),
+        "serialization_ms": result.get("serialization_ms"),
+        "hidden_bytes": result.get("hidden_bytes"),
+        "worker_compute_ms": result.get("worker_compute_ms") or result.get("compute_time_ms"),
+        "compute_time_ms": result.get("compute_time_ms") or result.get("worker_compute_ms"),
+        "shard_session_id": result.get("shard_session_id"),
+        "ms": int((time.perf_counter() - t_chain) * 1000),
+        "ok": result.get("ok", True) is not False,
+        "error": chain_error,
+        "direct_vs_relay": "chain_stream_batch",
+        "relay_trace": relay_trace,
+    }
+    if result.get("ok", True):
+        try:
+            response = _decode_pipeline_response(result)
+            worker_trace = response.get("transport_trace") if isinstance(response.get("transport_trace"), dict) else {}
+            if worker_trace:
+                hop_trace["worker_transport_trace"] = worker_trace
+                hop_trace["payload_hidden_transport_effective"] = (
+                    worker_trace.get("hidden_transport_effective") or response.get("hidden_transport")
+                )
+                hop_trace["response_serialize_ms"] = worker_trace.get("response_serialize_ms")
+                hop_trace["worker_grpc_payload_bytes"] = worker_trace.get("worker_grpc_payload_bytes")
+                hop_trace["python_mlx_pure_compute_ms"] = worker_trace.get("python_mlx_pure_compute_ms")
+        except Exception as exc:
+            hop_trace["ok"] = False
+            hop_trace["error"] = f"chain_batch_response_decode_failed:{type(exc).__name__}:{exc}"
+            result = {"ok": False, "error": hop_trace["error"]}
+    return result, [hop_trace]
 
 
 def _relay_pipeline_chain_once(
@@ -2910,10 +3165,43 @@ def _relay_pipeline_step(
         hop_traces: list[dict[str, Any]] = []
         micro_budget = _pipeline_micro_budget_from_payload(payload)
         if _pipeline_micro_decode_enabled(payload, peers):
-            emitted: list[int] = []
-            current_payload = dict(payload)
             base_step = int(payload.get("step") or 0)
             all_ids_seed = list(payload.get("history_token_ids") or payload.get("token_ids") or [])
+            batch_microbatch_id = f"{payload.get('request_id') or ''}:{base_step}:batch"
+            batch_token_start = len(all_ids_seed)
+            if _chain_coalesced_decode_enabled(peers, dtype, payload, micro_budget):
+                result, batch_traces = _relay_pipeline_chain_batch_once(
+                    peers,
+                    dtype,
+                    payload,
+                    token_count=micro_budget,
+                    microbatch_id=batch_microbatch_id,
+                    token_start=batch_token_start,
+                )
+                if result.get("ok", True) or not CHAIN_STREAM_FALLBACK_INITIATOR:
+                    accepted = 0
+                    try:
+                        response = _decode_pipeline_response(result)
+                        accepted = int(response.get("accepted_token_count") or len(response.get("candidate_token_ids") or []) or micro_budget)
+                    except Exception:
+                        accepted = 0
+                    return result, {
+                        **batching_trace(False, 1),
+                        "decode_batch_ms": int((time.perf_counter() - t_chain) * 1000),
+                        "chain_mode": PIPELINE_CHAIN_MODE,
+                        "hop_traces": batch_traces,
+                        "worker_to_worker_bypass": True,
+                        "pipeline_micro_decode": True,
+                        "pipeline_micro_tokens": accepted,
+                        "pipeline_chain_coalesced": True,
+                        "batch_hop_count": 1,
+                    }
+                for trace in batch_traces:
+                    trace["fallback_used"] = True
+                    trace["fallback_reason"] = trace.get("error") or "chain_batch_failed"
+                    trace["request_response_fallback"] = True
+            emitted: list[int] = []
+            current_payload = dict(payload)
             stop_ids_raw = payload.get("stop_token_ids") or []
             stop_ids_int = {
                 int(s) for s in stop_ids_raw
