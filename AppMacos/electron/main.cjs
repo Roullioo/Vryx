@@ -1256,7 +1256,10 @@ function spawnWorker(config, hardware) {
   const effectiveQuantization = validation.backend === 'llama_cpp' && !String(config.quantization || '').toLowerCase().includes('q4')
     ? 'q4'
     : config.quantization || 'fp16';
-  env.VRYX_HIDDEN_TRANSPORT = effectiveQuantization;
+  const hiddenTransport = validation.workerMode === 'shard' && validation.backend === 'mlx'
+    ? 'int8'
+    : effectiveQuantization;
+  env.VRYX_HIDDEN_TRANSPORT = hiddenTransport;
   env.VRYX_WEIGHT_QUANTIZATION = effectiveQuantization;
   if (validation.backend === 'llama_cpp') {
     env.VRYX_LLAMA_CPP_DIRECT = '1';
@@ -1292,11 +1295,15 @@ function spawnWorker(config, hardware) {
   if (validation.backend.includes('mlx')) {
     env.VRYX_ENABLE_MLX_RUNTIME = '1';
     env.VRYX_ENABLE_MLX_KERNELS = '1';
+    env.VRYX_MLX_SCAN_BACKEND = 'metal';
+    env.VRYX_MLX_COMPUTE_DTYPE = 'fp16';
   }
   if (validation.workerMode === 'shard' && validation.backend === 'mlx') {
+    env.VRYX_ENABLE_GGUF_MLX_SHARD = '1';
     env.VRYX_ENABLE_LLAMA_MLX_SHARD = validation.model.family === 'Llama' ? '1' : (env.VRYX_ENABLE_LLAMA_MLX_SHARD || '0');
     env.VRYX_GGUF_MLX_CACHE_GB = String(Math.max(2, Math.min(8, Math.floor(Number(config.memoryGb || 8) * 0.25))));
-    env.VRYX_DISABLE_PYTORCH_FALLBACK = validation.model.family === 'Llama' ? '1' : (env.VRYX_DISABLE_PYTORCH_FALLBACK || '0');
+    env.VRYX_MLX_STRICT = '1';
+    env.VRYX_DISABLE_PYTORCH_FALLBACK = '1';
   }
   env.PATH = [
     '/opt/homebrew/bin',

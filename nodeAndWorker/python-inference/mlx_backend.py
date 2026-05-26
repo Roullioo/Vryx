@@ -420,11 +420,14 @@ class MLXBackend:
             "kernel_status": "active",
             "linear_scan_backend": self.scan_backend_effective,
             "linear_scan_backend_requested": self.scan_backend_requested,
+            "linear_attn_backend": self.scan_backend_effective,
+            "scan_backend": self.scan_backend_effective,
             "linear_attn_ready": bool(linear_shapes),
             "linear_attn_shapes": linear_shapes,
             "state_pages": _STATE_ALLOCATOR.status() if _STATE_ALLOCATOR is not None else None,
             "source_weight_bytes": source_bytes,
             "weight_dtype": str(weight_dtype),
+            "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "rss_mb": round(_rss_mb(), 1),
         }
 
@@ -743,6 +746,8 @@ class MLXBackend:
 
         out_seq_pos = seq_pos
 
+        transformer_failure_reasons: list[str] = []
+
         def mlx_run_transformer(hidden_in: Any, seq_pos_run: int, seq_len_run: int, causal_here: Any) -> Any | None:
             """Passe Transformer (attention + MLP) ; met à jour kv_cache et shard.seq_position."""
             pos_ids_here = mx.arange(seq_pos_run, seq_pos_run + seq_len_run, dtype=mx.int32)
@@ -767,6 +772,16 @@ class MLXBackend:
                 has_dense_mlp = all(w is not None for w in [gate_w, up_w, down_w])
                 has_moe_mlp = f"{prefix}.mlp.gate.weight" in self.weights and f"{prefix}.mlp.switch_mlp.gate_proj.weight" in self.weights
                 if norm1_w is None or norm2_w is None or (not has_dense_mlp and not has_moe_mlp):
+                    missing = []
+                    if norm1_w is None:
+                        missing.append(f"{prefix}.input_layernorm.weight")
+                    if norm2_w is None:
+                        missing.append(f"{prefix}.post_attention_layernorm.weight")
+                    if not has_dense_mlp and not has_moe_mlp:
+                        missing.append(f"{prefix}.mlp")
+                    reason = f"{prefix}:missing_core_weights:{','.join(missing)}"
+                    transformer_failure_reasons.append(reason)
+                    print(f"[mlx] transformer fail {reason} sample_keys={list(self.weights.keys())[:24] if hasattr(self.weights, 'keys') else []}")
                     return None
                 normed = _mx_rms_norm(mx, h, norm1_w, rms_eps)
                 if self._has_linear_attn(prefix):
@@ -788,6 +803,18 @@ class MLXBackend:
                     q_norm_w = self.weights.get(f"{prefix}.self_attn.q_norm.weight")
                     k_norm_w = self.weights.get(f"{prefix}.self_attn.k_norm.weight")
                     if any(w is None for w in [q_w, k_w, v_w, o_w]):
+                        missing = [
+                            name for name, weight in [
+                                (f"{prefix}.self_attn.q_proj.weight", q_w),
+                                (f"{prefix}.self_attn.k_proj.weight", k_w),
+                                (f"{prefix}.self_attn.v_proj.weight", v_w),
+                                (f"{prefix}.self_attn.o_proj.weight", o_w),
+                            ]
+                            if weight is None
+                        ]
+                        reason = f"{prefix}:missing_attention_weights:{','.join(missing)}"
+                        transformer_failure_reasons.append(reason)
+                        print(f"[mlx] transformer fail {reason} sample_keys={list(self.weights.keys())[:24] if hasattr(self.weights, 'keys') else []}")
                         return None
                     q_w_heads_l = int(q_w.shape[0])
                     inferred_head_dim_l = head_dim_here or (hidden_size // n_heads_here)
@@ -852,9 +879,10 @@ class MLXBackend:
 
         hx = mlx_run_transformer(hidden, seq_pos, seq_len, causal_mask)
         if hx is None:
+            reason = transformer_failure_reasons[-1] if transformer_failure_reasons else "unknown"
             return json.dumps({
                 "ok": False,
-                "error": "mlx_run_transformer a échoué (voir logs linear_attn)",
+                "error": f"mlx_run_transformer a échoué: {reason}",
                 "session_id": sid,
                 "decode_mode": decode_mode,
                 "runtime_backend": "mlx",
@@ -1550,6 +1578,8 @@ class MLXBackend:
             "attention_backend": "mlx_metal" if self.available else None,
             "linear_scan_backend": self.scan_backend_effective,
             "linear_scan_backend_requested": self.scan_backend_requested,
+            "linear_attn_backend": self.scan_backend_effective,
+            "scan_backend": self.scan_backend_effective,
             "runtime_fallback_reason": self.unavailable_reason,
             "linear_attn_ready": any(".linear_attn." in key for key in self.weights),
             "batch_forward": True,
@@ -1557,6 +1587,7 @@ class MLXBackend:
             "state_pages": _STATE_ALLOCATOR.status() if _STATE_ALLOCATOR is not None else None,
             "rss_mb": round(_rss_mb(), 1),
             "weight_dtype": os.environ.get("VRYX_MLX_WEIGHT_DTYPE", "fp16"),
+            "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "q4_hidden_transport_supported": bool(self.available),
         }
 
@@ -1570,11 +1601,14 @@ class MLXBackend:
             "attention_backend": "mlx_metal" if self.available else None,
             "linear_scan_backend": self.scan_backend_effective,
             "linear_scan_backend_requested": self.scan_backend_requested,
+            "linear_attn_backend": self.scan_backend_effective,
+            "scan_backend": self.scan_backend_effective,
             "flash_attention": self.available,
             "linear_attn_ready": any(".linear_attn." in key for key in self.weights),
             "batch_forward": True,
             "paged_kv_cache": False,
             "state_paging": _STATE_ALLOCATOR.status() if _STATE_ALLOCATOR is not None else None,
             "weight_dtype": os.environ.get("VRYX_MLX_WEIGHT_DTYPE", "fp16"),
+            "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "q4_hidden_transport_supported": bool(self.available),
         }

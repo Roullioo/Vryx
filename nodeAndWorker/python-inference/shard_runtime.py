@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import importlib.metadata
 import inspect
 import json
 import os
@@ -628,6 +629,107 @@ def _purge_expired() -> None:
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+_RUNTIME_DIAG_ENV_KEYS = (
+    "VRYX_RUNTIME_BACKEND",
+    "VRYX_ENABLE_MLX_RUNTIME",
+    "VRYX_ENABLE_MLX_KERNELS",
+    "VRYX_MLX_SCAN_BACKEND",
+    "VRYX_MLX_SCAN_STRICT",
+    "VRYX_MLX_COMPUTE_DTYPE",
+    "VRYX_MLX_WEIGHT_DTYPE",
+    "VRYX_MLX_STRICT",
+    "VRYX_GGUF_MLX_CACHE_GB",
+    "VRYX_ENABLE_GGUF_MLX_SHARD",
+    "VRYX_ENABLE_LLAMA_MLX_SHARD",
+    "VRYX_DISABLE_PYTORCH_FALLBACK",
+    "VRYX_HIDDEN_TRANSPORT",
+    "VRYX_WEIGHT_QUANTIZATION",
+    "VRYX_WORKER_SHARD_ONLY",
+    "VRYX_EXPECT_MODEL_SHARDS_ONLY",
+    "VRYX_DISABLE_MLX_LM_DIRECT",
+    "VRYX_MLX_PREWARM",
+)
+
+
+def _safe_mlx_version() -> str | None:
+    try:
+        return importlib.metadata.version("mlx")
+    except Exception:
+        return None
+
+
+def runtime_diagnostics(shard: PipelineShard | None = None) -> dict[str, Any]:
+    """Diagnostic MLX/Metal sans secret, utilisable au boot et dans shard.status."""
+    env_snapshot = {key: os.environ.get(key) for key in _RUNTIME_DIAG_ENV_KEYS if os.environ.get(key) is not None}
+    selected = str(os.environ.get("VRYX_RUNTIME_BACKEND") or "").strip().lower() or "pytorch"
+    diag: dict[str, Any] = {
+        "runtime_backend_selected": selected,
+        "runtime_backend_detail": None,
+        "mlx_import_ok": False,
+        "mlx_version": None,
+        "metal_available": False,
+        "attention_backend": None,
+        "linear_attn_backend": None,
+        "linear_attn_ready": False,
+        "scan_backend": os.environ.get("VRYX_MLX_SCAN_BACKEND"),
+        "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
+        "fallback_reason": None,
+        "env": env_snapshot,
+    }
+    try:
+        import mlx.core as mx  # type: ignore
+
+        diag["mlx_import_ok"] = True
+        diag["mlx_version"] = _safe_mlx_version()
+        try:
+            diag["metal_available"] = bool(mx.metal.is_available())
+        except Exception as exc:
+            diag["metal_error"] = f"{type(exc).__name__}:{exc}"
+    except Exception as exc:
+        diag["mlx_import_error"] = f"{type(exc).__name__}:{exc}"
+
+    try:
+        from mlx_backend import _default_scan_backend, _normalize_scan_backend
+
+        diag["scan_backend"] = _normalize_scan_backend(os.environ.get("VRYX_MLX_SCAN_BACKEND") or _default_scan_backend())
+    except Exception:
+        pass
+
+    if shard is not None:
+        backend = shard.backend
+        status = backend.status() if backend is not None else {}
+        caps = backend.capabilities() if backend is not None else {}
+        diag["runtime_backend_selected"] = str(
+            status.get("runtime_backend") or getattr(backend, "name", None) or getattr(shard, "runtime_backend", selected)
+        )
+        diag["runtime_backend_detail"] = status.get("runtime_backend_detail") or getattr(backend, "name", None)
+        diag["attention_backend"] = status.get("attention_backend") or caps.get("attention_backend")
+        diag["linear_attn_backend"] = (
+            status.get("linear_attn_backend")
+            or status.get("linear_scan_backend")
+            or caps.get("linear_attn_backend")
+            or caps.get("linear_scan_backend")
+        )
+        diag["linear_attn_ready"] = bool(status.get("linear_attn_ready") or caps.get("linear_attn_ready"))
+        diag["scan_backend"] = (
+            status.get("scan_backend")
+            or status.get("linear_scan_backend")
+            or caps.get("scan_backend")
+            or caps.get("linear_scan_backend")
+            or diag.get("scan_backend")
+        )
+        diag["compute_dtype"] = status.get("compute_dtype") or caps.get("compute_dtype") or diag["compute_dtype"]
+        diag["fallback_reason"] = status.get("runtime_fallback_reason") or caps.get("runtime_fallback_reason")
+    elif diag["mlx_import_ok"] and diag["metal_available"] and selected == "mlx":
+        diag["attention_backend"] = "mlx_metal"
+
+    return diag
+
+
+def print_runtime_diagnostics(prefix: str = "[runtime]") -> None:
+    print(f"{prefix} {json.dumps(runtime_diagnostics(), ensure_ascii=False, sort_keys=True)}")
 
 
 def _requires_distributed_shards(model_id: str) -> bool:
@@ -2262,7 +2364,9 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                     "runtime_ready": False,
                     "error": f"Build GGUF échoué : {build_res.get('error')}",
                     "runtime_backend": build_res.get("runtime_backend"),
+                    "runtime_backend_detail": build_res.get("runtime_backend_detail"),
                     "runtime_fallback_reason": build_res.get("runtime_fallback_reason"),
+                    "build_error": build_res.get("error"),
                 })
 
             # Build immédiat
@@ -2323,6 +2427,7 @@ def pipeline_shard_build(sid: str) -> str:
         result = shard.backend.build()
         if not result.get("ok") and getattr(shard.backend, "name", "pytorch") != "pytorch":
             reason = str(result.get("error") or "runtime_build_failed")
+            setattr(shard, "build_error", reason[:500])
             if (
                 getattr(shard, "weight_load_mode", "") == "gguf_ranges"
                 or os.environ.get("VRYX_DISABLE_PYTORCH_FALLBACK", "0").lower() in ("1", "true", "yes")
@@ -2337,6 +2442,9 @@ def pipeline_shard_build(sid: str) -> str:
             result["runtime_fallback_reason"] = reason
         if result.get("ok"):
             setattr(shard, "build_ready", True)
+            setattr(shard, "build_error", "")
+        else:
+            setattr(shard, "build_error", str(result.get("error") or "runtime_build_failed")[:500])
         return json.dumps(result)
     finally:
         setattr(shard, "building", False)
@@ -2825,6 +2933,7 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
         backend_caps = shard.backend.capabilities() if shard.backend is not None else {}
         runtime_backend = str(backend_status.get("runtime_backend") or getattr(shard, "runtime_backend", "pytorch"))
         ready = bool(backend_status.get("ready")) if backend_status else shard.model_slice is not None and bool(shard.weights_loaded or shard.weight_arrays)
+        shard_diag = runtime_diagnostics(shard)
         shards.append({
             "session_id": sid,
             "model_id": shard.model_id,
@@ -2845,6 +2954,7 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "resident_vram": ready,
             "loading": bool(getattr(shard, "loading", False)),
             "load_error": str(getattr(shard, "load_error", "") or ""),
+            "build_error": str(getattr(shard, "build_error", "") or ""),
             "weight_load_mode": getattr(shard, "weight_load_mode", "memory"),
             "download_ms": shard.download_ms,
             "build_ms": shard.build_ms,
@@ -2854,6 +2964,7 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "int8_supported": True,
             "weight_quantization": getattr(shard, "weight_quantization", "fp16"),
             "runtime_backend": runtime_backend,
+            "runtime_backend_detail": backend_status.get("runtime_backend_detail") or getattr(shard.backend, "name", None),
             "requested_runtime_backend": backend_status.get("requested_runtime_backend"),
             "runtime_fallback_reason": backend_status.get("runtime_fallback_reason"),
             "supports_q4_weights": bool(backend_caps.get("supports_q4_weights", getattr(shard, "supports_q4_weights", False))),
@@ -2866,6 +2977,13 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "attention_backend": backend_status.get("attention_backend") or (getattr(shard.model_slice, "vryx_attention_backend", None) if shard.model_slice is not None else None),
             "flash_attention": bool(backend_caps.get("flash_attention", False)),
             "linear_attn_ready": bool(backend_caps.get("linear_attn_ready", False) or backend_status.get("linear_attn_ready", False)),
+            "linear_attn_backend": backend_status.get("linear_attn_backend") or backend_status.get("linear_scan_backend") or backend_caps.get("linear_attn_backend") or backend_caps.get("linear_scan_backend"),
+            "scan_backend": backend_status.get("scan_backend") or backend_status.get("linear_scan_backend") or backend_caps.get("scan_backend") or backend_caps.get("linear_scan_backend"),
+            "compute_dtype": backend_status.get("compute_dtype") or backend_caps.get("compute_dtype") or os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
+            "runtime_diagnostics": shard_diag,
+            "mapped_weight_sample_keys": backend_status.get("mapped_weight_sample_keys"),
+            "gguf_raw_mapped_samples": backend_status.get("gguf_raw_mapped_samples"),
+            "gguf_raw_unmapped_samples": backend_status.get("gguf_raw_unmapped_samples"),
             "state_bytes": int(backend_status.get("state_bytes") or 0),
             "state_pages": backend_status.get("state_pages") or backend_caps.get("state_paging"),
             "paged_kv_cache": bool(backend_caps.get("paged_kv_cache", False)),
@@ -2887,6 +3005,7 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
         "worker_generated_text": False,
         "shards": shards,
         "count": len(shards),
+        "runtime_diagnostics": runtime_diagnostics(),
         "persistent_relay": os.environ.get("VRYX_PERSISTENT_RELAY", "0").lower() in ("1", "true", "yes"),
         "pipeline_overlap": os.environ.get("VRYX_PIPELINE_OVERLAP", "0").lower() in ("1", "true", "yes"),
     })

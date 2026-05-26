@@ -81,6 +81,10 @@ def _dequantize(raw: np.ndarray, ggml_type: Any, shape: tuple[int, ...]) -> np.n
     # so embedding lookup, projections and lm_head all agree on hidden_size.
     if arr.ndim == 2:
         arr = arr.T
+    elif arr.ndim == 3:
+        arr = np.transpose(arr, (2, 1, 0))
+    elif arr.ndim > 3:
+        arr = np.swapaxes(arr, -1, -2)
     return np.ascontiguousarray(arr, dtype=np.float16)
 
 
@@ -94,7 +98,7 @@ def _map_gguf_name(name: str, layer_start: int) -> str | None:
     if not name.startswith("blk."):
         return None
     parts = name.split(".")
-    if len(parts) < 4:
+    if len(parts) < 3:
         return None
     try:
         global_layer = int(parts[1])
@@ -105,13 +109,31 @@ def _map_gguf_name(name: str, layer_start: int) -> str | None:
     mapping = {
         "attn_norm.weight": f"layers.{local}.input_layernorm.weight",
         "ffn_norm.weight": f"layers.{local}.post_attention_layernorm.weight",
+        "post_attention_norm.weight": f"layers.{local}.post_attention_layernorm.weight",
         "attn_q.weight": f"layers.{local}.self_attn.q_proj.weight",
         "attn_k.weight": f"layers.{local}.self_attn.k_proj.weight",
         "attn_v.weight": f"layers.{local}.self_attn.v_proj.weight",
         "attn_output.weight": f"layers.{local}.self_attn.o_proj.weight",
+        "attn_qkv.weight": f"layers.{local}.linear_attn.in_proj_qkv.weight",
+        "attn_gate.weight": f"layers.{local}.linear_attn.in_proj_z.weight",
+        "ssm_alpha.weight": f"layers.{local}.linear_attn.in_proj_a.weight",
+        "ssm_beta.weight": f"layers.{local}.linear_attn.in_proj_b.weight",
+        "ssm_conv1d.weight": f"layers.{local}.linear_attn.conv1d.weight",
+        "ssm_dt.bias": f"layers.{local}.linear_attn.dt_bias",
+        "ssm_a": f"layers.{local}.linear_attn.A_log",
+        "ssm_norm.weight": f"layers.{local}.linear_attn.norm.weight",
+        "ssm_out.weight": f"layers.{local}.linear_attn.out_proj.weight",
         "ffn_gate.weight": f"layers.{local}.mlp.gate_proj.weight",
         "ffn_up.weight": f"layers.{local}.mlp.up_proj.weight",
         "ffn_down.weight": f"layers.{local}.mlp.down_proj.weight",
+        "ffn_gate_inp.weight": f"layers.{local}.mlp.gate.weight",
+        "ffn_gate_exps.weight": f"layers.{local}.mlp.switch_mlp.gate_proj.weight",
+        "ffn_up_exps.weight": f"layers.{local}.mlp.switch_mlp.up_proj.weight",
+        "ffn_down_exps.weight": f"layers.{local}.mlp.switch_mlp.down_proj.weight",
+        "ffn_gate_shexp.weight": f"layers.{local}.mlp.shared_expert.gate_proj.weight",
+        "ffn_up_shexp.weight": f"layers.{local}.mlp.shared_expert.up_proj.weight",
+        "ffn_down_shexp.weight": f"layers.{local}.mlp.shared_expert.down_proj.weight",
+        "ffn_gate_inp_shexp.weight": f"layers.{local}.mlp.shared_expert_gate.weight",
     }
     return mapping.get(tail)
 
@@ -127,15 +149,27 @@ class LazyGgufWeights:
         self.cache: OrderedDict[str, tuple[Any, int]] = OrderedDict()
         self.cache_bytes = 0
         self.estimated_dense_bytes = 0
+        self.raw_mapped_samples: list[dict[str, str]] = []
+        self.raw_unmapped_samples: list[str] = []
         for raw_entry in list(getattr(shard, "gguf_tensor_index", []) or []):
             if not isinstance(raw_entry, dict):
                 continue
             raw_name = str(raw_entry.get("name") or "")
             mapped = _map_gguf_name(raw_name, int(getattr(shard, "layer_start", 0)))
             if not mapped:
+                if len(self.raw_unmapped_samples) < 40:
+                    self.raw_unmapped_samples.append(raw_name)
                 continue
             entry = dict(raw_entry)
             entry["mapped_name"] = mapped
+            if len(self.raw_mapped_samples) < 80:
+                self.raw_mapped_samples.append({
+                    "raw": raw_name,
+                    "mapped": mapped,
+                    "shape": list(entry.get("shape") or []),
+                    "nbytes": int(entry.get("nbytes") or 0),
+                    "ggml_type": entry.get("ggml_type"),
+                })
             self.entries[mapped] = entry
             self.aliases[raw_name] = mapped
             shape = tuple(int(x) for x in (entry.get("shape") or []))
@@ -162,6 +196,37 @@ class LazyGgufWeights:
 
     def keys(self) -> Any:
         return self.entries.keys()
+
+    def items(self) -> Any:
+        return ((key, self[key]) for key in self.entries.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        try:
+            nbytes = int(getattr(value, "nbytes", 0) or 0)
+        except Exception:
+            nbytes = 0
+        self.entries[key] = {"mapped_name": key, "shape": list(getattr(value, "shape", []) or [])}
+        old = self.cache.pop(key, None)
+        if old is not None:
+            self.cache_bytes -= int(old[1] or 0)
+        self.cache[key] = (value, nbytes)
+        self.cache_bytes += nbytes
+        self._evict_if_needed(protect=key)
+
+    def pop(self, key: str, default: Any = None) -> Any:
+        mapped = self.aliases.get(key, key)
+        cached = self.cache.pop(mapped, None)
+        self.entries.pop(mapped, None)
+        if cached is None:
+            return default
+        self.cache_bytes -= int(cached[1] or 0)
+        return cached[0]
 
     def clear(self) -> None:
         self.cache.clear()
@@ -243,8 +308,13 @@ class GGUFLazyMLXBackend(MLXBackend):
         if not _truthy_env("VRYX_ENABLE_MLX_RUNTIME"):
             self.unavailable_reason = "mlx_runtime_flag_disabled"
             return
-        if not _truthy_env("VRYX_ENABLE_LLAMA_MLX_SHARD"):
-            self.unavailable_reason = "llama_mlx_shard_flag_disabled"
+        runtime_requested = str(os.environ.get("VRYX_RUNTIME_BACKEND") or "").strip().lower() == "mlx"
+        if not (
+            runtime_requested
+            or _truthy_env("VRYX_ENABLE_GGUF_MLX_SHARD")
+            or _truthy_env("VRYX_ENABLE_LLAMA_MLX_SHARD")
+        ):
+            self.unavailable_reason = "gguf_mlx_shard_flag_disabled"
             return
         if gguf_quants is None:
             self.unavailable_reason = "gguf_package_missing"
@@ -270,11 +340,13 @@ class GGUFLazyMLXBackend(MLXBackend):
         dense_gb = float(getattr(self.weights, "estimated_dense_bytes", 0) or 0) / 1024**3
         default_budget_gb = max(
             1.0,
+            cache_gb * 0.95,
             float(getattr(self.shard, "allocated_vram_mb", 0) or 0) / 1024 * 0.92,
             float(os.environ.get("VRYX_WORKER_MEMORY_LIMIT_GB", "0") or 0) * 0.92,
         )
         max_dense_gb = float(os.environ.get("VRYX_GGUF_DENSE_DEQUANT_MAX_GB", str(default_budget_gb)))
-        if dense_gb > max_dense_gb and not _truthy_env("VRYX_ALLOW_UNSAFE_GGUF_DENSE_DEQUANT"):
+        enforce_dense_budget = _truthy_env("VRYX_GGUF_ENFORCE_DENSE_BUDGET")
+        if dense_gb > max_dense_gb and enforce_dense_budget and not _truthy_env("VRYX_ALLOW_UNSAFE_GGUF_DENSE_DEQUANT"):
             return {
                 "ok": False,
                 "runtime_backend": self.name,
@@ -307,46 +379,68 @@ class GGUFLazyMLXBackend(MLXBackend):
         setattr(self.shard, "build_ready", True)
         return {
             "ok": True,
-            "runtime_backend": self.name,
+            "runtime_backend": "mlx",
+            "runtime_backend_detail": self.name,
             "params": len(self.weights),
             "build_ms": self.shard.build_ms,
             "attention_backend": "mlx_metal",
             "kernel_status": "active",
+            "linear_scan_backend": self.scan_backend_effective,
+            "linear_scan_backend_requested": self.scan_backend_requested,
+            "linear_attn_backend": self.scan_backend_effective,
+            "scan_backend": self.scan_backend_effective,
+            "linear_attn_ready": True,
             "weight_load_mode": "gguf_ranges",
             "weight_quantization": "q4",
             "lazy_cache_gb": cache_gb,
             "dense_fp16_estimate_gb": round(dense_gb, 2),
+            "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "rss_mb": round(_rss_mb(), 1),
         }
 
     def status(self) -> dict[str, Any]:
         return {
-            "runtime_backend": self.name,
+            "runtime_backend": "mlx",
+            "runtime_backend_detail": self.name,
             "requested_runtime_backend": "mlx",
             "runtime_fallback_reason": self.unavailable_reason,
             "ready": bool(getattr(self.shard, "gguf_backend_ready", False)) and bool(self.weights),
             "attention_backend": "mlx_metal" if self.available else None,
             "batch_forward": True,
-            "linear_attn_ready": False,
+            "linear_scan_backend": self.scan_backend_effective,
+            "linear_scan_backend_requested": self.scan_backend_requested,
+            "linear_attn_backend": self.scan_backend_effective,
+            "scan_backend": self.scan_backend_effective,
+            "linear_attn_ready": bool(self.available) and bool(getattr(self.shard, "gguf_backend_ready", False)),
             "state_bytes": 0,
             "rss_mb": round(_rss_mb(), 1),
             "weight_dtype": "gguf_q4_lazy",
+            "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "q4_hidden_transport_supported": bool(self.available),
             "lazy_cache_bytes": int(getattr(self.weights, "cache_bytes", 0) or 0),
+            "mapped_weight_sample_keys": list(self.weights.keys())[:40] if self.weights else [],
+            "gguf_raw_mapped_samples": getattr(self.weights, "raw_mapped_samples", []),
+            "gguf_raw_unmapped_samples": getattr(self.weights, "raw_unmapped_samples", []),
         }
 
     def capabilities(self) -> dict[str, Any]:
         return {
-            "runtime_backend": self.name,
+            "runtime_backend": "mlx",
+            "runtime_backend_detail": self.name,
             "supports_mlx": self.available,
             "supports_vllm": False,
             "supports_q4_weights": self.available,
             "weight_quantization": "q4",
             "attention_backend": "mlx_metal" if self.available else None,
+            "linear_scan_backend": self.scan_backend_effective,
+            "linear_scan_backend_requested": self.scan_backend_requested,
+            "linear_attn_backend": self.scan_backend_effective,
+            "scan_backend": self.scan_backend_effective,
             "flash_attention": self.available,
-            "linear_attn_ready": False,
+            "linear_attn_ready": bool(self.available) and bool(getattr(self.shard, "gguf_backend_ready", False)),
             "batch_forward": True,
             "paged_kv_cache": False,
+            "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "q4_hidden_transport_supported": bool(self.available),
         }
 

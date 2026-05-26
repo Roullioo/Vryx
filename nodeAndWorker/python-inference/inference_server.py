@@ -198,6 +198,7 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                 print(f"[*] Stage 2 (worker) — mode shard-only : exécution de couches distribuées pour {model_id}.")
             else:
                 print(f"[*] Stage 2 (worker) — backend MLX direct résident pour {model_id}.")
+            shard_runtime.print_runtime_diagnostics("[runtime.startup]")
             prewarm_enabled = os.environ.get("VRYX_MLX_PREWARM", "1").strip().lower() not in (
                 "0",
                 "false",
@@ -776,6 +777,14 @@ class _HotReloadHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._respond(200, {"ok": True, "server": "vryx-worker-admin"})
+        elif self.path == "/runtime-diagnostics":
+            self._respond(200, {"ok": True, "runtime_diagnostics": shard_runtime.runtime_diagnostics()})
+        elif self.path == "/shard-status":
+            try:
+                status = json.loads(shard_runtime.pipeline_shard_status(b"{}"))
+            except Exception as exc:
+                status = {"ok": False, "error": f"{type(exc).__name__}:{exc}"}
+            self._respond(200 if status.get("ok") else 500, status)
         else:
             self._respond(404, {"ok": False, "error": "endpoint inconnu"})
 
