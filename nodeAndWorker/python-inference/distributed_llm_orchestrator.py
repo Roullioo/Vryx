@@ -474,6 +474,11 @@ PIPELINE_SESSION_REDIS_URL = (
 )
 PERSISTENT_RELAY = os.environ.get("VRYX_PERSISTENT_RELAY", "1").lower() not in ("0", "false", "no")
 RELAY_HTTP_KEEPALIVE = os.environ.get("VRYX_RELAY_HTTP_KEEPALIVE", "1").lower() not in ("0", "false", "no")
+PIPELINE_STREAM = os.environ.get("VRYX_PIPELINE_STREAM", "0").lower() in ("1", "true", "yes", "on")
+PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE = os.environ.get(
+    "VRYX_PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE", "1"
+).lower() not in ("0", "false", "no", "off")
+PIPELINE_STREAM_TTL_SEC = max(30, int(os.environ.get("VRYX_PIPELINE_STREAM_TTL_SEC", "3600") or "3600"))
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
 POOL_PREFERENCE_DEFAULT = os.environ.get("VRYX_POOL_PREFERENCE", "auto").lower()
@@ -2284,6 +2289,102 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
         }
 
 
+def _pipeline_stream_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOUT) -> dict:
+    trace_ctx = _current_trace_ctx()
+    if trace_ctx is not None:
+        trace_ctx.count_call("/api/p2p/pipeline-stream")
+        trace_ctx.count_call("pipeline_stream_frames_sent")
+        if dtype in trace_ctx.call_counts:
+            trace_ctx.count_call(dtype)
+    url = f"{RELAY_URL}/api/p2p/pipeline-stream"
+    t0 = time.perf_counter()
+    serialization_start = time.perf_counter()
+    session_id = ""
+    step_id = 0
+    request_id = hashlib.sha1(
+        f"stream:{peer_id}:{dtype}:{time.time_ns()}:{len(payload)}".encode("utf-8")
+    ).hexdigest()[:16]
+    timeout = timeout_for_dtype(dtype, timeout)
+    try:
+        payload_obj = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
+        if isinstance(payload_obj, dict):
+            session_id = str(payload_obj.get("session_id") or "")
+            request_id = str(payload_obj.get("request_id") or request_id)
+            step_id = int(payload_obj.get("step") or 0)
+    except Exception:
+        pass
+    body = json.dumps({
+        "target_peer": peer_id,
+        "dtype": dtype,
+        "data_b64": base64.standard_b64encode(payload).decode("ascii"),
+        "session_id": session_id,
+        "request_id": request_id,
+        "step_id": step_id,
+        "stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+    }).encode("utf-8")
+    serialization_ms = int((time.perf_counter() - serialization_start) * 1000)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if isinstance(result, dict):
+                result.setdefault("relay_ms", int((time.perf_counter() - t0) * 1000))
+                result.setdefault("serialization_ms", serialization_ms)
+                result.setdefault("hidden_bytes", len(payload))
+                result.setdefault("pipeline_stream", True)
+                result.setdefault("request_response_fallback", False)
+                if trace_ctx is not None and result.get("ok", True) is not False:
+                    trace_ctx.count_call("pipeline_stream_frames_received")
+            return result
+    except urllib.error.HTTPError as e:
+        body_err = ""
+        parsed_err: dict[str, Any] = {}
+        try:
+            body_err = e.read().decode("utf-8", errors="replace")[:500]
+            parsed_err = json.loads(body_err or "{}")
+        except Exception:
+            parsed_err = {}
+        return {
+            "ok": False,
+            "error": parsed_err.get("error") or f"HTTP {e.code}: {body_err}",
+            "relay_ms": int((time.perf_counter() - t0) * 1000),
+            "serialization_ms": serialization_ms,
+            "hidden_bytes": len(payload),
+            "pipeline_stream": True,
+            "request_response_fallback": True,
+            "relay_trace": parsed_err.get("relay_trace") if isinstance(parsed_err.get("relay_trace"), dict) else {},
+        }
+    except (TimeoutError, socket.timeout) as ex:
+        return _relay_timeout_payload(
+            peer_id,
+            dtype,
+            request_id,
+            session_id,
+            timeout,
+            int((time.perf_counter() - t0) * 1000),
+            len(payload),
+            [],
+            detail=str(ex) or "pipeline_stream_socket_timeout",
+            p2p_transport="pipeline_stream",
+            route_mode="initiator_pipeline_stream",
+        )
+    except Exception as ex:
+        return {
+            "ok": False,
+            "error": f"pipeline_stream:{type(ex).__name__}:{ex}",
+            "relay_ms": int((time.perf_counter() - t0) * 1000),
+            "serialization_ms": serialization_ms,
+            "hidden_bytes": len(payload),
+            "pipeline_stream": True,
+            "request_response_fallback": True,
+        }
+
+
 _batch_queues: dict[str, BatchQueue] = {}
 _batch_threads: dict[str, threading.Thread] = {}
 _batch_lock = threading.Lock()
@@ -2438,13 +2539,33 @@ def _relay_pipeline_chain_once(
         current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
         request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
         request_payload_bytes = len(current_payload_bytes)
-        result = _relay_raw(
-            hop_peer,
-            dtype,
-            current_payload_bytes,
-            timeout=PIPELINE_STEP_TIMEOUT,
-            routing_path=[],
+        used_pipeline_stream = bool(PIPELINE_STREAM and dtype == "vryx.shard.pipeline")
+        result = (
+            _pipeline_stream_raw(hop_peer, dtype, current_payload_bytes, timeout=PIPELINE_STEP_TIMEOUT)
+            if used_pipeline_stream
+            else _relay_raw(
+                hop_peer,
+                dtype,
+                current_payload_bytes,
+                timeout=PIPELINE_STEP_TIMEOUT,
+                routing_path=[],
+            )
         )
+        request_response_fallback = False
+        if (
+            used_pipeline_stream
+            and result.get("ok") is False
+            and PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE
+        ):
+            request_response_fallback = True
+            result = _relay_raw(
+                hop_peer,
+                dtype,
+                current_payload_bytes,
+                timeout=PIPELINE_STEP_TIMEOUT,
+                routing_path=[],
+            )
+            result["request_response_fallback"] = True
         hop_traces.append({
             "peer": hop_peer,
             "rank": hop_index,
@@ -2452,6 +2573,8 @@ def _relay_pipeline_chain_once(
             "request_json_encode_ms": request_json_encode_ms,
             "payload_dtype": dtype,
             "payload_hidden_transport": current_payload.get("hidden_transport"),
+            "pipeline_stream": used_pipeline_stream,
+            "request_response_fallback": request_response_fallback or bool(result.get("request_response_fallback")),
             "relay_ms": result.get("relay_ms"),
             "serialization_ms": result.get("serialization_ms"),
             "hidden_bytes": result.get("hidden_bytes"),
@@ -2469,7 +2592,14 @@ def _relay_pipeline_chain_once(
             hop_traces[-1]["base64_encode_ms"] = relay_trace.get("axum_response_base64_encode_ms")
             hop_traces[-1]["relay_request_payload_bytes"] = relay_trace.get("axum_request_payload_bytes")
             hop_traces[-1]["relay_response_payload_bytes"] = relay_trace.get("axum_response_payload_bytes")
-            hop_traces[-1]["direct_vs_relay"] = "relay"
+            hop_traces[-1]["stream_open_ms"] = relay_trace.get("stream_open_ms")
+            hop_traces[-1]["stream_reused"] = relay_trace.get("stream_reused")
+            hop_traces[-1]["stream_send_ms"] = relay_trace.get("stream_send_ms")
+            hop_traces[-1]["stream_wait_response_ms"] = relay_trace.get("stream_wait_response_ms")
+            hop_traces[-1]["stream_roundtrip_ms"] = relay_trace.get("stream_roundtrip_ms")
+            hop_traces[-1]["frames_sent"] = relay_trace.get("frames_sent")
+            hop_traces[-1]["frames_received"] = relay_trace.get("frames_received")
+            hop_traces[-1]["direct_vs_relay"] = "stream" if used_pipeline_stream and not hop_traces[-1]["request_response_fallback"] else "relay"
         if not result.get("ok", True):
             break
         decode_t0 = time.perf_counter()
@@ -3197,7 +3327,10 @@ class _PipelineTraceContext:
             "vryx.shard.status": 0,
             "vryx.shard.unload": 0,
             "/api/p2p/relay": 0,
+            "/api/p2p/pipeline-stream": 0,
             "request_response_send_request": 0,
+            "pipeline_stream_frames_sent": 0,
+            "pipeline_stream_frames_received": 0,
         }
         self.phase_trace: dict[str, Any] = {
             "select_workers_ms": 0,
@@ -5678,6 +5811,25 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     base64_encode_ms_total = _sum_hop_int("base64_encode_ms", "hidden_base64_encode_ms")
     base64_decode_ms_total = _sum_hop_int("base64_decode_ms", "hidden_base64_decode_ms")
     deserialization_ms_total = _sum_hop_int("hidden_deserialize_ms", "response_json_decode_ms", "request_json_parse_ms")
+    stream_open_ms_total = _sum_hop_int("stream_open_ms")
+    stream_send_ms_total = _sum_hop_int("stream_send_ms")
+    stream_wait_response_ms_total = _sum_hop_int("stream_wait_response_ms")
+    stream_roundtrip_ms_total = _sum_hop_int("stream_roundtrip_ms")
+    frames_sent_total = _sum_hop_int("frames_sent")
+    frames_received_total = _sum_hop_int("frames_received")
+    stream_fallback_count = 0
+    stream_reused_seen = False
+    stream_used_seen = False
+    for tok in token_timings:
+        if not isinstance(tok, dict):
+            continue
+        for hop in tok.get("hop_traces") or []:
+            if not isinstance(hop, dict):
+                continue
+            stream_used_seen = stream_used_seen or bool(hop.get("pipeline_stream"))
+            stream_reused_seen = stream_reused_seen or bool(hop.get("stream_reused"))
+            if bool(hop.get("request_response_fallback")):
+                stream_fallback_count += 1
     payload_bytes_by_hop = [
         {
             "step": int(tok.get("step") or 0),
@@ -5743,7 +5895,13 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "decode_modes": decode_modes,
         "stream_open": stream_open,
         "stream_close": stream_close,
-        "stream_fallback": "persistent_request_response" if PERSISTENT_RELAY else "request_response",
+        "pipeline_stream": PIPELINE_STREAM,
+        "pipeline_stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+        "stream_fallback": (
+            "request_response_on_stream_failure"
+            if (PIPELINE_STREAM and PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE)
+            else ("persistent_request_response" if PERSISTENT_RELAY else "request_response")
+        ),
         "persistent_relay": PERSISTENT_RELAY,
         "connection_reuse": PERSISTENT_RELAY,
         "relay_timeout_sec": TIMEOUT,
@@ -5879,7 +6037,17 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "base64_encode_ms": base64_encode_ms_total,
             "base64_decode_ms": base64_decode_ms_total,
             "relay_ms": relay_total_ms_detailed,
-            "direct_vs_relay": "relay",
+            "direct_vs_relay": "stream" if stream_used_seen and stream_fallback_count == 0 else "relay",
+            "pipeline_stream_enabled": PIPELINE_STREAM,
+            "stream_open_ms": stream_open_ms_total,
+            "stream_reused": stream_reused_seen,
+            "stream_send_ms": stream_send_ms_total,
+            "stream_wait_response_ms": stream_wait_response_ms_total,
+            "stream_roundtrip_ms": stream_roundtrip_ms_total,
+            "request_response_fallback": stream_fallback_count > 0,
+            "request_response_fallback_count": stream_fallback_count,
+            "frames_sent": frames_sent_total,
+            "frames_received": frames_received_total,
             "m1_compute_ms": m1_compute_total_ms,
             "m4_compute_ms": m4_compute_total_ms,
             "per_token": token_timings,

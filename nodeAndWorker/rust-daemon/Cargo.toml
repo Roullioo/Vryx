@@ -9,6 +9,7 @@ libp2p = { package = "libp2p", git = "https://github.com/libp2p/rust-libp2p", re
     "request-response", "json", "kad", "identify", "autonat", "quic",
     "relay", "dcutr",
 ] }
+libp2p-stream = { package = "libp2p-stream", git = "https://github.com/libp2p/rust-libp2p", rev = "c4efffcf6733b761eae9a2bb69306b34e37a005f" }
 tokio = { version = "1.0", features = ["full"] }
 tonic = "0.11"
 prost = "0.12"

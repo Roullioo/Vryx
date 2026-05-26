@@ -1415,7 +1415,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2051,6 +2051,19 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tracing",
+]
+
+[[package]]
+name = "libp2p-stream"
+version = "0.5.0-alpha"
+source = "git+https://github.com/libp2p/rust-libp2p?rev=c4efffcf6733b761eae9a2bb69306b34e37a005f#c4efffcf6733b761eae9a2bb69306b34e37a005f"
+dependencies = [
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.6",
  "tracing",
 ]
 
@@ -2773,7 +2786,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2810,7 +2823,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3049,6 +3062,7 @@ dependencies = [
  "clap",
  "futures",
  "libp2p",
+ "libp2p-stream",
  "prost",
  "reqwest",
  "serde",

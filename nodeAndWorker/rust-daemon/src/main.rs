@@ -9,7 +9,7 @@ use axum::{
 };
 use base64::Engine as _;
 use clap::Parser;
-use futures::StreamExt;
+use futures::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt, StreamExt};
 use libp2p::{
     autonat, dcutr, identify, kad, noise, relay,
     request_response::{self, ProtocolSupport},
@@ -27,7 +27,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
 use tokio::time;
 use tower_http::cors::CorsLayer;
 
@@ -250,6 +250,357 @@ struct TensorResponse {
     relay_trace_json: String,
 }
 
+const PIPELINE_STREAM_PROTOCOL: &str = "/vryx/pipeline/1";
+const PIPELINE_FRAME_MAGIC: &[u8; 4] = b"VRYX";
+const PIPELINE_FRAME_VERSION: u16 = 1;
+const PIPELINE_FRAME_REQUEST: u8 = 1;
+const PIPELINE_FRAME_RESPONSE: u8 = 2;
+const PIPELINE_FRAME_HEADER_LEN: usize = 32;
+const PIPELINE_FRAME_MAX_PAYLOAD: u64 = 512 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct PipelineFrame {
+    frame_type: u8,
+    request_id: String,
+    session_id: String,
+    step_id: u64,
+    dtype: String,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PipelineStreamTrace {
+    stream_open_ms: u64,
+    stream_reused: bool,
+    stream_send_ms: u64,
+    stream_wait_response_ms: u64,
+    stream_roundtrip_ms: u64,
+    request_response_fallback: bool,
+    frames_sent: u64,
+    frames_received: u64,
+}
+
+#[derive(Clone)]
+struct PipelineStreamHandle {
+    stream: Arc<tokio::sync::Mutex<libp2p::Stream>>,
+    opened_at: Instant,
+}
+
+type PipelineStreamCache = Arc<Mutex<HashMap<String, PipelineStreamHandle>>>;
+
+fn pipeline_stream_cache_key(session_id: &str, peer: &PeerId) -> String {
+    format!("{}|{}", session_id, peer)
+}
+
+fn put_u16(buf: &mut Vec<u8>, value: u16) {
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_u64(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([buf[offset], buf[offset + 1]])
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn encode_pipeline_frame(frame: &PipelineFrame) -> std::io::Result<Vec<u8>> {
+    let request_id = frame.request_id.as_bytes();
+    let session_id = frame.session_id.as_bytes();
+    let dtype = frame.dtype.as_bytes();
+    if request_id.len() > u16::MAX as usize
+        || session_id.len() > u16::MAX as usize
+        || dtype.len() > u16::MAX as usize
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pipeline frame metadata too large",
+        ));
+    }
+    if frame.payload.len() as u64 > PIPELINE_FRAME_MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pipeline frame payload too large",
+        ));
+    }
+    let mut out = Vec::with_capacity(
+        PIPELINE_FRAME_HEADER_LEN + request_id.len() + session_id.len() + dtype.len() + frame.payload.len(),
+    );
+    out.extend_from_slice(PIPELINE_FRAME_MAGIC);
+    put_u16(&mut out, PIPELINE_FRAME_VERSION);
+    out.push(frame.frame_type);
+    out.push(0);
+    put_u64(&mut out, frame.step_id);
+    put_u16(&mut out, request_id.len() as u16);
+    put_u16(&mut out, session_id.len() as u16);
+    put_u16(&mut out, dtype.len() as u16);
+    put_u16(&mut out, 0);
+    put_u64(&mut out, frame.payload.len() as u64);
+    out.extend_from_slice(request_id);
+    out.extend_from_slice(session_id);
+    out.extend_from_slice(dtype);
+    out.extend_from_slice(&frame.payload);
+    Ok(out)
+}
+
+async fn write_pipeline_frame(
+    stream: &mut libp2p::Stream,
+    frame: &PipelineFrame,
+) -> std::io::Result<()> {
+    let data = encode_pipeline_frame(frame)?;
+    stream.write_all(&data).await?;
+    stream.flush().await
+}
+
+async fn read_pipeline_frame(stream: &mut libp2p::Stream) -> std::io::Result<PipelineFrame> {
+    let mut header = [0u8; PIPELINE_FRAME_HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    if &header[0..4] != PIPELINE_FRAME_MAGIC {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pipeline frame magic"));
+    }
+    let version = read_u16(&header, 4);
+    if version != PIPELINE_FRAME_VERSION {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad pipeline frame version"));
+    }
+    let frame_type = header[6];
+    let step_id = read_u64(&header, 8);
+    let request_len = read_u16(&header, 16) as usize;
+    let session_len = read_u16(&header, 18) as usize;
+    let dtype_len = read_u16(&header, 20) as usize;
+    let payload_len = read_u64(&header, 24);
+    if payload_len > PIPELINE_FRAME_MAX_PAYLOAD {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "pipeline frame payload too large"));
+    }
+    let meta_len = request_len
+        .checked_add(session_len)
+        .and_then(|v| v.checked_add(dtype_len))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "pipeline frame metadata overflow"))?;
+    let mut meta = vec![0u8; meta_len];
+    if meta_len > 0 {
+        stream.read_exact(&mut meta).await?;
+    }
+    let mut payload = vec![0u8; payload_len as usize];
+    if payload_len > 0 {
+        stream.read_exact(&mut payload).await?;
+    }
+    let request_end = request_len;
+    let session_end = request_end + session_len;
+    let dtype_end = session_end + dtype_len;
+    let request_id = String::from_utf8(meta[..request_end].to_vec())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let session_id = String::from_utf8(meta[request_end..session_end].to_vec())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let dtype = String::from_utf8(meta[session_end..dtype_end].to_vec())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(PipelineFrame {
+        frame_type,
+        request_id,
+        session_id,
+        step_id,
+        dtype,
+        payload,
+    })
+}
+
+async fn handle_pipeline_stream(
+    peer: PeerId,
+    mut stream: libp2p::Stream,
+    grpc_port: u16,
+    trace_shard: Arc<Mutex<Option<serde_json::Value>>>,
+) {
+    loop {
+        let frame = match read_pipeline_frame(&mut stream).await {
+            Ok(frame) => frame,
+            Err(e) => {
+                eprintln!("[PIPELINE_STREAM] fermeture stream {} : {}", peer, e);
+                break;
+            }
+        };
+        if frame.frame_type != PIPELINE_FRAME_REQUEST {
+            eprintln!("[PIPELINE_STREAM] frame ignorée de {} : type={}", peer, frame.frame_type);
+            continue;
+        }
+        let dtype_in = frame.dtype.clone();
+        let session_id = frame.session_id.clone();
+        let compute_started = Instant::now();
+        let response = match call_local_inference(
+            grpc_port,
+            frame.payload,
+            dtype_in.clone(),
+            Vec::new(),
+            session_id.clone(),
+        )
+        .await
+        {
+            Ok((data, c, s, metrics, c_ms)) => {
+                if dtype_in.starts_with("vryx.shard.")
+                    || dtype_in.starts_with("vryx.tp.")
+                    || dtype_in.starts_with("vryx.dist.")
+                    || dtype_in == "vryx.pipeline.forward"
+                {
+                    let _ = trace_shard.lock().unwrap().replace(serde_json::json!({
+                        "dtype": dtype_in,
+                        "shard_session_id": metrics.shard_session_id,
+                        "shard_layer_id": metrics.shard_layer_id,
+                        "compute_ms": c_ms,
+                        "transport": "pipeline_stream",
+                        "ts_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                    }));
+                }
+                TensorResponse {
+                    data,
+                    compute_time_ns: c,
+                    serialization_time_ns: s,
+                    prompt_tokens_llm: metrics.prompt_tokens,
+                    completion_tokens_llm: metrics.completion_tokens,
+                    total_tokens_llm: metrics.total_tokens,
+                    vps_delegate_ms: compute_started.elapsed().as_millis() as u64,
+                    worker_compute_ms: c_ms,
+                    p2p_messages_in: 0,
+                    p2p_messages_out: 0,
+                    shard_session_id: metrics.shard_session_id,
+                    scheduler_workers_used: 0,
+                    shard_warmup_sent: 0,
+                    compute_time_ms: c_ms,
+                    relay_trace_json: serde_json::json!({
+                        "transport": "pipeline_stream",
+                        "worker_seen_request": true,
+                        "worker_compute_ms": c_ms,
+                        "pipeline_stream_worker_ms": compute_started.elapsed().as_millis() as u64,
+                    }).to_string(),
+                }
+            }
+            Err(e) => TensorResponse {
+                data: serde_json::json!({
+                    "ok": false,
+                    "error": format!("pipeline_stream_worker_error: {}", e),
+                })
+                .to_string()
+                .into_bytes(),
+                relay_trace_json: serde_json::json!({
+                    "transport": "pipeline_stream",
+                    "worker_seen_request": true,
+                    "error": e.to_string(),
+                })
+                .to_string(),
+                ..Default::default()
+            },
+        };
+        let payload = match serde_json::to_vec(&response) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("[PIPELINE_STREAM] sérialisation réponse impossible {} : {}", peer, e);
+                break;
+            }
+        };
+        let response_frame = PipelineFrame {
+            frame_type: PIPELINE_FRAME_RESPONSE,
+            request_id: frame.request_id,
+            session_id: frame.session_id,
+            step_id: frame.step_id,
+            dtype: frame.dtype,
+            payload,
+        };
+        if let Err(e) = write_pipeline_frame(&mut stream, &response_frame).await {
+            eprintln!("[PIPELINE_STREAM] réponse impossible vers {} : {}", peer, e);
+            break;
+        }
+    }
+}
+
+async fn pipeline_stream_roundtrip(
+    control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
+    cache: PipelineStreamCache,
+    peer: PeerId,
+    frame: PipelineFrame,
+    ttl: Duration,
+) -> std::result::Result<(PipelineFrame, PipelineStreamTrace), String> {
+    let key = pipeline_stream_cache_key(&frame.session_id, &peer);
+    let roundtrip_started = Instant::now();
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let now = Instant::now();
+        let mut stream_open_ms = 0u64;
+        let mut stream_reused = false;
+        let handle = {
+            let cached = {
+                let mut guard = cache.lock().unwrap();
+                guard.retain(|_, entry| now.duration_since(entry.opened_at) <= ttl);
+                guard.get(&key).cloned()
+            };
+            if let Some(handle) = cached {
+                stream_reused = true;
+                handle
+            } else {
+                let open_started = Instant::now();
+                let mut control_guard = control.lock().await;
+                let stream = control_guard
+                    .open_stream(peer, StreamProtocol::new(PIPELINE_STREAM_PROTOCOL))
+                    .await
+                    .map_err(|e| format!("pipeline_stream_open_failed: {}", e))?;
+                stream_open_ms = open_started.elapsed().as_millis() as u64;
+                let handle = PipelineStreamHandle {
+                    stream: Arc::new(tokio::sync::Mutex::new(stream)),
+                    opened_at: Instant::now(),
+                };
+                cache.lock().unwrap().insert(key.clone(), handle.clone());
+                handle
+            }
+        };
+        let mut stream_guard = handle.stream.lock().await;
+        let send_started = Instant::now();
+        if let Err(e) = write_pipeline_frame(&mut stream_guard, &frame).await {
+            last_error = format!("pipeline_stream_send_failed: {}", e);
+            cache.lock().unwrap().remove(&key);
+            if attempt == 0 {
+                continue;
+            }
+            break;
+        }
+        let stream_send_ms = send_started.elapsed().as_millis() as u64;
+        let wait_started = Instant::now();
+        match read_pipeline_frame(&mut stream_guard).await {
+            Ok(response) => {
+                let trace = PipelineStreamTrace {
+                    stream_open_ms,
+                    stream_reused,
+                    stream_send_ms,
+                    stream_wait_response_ms: wait_started.elapsed().as_millis() as u64,
+                    stream_roundtrip_ms: roundtrip_started.elapsed().as_millis() as u64,
+                    request_response_fallback: false,
+                    frames_sent: 1,
+                    frames_received: 1,
+                };
+                return Ok((response, trace));
+            }
+            Err(e) => {
+                last_error = format!("pipeline_stream_read_failed: {}", e);
+                cache.lock().unwrap().remove(&key);
+                if attempt == 0 {
+                    continue;
+                }
+            }
+        }
+    }
+    Err(last_error)
+}
+
 /// Tableau `routing_path` pour les réponses HTTP/SSE (aligné sur `pipeline_trace_json`).
 fn routing_path_from_trace(trace: &serde_json::Value) -> serde_json::Value {
     let mut rp = trace
@@ -450,6 +801,7 @@ mod base64_vec {
 #[derive(NetworkBehaviour)]
 struct VryxBehaviour {
     request_response: request_response::Behaviour<vryx_codec::Codec<TensorRequest, TensorResponse>>,
+    stream: libp2p_stream::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
     autonat: autonat::Behaviour,
@@ -1352,6 +1704,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )],
                 rr_config,
             );
+            let stream = libp2p_stream::Behaviour::new();
             let store = kad::store::MemoryStore::new(peer_id);
             let mut kad = kad::Behaviour::new(peer_id, store);
             if args.mode == "bootstrap" {
@@ -1380,6 +1733,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             Ok(VryxBehaviour {
                 request_response,
+                stream,
                 kad,
                 identify,
                 autonat,
@@ -1412,6 +1766,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let my_peer_id = *swarm.local_peer_id();
+    let pipeline_stream_ttl = Duration::from_secs(env_u64_clamped(
+        "VRYX_PIPELINE_STREAM_TTL_SEC",
+        3600,
+        30,
+        86400,
+    ));
+    let pipeline_stream_cache: PipelineStreamCache = Arc::new(Mutex::new(HashMap::new()));
+    let pipeline_stream_control = Arc::new(tokio::sync::Mutex::new(
+        swarm.behaviour().stream.new_control(),
+    ));
+    let mut pipeline_stream_incoming = swarm
+        .behaviour()
+        .stream
+        .new_control()
+        .accept(StreamProtocol::new(PIPELINE_STREAM_PROTOCOL))
+        .map_err(|e| format!("pipeline stream protocol déjà enregistré: {:?}", e))?;
     println!("\n╔══════════════════════════════════════════════╗");
     println!("║  Vryx Node  │  mode = {}  ", args.mode);
     println!("║  vryx-daemon commit: {}", daemon_commit());
@@ -1508,6 +1878,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tokens_out = Arc::new(AtomicU64::new(0));
     let tokens_generated = Arc::new(AtomicU64::new(0));
     let last_shard_trace = Arc::new(Mutex::new(Option::<serde_json::Value>::None));
+    {
+        let trace_shard_stream = Arc::clone(&last_shard_trace);
+        let grpc_pipeline_stream = args.grpc_port;
+        tokio::spawn(async move {
+            while let Some((peer, stream)) = pipeline_stream_incoming.next().await {
+                let trace = Arc::clone(&trace_shard_stream);
+                tokio::spawn(handle_pipeline_stream(
+                    peer,
+                    stream,
+                    grpc_pipeline_stream,
+                    trace,
+                ));
+            }
+        });
+    }
 
     // Channel pour envoyer des commandes chat via l'API (initiator seulement)
     // (Prompt, Response Sender)
@@ -1531,9 +1916,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let my_peer_id_str = my_peer_id.to_string();
         let cmd_tx_axum = cmd_tx.clone();
         let p2p_relay_axum = p2p_relay_tx.clone();
+        let pipeline_stream_control_axum = Arc::clone(&pipeline_stream_control);
+        let pipeline_stream_cache_axum = Arc::clone(&pipeline_stream_cache);
+        let pipeline_stream_ttl_axum = pipeline_stream_ttl;
         let mode_chat = args.mode.clone();
         let mode_chat_stream = args.mode.clone();
         let mode_relay = args.mode.clone();
+        let mode_pipeline_stream = args.mode.clone();
         let mode_status_diag = args.mode.clone();
         let mode_tp_diag = args.mode.clone();
         let grpc_axum_health = args.grpc_port;
@@ -1960,6 +2349,167 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             serde_json::json!({"event":"error","error":err.to_string(),"done":true})
                         )))
                         .unwrap(),
+                }
+            }))
+            .route("/api/p2p/pipeline-stream", post(move |Json(payload): Json<serde_json::Value>| {
+                let control = Arc::clone(&pipeline_stream_control_axum);
+                let cache = Arc::clone(&pipeline_stream_cache_axum);
+                let mode_pipeline_stream_call = mode_pipeline_stream.clone();
+                async move {
+                    use base64::{Engine as _, engine::general_purpose};
+                    let axum_started = Instant::now();
+                    if mode_pipeline_stream_call != "initiator" {
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({"ok": false, "error": "Pipeline stream : mode initiateur requis."})),
+                        );
+                    }
+                    let peer_str = payload.get("target_peer").and_then(|v| v.as_str()).unwrap_or("");
+                    let peer: PeerId = match PeerId::from_str(peer_str) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"ok": false, "error": "target_peer libp2p invalide."})),
+                            );
+                        }
+                    };
+                    let dtype = payload
+                        .get("dtype")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if dtype != "vryx.shard.pipeline" {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"ok": false, "error": "pipeline_stream_dtype_not_allowed"})),
+                        );
+                    }
+                    let data_b64 = payload.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+                    let data = match general_purpose::STANDARD.decode(data_b64) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"ok": false, "error": format!("data_b64 : {}", e)})),
+                            );
+                        }
+                    };
+                    let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let step_id = payload
+                        .get("step_id")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None })))
+                        .unwrap_or(0);
+                    let frame = PipelineFrame {
+                        frame_type: PIPELINE_FRAME_REQUEST,
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        step_id,
+                        dtype: dtype.clone(),
+                        payload: data,
+                    };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(3600),
+                        pipeline_stream_roundtrip(control, cache, peer, frame, pipeline_stream_ttl_axum),
+                    )
+                    .await
+                    {
+                        Ok(Ok((response_frame, trace))) => {
+                            let resp = match serde_json::from_slice::<TensorResponse>(&response_frame.payload) {
+                                Ok(resp) => resp,
+                                Err(e) => {
+                                    return (
+                                        axum::http::StatusCode::BAD_GATEWAY,
+                                        Json(serde_json::json!({
+                                            "ok": false,
+                                            "error": format!("pipeline_stream_response_decode_failed: {}", e),
+                                            "request_response_fallback": true,
+                                        })),
+                                    );
+                                }
+                            };
+                            let data_b64 = general_purpose::STANDARD.encode(&resp.data);
+                            let worker_trace = serde_json::from_str::<serde_json::Value>(&resp.relay_trace_json)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            let trace_json = serde_json::json!({
+                                "dtype": dtype,
+                                "method": dtype,
+                                "protocol": PIPELINE_STREAM_PROTOCOL,
+                                "transport": "pipeline_stream",
+                                "p2p_transport": "pipeline_stream",
+                                "peer_id": peer.to_string(),
+                                "request_id": request_id,
+                                "session_id": session_id,
+                                "step_id": step_id,
+                                "payload_bytes": response_frame.payload.len(),
+                                "axum_ms": axum_started.elapsed().as_millis() as u64,
+                                "stream_open_ms": trace.stream_open_ms,
+                                "stream_reused": trace.stream_reused,
+                                "stream_send_ms": trace.stream_send_ms,
+                                "stream_wait_response_ms": trace.stream_wait_response_ms,
+                                "stream_roundtrip_ms": trace.stream_roundtrip_ms,
+                                "request_response_fallback": trace.request_response_fallback,
+                                "frames_sent": trace.frames_sent,
+                                "frames_received": trace.frames_received,
+                                "worker_seen_request": true,
+                                "worker_transport_trace": worker_trace,
+                            });
+                            (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "ok": true,
+                                    "data_b64": data_b64,
+                                    "relay_ms": trace.stream_roundtrip_ms,
+                                    "serialization_ms": resp.serialization_time_ns / 1_000_000,
+                                    "hidden_bytes": resp.p2p_messages_in,
+                                    "persistent_relay": true,
+                                    "connection_reuse": trace.stream_reused,
+                                    "connection_transport": PIPELINE_STREAM_PROTOCOL,
+                                    "quic_available": true,
+                                    "quic_used": false,
+                                    "prompt_tokens": resp.prompt_tokens_llm,
+                                    "completion_tokens": resp.completion_tokens_llm,
+                                    "total_tokens": resp.total_tokens_llm,
+                                    "vps_delegate_ms": trace.stream_roundtrip_ms,
+                                    "worker_compute_ms": resp.worker_compute_ms,
+                                    "compute_time_ms": resp.compute_time_ms,
+                                    "shard_session_id": resp.shard_session_id,
+                                    "pipeline_stream": true,
+                                    "request_response_fallback": false,
+                                    "pipeline_stream_trace": trace_json,
+                                    "relay_trace": trace_json,
+                                })),
+                            )
+                        }
+                        Ok(Err(e)) => (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": e,
+                                "request_response_fallback": true,
+                                "relay_trace": {
+                                    "dtype": dtype,
+                                    "method": dtype,
+                                    "protocol": PIPELINE_STREAM_PROTOCOL,
+                                    "transport": "pipeline_stream",
+                                    "peer_id": peer.to_string(),
+                                    "request_id": request_id,
+                                    "session_id": session_id,
+                                    "step_id": step_id,
+                                    "elapsed_ms": axum_started.elapsed().as_millis() as u64,
+                                }
+                            })),
+                        ),
+                        Err(_) => (
+                            axum::http::StatusCode::GATEWAY_TIMEOUT,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": "pipeline_stream_timeout",
+                                "request_response_fallback": true,
+                            })),
+                        ),
+                    }
                 }
             }))
             .route("/api/p2p/relay", post(move |Json(payload): Json<serde_json::Value>| async move {
