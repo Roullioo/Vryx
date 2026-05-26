@@ -495,6 +495,12 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("decode_microbatch_cap") is not None
                             else maybe_payload.get("decodeMicrobatchCap")
                         )
+                    if maybe_payload.get("warmup_only") is not None or maybe_payload.get("warmupOnly") is not None:
+                        request_options["warmup_only"] = bool(
+                            maybe_payload.get("warmup_only")
+                            if maybe_payload.get("warmup_only") is not None
+                            else maybe_payload.get("warmupOnly")
+                        )
                     if "max_new_tokens" in maybe_payload and maybe_payload.get("max_new_tokens") is not None:
                         request_options["max_new_tokens"] = maybe_payload.get("max_new_tokens")
             except Exception:

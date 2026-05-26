@@ -4422,6 +4422,80 @@ def _query_worker_status(peer_id: str, session_id: str = "") -> dict:
     return status
 
 
+def _shard_ready_max_polls() -> int:
+    try:
+        return max(0, int(os.environ.get("VRYX_SHARD_READY_MAX_POLLS", "80") or 80))
+    except (TypeError, ValueError):
+        return 80
+
+
+def _status_shard_for_session(status: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    shards = status.get("shards") if isinstance(status, dict) else []
+    if not isinstance(shards, list):
+        return None
+    for shard in shards:
+        if isinstance(shard, dict) and shard.get("session_id") == session_id:
+            return shard
+    return None
+
+
+def _summarize_shard_status_poll(
+    peer_id: str,
+    session_id: str,
+    status: dict[str, Any],
+    ready: bool,
+    reason: str | None,
+    elapsed_ms: int,
+    poll_n: int,
+    assignment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    shard = _status_shard_for_session(status, session_id) or {}
+    shards = status.get("shards") if isinstance(status, dict) else []
+    shard_session_ids = []
+    if isinstance(shards, list):
+        shard_session_ids = [
+            str(s.get("session_id") or "")[:48]
+            for s in shards
+            if isinstance(s, dict) and s.get("session_id")
+        ][:8]
+    last_error = (
+        status.get("error")
+        or shard.get("load_error")
+        or shard.get("build_error")
+        or shard.get("error")
+        or shard.get("last_error")
+    )
+    return {
+        "event": "shard.status.poll",
+        "peer_id": peer_id,
+        "peer_short": _short(peer_id),
+        "session_id": session_id,
+        "poll": poll_n,
+        "elapsed_ms": elapsed_ms,
+        "ok": status.get("ok", True),
+        "status": "ready" if ready else "not_ready",
+        "ready": bool(ready),
+        "reason": reason,
+        "last_error": str(last_error)[:500] if last_error else None,
+        "model_id": shard.get("model_id") or status.get("model_id"),
+        "assignment": assignment or {},
+        "worker_backend": shard.get("runtime_backend") or status.get("runtime_backend") or status.get("backend"),
+        "attention_backend": shard.get("attention_backend"),
+        "linear_attn_ready": shard.get("linear_attn_ready"),
+        "weights_loaded": shard.get("weights_loaded"),
+        "ready_flag": shard.get("ready"),
+        "built": shard.get("built"),
+        "build_ready": shard.get("build_ready"),
+        "loading": shard.get("loading"),
+        "download_ms": shard.get("download_ms"),
+        "build_ms": shard.get("build_ms"),
+        "count": status.get("count"),
+        "shard_count": len(shards) if isinstance(shards, list) else None,
+        "shard_session_ids": shard_session_ids,
+        "matched_session": bool(shard),
+    }
+
+
 def _is_unknown_session_error(value: Any) -> bool:
     text = str(value or "").lower()
     return "session" in text and ("inconnue" in text or "unknown" in text or "not found" in text)
@@ -4867,6 +4941,23 @@ def _get_or_create_session(
             elapsed = 0
             init_attempts = max(1, int(os.environ.get("VRYX_SHARD_INIT_ATTEMPTS", "2")))
             for attempt in range(init_attempts):
+                assignment_trace = {
+                    "worker_index": i,
+                    "layer_start": ls,
+                    "layer_end": le,
+                    "has_embedding": has_emb,
+                    "has_lm_head": has_head,
+                    "manifest_url_preview": download_url[:120],
+                    "worker_backend": _runtime_for_pool(pool_class, worker_info),
+                    "worker_model_id": worker_info.get("model") or worker_info.get("model_id"),
+                }
+                print("[VPS][shard.init] " + json.dumps({
+                    "event": "shard.init.send",
+                    "peer_id": peer,
+                    "peer_short": _short(peer),
+                    "session_id": session_id,
+                    "assignment": assignment_trace,
+                }, ensure_ascii=False, default=str))
                 if trace_ctx is not None:
                     trace_ctx.count_call("vryx.shard.init")
                     trace_ctx.count_call("/api/p2p/relay")
@@ -4874,6 +4965,17 @@ def _get_or_create_session(
                 t0 = time.perf_counter()
                 r = _relay_raw(peer, "vryx.shard.init", init_payload, timeout=SHARD_INIT_TIMEOUT)
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                print("[VPS][shard.init] " + json.dumps({
+                    "event": "shard.init.response",
+                    "peer_id": peer,
+                    "peer_short": _short(peer),
+                    "session_id": session_id,
+                    "assignment": assignment_trace,
+                    "ok": r.get("ok", True),
+                    "error": r.get("error"),
+                    "elapsed_ms": elapsed,
+                    "relay_trace": r.get("relay_trace") if isinstance(r.get("relay_trace"), dict) else None,
+                }, ensure_ascii=False, default=str))
                 if trace_ctx is not None:
                     trace_ctx.add_phase_ms("session_init_ms", elapsed)
                 relay_ok = r.get("ok") is not False and not str(r.get("error") or "").strip()
@@ -4891,6 +4993,24 @@ def _get_or_create_session(
                     inner = json.loads(base64.b64decode(inner_b64).decode("utf-8", errors="replace")) if inner_b64 else {}
                     weights_loaded = inner.get("weights_loaded", 0)
                     inner_ok = inner.get("ok", True)
+                    print("[VPS][shard.init] " + json.dumps({
+                        "event": "shard.init.accepted",
+                        "peer_id": peer,
+                        "peer_short": _short(peer),
+                        "session_id": session_id,
+                        "assignment": assignment_trace,
+                        "ok": inner_ok,
+                        "weights_loaded": weights_loaded,
+                        "ready": inner.get("ready"),
+                        "built": inner.get("built"),
+                        "build_ready": inner.get("build_ready"),
+                        "model_id": inner.get("model_id"),
+                        "runtime_backend": inner.get("runtime_backend"),
+                        "download_ms": inner.get("download_ms"),
+                        "build_ms": inner.get("build_ms"),
+                        "last_error": inner.get("error") or inner.get("load_error") or inner.get("build_error"),
+                        "elapsed_ms": elapsed,
+                    }, ensure_ascii=False, default=str))
                     print(f"[VPS] Worker {i} ({peer[:16]}) : init accepté en {elapsed}ms")
                     if not inner_ok:
                         det = str(inner.get("error") or inner)[:500]
@@ -4911,14 +5031,32 @@ def _get_or_create_session(
                     wait_started = time.perf_counter()
                     poll_n = 0
                     last_reason: str | None = None
+                    last_status_summary: dict[str, Any] | None = None
+                    last_status_full: dict[str, Any] | None = None
+                    max_ready_polls = _shard_ready_max_polls()
                     ready_poll_start = time.perf_counter()
                     while time.perf_counter() - wait_started < SHARD_READY_TIMEOUT:
                         if trace_ctx is not None:
                             trace_ctx.count_call("vryx.shard.status")
                             trace_ctx.count_call("/api/p2p/relay")
                             trace_ctx.count_call("request_response_send_request")
+                        poll_n += 1
                         status = _query_worker_status(peer, session_id)
                         ready, reason, shard_hit = _session_ready_from_status(status, session_id, MODEL_ID)
+                        elapsed_poll_ms = int((time.perf_counter() - ready_poll_start) * 1000)
+                        status_summary = _summarize_shard_status_poll(
+                            peer,
+                            session_id,
+                            status,
+                            ready,
+                            reason,
+                            elapsed_poll_ms,
+                            poll_n,
+                            assignment_trace,
+                        )
+                        last_status_summary = status_summary
+                        last_status_full = status
+                        print("[VPS][shard.status] " + json.dumps(status_summary, ensure_ascii=False, default=str))
                         if ready and shard_hit is not None:
                             weights_loaded = shard_hit.get("weights_loaded", weights_loaded)
                             if trace_ctx is not None:
@@ -4936,7 +5074,9 @@ def _get_or_create_session(
                         last_reason = reason or (
                             str(status.get("error")) if not status.get("ok", True) else last_reason
                         )
-                        poll_n += 1
+                        if max_ready_polls > 0 and poll_n >= max_ready_polls:
+                            last_reason = f"ready_poll_max_polls_{max_ready_polls}:{last_reason or 'session_not_ready'}"
+                            break
                         time.sleep(_shard_ready_sleep_sec(poll_n))
                     if trace_ctx is not None:
                         trace_ctx.add_phase_ms(
@@ -4951,12 +5091,25 @@ def _get_or_create_session(
                         f"[VPS] Worker {i} ({peer[:16]}) timeout readiness après init "
                         f"({int(SHARD_READY_TIMEOUT)}s) : {detail}"
                     )
+                    if last_status_full is not None:
+                        print("[VPS][shard.status.last] " + json.dumps({
+                            "event": "shard.status.last_response",
+                            "peer_id": peer,
+                            "peer_short": _short(peer),
+                            "session_id": session_id,
+                            "assignment": assignment_trace,
+                            "summary": last_status_summary,
+                            "status": last_status_full,
+                        }, ensure_ascii=False, default=str)[:12000])
                     diag.append({
                         "worker_index": i,
                         "peer": peer[:48],
                         "phase": "ready_poll_timeout",
                         "detail": detail,
                         "manifest_url_preview": download_url[:120],
+                        "assignment": assignment_trace,
+                        "last_status_summary": last_status_summary,
+                        "last_status_full": last_status_full,
                     })
                     return False
                 except Exception as e:
@@ -5091,6 +5244,17 @@ def _get_or_create_session(
                 })
 
         validation = _validate_cached_session(peers, session_id, pool_class, MODEL_ID)
+        print("[VPS][session.validation] " + json.dumps({
+            "event": "session.validation",
+            "session_id": session_id,
+            "peers": peers,
+            "ready": validation.get("ready"),
+            "ready_workers": validation.get("ready_workers"),
+            "worker_count": validation.get("worker_count"),
+            "fallback_reason": validation.get("fallback_reason"),
+            "runtime_backend_per_worker": validation.get("runtime_backend_per_worker"),
+            "attention_backend_per_worker": validation.get("attention_backend_per_worker"),
+        }, ensure_ascii=False, default=str))
         actual_pool_class = str(validation.get("actual_pool_class") or pool_class)
         validation_reason = validation.get("fallback_reason")
         if pool_class == "velocity_mlx" and actual_pool_class != "velocity_mlx":
@@ -5917,6 +6081,33 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "pool_fallback_reason": pool_fallback_reason,
         "ready": bool(pool_validation.get("ready")),
     })
+
+    if isinstance(options, dict) and (options.get("warmup_only") is True or options.get("warmupOnly") is True):
+        return {
+            "ok": bool(pool_validation.get("ready")),
+            "text": "",
+            "error": None if pool_validation.get("ready") else (pool_validation.get("fallback_reason") or "warmup_session_not_ready"),
+            "trace": {
+                "layout": "pipeline_relay_daisy_chain",
+                "ok": bool(pool_validation.get("ready")),
+                "routing_path": peers,
+                "peers": peers,
+                "session_id": session_id,
+                "session_status": sess_status,
+                "session_reused": bool(trace_ctx.session.get("reused") or sess_status == "reused"),
+                "session_reuse_source": trace_ctx.session.get("reuse_source"),
+                "session_reuse_reason": trace_ctx.session.get("reuse_reason") or ("hot_session_ready" if sess_status == "reused" else "fresh_session_init"),
+                "setup_ms": setup_ms,
+                "phase_trace": phase_trace,
+                "call_counts": trace_ctx.call_counts,
+                "assignments": pool_info.get("assignments") or [],
+                "pool_validation": pool_validation,
+                "worker_statuses": worker_statuses,
+                "shard_prep_diag": shard_prep_diag,
+                "warmup_only": True,
+            },
+            "metrics": {"prompt_tokens": len(input_ids), "completion_tokens": 0, "total_tokens": len(input_ids)},
+        }
 
     # Réutilise la version tokenisée commune (alignement avec métriques / clamp contextuel).
     formatted = formatted_prompt
