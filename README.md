@@ -157,68 +157,6 @@ Endpoints utiles :
 | `GET /api/admin/inference/summary?hours=24` | Admin | TPS, TTFT, latence, tokens, coûts. |
 | `GET /api/admin/observability/health` | Admin | PM2, systemd initiateur, disque, health runtime. |
 
----
-
-## Démarrage local
-
-Prérequis : **Node.js 20+** et Docker pour MariaDB.
-
-```bash
-cd website
-cp server/env.example server/.env
-
-npm run install:all
-npm run docker:db
-npm run dev
-```
-
-Vérifier l’API :
-
-```bash
-curl -s http://127.0.0.1:4000/api/health
-```
-
-Tests ciblés côté API :
-
-```bash
-npm run test:production-readiness --prefix website/server
-npm run test:inference-metrics --prefix website/server
-npm run test:pricing-models --prefix website/server
-```
-
-Build frontend :
-
-```bash
-npm run build --prefix website
-```
-
----
-
-## Déploiement VPS
-
-Le déploiement site + API se fait depuis la racine du repo :
-
-```bash
-export VRYX_VPS_SSH_PASSWORD='...'
-python3 website_deploy.py
-```
-
-Le script :
-
-- build `website/dist` ;
-- archive le front et `website/server` sans `.env` ;
-- déploie dans `/var/www/vryx` par défaut ;
-- installe les dépendances serveur avec `npm ci --omit=dev` ;
-- redémarre `vryx-api` avec PM2 ;
-- vérifie `/api/health` en local VPS.
-
-Pour le bootstrap / daemon Rust, utiliser :
-
-```bash
-python3 vps_deploy.py
-```
-
----
 
 ## Pages et surfaces produit
 
