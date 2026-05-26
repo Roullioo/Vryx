@@ -159,6 +159,21 @@ def _is_hot(summary: dict[str, Any]) -> bool:
     )
 
 
+def _emit(row: dict[str, Any]) -> None:
+    trace_file = os.environ.get("VRYX_CHAIN_BENCH_TRACE_FILE", "").strip()
+    if trace_file:
+        with open(trace_file, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    if os.environ.get("VRYX_CHAIN_BENCH_VERBOSE", "0").strip().lower() in ("1", "true", "yes", "on"):
+        print(json.dumps(row, ensure_ascii=False, sort_keys=True), flush=True)
+        return
+    compact = dict(row)
+    if isinstance(compact.get("chain_hops"), list):
+        compact["chain_hops_sample"] = compact["chain_hops"][:3]
+        compact.pop("chain_hops", None)
+    print(json.dumps(compact, ensure_ascii=False, sort_keys=True), flush=True)
+
+
 def main() -> int:
     url = os.environ.get("VRYX_CHAIN_BENCH_URL", "http://127.0.0.1:3031/api/chat").rstrip("/")
     timeout = _env_float("VRYX_CHAIN_BENCH_TIMEOUT", 240.0)
@@ -184,9 +199,9 @@ def main() -> int:
         timeout,
     )
     warmup = _summary("warmup_stable_no_chain", warmup_tokens, status, data, wall_ms)
-    print(json.dumps(warmup, ensure_ascii=False, sort_keys=True), flush=True)
+    _emit(warmup)
     if not warmup["ok"]:
-        print(json.dumps({"ok": False, "error": "warmup_failed", "warmup": warmup}, ensure_ascii=False, sort_keys=True), flush=True)
+        _emit({"ok": False, "error": "warmup_failed", "warmup": warmup})
         return 1
 
     plan: list[dict[str, Any]] = []
@@ -231,35 +246,35 @@ def main() -> int:
         summary = _summary(label, tokens, status, data, wall_ms)
         summary["mode"] = "direct_chain_decode_only" if item["chain_stream"] else "stable_stream"
         summary["decode_microbatch_cap"] = item.get("cap")
-        print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
+        _emit(summary)
         results.append(summary)
 
         if not _is_hot(summary):
-            print(json.dumps({"ok": False, "error": "not_hot_path", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+            _emit({"ok": False, "error": "not_hot_path", "failed_label": label, "summary": summary})
             return 3
         if not summary["ok"]:
-            print(json.dumps({"ok": False, "error": "direct_run_failed", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+            _emit({"ok": False, "error": "direct_run_failed", "failed_label": label, "summary": summary})
             return 1
         if os.environ.get("VRYX_CHAIN_BENCH_REQUIRE_FULL_TOKENS", "1").strip().lower() not in ("0", "false", "no", "off"):
             if int(summary.get("completion_tokens") or 0) < tokens:
-                print(json.dumps({"ok": False, "error": "short_completion", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+                _emit({"ok": False, "error": "short_completion", "failed_label": label, "summary": summary})
                 return 6
         if summary.get("duplicate_pending"):
-            print(json.dumps({"ok": False, "error": "duplicate_pending", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+            _emit({"ok": False, "error": "duplicate_pending", "failed_label": label, "summary": summary})
             return 7
         if summary.get("duplicate_microbatch"):
-            print(json.dumps({"ok": False, "error": "duplicate_microbatch", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+            _emit({"ok": False, "error": "duplicate_microbatch", "failed_label": label, "summary": summary})
             return 8
         if bool(item["expect_chain"]):
             if summary.get("chain_stream_used") is not True or summary.get("chain_result_direct") is not True:
-                print(json.dumps({"ok": False, "error": "chain_not_used", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+                _emit({"ok": False, "error": "chain_not_used", "failed_label": label, "summary": summary})
                 return 4
             if summary.get("fallback_used") or summary.get("request_response_fallback"):
-                print(json.dumps({"ok": False, "error": "fallback_used", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+                _emit({"ok": False, "error": "fallback_used", "failed_label": label, "summary": summary})
                 return 5
         else:
             if summary.get("chain_stream_used") or summary.get("chain_result_direct"):
-                print(json.dumps({"ok": False, "error": "stable_used_chain", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+                _emit({"ok": False, "error": "stable_used_chain", "failed_label": label, "summary": summary})
                 return 9
 
     direct_decode = [
@@ -278,9 +293,9 @@ def main() -> int:
     if direct_decode and min(direct_decode) < float(os.environ.get("VRYX_CHAIN_BENCH_MIN_DECODE_TPS", "3")):
         summary["ok"] = False
         summary["error"] = "decode_tps_below_target"
-        print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
+        _emit(summary)
         return 10
-    print(json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
+    _emit(summary)
     return 0
 
 
