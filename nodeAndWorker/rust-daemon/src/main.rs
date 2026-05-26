@@ -3175,6 +3175,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     {
                         request_obj["force_distributed"] = serde_json::json!(true);
                     }
+                    for (snake, camel) in [
+                        ("chain_stream", "chainStream"),
+                        ("chain_result_direct", "chainResultDirect"),
+                    ] {
+                        if let Some(value) = payload
+                            .get(snake)
+                            .or_else(|| payload.get(camel))
+                            .and_then(|v| v.as_bool())
+                        {
+                            request_obj[snake] = serde_json::json!(value);
+                        }
+                    }
                     for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                         if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                             request_obj[key] = serde_json::json!(value);
@@ -3292,6 +3304,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     == Some(true)
                 {
                     request_obj["force_distributed"] = serde_json::json!(true);
+                }
+                for (snake, camel) in [
+                    ("chain_stream", "chainStream"),
+                    ("chain_result_direct", "chainResultDirect"),
+                ] {
+                    if let Some(value) = payload
+                        .get(snake)
+                        .or_else(|| payload.get(camel))
+                        .and_then(|v| v.as_bool())
+                    {
+                        request_obj[snake] = serde_json::json!(value);
+                    }
                 }
                 for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                     if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
