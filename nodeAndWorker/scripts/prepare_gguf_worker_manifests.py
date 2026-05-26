@@ -66,6 +66,18 @@ def _to_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _worker_is_m1(worker: dict) -> bool:
+    text = " ".join(
+        str(worker.get(key) or "")
+        for key in ("peer_id", "gpu_name", "model")
+    ).lower()
+    return "m1" in text or "apple m1" in text
+
+
 def _read_json_arg(value: str) -> object:
     src = value.strip()
     if src.startswith("@"):
@@ -265,6 +277,57 @@ def _assign_layers_by_capacity(
     return assignments
 
 
+def _sum_layer_bytes(layer_bytes: list[int], start: int, end: int) -> int:
+    if end < start:
+        return 0
+    return sum(layer_bytes[max(0, start): min(len(layer_bytes), end + 1)])
+
+
+def _apply_speed_aware_first_shard(
+    assignments: list[dict],
+    layer_bytes: list[int],
+    first_max_layers: int,
+) -> tuple[list[dict], dict]:
+    meta = {
+        "enabled": True,
+        "applied": False,
+        "reason": "",
+        "first_max_layers": int(first_max_layers),
+    }
+    if len(assignments) != 2:
+        meta["reason"] = f"requires_two_workers:{len(assignments)}"
+        return assignments, meta
+    total_layers = len(layer_bytes)
+    if total_layers < 2:
+        meta["reason"] = f"not_enough_layers:{total_layers}"
+        return assignments, meta
+    max_layers = max(1, min(int(first_max_layers or 2), total_layers - 1))
+    first = dict(assignments[0])
+    last = dict(assignments[1])
+    if int(first.get("layer_start") or 0) != 0:
+        meta["reason"] = "first_assignment_does_not_start_at_0"
+        return assignments, meta
+    current_first_layers = max(0, int(first.get("layer_end") or -1) - int(first.get("layer_start") or 0) + 1)
+    if current_first_layers <= max_layers:
+        meta["reason"] = "already_within_first_max_layers"
+        return assignments, meta
+    first["layer_start"] = 0
+    first["layer_end"] = max_layers - 1
+    first["layer_bytes"] = _sum_layer_bytes(layer_bytes, int(first["layer_start"]), int(first["layer_end"]))
+    last["layer_start"] = max_layers
+    last["layer_end"] = total_layers - 1
+    last["layer_bytes"] = _sum_layer_bytes(layer_bytes, int(last["layer_start"]), int(last["layer_end"]))
+    meta.update({
+        "applied": True,
+        "reason": "first_worker_capped",
+        "old_first_layers": current_first_layers,
+        "new_first_layers": max_layers,
+        "last_layers": max(0, int(last["layer_end"]) - int(last["layer_start"]) + 1),
+        "first_worker_class": "m1" if _worker_is_m1(first.get("worker") or {}) else "unknown",
+    })
+    return [first, last], meta
+
+
 def _tensor_entry(tensor: object, source_url: str) -> dict:
     name = str(getattr(tensor, "name"))
     shape = [int(x) for x in getattr(tensor, "shape")]
@@ -289,6 +352,13 @@ def main() -> int:
     parser.add_argument("--safety-gb", type=float, default=1.0)
     parser.add_argument("--target-fill", type=float, default=0.92)
     parser.add_argument("--preserve-worker-order", action="store_true")
+    parser.add_argument("--speed-aware", action="store_true", default=_env_truthy("VRYX_SCHEDULER_SPEED_AWARE"))
+    parser.add_argument(
+        "--speed-aware-first-max-layers",
+        type=int,
+        default=_to_int(os.environ.get("VRYX_SCHEDULER_FIRST_MAX_LAYERS") or os.environ.get("VRYX_M1_MAX_LAYERS"), 2),
+        help="Quand --speed-aware est actif, limite le premier worker pipeline à N couches.",
+    )
     parser.add_argument("--shard-base", default=os.environ.get("VRYX_SHARD_BASE_DIR", "/var/lib/vryx-shards"))
     parser.add_argument("--api-base", default=os.environ.get("VRYX_SHARD_DOWNLOAD_BASE_URL", "https://vryx.eu"))
     parser.add_argument("--source-rel", default="models/ollama/llama2-70b.gguf")
@@ -340,11 +410,19 @@ def main() -> int:
         safety_gb=args.safety_gb,
         target_fill=args.target_fill,
     )
+    speed_aware_meta = {"enabled": bool(args.speed_aware), "applied": False}
+    if args.speed_aware:
+        assignments, speed_aware_meta = _apply_speed_aware_first_shard(
+            assignments,
+            layer_bytes,
+            args.speed_aware_first_max_layers,
+        )
 
     summary = {
         "ok": True,
         "format": "gguf-ranges-v1",
-        "placement": "allocated-vram-greedy",
+        "placement": "allocated-vram-greedy+speed-aware" if speed_aware_meta.get("applied") else "allocated-vram-greedy",
+        "speed_aware": speed_aware_meta,
         "model_id": args.model_id,
         "gguf": str(source),
         "source_url": source_url,
@@ -390,6 +468,7 @@ def main() -> int:
             "binary_total_bytes": total_bytes,
             "usable_bytes": usable_bytes or None,
             "planned_fill_percent": round((total_bytes / usable_bytes) * 100, 1) if usable_bytes > 0 else None,
+            "speed_aware": speed_aware_meta,
         }
         path = session_dir / f"worker-{rank}.json"
         path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

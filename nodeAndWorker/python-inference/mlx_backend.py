@@ -689,6 +689,29 @@ class MLXBackend:
                 self.linear_states = [{} for _ in range(max(0, self.shard.layer_end - self.shard.layer_start + 1))]
                 self._request_states.pop(request_id, None)
 
+        lazy_tracker = self.weights if hasattr(self.weights, "begin_forward") and hasattr(self.weights, "end_forward") else None
+        lazy_finished = False
+        if lazy_tracker is not None:
+            try:
+                lazy_tracker.begin_forward()
+            except Exception:
+                lazy_tracker = None
+
+        def _finish_lazy_trace() -> dict[str, Any]:
+            nonlocal lazy_finished
+            if lazy_tracker is None:
+                return {}
+            if lazy_finished:
+                try:
+                    return dict(lazy_tracker.snapshot_stats())
+                except Exception:
+                    return {}
+            lazy_finished = True
+            try:
+                return dict(lazy_tracker.end_forward())
+            except Exception as exc:
+                return {"gguf_lazy_trace_error": str(exc)[:200]}
+
         # ── Obtenir hidden_states ────────────────────────────────────────────
         if self.shard.has_embedding and "token_ids" in payload:
             token_ids = payload["token_ids"]
@@ -696,7 +719,7 @@ class MLXBackend:
             try:
                 hidden = self._embedding_lookup(mx, ids_mx)  # [L, D]
             except Exception as exc:
-                return json.dumps({"ok": False, "error": str(exc)}).encode()
+                return json.dumps({"ok": False, "error": str(exc), "transport_trace": _finish_lazy_trace()}).encode()
             hidden = mx.expand_dims(hidden, axis=0)  # [1, L, D]
             seq_len = len(token_ids)
             inbound_hidden_trace = {
@@ -709,7 +732,7 @@ class MLXBackend:
         else:
             hidden, inbound_hidden_trace = self._decode_hidden(payload, hidden_size)
             if hidden is None:
-                return json.dumps({"ok": False, "error": "hidden state manquant"}).encode()
+                return json.dumps({"ok": False, "error": "hidden state manquant", "transport_trace": _finish_lazy_trace()}).encode()
             if hidden.ndim == 2:
                 hidden = mx.expand_dims(hidden, axis=0)
             seq_len = int(hidden.shape[1])
@@ -725,6 +748,7 @@ class MLXBackend:
                 "step": step,
                 "seq_pos": seq_pos,
                 "decode_mode": "full_context_fallback",
+                "transport_trace": _finish_lazy_trace(),
             }).encode()
         if step > 0 and stateful_required and use_kv and self.kv_cache is None:
             return json.dumps({
@@ -736,6 +760,7 @@ class MLXBackend:
                 "decode_mode": "single_token_stateful",
                 "kv_cache": False,
                 "runtime_backend": "mlx",
+                "transport_trace": _finish_lazy_trace(),
             }).encode()
         decode_mode = (
             "prefill_full_context"
@@ -880,12 +905,14 @@ class MLXBackend:
         hx = mlx_run_transformer(hidden, seq_pos, seq_len, causal_mask)
         if hx is None:
             reason = transformer_failure_reasons[-1] if transformer_failure_reasons else "unknown"
+            lazy_trace = _finish_lazy_trace()
             return json.dumps({
                 "ok": False,
                 "error": f"mlx_run_transformer a échoué: {reason}",
                 "session_id": sid,
                 "decode_mode": decode_mode,
                 "runtime_backend": "mlx",
+                "transport_trace": lazy_trace,
             }).encode()
         hidden = hx
         compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
@@ -979,6 +1006,7 @@ class MLXBackend:
 
             compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
             self.shard.last_forward_ms = compute_ms
+            lazy_trace = _finish_lazy_trace()
 
             if request_id != "default":
                 self._request_states[request_id] = {
@@ -1019,6 +1047,7 @@ class MLXBackend:
                     "hidden_transport_effective": "lm_head_only",
                     "python_mlx_pure_compute_ms": compute_ms,
                     **inbound_hidden_trace,
+                    **lazy_trace,
                 },
             }
             debug_top_logits = _debug_top_logits_mx(mx, logits)
@@ -1040,6 +1069,7 @@ class MLXBackend:
             hidden_payload, hidden_metrics = self._encode_hidden_payload(mx, hidden, transport)
             hidden_encode_ms = max(0, int((time.perf_counter() - encode_t0) * 1000))
             hidden_metrics["hidden_encode_ms"] = hidden_encode_ms
+            lazy_trace = _finish_lazy_trace()
 
             print(f"[mlx] forward {sid[:12]}… step={step} seq_pos={out_seq_pos} ({compute_ms}ms)")
             out = {
@@ -1069,6 +1099,7 @@ class MLXBackend:
                     "python_mlx_pure_compute_ms": compute_ms,
                     **inbound_hidden_trace,
                     **hidden_metrics,
+                    **lazy_trace,
                 },
             }
             out.update(hidden_payload)

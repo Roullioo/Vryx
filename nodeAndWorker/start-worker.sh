@@ -42,6 +42,13 @@ if [ "${VRYX_WORKER_SHARD_ONLY:-0}" = "1" ] && [ -z "${VRYX_RUNTIME_BACKEND:-}" 
 fi
 if [ "${VRYX_WORKER_SHARD_ONLY:-0}" = "1" ] && [ "${VRYX_RUNTIME_BACKEND:-}" = "mlx" ]; then
     export VRYX_ENABLE_MLX_RUNTIME="${VRYX_ENABLE_MLX_RUNTIME:-1}"
+    export VRYX_MLX_PREFETCH_SHARD_WEIGHTS="${VRYX_MLX_PREFETCH_SHARD_WEIGHTS:-1}"
+    export VRYX_MLX_PREFETCH_ON_BUILD="${VRYX_MLX_PREFETCH_ON_BUILD:-1}"
+    export VRYX_MLX_LOCAL_GGUF_CACHE="${VRYX_MLX_LOCAL_GGUF_CACHE:-1}"
+    export VRYX_GGUF_LOCAL_CACHE_DIR="${VRYX_GGUF_LOCAL_CACHE_DIR:-${VRYX_WORKER_SHARD_CACHE_DIR:-${HOME}/.cache/vryx/shards}/gguf-cache}"
+    if [ -z "${VRYX_GGUF_LOCAL_SOURCE_PATH:-}" ] && [ -n "${VRYX_MODEL_CACHE_DIR:-}" ] && [ -f "${VRYX_MODEL_CACHE_DIR}/gguf/qwen36-35b-iq4-xs.gguf" ]; then
+        export VRYX_GGUF_LOCAL_SOURCE_PATH="${VRYX_MODEL_CACHE_DIR}/gguf/qwen36-35b-iq4-xs.gguf"
+    fi
     case "$(printf '%s' "$MODEL_ID" | tr '[:upper:]' '[:lower:]')" in
         *llama*70b*)
             export VRYX_ENABLE_LLAMA_MLX_SHARD="${VRYX_ENABLE_LLAMA_MLX_SHARD:-1}"

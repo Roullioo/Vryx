@@ -1302,6 +1302,14 @@ function spawnWorker(config, hardware) {
     env.VRYX_ENABLE_GGUF_MLX_SHARD = '1';
     env.VRYX_ENABLE_LLAMA_MLX_SHARD = validation.model.family === 'Llama' ? '1' : (env.VRYX_ENABLE_LLAMA_MLX_SHARD || '0');
     env.VRYX_GGUF_MLX_CACHE_GB = String(Math.max(2, Math.min(8, Math.floor(Number(config.memoryGb || 8) * 0.25))));
+    env.VRYX_MLX_PREFETCH_SHARD_WEIGHTS = env.VRYX_MLX_PREFETCH_SHARD_WEIGHTS || '1';
+    env.VRYX_MLX_PREFETCH_ON_BUILD = env.VRYX_MLX_PREFETCH_ON_BUILD || '1';
+    env.VRYX_MLX_LOCAL_GGUF_CACHE = env.VRYX_MLX_LOCAL_GGUF_CACHE || '1';
+    env.VRYX_GGUF_LOCAL_CACHE_DIR = env.VRYX_GGUF_LOCAL_CACHE_DIR || path.join(env.VRYX_WORKER_SHARD_CACHE_DIR, 'gguf-cache');
+    const localQwen36Gguf = path.join(env.VRYX_MODEL_CACHE_DIR, 'gguf', 'qwen36-35b-iq4-xs.gguf');
+    if (!env.VRYX_GGUF_LOCAL_SOURCE_PATH && fs.existsSync(localQwen36Gguf)) {
+      env.VRYX_GGUF_LOCAL_SOURCE_PATH = localQwen36Gguf;
+    }
     env.VRYX_MLX_STRICT = '1';
     env.VRYX_DISABLE_PYTORCH_FALLBACK = '1';
   }

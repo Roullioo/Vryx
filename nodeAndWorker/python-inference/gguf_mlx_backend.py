@@ -8,6 +8,7 @@ LRU cache so a worker never has to materialize the full 70B model.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import ssl
 import time
@@ -35,6 +36,53 @@ except Exception:  # pragma: no cover - optional dependency handled at runtime.
 
 def _truthy_env(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int_env(name: str, default: int = 0) -> int:
+    try:
+        return int(float(os.environ.get(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_env(name: str, default: float = 0.0) -> float:
+    try:
+        return float(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_cache_component(value: str) -> str:
+    out = []
+    for ch in value:
+        out.append(ch if ch.isalnum() or ch in ("-", "_", ".") else "_")
+    safe = "".join(out).strip("._")
+    return (safe or "default")[:96]
+
+
+def _prefetch_sort_key(name: str) -> tuple[int, int, int, str]:
+    if name.startswith("embed_tokens."):
+        return (0, -1, 0, name)
+    if name.startswith("layers."):
+        parts = name.split(".")
+        try:
+            layer = int(parts[1])
+        except Exception:
+            layer = 0
+        tail = ".".join(parts[2:])
+        priority = 50
+        if "input_layernorm" in tail:
+            priority = 0
+        elif ".linear_attn." in tail or ".self_attn." in tail:
+            priority = 10
+        elif "post_attention_layernorm" in tail:
+            priority = 20
+        elif ".mlp.gate" in tail or ".mlp.switch_mlp" in tail or ".mlp.shared_expert" in tail:
+            priority = 30
+        return (1, layer, priority, name)
+    if name.startswith("norm.") or name.startswith("lm_head."):
+        return (2, 10_000, 0, name)
+    return (3, 10_000, 0, name)
 
 
 def _range_ssl_context(source_url: str) -> ssl.SSLContext | None:
@@ -143,12 +191,61 @@ class LazyGgufWeights:
         self.shard = shard
         self.mx = mx
         self.path = str(getattr(shard, "weight_file_path", "") or "")
+        local_source_path = (
+            os.environ.get("VRYX_GGUF_LOCAL_SOURCE_PATH")
+            or os.environ.get("VRYX_MLX_LOCAL_GGUF_SOURCE_PATH")
+            or ""
+        ).strip()
+        if local_source_path and os.path.isfile(os.path.expanduser(local_source_path)):
+            self.path = os.path.abspath(os.path.expanduser(local_source_path))
         self.max_cache_bytes = max(256 * 1024 * 1024, int(max_cache_bytes))
         self.entries: dict[str, dict[str, Any]] = {}
         self.aliases: dict[str, str] = {}
         self.cache: OrderedDict[str, tuple[Any, int]] = OrderedDict()
         self.cache_bytes = 0
         self.estimated_dense_bytes = 0
+        self.prefetch_enabled = False
+        self.prefetch_stats: dict[str, Any] = {
+            "gguf_prefetch_enabled": False,
+            "gguf_prefetch_in_progress": False,
+            "gguf_prefetch_ms": 0,
+            "gguf_prefetch_bytes": 0,
+            "gguf_prefetch_dense_bytes": 0,
+            "gguf_prefetch_tensor_count": 0,
+            "gguf_prefetch_errors": [],
+        }
+        self.stats: dict[str, Any] = {
+            "lazy_hits": 0,
+            "lazy_misses": 0,
+            "lazy_read_ms": 0,
+            "lazy_dequant_ms": 0,
+            "lazy_materialize_ms": 0,
+            "lazy_source_bytes": 0,
+            "lazy_dense_bytes": 0,
+            "local_cache_hits": 0,
+            "local_cache_misses": 0,
+            "local_cache_write_errors": 0,
+        }
+        self.local_source_path = self.path if self.path and os.path.isfile(self.path) else ""
+        self.forward_count = 0
+        self._active_forward: dict[str, Any] | None = None
+        self.first_forward_stats: dict[str, Any] = {}
+        self.last_forward_stats: dict[str, Any] = {}
+        self.local_cache_enabled = _truthy_env("VRYX_MLX_LOCAL_GGUF_CACHE")
+        cache_base = (
+            os.environ.get("VRYX_GGUF_LOCAL_CACHE_DIR")
+            or os.environ.get("VRYX_MLX_LOCAL_GGUF_CACHE_DIR")
+            or os.environ.get("VRYX_WORKER_SHARD_CACHE_DIR")
+            or os.path.join("~", ".cache", "vryx", "gguf-ranges")
+        )
+        session_component = _safe_cache_component(str(getattr(shard, "session_id", "") or "session"))
+        self.local_cache_dir = os.path.abspath(os.path.expanduser(os.path.join(cache_base, "gguf-ranges", session_component)))
+        if self.local_cache_enabled:
+            try:
+                os.makedirs(self.local_cache_dir, exist_ok=True)
+            except Exception as exc:
+                self.local_cache_enabled = False
+                self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append(f"local_cache_dir:{exc}")
         self.raw_mapped_samples: list[dict[str, str]] = []
         self.raw_unmapped_samples: list[str] = []
         for raw_entry in list(getattr(shard, "gguf_tensor_index", []) or []):
@@ -181,6 +278,22 @@ class LazyGgufWeights:
         if "lm_head.weight" not in self.entries and "embed_tokens.weight" in self.entries:
             # Llama GGUF may tie output to token embeddings.
             self.entries["lm_head.weight"] = self.entries["embed_tokens.weight"]
+        if self.local_source_path:
+            try:
+                required_size = max(
+                    int(entry.get("source_offset") or entry.get("offset") or 0) + int(entry.get("nbytes") or 0)
+                    for entry in self.entries.values()
+                )
+                if os.path.getsize(self.local_source_path) < required_size:
+                    self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append("local_source_incomplete")
+                    self.path = ""
+                    self.local_source_path = ""
+            except ValueError:
+                pass
+            except Exception as exc:
+                self.prefetch_stats.setdefault("gguf_prefetch_errors", []).append(f"local_source_check:{exc}")
+                self.path = ""
+                self.local_source_path = ""
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -232,51 +345,244 @@ class LazyGgufWeights:
         self.cache.clear()
         self.cache_bytes = 0
 
+    def _bump(self, key: str, value: int = 1) -> None:
+        self.stats[key] = int(self.stats.get(key) or 0) + int(value)
+        if self._active_forward is not None:
+            self._active_forward[key] = int(self._active_forward.get(key) or 0) + int(value)
+
+    def begin_forward(self) -> None:
+        self._active_forward = {
+            "started_at": time.perf_counter(),
+            "lazy_hits": 0,
+            "lazy_misses": 0,
+            "lazy_read_ms": 0,
+            "lazy_dequant_ms": 0,
+            "lazy_materialize_ms": 0,
+            "lazy_source_bytes": 0,
+            "lazy_dense_bytes": 0,
+            "local_cache_hits": 0,
+            "local_cache_misses": 0,
+        }
+
+    def end_forward(self) -> dict[str, Any]:
+        active = self._active_forward or {"started_at": time.perf_counter()}
+        active["forward_wall_ms"] = max(0, int((time.perf_counter() - float(active.get("started_at") or time.perf_counter())) * 1000))
+        active.pop("started_at", None)
+        self.last_forward_stats = dict(active)
+        if self.forward_count == 0:
+            self.first_forward_stats = dict(active)
+        self.forward_count += 1
+        self._active_forward = None
+        return self.snapshot_stats()
+
+    def _range_cache_path(self, entry: dict[str, Any]) -> str:
+        source_url = str(entry.get("source_url") or "").split("?", 1)[0]
+        raw_name = str(entry.get("name") or entry.get("mapped_name") or "tensor")
+        source_offset = int(entry.get("source_offset") or 0)
+        nbytes = int(entry.get("nbytes") or 0)
+        digest = hashlib.sha256(f"{source_url}|{source_offset}|{nbytes}|{raw_name}".encode("utf-8")).hexdigest()[:32]
+        return os.path.join(self.local_cache_dir, f"{digest}-{_safe_cache_component(raw_name)[:48]}.bin")
+
+    def _read_range_bytes(self, entry: dict[str, Any], source_url: str, source_offset: int, nbytes: int) -> tuple[bytes, bool, int]:
+        cache_path = self._range_cache_path(entry) if self.local_cache_enabled else ""
+        if cache_path:
+            try:
+                if os.path.isfile(cache_path) and os.path.getsize(cache_path) == nbytes:
+                    read_t0 = time.perf_counter()
+                    with open(cache_path, "rb") as fp:
+                        data = fp.read()
+                    if len(data) == nbytes:
+                        return data, True, max(0, int((time.perf_counter() - read_t0) * 1000))
+            except Exception:
+                pass
+        read_t0 = time.perf_counter()
+        req = urllib.request.Request(source_url, method="GET")
+        req.add_header("Range", f"bytes={source_offset}-{source_offset + nbytes - 1}")
+        with urllib.request.urlopen(
+            req,
+            timeout=float(os.environ.get("VRYX_GGUF_RANGE_FETCH_TIMEOUT_SEC", "180")),
+            context=_range_ssl_context(source_url),
+        ) as resp:
+            status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+            if status != 206:
+                raise RuntimeError(f"gguf_range_non_supporte:{status}")
+            data = resp.read(nbytes)
+        read_ms = max(0, int((time.perf_counter() - read_t0) * 1000))
+        if len(data) != nbytes:
+            raise RuntimeError(f"gguf_range_incomplet:{len(data)}/{nbytes}")
+        if cache_path:
+            try:
+                tmp_path = f"{cache_path}.part-{os.getpid()}"
+                with open(tmp_path, "wb") as fp:
+                    fp.write(data)
+                os.replace(tmp_path, cache_path)
+            except Exception:
+                self._bump("local_cache_write_errors")
+                try:
+                    if "tmp_path" in locals() and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+        return data, False, read_ms
+
     def get(self, key: str, default: Any = None) -> Any:
         mapped = self.aliases.get(key, key)
         if mapped in self.cache:
             value, nbytes = self.cache.pop(mapped)
             self.cache[mapped] = (value, nbytes)
+            self._bump("lazy_hits")
             return value
         entry = self.entries.get(mapped)
         if not entry:
             return default
-        value, nbytes = self._load_entry(entry)
+        self._bump("lazy_misses")
+        value, nbytes, metrics = self._load_entry(entry)
+        self._bump("lazy_read_ms", int(metrics.get("read_ms") or 0))
+        self._bump("lazy_dequant_ms", int(metrics.get("dequant_ms") or 0))
+        self._bump("lazy_materialize_ms", int(metrics.get("materialize_ms") or 0))
+        self._bump("lazy_source_bytes", int(metrics.get("source_bytes") or 0))
+        self._bump("lazy_dense_bytes", int(metrics.get("dense_bytes") or 0))
+        self._bump("local_cache_hits" if metrics.get("local_cache_hit") else "local_cache_misses")
         self.cache[mapped] = (value, nbytes)
         self.cache_bytes += nbytes
         self._evict_if_needed(protect=mapped)
         return value
 
-    def _load_entry(self, entry: dict[str, Any]) -> tuple[Any, int]:
+    def _load_entry(self, entry: dict[str, Any]) -> tuple[Any, int, dict[str, Any]]:
         nbytes = int(entry.get("nbytes") or 0)
         shape = tuple(int(x) for x in (entry.get("shape") or []))
         ggml_type = entry.get("ggml_type")
+        read_ms = 0
+        local_cache_hit = False
         if self.path and os.path.isfile(self.path):
-            offset = int(entry.get("offset") or 0)
+            offset = int(entry.get("offset") if entry.get("offset") is not None else entry.get("source_offset") or 0)
             raw = np.memmap(self.path, dtype=np.uint8, mode="r", offset=offset, shape=(nbytes,))
         else:
             source_url = str(entry.get("source_url") or "")
             source_offset = int(entry.get("source_offset") or 0)
             if not source_url or nbytes <= 0:
                 raise RuntimeError("gguf_range_source_missing")
-            req = urllib.request.Request(source_url, method="GET")
-            req.add_header("Range", f"bytes={source_offset}-{source_offset + nbytes - 1}")
-            with urllib.request.urlopen(
-                req,
-                timeout=float(os.environ.get("VRYX_GGUF_RANGE_FETCH_TIMEOUT_SEC", "180")),
-                context=_range_ssl_context(source_url),
-            ) as resp:
-                status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
-                if status != 206:
-                    raise RuntimeError(f"gguf_range_non_supporte:{status}")
-                data = resp.read(nbytes)
-            if len(data) != nbytes:
-                raise RuntimeError(f"gguf_range_incomplet:{len(data)}/{nbytes}")
+            data, local_cache_hit, read_ms = self._read_range_bytes(entry, source_url, source_offset, nbytes)
             raw = np.frombuffer(data, dtype=np.uint8)
+        dequant_t0 = time.perf_counter()
         dense = _dequantize(raw, ggml_type, shape)
+        dequant_ms = max(0, int((time.perf_counter() - dequant_t0) * 1000))
+        materialize_t0 = time.perf_counter()
         value = self.mx.array(dense, dtype=self.mx.float16)
         self.mx.eval(value)
-        return value, int(dense.nbytes)
+        materialize_ms = max(0, int((time.perf_counter() - materialize_t0) * 1000))
+        dense_bytes = int(dense.nbytes)
+        return value, dense_bytes, {
+            "read_ms": read_ms,
+            "dequant_ms": dequant_ms,
+            "materialize_ms": materialize_ms,
+            "source_bytes": nbytes,
+            "dense_bytes": dense_bytes,
+            "local_cache_hit": local_cache_hit,
+        }
+
+    def prefetch(self, keys: list[str] | None = None) -> dict[str, Any]:
+        self.prefetch_enabled = True
+        t0 = time.perf_counter()
+        ordered = list(keys or sorted(self.entries.keys(), key=_prefetch_sort_key))
+        max_tensors = _int_env("VRYX_MLX_PREFETCH_MAX_TENSORS", 0)
+        max_source_bytes = int(max(0.0, _float_env("VRYX_MLX_PREFETCH_MAX_GB", 0.0)) * 1024**3)
+        fetched = 0
+        source_bytes = 0
+        dense_bytes = 0
+        errors: list[str] = []
+        self.prefetch_stats = {
+            "gguf_prefetch_enabled": True,
+            "gguf_prefetch_in_progress": True,
+            "gguf_prefetch_ms": 0,
+            "gguf_prefetch_bytes": 0,
+            "gguf_prefetch_dense_bytes": 0,
+            "gguf_prefetch_tensor_count": 0,
+            "gguf_prefetch_total_tensors": len(ordered),
+            "gguf_prefetch_last_key": None,
+            "gguf_prefetch_errors": [],
+        }
+        for key in ordered:
+            if max_tensors > 0 and fetched >= max_tensors:
+                break
+            entry = self.entries.get(key)
+            if not entry:
+                continue
+            entry_bytes = int(entry.get("nbytes") or 0)
+            if max_source_bytes > 0 and fetched > 0 and source_bytes + entry_bytes > max_source_bytes:
+                break
+            try:
+                before_dense = int(self.stats.get("lazy_dense_bytes") or 0)
+                self.get(key)
+                after_dense = int(self.stats.get("lazy_dense_bytes") or 0)
+                fetched += 1
+                source_bytes += entry_bytes
+                dense_bytes += max(0, after_dense - before_dense)
+                self.prefetch_stats.update({
+                    "gguf_prefetch_ms": max(0, int((time.perf_counter() - t0) * 1000)),
+                    "gguf_prefetch_bytes": int(source_bytes),
+                    "gguf_prefetch_dense_bytes": int(dense_bytes),
+                    "gguf_prefetch_tensor_count": int(fetched),
+                    "gguf_prefetch_total_tensors": len(ordered),
+                    "gguf_prefetch_last_key": key,
+                })
+            except Exception as exc:
+                if len(errors) < 8:
+                    errors.append(f"{key}:{exc}")
+                self.prefetch_stats["gguf_prefetch_errors"] = list(errors)
+        self.prefetch_stats = {
+            "gguf_prefetch_enabled": True,
+            "gguf_prefetch_in_progress": False,
+            "gguf_prefetch_ms": max(0, int((time.perf_counter() - t0) * 1000)),
+            "gguf_prefetch_bytes": int(source_bytes),
+            "gguf_prefetch_dense_bytes": int(dense_bytes),
+            "gguf_prefetch_tensor_count": int(fetched),
+            "gguf_prefetch_total_tensors": len(ordered),
+            "gguf_prefetch_last_key": ordered[min(fetched, len(ordered)) - 1] if fetched > 0 and ordered else None,
+            "gguf_prefetch_errors": errors,
+        }
+        print(
+            "[mlx][gguf] prefetch "
+            f"enabled=1 tensors={fetched}/{len(ordered)} "
+            f"source={source_bytes / 1024**2:.1f}MiB dense={dense_bytes / 1024**2:.1f}MiB "
+            f"ms={self.prefetch_stats['gguf_prefetch_ms']} cache_bytes={self.cache_bytes / 1024**2:.1f}MiB "
+            f"errors={errors[:2]}"
+        )
+        return dict(self.prefetch_stats)
+
+    def snapshot_stats(self) -> dict[str, Any]:
+        local_hits = int(self.stats.get("local_cache_hits") or 0)
+        local_misses = int(self.stats.get("local_cache_misses") or 0)
+        local_total = local_hits + local_misses
+        first = self.first_forward_stats or {}
+        last = self.last_forward_stats or {}
+        return {
+            **dict(self.prefetch_stats),
+            "lazy_cache_bytes": int(self.cache_bytes),
+            "lazy_cache_max_bytes": int(self.max_cache_bytes),
+            "lazy_cache_entries": len(self.cache),
+            "lazy_total_hits": int(self.stats.get("lazy_hits") or 0),
+            "lazy_total_misses": int(self.stats.get("lazy_misses") or 0),
+            "lazy_total_read_ms": int(self.stats.get("lazy_read_ms") or 0),
+            "lazy_total_dequant_ms": int(self.stats.get("lazy_dequant_ms") or 0),
+            "local_cache_enabled": bool(self.local_cache_enabled),
+            "local_source_path_present": bool(self.local_source_path),
+            "local_cache_hit_rate": round((local_hits / local_total), 4) if local_total else 0.0,
+            "local_cache_hits": local_hits,
+            "local_cache_misses": local_misses,
+            "local_cache_write_errors": int(self.stats.get("local_cache_write_errors") or 0),
+            "first_forward_lazy_misses": int(first.get("lazy_misses") or 0),
+            "first_forward_lazy_read_ms": int(first.get("lazy_read_ms") or 0),
+            "first_forward_dequant_ms": int(first.get("lazy_dequant_ms") or 0),
+            "first_forward_materialize_ms": int(first.get("lazy_materialize_ms") or 0),
+            "first_forward_wall_ms": int(first.get("forward_wall_ms") or 0),
+            "last_forward_lazy_misses": int(last.get("lazy_misses") or 0),
+            "last_forward_lazy_read_ms": int(last.get("lazy_read_ms") or 0),
+            "last_forward_dequant_ms": int(last.get("lazy_dequant_ms") or 0),
+            "last_forward_materialize_ms": int(last.get("lazy_materialize_ms") or 0),
+            "last_forward_wall_ms": int(last.get("forward_wall_ms") or 0),
+            "forward_count": int(self.forward_count),
+        }
 
     def _evict_if_needed(self, *, protect: str) -> None:
         while self.cache_bytes > self.max_cache_bytes and len(self.cache) > 1:
@@ -374,6 +680,9 @@ class GGUFLazyMLXBackend(MLXBackend):
         self.linear_states = [{} for _ in range(max(0, self.shard.layer_end - self.shard.layer_start + 1))]
         if _STATE_ALLOCATOR is not None:
             self.state_page = _STATE_ALLOCATOR.acquire(self.shard.session_id)
+        prefetch_stats: dict[str, Any] = self.weights.snapshot_stats()
+        if _truthy_env("VRYX_MLX_PREFETCH_SHARD_WEIGHTS") or _truthy_env("VRYX_MLX_PREFETCH_ON_BUILD"):
+            prefetch_stats = self.weights.prefetch()
         self.shard.build_ms = int((time.perf_counter() - t0) * 1000)
         setattr(self.shard, "gguf_backend_ready", True)
         setattr(self.shard, "build_ready", True)
@@ -396,9 +705,11 @@ class GGUFLazyMLXBackend(MLXBackend):
             "dense_fp16_estimate_gb": round(dense_gb, 2),
             "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "rss_mb": round(_rss_mb(), 1),
+            **prefetch_stats,
         }
 
     def status(self) -> dict[str, Any]:
+        lazy_stats = self.weights.snapshot_stats() if hasattr(self.weights, "snapshot_stats") else {}
         return {
             "runtime_backend": "mlx",
             "runtime_backend_detail": self.name,
@@ -421,9 +732,11 @@ class GGUFLazyMLXBackend(MLXBackend):
             "mapped_weight_sample_keys": list(self.weights.keys())[:40] if self.weights else [],
             "gguf_raw_mapped_samples": getattr(self.weights, "raw_mapped_samples", []),
             "gguf_raw_unmapped_samples": getattr(self.weights, "raw_unmapped_samples", []),
+            **lazy_stats,
         }
 
     def capabilities(self) -> dict[str, Any]:
+        lazy_stats = self.weights.snapshot_stats() if hasattr(self.weights, "snapshot_stats") else {}
         return {
             "runtime_backend": "mlx",
             "runtime_backend_detail": self.name,
@@ -442,6 +755,7 @@ class GGUFLazyMLXBackend(MLXBackend):
             "paged_kv_cache": False,
             "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "q4_hidden_transport_supported": bool(self.available),
+            **lazy_stats,
         }
 
     def unload(self) -> None:

@@ -3823,6 +3823,26 @@ def _prepared_gguf_assignments_for_peers(peers: list[str]) -> list[tuple[str, in
     return out if len(out) >= min(len(peers), len(manifests)) else None
 
 
+def _log_speed_aware_prepared_manifest_hint(assignments: list[tuple[str, int, int, bool, bool]]) -> None:
+    if os.environ.get("VRYX_SCHEDULER_SPEED_AWARE", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    if not assignments:
+        return
+    try:
+        first_max = int(float(os.environ.get("VRYX_SCHEDULER_FIRST_MAX_LAYERS") or os.environ.get("VRYX_M1_MAX_LAYERS") or "2"))
+    except (TypeError, ValueError):
+        first_max = 2
+    first = assignments[0]
+    first_layers = max(0, int(first[2]) - int(first[1]) + 1)
+    if first_layers > max(1, first_max):
+        print(
+            "[VPS] VRYX_SCHEDULER_SPEED_AWARE=1 demandé, mais le manifeste GGUF préparé "
+            f"donne encore {first_layers} couches au premier worker. Régénère les manifests avec "
+            f"prepare_gguf_worker_manifests.py --speed-aware --speed-aware-first-max-layers {first_max}; "
+            "l'orchestrateur ne re-slice pas un manifeste déjà filtré pour éviter des ranges manquants."
+        )
+
+
 def _delete_temp_shard_files(session_id: str, peer_idx: Any) -> None:
     if os.environ.get("VRYX_DELETE_SHARD_MANIFEST_AFTER_INIT", "0").strip().lower() not in ("1", "true", "yes", "on"):
         return
@@ -4750,6 +4770,7 @@ def _plan_pipeline_assignments(
     total_layers = model_config["num_hidden_layers_total"]
     prepared_gguf_assignments = _prepared_gguf_assignments_for_peers(peers)
     if prepared_gguf_assignments:
+        _log_speed_aware_prepared_manifest_hint(prepared_gguf_assignments)
         ordered = [a[0] for a in prepared_gguf_assignments]
         return ordered, prepared_gguf_assignments
 
