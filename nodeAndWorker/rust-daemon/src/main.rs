@@ -530,10 +530,80 @@ async fn handle_chain_control_frame(
                     );
                 }
             };
+            let forward_dtype = body
+                .get("forward_dtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("vryx.shard.pipeline")
+                .to_string();
+            let current_payload = body
+                .get("payload_b64")
+                .and_then(|v| v.as_str())
+                .and_then(|s| general_purpose::STANDARD.decode(s).ok())
+                .unwrap_or_default();
+            let next_payload = if forward_dtype.starts_with("vryx.chain.fake_tensor") {
+                current_payload
+            } else {
+                match tokio::time::timeout(
+                    chain_total_step_timeout(),
+                    call_local_inference(
+                        grpc_port,
+                        current_payload,
+                        forward_dtype.clone(),
+                        Vec::new(),
+                        frame.session_id.clone(),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok((data, _c, _s, _metrics, _c_ms))) => data,
+                    Ok(Err(e)) => {
+                        return (
+                            false,
+                            serde_json::json!({
+                                "ok": false,
+                                "chain_type": "CHAIN_ERROR",
+                                "error": format!("chain_forward_local_compute_failed: {}", e),
+                                "latency_ms": started.elapsed().as_millis() as u64,
+                            })
+                            .to_string()
+                            .into_bytes(),
+                        );
+                    }
+                    Err(_) => {
+                        return (
+                            false,
+                            serde_json::json!({
+                                "ok": false,
+                                "chain_type": "CHAIN_ERROR",
+                                "error": "chain_forward_local_compute_timeout",
+                                "latency_ms": started.elapsed().as_millis() as u64,
+                            })
+                            .to_string()
+                            .into_bytes(),
+                        );
+                    }
+                }
+            };
             if let Some(obj) = body.as_object_mut() {
                 obj.insert(
                     "routing_path".to_string(),
                     serde_json::json!(routing_path[1..].to_vec()),
+                );
+                obj.insert(
+                    "payload_b64".to_string(),
+                    serde_json::json!(general_purpose::STANDARD.encode(&next_payload)),
+                );
+                obj.insert(
+                    "payload_len".to_string(),
+                    serde_json::json!(next_payload.len()),
+                );
+                obj.insert(
+                    "upstream_peer".to_string(),
+                    serde_json::json!(my_peer_id.to_string()),
+                );
+                obj.insert(
+                    "upstream_compute_ms".to_string(),
+                    serde_json::json!(started.elapsed().as_millis() as u64),
                 );
             }
             let payload = serde_json::to_vec(&body).unwrap_or_else(|_| frame.payload.clone());
