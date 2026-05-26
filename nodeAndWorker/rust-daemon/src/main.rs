@@ -291,6 +291,33 @@ struct PipelineStreamHandle {
 }
 
 type PipelineStreamCache = Arc<Mutex<HashMap<String, PipelineStreamHandle>>>;
+type ChainPendingResults =
+    Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>;
+
+fn chain_pending_key(session_id: &str, request_id: &str, step_id: u64) -> String {
+    format!("{}:{}:{}", session_id, request_id, step_id)
+}
+
+fn env_duration_ms(name: &str, default_ms: u64, min_ms: u64, max_ms: u64) -> Duration {
+    let value = std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_ms)
+        .clamp(min_ms, max_ms);
+    Duration::from_millis(value)
+}
+
+fn chain_forward_ack_timeout() -> Duration {
+    env_duration_ms("VRYX_CHAIN_FORWARD_ACK_TIMEOUT_MS", 5_000, 500, 60_000)
+}
+
+fn chain_result_timeout() -> Duration {
+    env_duration_ms("VRYX_CHAIN_RESULT_TIMEOUT_MS", 30_000, 1_000, 300_000)
+}
+
+fn chain_total_step_timeout() -> Duration {
+    env_duration_ms("VRYX_CHAIN_TOTAL_STEP_TIMEOUT_MS", 60_000, 1_000, 600_000)
+}
 
 fn pipeline_stream_cache_key(session_id: &str, peer: &PeerId) -> String {
     format!("{}|{}", session_id, peer)
@@ -453,7 +480,10 @@ async fn read_pipeline_frame(stream: &mut libp2p::Stream) -> std::io::Result<Pip
 }
 
 async fn handle_chain_control_frame(
+    peer: PeerId,
+    my_peer_id: PeerId,
     frame: PipelineFrame,
+    grpc_port: u16,
     stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
     stream_cache: PipelineStreamCache,
     stream_ttl: Duration,
@@ -471,6 +501,275 @@ async fn handle_chain_control_frame(
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default();
+
+    if frame.dtype == "vryx.chain.forward" {
+        let result_peer_str = body
+            .get("result_peer")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| peer.to_string());
+        if let Some(obj) = body.as_object_mut() {
+            obj.entry("result_peer".to_string())
+                .or_insert_with(|| serde_json::json!(result_peer_str.clone()));
+            obj.entry("source_peer".to_string())
+                .or_insert_with(|| serde_json::json!(peer.to_string()));
+        }
+        if let Some(next_peer_str) = routing_path.first() {
+            let next_peer = match PeerId::from_str(next_peer_str) {
+                Ok(peer) => peer,
+                Err(e) => {
+                    return (
+                        false,
+                        serde_json::json!({
+                            "ok": false,
+                            "chain_type": "CHAIN_ERROR",
+                            "error": format!("bad_next_peer: {}", e),
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    );
+                }
+            };
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "routing_path".to_string(),
+                    serde_json::json!(routing_path[1..].to_vec()),
+                );
+            }
+            let payload = serde_json::to_vec(&body).unwrap_or_else(|_| frame.payload.clone());
+            let next_frame = PipelineFrame {
+                frame_type: PIPELINE_FRAME_REQUEST,
+                request_id: frame.request_id.clone(),
+                session_id: frame.session_id.clone(),
+                step_id: frame.step_id,
+                dtype: frame.dtype.clone(),
+                payload,
+            };
+            return match tokio::time::timeout(
+                chain_forward_ack_timeout(),
+                pipeline_stream_roundtrip(
+                    stream_control,
+                    stream_cache,
+                    next_peer,
+                    next_frame,
+                    stream_ttl,
+                ),
+            )
+            .await
+            {
+                Ok(Ok((response, trace))) => {
+                    let mut value = serde_json::from_slice::<serde_json::Value>(&response.payload)
+                        .unwrap_or_else(|_| serde_json::json!({"ok": false, "chain_type": "CHAIN_ERROR", "error": "bad_downstream_ack_json"}));
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("chain_forwarded".to_string(), serde_json::json!(true));
+                        obj.insert(
+                            "chain_ack_ms".to_string(),
+                            serde_json::json!(trace.stream_roundtrip_ms),
+                        );
+                        obj.insert(
+                            "chain_reused".to_string(),
+                            serde_json::json!(trace.stream_reused),
+                        );
+                    }
+                    (
+                        value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+                        value.to_string().into_bytes(),
+                    )
+                }
+                Ok(Err(e)) => (
+                    false,
+                    serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_ERROR",
+                        "error": e,
+                        "latency_ms": started.elapsed().as_millis() as u64,
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                Err(_) => (
+                    false,
+                    serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_ERROR",
+                        "error": "chain_forward_ack_timeout",
+                        "latency_ms": started.elapsed().as_millis() as u64,
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+            };
+        }
+
+        let result_peer = match PeerId::from_str(&result_peer_str) {
+            Ok(peer) => peer,
+            Err(e) => {
+                return (
+                    false,
+                    serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_ERROR",
+                        "error": format!("bad_result_peer: {}", e),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                );
+            }
+        };
+        let forward_dtype = body
+            .get("forward_dtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("vryx.shard.pipeline")
+            .to_string();
+        let payload_bytes = body
+            .get("payload_b64")
+            .and_then(|v| v.as_str())
+            .and_then(|s| general_purpose::STANDARD.decode(s).ok())
+            .unwrap_or_default();
+        let request_id = frame.request_id.clone();
+        let session_id = frame.session_id.clone();
+        let step_id = frame.step_id;
+        let final_peer = body
+            .get("final_peer")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| my_peer_id.to_string());
+        let control_for_result = Arc::clone(&stream_control);
+        let cache_for_result = Arc::clone(&stream_cache);
+        let forward_dtype_for_ack = forward_dtype.clone();
+        let final_peer_for_ack = final_peer.clone();
+        tokio::spawn(async move {
+            let compute_started = Instant::now();
+            let result_body = if forward_dtype.starts_with("vryx.chain.fake_tensor") {
+                serde_json::json!({
+                    "ok": true,
+                    "chain_type": "CHAIN_RESULT",
+                    "session_id": session_id,
+                    "request_id": request_id,
+                    "step_id": step_id,
+                    "from_peer": final_peer,
+                    "final_peer": final_peer,
+                    "dtype": forward_dtype,
+                    "payload_len": payload_bytes.len(),
+                    "payload_b64": general_purpose::STANDARD.encode(&payload_bytes),
+                    "checksum": bytes_checksum(&payload_bytes),
+                    "is_fake_tensor": true,
+                    "compute_ms": compute_started.elapsed().as_millis() as u64,
+                })
+            } else {
+                match call_local_inference(
+                    grpc_port,
+                    payload_bytes,
+                    forward_dtype.clone(),
+                    Vec::new(),
+                    session_id.clone(),
+                )
+                .await
+                {
+                    Ok((data, c, s, metrics, c_ms)) => {
+                        let response = TensorResponse {
+                            data,
+                            compute_time_ns: c,
+                            serialization_time_ns: s,
+                            prompt_tokens_llm: metrics.prompt_tokens,
+                            completion_tokens_llm: metrics.completion_tokens,
+                            total_tokens_llm: metrics.total_tokens,
+                            vps_delegate_ms: compute_started.elapsed().as_millis() as u64,
+                            worker_compute_ms: c_ms,
+                            p2p_messages_in: 0,
+                            p2p_messages_out: 0,
+                            shard_session_id: metrics.shard_session_id,
+                            scheduler_workers_used: 0,
+                            shard_warmup_sent: 0,
+                            compute_time_ms: c_ms,
+                            relay_trace_json: serde_json::json!({
+                                "transport": "pipeline_stream_chain_result_direct",
+                                "worker_seen_request": true,
+                                "worker_compute_ms": c_ms,
+                                "chain_result_direct": true,
+                                "chain_result_from_peer": final_peer,
+                            })
+                            .to_string(),
+                        };
+                        let payload = serde_json::to_vec(&response).unwrap_or_default();
+                        serde_json::json!({
+                            "ok": true,
+                            "chain_type": "CHAIN_RESULT",
+                            "session_id": session_id,
+                            "request_id": request_id,
+                            "step_id": step_id,
+                            "from_peer": final_peer,
+                            "final_peer": final_peer,
+                            "dtype": forward_dtype,
+                            "payload_len": payload.len(),
+                            "payload_b64": general_purpose::STANDARD.encode(&payload),
+                            "compute_ms": c_ms,
+                        })
+                    }
+                    Err(e) => serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_RESULT",
+                        "session_id": session_id,
+                        "request_id": request_id,
+                        "step_id": step_id,
+                        "from_peer": final_peer,
+                        "final_peer": final_peer,
+                        "dtype": forward_dtype,
+                        "payload_len": 0,
+                        "error": format!("chain_result_compute_failed: {}", e),
+                    }),
+                }
+            };
+            let result_frame = PipelineFrame {
+                frame_type: PIPELINE_FRAME_REQUEST,
+                request_id: result_body
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                session_id: result_body
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                step_id,
+                dtype: "vryx.chain.result".to_string(),
+                payload: serde_json::to_vec(&result_body).unwrap_or_default(),
+            };
+            if let Err(e) = pipeline_stream_roundtrip(
+                control_for_result,
+                cache_for_result,
+                result_peer,
+                result_frame,
+                stream_ttl,
+            )
+            .await
+            {
+                eprintln!(
+                    "[CHAIN_RESULT] envoi direct échoué vers {} : {}",
+                    result_peer, e
+                );
+            }
+        });
+        return (
+            true,
+            serde_json::json!({
+                "ok": true,
+                "chain_type": "CHAIN_FORWARD_ACK",
+                "request_id": frame.request_id,
+                "session_id": frame.session_id,
+                "step_id": frame.step_id,
+                "from_peer": my_peer_id.to_string(),
+                "final_peer": final_peer_for_ack,
+                "result_peer": result_peer_str,
+                "dtype": forward_dtype_for_ack,
+                "latency_ms": started.elapsed().as_millis() as u64,
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+
     if let Some(next_peer_str) = routing_path.first() {
         let next_peer = match PeerId::from_str(next_peer_str) {
             Ok(peer) => peer,
@@ -566,7 +865,9 @@ async fn handle_chain_control_frame(
                         "vryx.chain.hello",
                         "vryx.chain.ping",
                         "vryx.chain.echo",
-                        "vryx.chain.fake_tensor"
+                        "vryx.chain.fake_tensor",
+                        "vryx.chain.forward",
+                        "vryx.chain.result"
                     ],
                 })
                 .to_string()
@@ -596,12 +897,14 @@ async fn handle_chain_control_frame(
 
 async fn handle_pipeline_stream(
     peer: PeerId,
+    my_peer_id: PeerId,
     mut stream: libp2p::Stream,
     grpc_port: u16,
     trace_shard: Arc<Mutex<Option<serde_json::Value>>>,
     stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
     stream_cache: PipelineStreamCache,
     stream_ttl: Duration,
+    chain_pending_results: ChainPendingResults,
 ) {
     loop {
         let frame =
@@ -625,9 +928,68 @@ async fn handle_pipeline_stream(
             );
             continue;
         }
+        if frame.dtype == "vryx.chain.result" {
+            let result_json = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                .unwrap_or_else(|_| serde_json::json!({"ok": false, "chain_type": "CHAIN_ERROR", "error": "bad_chain_result_json"}));
+            let session = result_json
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&frame.session_id);
+            let request = result_json
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&frame.request_id);
+            let step = result_json
+                .get("step_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(frame.step_id);
+            let key = chain_pending_key(session, request, step);
+            let pending = { chain_pending_results.lock().await.remove(&key) };
+            let duplicate = pending.is_none();
+            if let Some(tx) = pending {
+                let _ = tx.send(result_json.clone());
+            } else {
+                eprintln!(
+                    "[CHAIN_RESULT] duplicate_or_unknown_result key={} from={}",
+                    key, peer
+                );
+            }
+            let response_frame = PipelineFrame {
+                frame_type: PIPELINE_FRAME_RESPONSE,
+                request_id: frame.request_id,
+                session_id: frame.session_id,
+                step_id: frame.step_id,
+                dtype: frame.dtype,
+                payload: serde_json::json!({
+                    "ok": true,
+                    "chain_type": "CHAIN_RESULT_ACK",
+                    "duplicate": duplicate,
+                    "key": key,
+                    "to_peer": my_peer_id.to_string(),
+                })
+                .to_string()
+                .into_bytes(),
+            };
+            let write_result = tokio::time::timeout(
+                pipeline_frame_deadline(),
+                write_pipeline_frame(&mut stream, &response_frame),
+            )
+            .await;
+            if !matches!(write_result, Ok(Ok(()))) {
+                eprintln!(
+                    "[PIPELINE_STREAM] ack chain_result impossible vers {}",
+                    peer
+                );
+                break;
+            }
+            continue;
+        }
         if frame.dtype.starts_with("vryx.chain.") {
             let response = handle_chain_control_frame(
+                peer,
+                my_peer_id,
                 frame.clone(),
+                grpc_port,
                 Arc::clone(&stream_control),
                 Arc::clone(&stream_cache),
                 stream_ttl,
@@ -2137,6 +2499,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         86400,
     ));
     let pipeline_stream_cache: PipelineStreamCache = Arc::new(Mutex::new(HashMap::new()));
+    let chain_pending_results: ChainPendingResults =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pipeline_stream_control = Arc::new(tokio::sync::Mutex::new(
         swarm.behaviour().stream.new_control(),
     ));
@@ -2247,20 +2611,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let grpc_pipeline_stream = args.grpc_port;
         let control_pipeline_stream = Arc::clone(&pipeline_stream_control);
         let cache_pipeline_stream = Arc::clone(&pipeline_stream_cache);
+        let chain_pending_results_stream = Arc::clone(&chain_pending_results);
         let ttl_pipeline_stream = pipeline_stream_ttl;
         tokio::spawn(async move {
             while let Some((peer, stream)) = pipeline_stream_incoming.next().await {
                 let trace = Arc::clone(&trace_shard_stream);
                 let control = Arc::clone(&control_pipeline_stream);
                 let cache = Arc::clone(&cache_pipeline_stream);
+                let pending = Arc::clone(&chain_pending_results_stream);
                 tokio::spawn(handle_pipeline_stream(
                     peer,
+                    my_peer_id,
                     stream,
                     grpc_pipeline_stream,
                     trace,
                     control,
                     cache,
                     ttl_pipeline_stream,
+                    pending,
                 ));
             }
         });
@@ -2294,11 +2662,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let pipeline_stream_control_chain_axum = Arc::clone(&pipeline_stream_control);
         let pipeline_stream_cache_chain_axum = Arc::clone(&pipeline_stream_cache);
         let pipeline_stream_ttl_chain_axum = pipeline_stream_ttl;
+        let pipeline_stream_control_direct_axum = Arc::clone(&pipeline_stream_control);
+        let pipeline_stream_cache_direct_axum = Arc::clone(&pipeline_stream_cache);
+        let pipeline_stream_ttl_direct_axum = pipeline_stream_ttl;
+        let chain_pending_results_axum = Arc::clone(&chain_pending_results);
+        let my_peer_id_chain_axum = my_peer_id;
         let mode_chat = args.mode.clone();
         let mode_chat_stream = args.mode.clone();
         let mode_relay = args.mode.clone();
         let mode_pipeline_stream = args.mode.clone();
         let mode_chain_stream = args.mode.clone();
+        let mode_chain_forward = args.mode.clone();
         let mode_status_diag = args.mode.clone();
         let mode_tp_diag = args.mode.clone();
         let grpc_axum_health = args.grpc_port;
@@ -2725,6 +3099,303 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             serde_json::json!({"event":"error","error":err.to_string(),"done":true})
                         )))
                         .unwrap(),
+                }
+            }))
+            .route("/api/p2p/chain-forward", post(move |Json(payload): Json<serde_json::Value>| {
+                let control = Arc::clone(&pipeline_stream_control_direct_axum);
+                let cache = Arc::clone(&pipeline_stream_cache_direct_axum);
+                let pending_results = Arc::clone(&chain_pending_results_axum);
+                let mode_chain_stream_call = mode_chain_forward.clone();
+                async move {
+                    use base64::{engine::general_purpose, Engine as _};
+                    let started = Instant::now();
+                    if mode_chain_stream_call != "initiator" {
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({"ok": false, "error": "Chain forward : mode initiateur requis."})),
+                        );
+                    }
+                    let target_str = payload.get("target_peer").and_then(|v| v.as_str()).unwrap_or("");
+                    let final_str = payload.get("final_peer").and_then(|v| v.as_str()).unwrap_or("");
+                    let target_peer: PeerId = match PeerId::from_str(target_str) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"ok": false, "error": "target_peer libp2p invalide."})),
+                            );
+                        }
+                    };
+                    if PeerId::from_str(final_str).is_err() {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"ok": false, "error": "final_peer libp2p invalide."})),
+                        );
+                    }
+                    let forward_dtype = payload
+                        .get("forward_dtype")
+                        .or_else(|| payload.get("dtype"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("vryx.shard.pipeline")
+                        .to_string();
+                    let data_b64 = payload.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+                    let data = match general_purpose::STANDARD.decode(data_b64) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"ok": false, "error": format!("data_b64 : {}", e)})),
+                            );
+                        }
+                    };
+                    let session_id = payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let step_id = payload
+                        .get("step_id")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None })))
+                        .unwrap_or(0);
+                    let key = chain_pending_key(&session_id, &request_id, step_id);
+                    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+                    let pending_count = {
+                        let mut guard = pending_results.lock().await;
+                        if guard.insert(key.clone(), tx).is_some() {
+                            eprintln!("[CHAIN_FORWARD] pending remplacé key={}", key);
+                        }
+                        guard.len()
+                    };
+                    let body = serde_json::json!({
+                        "routing_path": [final_str],
+                        "result_peer": my_peer_id_chain_axum.to_string(),
+                        "final_peer": final_str,
+                        "forward_dtype": forward_dtype,
+                        "payload_b64": general_purpose::STANDARD.encode(&data),
+                        "payload_len": data.len(),
+                    });
+                    let frame = PipelineFrame {
+                        frame_type: PIPELINE_FRAME_REQUEST,
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        step_id,
+                        dtype: "vryx.chain.forward".to_string(),
+                        payload: serde_json::to_vec(&body).unwrap_or_default(),
+                    };
+                    let ack_started = Instant::now();
+                    let ack_result = tokio::time::timeout(
+                        chain_forward_ack_timeout(),
+                        pipeline_stream_roundtrip(control, cache, target_peer, frame, pipeline_stream_ttl_direct_axum),
+                    )
+                    .await;
+                    let chain_ack_ms = ack_started.elapsed().as_millis() as u64;
+                    let ack_trace;
+                    match ack_result {
+                        Ok(Ok((ack_frame, trace))) => {
+                            ack_trace = trace;
+                            let ack_json = serde_json::from_slice::<serde_json::Value>(&ack_frame.payload)
+                                .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "bad_chain_forward_ack_json"}));
+                            if ack_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                                pending_results.lock().await.remove(&key);
+                                return (
+                                    axum::http::StatusCode::BAD_GATEWAY,
+                                    Json(serde_json::json!({
+                                        "ok": false,
+                                        "error": ack_json.get("error").and_then(|v| v.as_str()).unwrap_or("chain_forward_ack_error"),
+                                        "chain_fallback_reason": "chain_forward_ack_error",
+                                        "request_response_fallback": true,
+                                        "relay_trace": {"chain_ack_ms": chain_ack_ms, "chain_pending_count": pending_count},
+                                    })),
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            pending_results.lock().await.remove(&key);
+                            return (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": e,
+                                    "chain_fallback_reason": "chain_forward_failed",
+                                    "request_response_fallback": true,
+                                    "relay_trace": {"chain_ack_ms": chain_ack_ms, "chain_pending_count": pending_count},
+                                })),
+                            );
+                        }
+                        Err(_) => {
+                            pending_results.lock().await.remove(&key);
+                            return (
+                                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "chain_forward_ack_timeout",
+                                    "chain_fallback_reason": "chain_forward_ack_timeout",
+                                    "request_response_fallback": true,
+                                    "relay_trace": {"chain_ack_ms": chain_ack_ms, "chain_pending_count": pending_count},
+                                })),
+                            );
+                        }
+                    }
+                    let wait_started = Instant::now();
+                    let result_timeout = std::cmp::min(chain_result_timeout(), chain_total_step_timeout());
+                    let result_json = match tokio::time::timeout(result_timeout, rx).await {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(_)) => {
+                            pending_results.lock().await.remove(&key);
+                            return (
+                                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "chain_result_waiter_closed",
+                                    "chain_fallback_reason": "chain_result_waiter_closed",
+                                    "request_response_fallback": true,
+                                })),
+                            );
+                        }
+                        Err(_) => {
+                            pending_results.lock().await.remove(&key);
+                            return (
+                                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "chain_result_timeout",
+                                    "chain_fallback_reason": "chain_result_timeout",
+                                    "request_response_fallback": true,
+                                    "relay_trace": {
+                                        "chain_ack_ms": chain_ack_ms,
+                                        "chain_result_wait_ms": wait_started.elapsed().as_millis() as u64,
+                                        "chain_pending_count": pending_count,
+                                    },
+                                })),
+                            );
+                        }
+                    };
+                    let chain_result_wait_ms = wait_started.elapsed().as_millis() as u64;
+                    if result_json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                        return (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": result_json.get("error").and_then(|v| v.as_str()).unwrap_or("chain_result_error"),
+                                "chain_fallback_reason": "chain_result_error",
+                                "request_response_fallback": true,
+                                "chain_result": result_json,
+                            })),
+                        );
+                    }
+                    if result_json.get("is_fake_tensor").and_then(|v| v.as_bool()) == Some(true) {
+                        let trace_json = serde_json::json!({
+                            "dtype": forward_dtype,
+                            "method": "vryx.chain.forward",
+                            "protocol": PIPELINE_STREAM_PROTOCOL,
+                            "transport": "pipeline_stream_chain_result_direct",
+                            "p2p_transport": "pipeline_stream",
+                            "peer_id": target_peer.to_string(),
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "step_id": step_id,
+                            "chain_forward_ms": started.elapsed().as_millis() as u64,
+                            "chain_ack_ms": chain_ack_ms,
+                            "chain_result_wait_ms": chain_result_wait_ms,
+                            "chain_result_direct": true,
+                            "chain_result_from_peer": result_json.get("from_peer").and_then(|v| v.as_str()),
+                            "chain_pending_count": pending_count,
+                            "stream_open_ms": ack_trace.stream_open_ms,
+                            "stream_reused": ack_trace.stream_reused,
+                            "stream_send_ms": ack_trace.stream_send_ms,
+                            "stream_wait_response_ms": ack_trace.stream_wait_response_ms,
+                            "stream_roundtrip_ms": ack_trace.stream_roundtrip_ms,
+                            "request_response_fallback": false,
+                            "frames_sent": ack_trace.frames_sent + 1,
+                            "frames_received": ack_trace.frames_received + 1,
+                        });
+                        return (
+                            axum::http::StatusCode::OK,
+                            Json(serde_json::json!({
+                                "ok": true,
+                                "data": result_json,
+                                "relay_ms": started.elapsed().as_millis() as u64,
+                                "pipeline_stream": true,
+                                "chain_result_direct": true,
+                                "request_response_fallback": false,
+                                "pipeline_stream_trace": trace_json,
+                                "relay_trace": trace_json,
+                            })),
+                        );
+                    }
+                    let payload_b64 = result_json.get("payload_b64").and_then(|v| v.as_str()).unwrap_or("");
+                    let payload_bytes = match general_purpose::STANDARD.decode(payload_b64) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"ok": false, "error": format!("chain_result_payload_b64: {}", e)})),
+                            );
+                        }
+                    };
+                    let resp = match serde_json::from_slice::<TensorResponse>(&payload_bytes) {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            return (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({"ok": false, "error": format!("chain_result_tensor_decode_failed: {}", e)})),
+                            );
+                        }
+                    };
+                    let data_b64 = general_purpose::STANDARD.encode(&resp.data);
+                    let worker_trace = serde_json::from_str::<serde_json::Value>(&resp.relay_trace_json)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let trace_json = serde_json::json!({
+                        "dtype": forward_dtype,
+                        "method": "vryx.chain.forward",
+                        "protocol": PIPELINE_STREAM_PROTOCOL,
+                        "transport": "pipeline_stream_chain_result_direct",
+                        "p2p_transport": "pipeline_stream",
+                        "peer_id": target_peer.to_string(),
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "step_id": step_id,
+                        "payload_bytes": payload_bytes.len(),
+                        "axum_ms": started.elapsed().as_millis() as u64,
+                        "chain_forward_ms": started.elapsed().as_millis() as u64,
+                        "chain_ack_ms": chain_ack_ms,
+                        "chain_result_wait_ms": chain_result_wait_ms,
+                        "chain_result_direct": true,
+                        "chain_result_from_peer": result_json.get("from_peer").and_then(|v| v.as_str()),
+                        "chain_pending_count": pending_count,
+                        "stream_open_ms": ack_trace.stream_open_ms,
+                        "stream_reused": ack_trace.stream_reused,
+                        "stream_send_ms": ack_trace.stream_send_ms,
+                        "stream_wait_response_ms": ack_trace.stream_wait_response_ms,
+                        "stream_roundtrip_ms": ack_trace.stream_roundtrip_ms,
+                        "request_response_fallback": false,
+                        "frames_sent": ack_trace.frames_sent + 1,
+                        "frames_received": ack_trace.frames_received + 1,
+                        "worker_seen_request": true,
+                        "worker_transport_trace": worker_trace,
+                    });
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": true,
+                            "data_b64": data_b64,
+                            "relay_ms": started.elapsed().as_millis() as u64,
+                            "serialization_ms": resp.serialization_time_ns / 1_000_000,
+                            "hidden_bytes": resp.p2p_messages_in,
+                            "persistent_relay": true,
+                            "connection_reuse": ack_trace.stream_reused,
+                            "connection_transport": PIPELINE_STREAM_PROTOCOL,
+                            "prompt_tokens": resp.prompt_tokens_llm,
+                            "completion_tokens": resp.completion_tokens_llm,
+                            "total_tokens": resp.total_tokens_llm,
+                            "vps_delegate_ms": started.elapsed().as_millis() as u64,
+                            "worker_compute_ms": resp.worker_compute_ms,
+                            "compute_time_ms": resp.compute_time_ms,
+                            "shard_session_id": resp.shard_session_id,
+                            "pipeline_stream": true,
+                            "chain_result_direct": true,
+                            "request_response_fallback": false,
+                            "pipeline_stream_trace": trace_json,
+                            "relay_trace": trace_json,
+                        })),
+                    )
                 }
             }))
             .route("/api/p2p/chain-test", post(move |Json(payload): Json<serde_json::Value>| {

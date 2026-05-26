@@ -483,6 +483,7 @@ CHAIN_STREAM = os.environ.get("VRYX_CHAIN_STREAM", "0").lower() in ("1", "true",
 CHAIN_STREAM_FALLBACK_INITIATOR = os.environ.get(
     "VRYX_CHAIN_STREAM_FALLBACK_INITIATOR", "1"
 ).lower() not in ("0", "false", "no", "off")
+CHAIN_RESULT_DIRECT = os.environ.get("VRYX_CHAIN_RESULT_DIRECT", "0").lower() in ("1", "true", "yes", "on")
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
 POOL_PREFERENCE_DEFAULT = os.environ.get("VRYX_POOL_PREFERENCE", "auto").lower()
@@ -2396,6 +2397,114 @@ def _pipeline_stream_raw(
         }
 
 
+def _chain_forward_raw(
+    peer_id: str,
+    final_peer: str,
+    dtype: str,
+    payload: bytes,
+    timeout: float = TIMEOUT,
+) -> dict:
+    trace_ctx = _current_trace_ctx()
+    if trace_ctx is not None:
+        trace_ctx.count_call("/api/p2p/chain-forward")
+        trace_ctx.count_call("chain_forward_frames_sent")
+        if dtype in trace_ctx.call_counts:
+            trace_ctx.count_call(dtype)
+    url = f"{RELAY_URL}/api/p2p/chain-forward"
+    t0 = time.perf_counter()
+    serialization_start = time.perf_counter()
+    session_id = ""
+    step_id = 0
+    request_id = hashlib.sha1(
+        f"chain:{peer_id}:{final_peer}:{dtype}:{time.time_ns()}:{len(payload)}".encode("utf-8")
+    ).hexdigest()[:16]
+    timeout = timeout_for_dtype(dtype, timeout)
+    try:
+        payload_obj = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
+        if isinstance(payload_obj, dict):
+            session_id = str(payload_obj.get("session_id") or "")
+            request_id = str(payload_obj.get("request_id") or request_id)
+            step_id = int(payload_obj.get("step") or 0)
+    except Exception:
+        pass
+    body = json.dumps({
+        "target_peer": peer_id,
+        "final_peer": final_peer,
+        "forward_dtype": dtype,
+        "data_b64": base64.standard_b64encode(payload).decode("ascii"),
+        "session_id": session_id,
+        "request_id": request_id,
+        "step_id": step_id,
+        "stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+    }).encode("utf-8")
+    serialization_ms = int((time.perf_counter() - serialization_start) * 1000)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if isinstance(result, dict):
+                result.setdefault("relay_ms", int((time.perf_counter() - t0) * 1000))
+                result.setdefault("serialization_ms", serialization_ms)
+                result.setdefault("hidden_bytes", len(payload))
+                result.setdefault("pipeline_stream", True)
+                result.setdefault("chain_result_direct", True)
+                result.setdefault("request_response_fallback", False)
+                if trace_ctx is not None and result.get("ok", True) is not False:
+                    trace_ctx.count_call("chain_forward_frames_received")
+            return result
+    except urllib.error.HTTPError as e:
+        body_err = ""
+        parsed_err: dict[str, Any] = {}
+        try:
+            body_err = e.read().decode("utf-8", errors="replace")[:800]
+            parsed_err = json.loads(body_err or "{}")
+        except Exception:
+            parsed_err = {}
+        return {
+            "ok": False,
+            "error": parsed_err.get("error") or f"HTTP {e.code}: {body_err}",
+            "relay_ms": int((time.perf_counter() - t0) * 1000),
+            "serialization_ms": serialization_ms,
+            "hidden_bytes": len(payload),
+            "pipeline_stream": True,
+            "chain_result_direct": True,
+            "request_response_fallback": True,
+            "chain_fallback_reason": parsed_err.get("chain_fallback_reason") or "chain_forward_http_error",
+            "relay_trace": parsed_err.get("relay_trace") if isinstance(parsed_err.get("relay_trace"), dict) else {},
+        }
+    except (TimeoutError, socket.timeout) as ex:
+        return _relay_timeout_payload(
+            peer_id,
+            dtype,
+            request_id,
+            session_id,
+            timeout,
+            int((time.perf_counter() - t0) * 1000),
+            len(payload),
+            [final_peer],
+            detail=str(ex) or "chain_forward_socket_timeout",
+            p2p_transport="pipeline_stream_chain_result_direct",
+            route_mode="initiator_chain_forward",
+        )
+    except Exception as ex:
+        return {
+            "ok": False,
+            "error": f"chain_forward:{type(ex).__name__}:{ex}",
+            "relay_ms": int((time.perf_counter() - t0) * 1000),
+            "serialization_ms": serialization_ms,
+            "hidden_bytes": len(payload),
+            "pipeline_stream": True,
+            "chain_result_direct": True,
+            "request_response_fallback": True,
+            "chain_fallback_reason": "chain_forward_exception",
+        }
+
+
 _batch_queues: dict[str, BatchQueue] = {}
 _batch_threads: dict[str, threading.Thread] = {}
 _batch_lock = threading.Lock()
@@ -2563,12 +2672,22 @@ def _relay_pipeline_chain_once(
         current_payload["routing_path"] = list(peers[1:])
         current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
         request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
-        result = _pipeline_stream_raw(
-            peers[0],
-            dtype,
-            current_payload_bytes,
-            timeout=PIPELINE_STEP_TIMEOUT,
-            routing_path=list(peers[1:]),
+        result = (
+            _chain_forward_raw(
+                peers[0],
+                peers[1],
+                dtype,
+                current_payload_bytes,
+                timeout=PIPELINE_STEP_TIMEOUT,
+            )
+            if CHAIN_RESULT_DIRECT and len(peers) == 2
+            else _pipeline_stream_raw(
+                peers[0],
+                dtype,
+                current_payload_bytes,
+                timeout=PIPELINE_STEP_TIMEOUT,
+                routing_path=list(peers[1:]),
+            )
         )
         relay_trace = result.get("relay_trace") if isinstance(result.get("relay_trace"), dict) else {}
         chain_error = None if result.get("ok", True) else str(result.get("error") or "chain_stream_failed")
@@ -2584,6 +2703,12 @@ def _relay_pipeline_chain_once(
             "chain_route": list(peers),
             "chain_downstream_peer": peers[1],
             "chain_payload_bytes": len(current_payload_bytes),
+            "chain_result_direct": bool(result.get("chain_result_direct")),
+            "chain_result_from_peer": relay_trace.get("chain_result_from_peer"),
+            "chain_forward_ms": relay_trace.get("chain_forward_ms"),
+            "chain_ack_ms": relay_trace.get("chain_ack_ms"),
+            "chain_result_wait_ms": relay_trace.get("chain_result_wait_ms"),
+            "chain_pending_count": relay_trace.get("chain_pending_count"),
             "chain_deadlock_guard_ms": int(PIPELINE_STEP_TIMEOUT * 1000),
             "chain_open_ms": relay_trace.get("stream_open_ms"),
             "chain_handshake_ms": relay_trace.get("stream_open_ms"),
@@ -5932,6 +6057,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     chain_send_ms_total = _sum_hop_int("chain_send_ms")
     chain_wait_ms_total = _sum_hop_int("chain_wait_ms")
     chain_roundtrip_ms_total = _sum_hop_int("chain_roundtrip_ms")
+    chain_forward_ms_total = _sum_hop_int("chain_forward_ms")
+    chain_ack_ms_total = _sum_hop_int("chain_ack_ms")
+    chain_result_wait_ms_total = _sum_hop_int("chain_result_wait_ms")
     chain_payload_bytes_total = _sum_hop_int("chain_payload_bytes")
     chain_deadlock_guard_ms_max = max(
         [int(hop.get("chain_deadlock_guard_ms") or 0) for tok in token_timings if isinstance(tok, dict) for hop in (tok.get("hop_traces") or []) if isinstance(hop, dict)]
@@ -6028,6 +6156,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "pipeline_stream": PIPELINE_STREAM,
         "pipeline_stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
         "chain_stream": CHAIN_STREAM,
+        "chain_result_direct": CHAIN_RESULT_DIRECT,
         "chain_stream_fallback_initiator": CHAIN_STREAM_FALLBACK_INITIATOR,
         "stream_fallback": (
             "request_response_on_stream_failure"
@@ -6183,6 +6312,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "chain_send_ms": chain_send_ms_total,
             "chain_wait_ms": chain_wait_ms_total,
             "chain_roundtrip_ms": chain_roundtrip_ms_total,
+            "chain_forward_ms": chain_forward_ms_total,
+            "chain_ack_ms": chain_ack_ms_total,
+            "chain_result_wait_ms": chain_result_wait_ms_total,
+            "chain_result_direct": CHAIN_RESULT_DIRECT and chain_stream_used_seen,
             "chain_payload_bytes": chain_payload_bytes_total,
             "chain_deadlock_guard_ms": chain_deadlock_guard_ms_max,
             "fallback_used": chain_fallback_count > 0,

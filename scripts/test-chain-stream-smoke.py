@@ -70,12 +70,47 @@ def run_case(api_url: str, source_peer: str, target_peer: str, test: str, payloa
     return ok
 
 
+
+def run_direct_fake(api_url: str, source_peer: str, target_peer: str, timeout: float) -> bool:
+    import base64
+    payload = b"v" * (64 * 1024)
+    body = {
+        "target_peer": source_peer,
+        "final_peer": target_peer,
+        "forward_dtype": "vryx.chain.fake_tensor",
+        "data_b64": base64.b64encode(payload).decode("ascii"),
+        "session_id": "chain-smoke-direct",
+        "request_id": f"chain-smoke-direct-{time.time_ns()}",
+        "step_id": 1,
+    }
+    t0 = time.perf_counter()
+    result = post_json(f"{api_url.rstrip('/')}/api/p2p/chain-forward", body, timeout)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    relay_trace = result.get("relay_trace") if isinstance(result.get("relay_trace"), dict) else {}
+    ok = bool(result.get("ok")) and data.get("chain_type") == "CHAIN_RESULT"
+    print(json.dumps({
+        "ok": ok,
+        "test": "chain_forward_fake_tensor_direct_result",
+        "payload_bytes": len(payload),
+        "elapsed_ms": elapsed_ms,
+        "chain_type": data.get("chain_type"),
+        "chain_result_direct": result.get("chain_result_direct") or relay_trace.get("chain_result_direct"),
+        "chain_result_from_peer": relay_trace.get("chain_result_from_peer") or data.get("from_peer"),
+        "chain_ack_ms": relay_trace.get("chain_ack_ms"),
+        "chain_result_wait_ms": relay_trace.get("chain_result_wait_ms"),
+        "checksum": data.get("checksum"),
+        "error": result.get("error") or data.get("error"),
+    }, ensure_ascii=False))
+    return ok
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", default="http://127.0.0.1:3031")
     parser.add_argument("--source-peer", default="", help="M1 peer id. Defaults to first /api/tp-peers peer.")
     parser.add_argument("--target-peer", default="", help="M4 peer id. Defaults to second /api/tp-peers peer.")
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--direct-result", action="store_true", help="Also test CHAIN_FORWARD + CHAIN_RESULT fake tensor.")
     args = parser.parse_args()
 
     source_peer = args.source_peer
@@ -96,6 +131,8 @@ def main() -> int:
     all_ok = True
     for test, payload_bytes in cases:
         all_ok = run_case(args.api_url, source_peer, target_peer, test, payload_bytes, args.timeout) and all_ok
+    if args.direct_result:
+        all_ok = run_direct_fake(args.api_url, source_peer, target_peer, args.timeout) and all_ok
     return 0 if all_ok else 1
 
 
