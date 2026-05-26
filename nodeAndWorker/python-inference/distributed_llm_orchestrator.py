@@ -5970,6 +5970,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "repetition_penalty": REPETITION_PENALTY,
             },
             "hidden_quic": HIDDEN_QUIC,
+            "chain_stream_request": request_chain_stream,
+            "chain_result_direct_request": request_chain_result_direct,
             "prefix_cache_key": prefix_cache_hit.get("cache_key"),
             "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
             "speculative_heads": SPECULATIVE_HEADS,

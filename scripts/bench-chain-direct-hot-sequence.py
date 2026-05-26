@@ -146,7 +146,7 @@ def main() -> int:
     timeout = _env_float("VRYX_CHAIN_BENCH_TIMEOUT", 240.0)
     prompt = os.environ.get(
         "VRYX_CHAIN_BENCH_PROMPT",
-        "Continue with short comma-separated numbers only: 1, 2, 3, 4,",
+        "Print a long stream of the word alpha separated by spaces. Do not use punctuation. alpha alpha alpha alpha",
     )
     sequence = [int(x) for x in os.environ.get("VRYX_CHAIN_BENCH_SEQUENCE", "1,2,4,8,12").split(",") if x.strip()]
     common = {
@@ -185,6 +185,10 @@ def main() -> int:
         if not summary["ok"]:
             print(json.dumps({"ok": False, "error": "direct_run_failed", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
             return 1
+        if os.environ.get("VRYX_CHAIN_BENCH_REQUIRE_FULL_TOKENS", "1").strip().lower() not in ("0", "false", "no", "off"):
+            if int(summary.get("completion_tokens") or 0) < tokens:
+                print(json.dumps({"ok": False, "error": "short_completion", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
+                return 6
         if tokens >= 2:
             if summary.get("chain_stream_used") is not True or summary.get("chain_result_direct") is not True:
                 print(json.dumps({"ok": False, "error": "chain_not_used", "failed_label": label, "summary": summary}, ensure_ascii=False, sort_keys=True), flush=True)
