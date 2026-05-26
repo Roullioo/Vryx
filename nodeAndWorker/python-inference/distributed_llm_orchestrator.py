@@ -2289,13 +2289,7 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
         }
 
 
-def _pipeline_stream_raw(
-    peer_id: str,
-    dtype: str,
-    payload: bytes,
-    timeout: float = TIMEOUT,
-    routing_path: list | None = None,
-) -> dict:
+def _pipeline_stream_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOUT) -> dict:
     trace_ctx = _current_trace_ctx()
     if trace_ctx is not None:
         trace_ctx.count_call("/api/p2p/pipeline-stream")
@@ -2311,22 +2305,18 @@ def _pipeline_stream_raw(
         f"stream:{peer_id}:{dtype}:{time.time_ns()}:{len(payload)}".encode("utf-8")
     ).hexdigest()[:16]
     timeout = timeout_for_dtype(dtype, timeout)
-    send_payload = payload
     try:
         payload_obj = json.loads(payload.decode("utf-8", errors="replace")) if payload else {}
         if isinstance(payload_obj, dict):
             session_id = str(payload_obj.get("session_id") or "")
             request_id = str(payload_obj.get("request_id") or request_id)
             step_id = int(payload_obj.get("step") or 0)
-            if routing_path:
-                payload_obj["routing_path"] = list(routing_path)
-                send_payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
     except Exception:
         pass
     body = json.dumps({
         "target_peer": peer_id,
         "dtype": dtype,
-        "data_b64": base64.standard_b64encode(send_payload).decode("ascii"),
+        "data_b64": base64.standard_b64encode(payload).decode("ascii"),
         "session_id": session_id,
         "request_id": request_id,
         "step_id": step_id,
@@ -2345,7 +2335,7 @@ def _pipeline_stream_raw(
             if isinstance(result, dict):
                 result.setdefault("relay_ms", int((time.perf_counter() - t0) * 1000))
                 result.setdefault("serialization_ms", serialization_ms)
-                result.setdefault("hidden_bytes", len(send_payload))
+                result.setdefault("hidden_bytes", len(payload))
                 result.setdefault("pipeline_stream", True)
                 result.setdefault("request_response_fallback", False)
                 if trace_ctx is not None and result.get("ok", True) is not False:
@@ -2364,7 +2354,7 @@ def _pipeline_stream_raw(
             "error": parsed_err.get("error") or f"HTTP {e.code}: {body_err}",
             "relay_ms": int((time.perf_counter() - t0) * 1000),
             "serialization_ms": serialization_ms,
-            "hidden_bytes": len(send_payload),
+            "hidden_bytes": len(payload),
             "pipeline_stream": True,
             "request_response_fallback": True,
             "relay_trace": parsed_err.get("relay_trace") if isinstance(parsed_err.get("relay_trace"), dict) else {},
@@ -2377,8 +2367,8 @@ def _pipeline_stream_raw(
             session_id,
             timeout,
             int((time.perf_counter() - t0) * 1000),
-            len(send_payload),
-            routing_path or [],
+            len(payload),
+            [],
             detail=str(ex) or "pipeline_stream_socket_timeout",
             p2p_transport="pipeline_stream",
             route_mode="initiator_pipeline_stream",
@@ -2389,7 +2379,7 @@ def _pipeline_stream_raw(
             "error": f"pipeline_stream:{type(ex).__name__}:{ex}",
             "relay_ms": int((time.perf_counter() - t0) * 1000),
             "serialization_ms": serialization_ms,
-            "hidden_bytes": len(send_payload),
+            "hidden_bytes": len(payload),
             "pipeline_stream": True,
             "request_response_fallback": True,
         }
@@ -2543,9 +2533,7 @@ def _relay_pipeline_chain_once(
     current_payload = payload
     hop_traces: list[dict[str, Any]] = []
     result: dict[str, Any] = {"ok": False, "error": "pipeline chain empty"}
-    stream_chain = bool(PIPELINE_STREAM and dtype == "vryx.shard.pipeline" and len(peers) > 1)
-    pipeline_hops = peers[:1] if stream_chain else peers
-    for hop_index, hop_peer in enumerate(pipeline_hops):
+    for hop_index, hop_peer in enumerate(peers):
         t_hop = time.perf_counter()
         encode_t0 = time.perf_counter()
         current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
@@ -2553,13 +2541,7 @@ def _relay_pipeline_chain_once(
         request_payload_bytes = len(current_payload_bytes)
         used_pipeline_stream = bool(PIPELINE_STREAM and dtype == "vryx.shard.pipeline")
         result = (
-            _pipeline_stream_raw(
-                hop_peer,
-                dtype,
-                current_payload_bytes,
-                timeout=PIPELINE_STEP_TIMEOUT,
-                routing_path=peers[1:] if stream_chain and hop_index == 0 else None,
-            )
+            _pipeline_stream_raw(hop_peer, dtype, current_payload_bytes, timeout=PIPELINE_STEP_TIMEOUT)
             if used_pipeline_stream
             else _relay_raw(
                 hop_peer,
@@ -2581,7 +2563,7 @@ def _relay_pipeline_chain_once(
                 dtype,
                 current_payload_bytes,
                 timeout=PIPELINE_STEP_TIMEOUT,
-                routing_path=peers[1:] if stream_chain and hop_index == 0 else [],
+                routing_path=[],
             )
             result["request_response_fallback"] = True
         hop_traces.append({
@@ -2592,7 +2574,6 @@ def _relay_pipeline_chain_once(
             "payload_dtype": dtype,
             "payload_hidden_transport": current_payload.get("hidden_transport"),
             "pipeline_stream": used_pipeline_stream,
-            "pipeline_stream_chain": stream_chain,
             "request_response_fallback": request_response_fallback or bool(result.get("request_response_fallback")),
             "relay_ms": result.get("relay_ms"),
             "serialization_ms": result.get("serialization_ms"),
@@ -2638,7 +2619,7 @@ def _relay_pipeline_chain_once(
             hop_traces[-1]["response_serialize_ms"] = worker_trace.get("response_serialize_ms")
             hop_traces[-1]["worker_grpc_payload_bytes"] = worker_trace.get("worker_grpc_payload_bytes")
             hop_traces[-1]["python_mlx_pure_compute_ms"] = worker_trace.get("python_mlx_pure_compute_ms")
-        if hop_index < len(pipeline_hops) - 1:
+        if hop_index < len(peers) - 1:
             if response.get("ok") is False:
                 result = {"ok": False, "error": response.get("error") or f"hop {hop_index} refused"}
                 hop_traces[-1]["ok"] = False

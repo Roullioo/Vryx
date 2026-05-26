@@ -440,9 +440,6 @@ async fn handle_pipeline_stream(
     mut stream: libp2p::Stream,
     grpc_port: u16,
     trace_shard: Arc<Mutex<Option<serde_json::Value>>>,
-    stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
-    stream_cache: PipelineStreamCache,
-    stream_ttl: Duration,
 ) {
     loop {
         let frame = match read_pipeline_frame(&mut stream).await {
@@ -461,16 +458,6 @@ async fn handle_pipeline_stream(
         }
         let dtype_in = frame.dtype.clone();
         let session_id = frame.session_id.clone();
-        let routing_path: Vec<String> = serde_json::from_slice::<serde_json::Value>(&frame.payload)
-            .ok()
-            .and_then(|v| {
-                v.get("routing_path").and_then(|r| r.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect::<Vec<String>>()
-                })
-            })
-            .unwrap_or_default();
         let compute_started = Instant::now();
         let response = match call_local_inference(
             grpc_port,
@@ -499,7 +486,7 @@ async fn handle_pipeline_stream(
                             .unwrap_or(0),
                     }));
                 }
-                let mut local_response = TensorResponse {
+                TensorResponse {
                     data,
                     compute_time_ns: c,
                     serialization_time_ns: s,
@@ -521,98 +508,7 @@ async fn handle_pipeline_stream(
                         "pipeline_stream_worker_ms": compute_started.elapsed().as_millis() as u64,
                     })
                     .to_string(),
-                };
-                if let Some(next_peer_str) = routing_path.first() {
-                    match PeerId::from_str(next_peer_str) {
-                        Ok(next_peer) => {
-                            let next_payload = if routing_path.len() > 1 {
-                                serde_json::from_slice::<serde_json::Value>(&local_response.data)
-                                    .ok()
-                                    .and_then(|mut v| {
-                                        if let Some(obj) = v.as_object_mut() {
-                                            obj.insert(
-                                                "routing_path".to_string(),
-                                                serde_json::json!(routing_path[1..].to_vec()),
-                                            );
-                                        }
-                                        serde_json::to_vec(&v).ok()
-                                    })
-                                    .unwrap_or_else(|| local_response.data.clone())
-                            } else {
-                                local_response.data.clone()
-                            };
-                            let next_frame = PipelineFrame {
-                                frame_type: PIPELINE_FRAME_REQUEST,
-                                request_id: frame.request_id.clone(),
-                                session_id: frame.session_id.clone(),
-                                step_id: frame.step_id,
-                                dtype: dtype_in.clone(),
-                                payload: next_payload,
-                            };
-                            match pipeline_stream_roundtrip(
-                                Arc::clone(&stream_control),
-                                Arc::clone(&stream_cache),
-                                next_peer,
-                                next_frame,
-                                stream_ttl,
-                            )
-                            .await
-                            {
-                                Ok((response_frame, trace)) => {
-                                    match serde_json::from_slice::<TensorResponse>(
-                                        &response_frame.payload,
-                                    ) {
-                                        Ok(mut downstream) => {
-                                            downstream.compute_time_ns =
-                                                downstream.compute_time_ns.saturating_add(c);
-                                            downstream.compute_time_ms =
-                                                downstream.compute_time_ms.saturating_add(c_ms);
-                                            downstream.worker_compute_ms =
-                                                downstream.worker_compute_ms.saturating_add(c_ms);
-                                            downstream.relay_trace_json = serde_json::json!({
-                                                "transport": "pipeline_stream_chain",
-                                                "worker_seen_request": true,
-                                                "worker_compute_ms": c_ms,
-                                                "downstream_peer": next_peer.to_string(),
-                                                "downstream_stream_reused": trace.stream_reused,
-                                                "downstream_stream_roundtrip_ms": trace.stream_roundtrip_ms,
-                                                "downstream_frames_sent": trace.frames_sent,
-                                                "downstream_frames_received": trace.frames_received,
-                                            })
-                                            .to_string();
-                                            local_response = downstream;
-                                        }
-                                        Err(e) => {
-                                            local_response.data = serde_json::json!({
-                                                "ok": false,
-                                                "error": format!("pipeline_stream_chain_decode_failed: {}", e),
-                                            })
-                                            .to_string()
-                                            .into_bytes();
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    local_response.data = serde_json::json!({
-                                        "ok": false,
-                                        "error": format!("pipeline_stream_chain_forward_failed: {}", e),
-                                    })
-                                    .to_string()
-                                    .into_bytes();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            local_response.data = serde_json::json!({
-                                "ok": false,
-                                "error": format!("pipeline_stream_bad_next_peer: {}", e),
-                            })
-                            .to_string()
-                            .into_bytes();
-                        }
-                    }
                 }
-                local_response
             }
             Err(e) => TensorResponse {
                 data: serde_json::json!({
@@ -2012,22 +1908,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let trace_shard_stream = Arc::clone(&last_shard_trace);
         let grpc_pipeline_stream = args.grpc_port;
-        let control_pipeline_stream = Arc::clone(&pipeline_stream_control);
-        let cache_pipeline_stream = Arc::clone(&pipeline_stream_cache);
-        let ttl_pipeline_stream = pipeline_stream_ttl;
         tokio::spawn(async move {
             while let Some((peer, stream)) = pipeline_stream_incoming.next().await {
                 let trace = Arc::clone(&trace_shard_stream);
-                let control = Arc::clone(&control_pipeline_stream);
-                let cache = Arc::clone(&cache_pipeline_stream);
                 tokio::spawn(handle_pipeline_stream(
                     peer,
                     stream,
                     grpc_pipeline_stream,
                     trace,
-                    control,
-                    cache,
-                    ttl_pipeline_stream,
                 ));
             }
         });
