@@ -479,6 +479,10 @@ PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE = os.environ.get(
     "VRYX_PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE", "1"
 ).lower() not in ("0", "false", "no", "off")
 PIPELINE_STREAM_TTL_SEC = max(30, int(os.environ.get("VRYX_PIPELINE_STREAM_TTL_SEC", "3600") or "3600"))
+CHAIN_STREAM = os.environ.get("VRYX_CHAIN_STREAM", "0").lower() in ("1", "true", "yes", "on")
+CHAIN_STREAM_FALLBACK_INITIATOR = os.environ.get(
+    "VRYX_CHAIN_STREAM_FALLBACK_INITIATOR", "1"
+).lower() not in ("0", "false", "no", "off")
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
 POOL_PREFERENCE_DEFAULT = os.environ.get("VRYX_POOL_PREFERENCE", "auto").lower()
@@ -2289,7 +2293,13 @@ def _relay_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOU
         }
 
 
-def _pipeline_stream_raw(peer_id: str, dtype: str, payload: bytes, timeout: float = TIMEOUT) -> dict:
+def _pipeline_stream_raw(
+    peer_id: str,
+    dtype: str,
+    payload: bytes,
+    timeout: float = TIMEOUT,
+    routing_path: list[str] | None = None,
+) -> dict:
     trace_ctx = _current_trace_ctx()
     if trace_ctx is not None:
         trace_ctx.count_call("/api/p2p/pipeline-stream")
@@ -2321,6 +2331,7 @@ def _pipeline_stream_raw(peer_id: str, dtype: str, payload: bytes, timeout: floa
         "request_id": request_id,
         "step_id": step_id,
         "stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+        "routing_path": routing_path or [],
     }).encode("utf-8")
     serialization_ms = int((time.perf_counter() - serialization_start) * 1000)
     req = urllib.request.Request(
@@ -2525,12 +2536,110 @@ def _pipeline_micro_decode_enabled(payload: dict[str, Any], peers: list[str]) ->
     return _pipeline_micro_budget_from_payload(payload) > 1
 
 
+def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str, Any]) -> bool:
+    if not (PIPELINE_STREAM and CHAIN_STREAM):
+        return False
+    if dtype != "vryx.shard.pipeline" or len(peers) < 2:
+        return False
+    if payload.get("__disable_chain_stream"):
+        return False
+    try:
+        if int(payload.get("step") or 0) < 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _relay_pipeline_chain_once(
     peers: list[str],
     dtype: str,
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    current_payload = payload
+    if _chain_stream_decode_enabled(peers, dtype, payload):
+        t_chain = time.perf_counter()
+        encode_t0 = time.perf_counter()
+        current_payload = {k: v for k, v in payload.items() if k != "__disable_chain_stream"}
+        current_payload["routing_path"] = list(peers[1:])
+        current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
+        request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
+        result = _pipeline_stream_raw(
+            peers[0],
+            dtype,
+            current_payload_bytes,
+            timeout=PIPELINE_STEP_TIMEOUT,
+            routing_path=list(peers[1:]),
+        )
+        relay_trace = result.get("relay_trace") if isinstance(result.get("relay_trace"), dict) else {}
+        chain_error = None if result.get("ok", True) else str(result.get("error") or "chain_stream_failed")
+        hop_trace = {
+            "peer": peers[0],
+            "rank": 0,
+            "request_payload_bytes": len(current_payload_bytes),
+            "request_json_encode_ms": request_json_encode_ms,
+            "payload_dtype": dtype,
+            "payload_hidden_transport": current_payload.get("hidden_transport"),
+            "pipeline_stream": True,
+            "chain_stream_used": result.get("ok", True) is not False,
+            "chain_route": list(peers),
+            "chain_downstream_peer": peers[1],
+            "chain_payload_bytes": len(current_payload_bytes),
+            "chain_deadlock_guard_ms": int(PIPELINE_STEP_TIMEOUT * 1000),
+            "chain_open_ms": relay_trace.get("stream_open_ms"),
+            "chain_handshake_ms": relay_trace.get("stream_open_ms"),
+            "chain_send_ms": relay_trace.get("stream_send_ms"),
+            "chain_wait_ms": relay_trace.get("stream_wait_response_ms"),
+            "chain_roundtrip_ms": relay_trace.get("stream_roundtrip_ms") or result.get("relay_ms"),
+            "stream_open_ms": relay_trace.get("stream_open_ms"),
+            "stream_reused": relay_trace.get("stream_reused"),
+            "stream_send_ms": relay_trace.get("stream_send_ms"),
+            "stream_wait_response_ms": relay_trace.get("stream_wait_response_ms"),
+            "stream_roundtrip_ms": relay_trace.get("stream_roundtrip_ms"),
+            "frames_sent": relay_trace.get("frames_sent"),
+            "frames_received": relay_trace.get("frames_received"),
+            "request_response_fallback": False,
+            "fallback_used": False,
+            "fallback_reason": None,
+            "relay_ms": result.get("relay_ms"),
+            "serialization_ms": result.get("serialization_ms"),
+            "hidden_bytes": result.get("hidden_bytes"),
+            "worker_compute_ms": result.get("worker_compute_ms") or result.get("compute_time_ms"),
+            "compute_time_ms": result.get("compute_time_ms") or result.get("worker_compute_ms"),
+            "shard_session_id": result.get("shard_session_id"),
+            "ms": int((time.perf_counter() - t_chain) * 1000),
+            "ok": result.get("ok", True) is not False,
+            "error": chain_error,
+            "direct_vs_relay": "chain_stream",
+            "relay_trace": relay_trace,
+        }
+        if result.get("ok", True):
+            try:
+                response = _decode_pipeline_response(result)
+                worker_trace = response.get("transport_trace") if isinstance(response.get("transport_trace"), dict) else {}
+                if worker_trace:
+                    hop_trace["worker_transport_trace"] = worker_trace
+                    hop_trace["payload_hidden_transport_effective"] = (
+                        worker_trace.get("hidden_transport_effective") or response.get("hidden_transport")
+                    )
+                    hop_trace["response_serialize_ms"] = worker_trace.get("response_serialize_ms")
+                    hop_trace["worker_grpc_payload_bytes"] = worker_trace.get("worker_grpc_payload_bytes")
+                    hop_trace["python_mlx_pure_compute_ms"] = worker_trace.get("python_mlx_pure_compute_ms")
+            except Exception as exc:
+                hop_trace["ok"] = False
+                hop_trace["error"] = f"chain_response_decode_failed:{type(exc).__name__}:{exc}"
+                result = {"ok": False, "error": hop_trace["error"]}
+        if result.get("ok", True) or not CHAIN_STREAM_FALLBACK_INITIATOR:
+            return result, [hop_trace]
+        fallback_payload = {k: v for k, v in payload.items() if k != "__disable_chain_stream"}
+        fallback_payload["__disable_chain_stream"] = True
+        fallback_result, fallback_traces = _relay_pipeline_chain_once(peers, dtype, fallback_payload)
+        hop_trace["chain_stream_used"] = False
+        hop_trace["fallback_used"] = True
+        hop_trace["fallback_reason"] = chain_error or "chain_stream_failed"
+        hop_trace["request_response_fallback"] = bool(fallback_result.get("request_response_fallback"))
+        return fallback_result, [hop_trace, *fallback_traces]
+
+    current_payload = {k: v for k, v in payload.items() if k != "__disable_chain_stream"}
     hop_traces: list[dict[str, Any]] = []
     result: dict[str, Any] = {"ok": False, "error": "pipeline chain empty"}
     for hop_index, hop_peer in enumerate(peers):
@@ -2574,7 +2683,10 @@ def _relay_pipeline_chain_once(
             "payload_dtype": dtype,
             "payload_hidden_transport": current_payload.get("hidden_transport"),
             "pipeline_stream": used_pipeline_stream,
+            "chain_stream_used": False,
             "request_response_fallback": request_response_fallback or bool(result.get("request_response_fallback")),
+            "fallback_used": request_response_fallback,
+            "fallback_reason": "pipeline_stream_failed" if request_response_fallback else None,
             "relay_ms": result.get("relay_ms"),
             "serialization_ms": result.get("serialization_ms"),
             "hidden_bytes": result.get("hidden_bytes"),
@@ -5815,11 +5927,24 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     stream_send_ms_total = _sum_hop_int("stream_send_ms")
     stream_wait_response_ms_total = _sum_hop_int("stream_wait_response_ms")
     stream_roundtrip_ms_total = _sum_hop_int("stream_roundtrip_ms")
+    chain_open_ms_total = _sum_hop_int("chain_open_ms")
+    chain_handshake_ms_total = _sum_hop_int("chain_handshake_ms")
+    chain_send_ms_total = _sum_hop_int("chain_send_ms")
+    chain_wait_ms_total = _sum_hop_int("chain_wait_ms")
+    chain_roundtrip_ms_total = _sum_hop_int("chain_roundtrip_ms")
+    chain_payload_bytes_total = _sum_hop_int("chain_payload_bytes")
+    chain_deadlock_guard_ms_max = max(
+        [int(hop.get("chain_deadlock_guard_ms") or 0) for tok in token_timings if isinstance(tok, dict) for hop in (tok.get("hop_traces") or []) if isinstance(hop, dict)]
+        or [0]
+    )
     frames_sent_total = _sum_hop_int("frames_sent")
     frames_received_total = _sum_hop_int("frames_received")
     stream_fallback_count = 0
+    chain_fallback_count = 0
     stream_reused_seen = False
     stream_used_seen = False
+    chain_stream_used_seen = False
+    chain_fallback_reasons: list[str] = []
     for tok in token_timings:
         if not isinstance(tok, dict):
             continue
@@ -5828,8 +5953,13 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 continue
             stream_used_seen = stream_used_seen or bool(hop.get("pipeline_stream"))
             stream_reused_seen = stream_reused_seen or bool(hop.get("stream_reused"))
+            chain_stream_used_seen = chain_stream_used_seen or bool(hop.get("chain_stream_used"))
             if bool(hop.get("request_response_fallback")):
                 stream_fallback_count += 1
+            if bool(hop.get("fallback_used")):
+                chain_fallback_count += 1
+                if hop.get("fallback_reason"):
+                    chain_fallback_reasons.append(str(hop.get("fallback_reason")))
     payload_bytes_by_hop = [
         {
             "step": int(tok.get("step") or 0),
@@ -5897,6 +6027,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "stream_close": stream_close,
         "pipeline_stream": PIPELINE_STREAM,
         "pipeline_stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+        "chain_stream": CHAIN_STREAM,
+        "chain_stream_fallback_initiator": CHAIN_STREAM_FALLBACK_INITIATOR,
         "stream_fallback": (
             "request_response_on_stream_failure"
             if (PIPELINE_STREAM and PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE)
@@ -6044,6 +6176,18 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "stream_send_ms": stream_send_ms_total,
             "stream_wait_response_ms": stream_wait_response_ms_total,
             "stream_roundtrip_ms": stream_roundtrip_ms_total,
+            "chain_stream_enabled": CHAIN_STREAM,
+            "chain_stream_used": chain_stream_used_seen,
+            "chain_open_ms": chain_open_ms_total,
+            "chain_handshake_ms": chain_handshake_ms_total,
+            "chain_send_ms": chain_send_ms_total,
+            "chain_wait_ms": chain_wait_ms_total,
+            "chain_roundtrip_ms": chain_roundtrip_ms_total,
+            "chain_payload_bytes": chain_payload_bytes_total,
+            "chain_deadlock_guard_ms": chain_deadlock_guard_ms_max,
+            "fallback_used": chain_fallback_count > 0,
+            "fallback_reason": chain_fallback_reasons[0] if chain_fallback_reasons else None,
+            "fallback_count": chain_fallback_count,
             "request_response_fallback": stream_fallback_count > 0,
             "request_response_fallback_count": stream_fallback_count,
             "frames_sent": frames_sent_total,

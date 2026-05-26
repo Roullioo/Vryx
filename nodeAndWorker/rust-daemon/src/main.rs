@@ -21,6 +21,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::hash::{Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -257,6 +258,7 @@ const PIPELINE_FRAME_MAGIC: &[u8; 4] = b"VRYX";
 const PIPELINE_FRAME_VERSION: u16 = 1;
 const PIPELINE_FRAME_REQUEST: u8 = 1;
 const PIPELINE_FRAME_RESPONSE: u8 = 2;
+const PIPELINE_FRAME_ERROR: u8 = 255;
 const PIPELINE_FRAME_HEADER_LEN: usize = 32;
 const PIPELINE_FRAME_MAX_PAYLOAD: u64 = 512 * 1024 * 1024;
 
@@ -292,6 +294,21 @@ type PipelineStreamCache = Arc<Mutex<HashMap<String, PipelineStreamHandle>>>;
 
 fn pipeline_stream_cache_key(session_id: &str, peer: &PeerId) -> String {
     format!("{}|{}", session_id, peer)
+}
+
+fn pipeline_frame_deadline() -> Duration {
+    Duration::from_millis(env_u64_clamped(
+        "VRYX_PIPELINE_STREAM_FRAME_TIMEOUT_MS",
+        300_000,
+        1_000,
+        900_000,
+    ))
+}
+
+fn bytes_checksum(data: &[u8]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn put_u16(buf: &mut Vec<u8>, value: u16) {
@@ -435,20 +452,172 @@ async fn read_pipeline_frame(stream: &mut libp2p::Stream) -> std::io::Result<Pip
     })
 }
 
+async fn handle_chain_control_frame(
+    frame: PipelineFrame,
+    stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
+    stream_cache: PipelineStreamCache,
+    stream_ttl: Duration,
+) -> (bool, Vec<u8>) {
+    use base64::{engine::general_purpose, Engine as _};
+    let started = Instant::now();
+    let mut body = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let routing_path: Vec<String> = body
+        .get("routing_path")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    if let Some(next_peer_str) = routing_path.first() {
+        let next_peer = match PeerId::from_str(next_peer_str) {
+            Ok(peer) => peer,
+            Err(e) => {
+                return (
+                    false,
+                    serde_json::json!({
+                        "ok": false,
+                        "chain_type": "CHAIN_ERROR",
+                        "error": format!("bad_next_peer: {}", e),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                );
+            }
+        };
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "routing_path".to_string(),
+                serde_json::json!(routing_path[1..].to_vec()),
+            );
+        }
+        let payload = serde_json::to_vec(&body).unwrap_or_else(|_| frame.payload.clone());
+        let next_frame = PipelineFrame {
+            frame_type: PIPELINE_FRAME_REQUEST,
+            request_id: frame.request_id,
+            session_id: frame.session_id,
+            step_id: frame.step_id,
+            dtype: frame.dtype,
+            payload,
+        };
+        return match pipeline_stream_roundtrip(
+            stream_control,
+            stream_cache,
+            next_peer,
+            next_frame,
+            stream_ttl,
+        )
+        .await
+        {
+            Ok((response, trace)) => {
+                let mut value = serde_json::from_slice::<serde_json::Value>(&response.payload)
+                    .unwrap_or_else(|_| serde_json::json!({"ok": false, "chain_type": "CHAIN_ERROR", "error": "bad_downstream_json"}));
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("chain_forwarded".to_string(), serde_json::json!(true));
+                    obj.insert(
+                        "chain_roundtrip_ms".to_string(),
+                        serde_json::json!(trace.stream_roundtrip_ms),
+                    );
+                    obj.insert(
+                        "chain_reused".to_string(),
+                        serde_json::json!(trace.stream_reused),
+                    );
+                }
+                (
+                    value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+                    value.to_string().into_bytes(),
+                )
+            }
+            Err(e) => (
+                false,
+                serde_json::json!({
+                    "ok": false,
+                    "chain_type": "CHAIN_ERROR",
+                    "error": e,
+                    "latency_ms": started.elapsed().as_millis() as u64,
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        };
+    }
+
+    let payload_bytes = body
+        .get("payload_b64")
+        .and_then(|v| v.as_str())
+        .and_then(|s| general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_else(|| frame.payload.clone());
+    let chain_type = match frame.dtype.as_str() {
+        "vryx.chain.hello" => "CHAIN_READY",
+        "vryx.chain.ready" => "CHAIN_READY",
+        "vryx.chain.ping" => "CHAIN_PONG",
+        "vryx.chain.echo" => "CHAIN_ECHO",
+        "vryx.chain.fake_tensor" => "CHAIN_READY",
+        other => {
+            return (
+                false,
+                serde_json::json!({
+                    "ok": false,
+                    "chain_type": "CHAIN_ERROR",
+                    "error": format!("unexpected_dtype: {}", other),
+                    "expected": [
+                        "vryx.chain.hello",
+                        "vryx.chain.ping",
+                        "vryx.chain.echo",
+                        "vryx.chain.fake_tensor"
+                    ],
+                })
+                .to_string()
+                .into_bytes(),
+            );
+        }
+    };
+    (
+        true,
+        serde_json::json!({
+            "ok": true,
+            "chain_type": chain_type,
+            "request_id": frame.request_id,
+            "session_id": frame.session_id,
+            "step_id": frame.step_id,
+            "dtype": frame.dtype,
+            "payload_bytes": payload_bytes.len(),
+            "checksum": bytes_checksum(&payload_bytes),
+            "tensor_dtype": body.get("tensor_dtype").and_then(|v| v.as_str()),
+            "shape": body.get("shape").cloned().unwrap_or(serde_json::Value::Null),
+            "latency_ms": started.elapsed().as_millis() as u64,
+        })
+        .to_string()
+        .into_bytes(),
+    )
+}
+
 async fn handle_pipeline_stream(
     peer: PeerId,
     mut stream: libp2p::Stream,
     grpc_port: u16,
     trace_shard: Arc<Mutex<Option<serde_json::Value>>>,
+    stream_control: Arc<tokio::sync::Mutex<libp2p_stream::Control>>,
+    stream_cache: PipelineStreamCache,
+    stream_ttl: Duration,
 ) {
     loop {
-        let frame = match read_pipeline_frame(&mut stream).await {
-            Ok(frame) => frame,
-            Err(e) => {
-                eprintln!("[PIPELINE_STREAM] fermeture stream {} : {}", peer, e);
-                break;
-            }
-        };
+        let frame =
+            match tokio::time::timeout(pipeline_frame_deadline(), read_pipeline_frame(&mut stream))
+                .await
+            {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(e)) => {
+                    eprintln!("[PIPELINE_STREAM] fermeture stream {} : {}", peer, e);
+                    break;
+                }
+                Err(_) => {
+                    eprintln!("[PIPELINE_STREAM] timeout lecture frame {}", peer);
+                    break;
+                }
+            };
         if frame.frame_type != PIPELINE_FRAME_REQUEST {
             eprintln!(
                 "[PIPELINE_STREAM] frame ignorée de {} : type={}",
@@ -456,8 +625,49 @@ async fn handle_pipeline_stream(
             );
             continue;
         }
+        if frame.dtype.starts_with("vryx.chain.") {
+            let response = handle_chain_control_frame(
+                frame.clone(),
+                Arc::clone(&stream_control),
+                Arc::clone(&stream_cache),
+                stream_ttl,
+            )
+            .await;
+            let response_frame = PipelineFrame {
+                frame_type: if response.0 {
+                    PIPELINE_FRAME_RESPONSE
+                } else {
+                    PIPELINE_FRAME_ERROR
+                },
+                request_id: frame.request_id,
+                session_id: frame.session_id,
+                step_id: frame.step_id,
+                dtype: frame.dtype,
+                payload: response.1,
+            };
+            let write_result = tokio::time::timeout(
+                pipeline_frame_deadline(),
+                write_pipeline_frame(&mut stream, &response_frame),
+            )
+            .await;
+            if !matches!(write_result, Ok(Ok(()))) {
+                eprintln!("[PIPELINE_STREAM] réponse chain impossible vers {}", peer);
+                break;
+            }
+            continue;
+        }
         let dtype_in = frame.dtype.clone();
         let session_id = frame.session_id.clone();
+        let routing_path: Vec<String> = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+            .ok()
+            .and_then(|v| {
+                v.get("routing_path").and_then(|r| r.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                })
+            })
+            .unwrap_or_default();
         let compute_started = Instant::now();
         let response = match call_local_inference(
             grpc_port,
@@ -486,7 +696,7 @@ async fn handle_pipeline_stream(
                             .unwrap_or(0),
                     }));
                 }
-                TensorResponse {
+                let mut local_response = TensorResponse {
                     data,
                     compute_time_ns: c,
                     serialization_time_ns: s,
@@ -508,7 +718,101 @@ async fn handle_pipeline_stream(
                         "pipeline_stream_worker_ms": compute_started.elapsed().as_millis() as u64,
                     })
                     .to_string(),
+                };
+                if let Some(next_peer_str) = routing_path.first() {
+                    match PeerId::from_str(next_peer_str) {
+                        Ok(next_peer) => {
+                            let next_payload = if routing_path.len() > 1 {
+                                serde_json::from_slice::<serde_json::Value>(&local_response.data)
+                                    .ok()
+                                    .and_then(|mut v| {
+                                        if let Some(obj) = v.as_object_mut() {
+                                            obj.insert(
+                                                "routing_path".to_string(),
+                                                serde_json::json!(routing_path[1..].to_vec()),
+                                            );
+                                        }
+                                        serde_json::to_vec(&v).ok()
+                                    })
+                                    .unwrap_or_else(|| local_response.data.clone())
+                            } else {
+                                local_response.data.clone()
+                            };
+                            let next_frame = PipelineFrame {
+                                frame_type: PIPELINE_FRAME_REQUEST,
+                                request_id: frame.request_id.clone(),
+                                session_id: frame.session_id.clone(),
+                                step_id: frame.step_id,
+                                dtype: dtype_in.clone(),
+                                payload: next_payload,
+                            };
+                            match pipeline_stream_roundtrip(
+                                Arc::clone(&stream_control),
+                                Arc::clone(&stream_cache),
+                                next_peer,
+                                next_frame,
+                                stream_ttl,
+                            )
+                            .await
+                            {
+                                Ok((response_frame, trace)) => {
+                                    match serde_json::from_slice::<TensorResponse>(
+                                        &response_frame.payload,
+                                    ) {
+                                        Ok(mut downstream) => {
+                                            downstream.compute_time_ns =
+                                                downstream.compute_time_ns.saturating_add(c);
+                                            downstream.compute_time_ms =
+                                                downstream.compute_time_ms.saturating_add(c_ms);
+                                            downstream.worker_compute_ms =
+                                                downstream.worker_compute_ms.saturating_add(c_ms);
+                                            downstream.relay_trace_json = serde_json::json!({
+                                                "transport": "pipeline_stream_chain",
+                                                "worker_seen_request": true,
+                                                "worker_compute_ms": c_ms,
+                                                "chain_stream_used": true,
+                                                "chain_downstream_peer": next_peer.to_string(),
+                                                "chain_roundtrip_ms": trace.stream_roundtrip_ms,
+                                                "chain_reused": trace.stream_reused,
+                                                "chain_payload_bytes": downstream.data.len(),
+                                            })
+                                            .to_string();
+                                            local_response = downstream;
+                                        }
+                                        Err(e) => {
+                                            local_response.data = serde_json::json!({
+                                                "ok": false,
+                                                "error": format!("pipeline_stream_chain_decode_failed: {}", e),
+                                                "chain_stream_used": true,
+                                            })
+                                            .to_string()
+                                            .into_bytes();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    local_response.data = serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("pipeline_stream_chain_forward_failed: {}", e),
+                                        "chain_stream_used": true,
+                                    })
+                                    .to_string()
+                                    .into_bytes();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            local_response.data = serde_json::json!({
+                                "ok": false,
+                                "error": format!("pipeline_stream_bad_next_peer: {}", e),
+                                "chain_stream_used": true,
+                            })
+                            .to_string()
+                            .into_bytes();
+                        }
+                    }
                 }
+                local_response
             }
             Err(e) => TensorResponse {
                 data: serde_json::json!({
@@ -544,8 +848,13 @@ async fn handle_pipeline_stream(
             dtype: frame.dtype,
             payload,
         };
-        if let Err(e) = write_pipeline_frame(&mut stream, &response_frame).await {
-            eprintln!("[PIPELINE_STREAM] réponse impossible vers {} : {}", peer, e);
+        let write_result = tokio::time::timeout(
+            pipeline_frame_deadline(),
+            write_pipeline_frame(&mut stream, &response_frame),
+        )
+        .await;
+        if !matches!(write_result, Ok(Ok(()))) {
+            eprintln!("[PIPELINE_STREAM] réponse impossible vers {}", peer);
             break;
         }
     }
@@ -592,18 +901,39 @@ async fn pipeline_stream_roundtrip(
         };
         let mut stream_guard = handle.stream.lock().await;
         let send_started = Instant::now();
-        if let Err(e) = write_pipeline_frame(&mut stream_guard, &frame).await {
-            last_error = format!("pipeline_stream_send_failed: {}", e);
-            cache.lock().unwrap().remove(&key);
-            if attempt == 0 {
-                continue;
+        match tokio::time::timeout(
+            pipeline_frame_deadline(),
+            write_pipeline_frame(&mut stream_guard, &frame),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                last_error = format!("pipeline_stream_send_failed: {}", e);
+                cache.lock().unwrap().remove(&key);
+                if attempt == 0 {
+                    continue;
+                }
+                break;
             }
-            break;
+            Err(_) => {
+                last_error = "pipeline_stream_send_timeout".to_string();
+                cache.lock().unwrap().remove(&key);
+                if attempt == 0 {
+                    continue;
+                }
+                break;
+            }
         }
         let stream_send_ms = send_started.elapsed().as_millis() as u64;
         let wait_started = Instant::now();
-        match read_pipeline_frame(&mut stream_guard).await {
-            Ok(response) => {
+        match tokio::time::timeout(
+            pipeline_frame_deadline(),
+            read_pipeline_frame(&mut stream_guard),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
                 let trace = PipelineStreamTrace {
                     stream_open_ms,
                     stream_reused,
@@ -616,8 +946,15 @@ async fn pipeline_stream_roundtrip(
                 };
                 return Ok((response, trace));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 last_error = format!("pipeline_stream_read_failed: {}", e);
+                cache.lock().unwrap().remove(&key);
+                if attempt == 0 {
+                    continue;
+                }
+            }
+            Err(_) => {
+                last_error = "pipeline_stream_read_timeout".to_string();
                 cache.lock().unwrap().remove(&key);
                 if attempt == 0 {
                     continue;
@@ -1908,14 +2245,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let trace_shard_stream = Arc::clone(&last_shard_trace);
         let grpc_pipeline_stream = args.grpc_port;
+        let control_pipeline_stream = Arc::clone(&pipeline_stream_control);
+        let cache_pipeline_stream = Arc::clone(&pipeline_stream_cache);
+        let ttl_pipeline_stream = pipeline_stream_ttl;
         tokio::spawn(async move {
             while let Some((peer, stream)) = pipeline_stream_incoming.next().await {
                 let trace = Arc::clone(&trace_shard_stream);
+                let control = Arc::clone(&control_pipeline_stream);
+                let cache = Arc::clone(&cache_pipeline_stream);
                 tokio::spawn(handle_pipeline_stream(
                     peer,
                     stream,
                     grpc_pipeline_stream,
                     trace,
+                    control,
+                    cache,
+                    ttl_pipeline_stream,
                 ));
             }
         });
@@ -1946,10 +2291,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let pipeline_stream_control_axum = Arc::clone(&pipeline_stream_control);
         let pipeline_stream_cache_axum = Arc::clone(&pipeline_stream_cache);
         let pipeline_stream_ttl_axum = pipeline_stream_ttl;
+        let pipeline_stream_control_chain_axum = Arc::clone(&pipeline_stream_control);
+        let pipeline_stream_cache_chain_axum = Arc::clone(&pipeline_stream_cache);
+        let pipeline_stream_ttl_chain_axum = pipeline_stream_ttl;
         let mode_chat = args.mode.clone();
         let mode_chat_stream = args.mode.clone();
         let mode_relay = args.mode.clone();
         let mode_pipeline_stream = args.mode.clone();
+        let mode_chain_stream = args.mode.clone();
         let mode_status_diag = args.mode.clone();
         let mode_tp_diag = args.mode.clone();
         let grpc_axum_health = args.grpc_port;
@@ -2378,6 +2727,137 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                 }
             }))
+            .route("/api/p2p/chain-test", post(move |Json(payload): Json<serde_json::Value>| {
+                let control = Arc::clone(&pipeline_stream_control_chain_axum);
+                let cache = Arc::clone(&pipeline_stream_cache_chain_axum);
+                let mode_chain_stream_call = mode_chain_stream.clone();
+                async move {
+                    use base64::{Engine as _, engine::general_purpose};
+                    let started = Instant::now();
+                    if mode_chain_stream_call != "initiator" {
+                        return (
+                            axum::http::StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({"ok": false, "error": "Chain stream : mode initiateur requis."})),
+                        );
+                    }
+                    let source_str = payload.get("source_peer").and_then(|v| v.as_str()).unwrap_or("");
+                    let target_str = payload.get("target_peer").and_then(|v| v.as_str()).unwrap_or("");
+                    let source_peer: PeerId = match PeerId::from_str(source_str) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"ok": false, "error": "source_peer libp2p invalide."})),
+                            );
+                        }
+                    };
+                    if PeerId::from_str(target_str).is_err() {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"ok": false, "error": "target_peer libp2p invalide."})),
+                        );
+                    }
+                    let test = payload
+                        .get("test")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ping")
+                        .trim()
+                        .to_lowercase();
+                    let dtype = match test.as_str() {
+                        "hello" => "vryx.chain.hello",
+                        "ready" => "vryx.chain.ready",
+                        "ping" => "vryx.chain.ping",
+                        "echo" => "vryx.chain.echo",
+                        "fake_tensor" | "tensor" => "vryx.chain.fake_tensor",
+                        _ => {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"ok": false, "error": "chain_test_type_not_allowed"})),
+                            );
+                        }
+                    }
+                    .to_string();
+                    let payload_len = payload
+                        .get("payload_bytes")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None })))
+                        .unwrap_or(0)
+                        .min(8 * 1024 * 1024) as usize;
+                    let payload_bytes = vec![b'v'; payload_len];
+                    let session_id = payload
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("chain-smoke")
+                        .to_string();
+                    let request_id = payload
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("chain-{}", started.elapsed().as_nanos()));
+                    let body = serde_json::json!({
+                        "routing_path": [target_str],
+                        "payload_b64": general_purpose::STANDARD.encode(&payload_bytes),
+                        "payload_bytes": payload_len,
+                        "checksum": bytes_checksum(&payload_bytes),
+                        "tensor_dtype": payload.get("tensor_dtype").and_then(|v| v.as_str()).unwrap_or("fp16"),
+                        "shape": payload.get("shape").cloned().unwrap_or_else(|| serde_json::json!([1, payload_len])),
+                    });
+                    let frame = PipelineFrame {
+                        frame_type: PIPELINE_FRAME_REQUEST,
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        step_id: payload
+                            .get("step_id")
+                            .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None })))
+                            .unwrap_or(0),
+                        dtype: dtype.clone(),
+                        payload: serde_json::to_vec(&body).unwrap_or_default(),
+                    };
+                    match pipeline_stream_roundtrip(control, cache, source_peer, frame, pipeline_stream_ttl_chain_axum).await {
+                        Ok((response_frame, trace)) => {
+                            let response_json = serde_json::from_slice::<serde_json::Value>(&response_frame.payload)
+                                .unwrap_or_else(|_| serde_json::json!({"ok": false, "chain_type": "CHAIN_ERROR", "error": "bad_chain_response_json"}));
+                            let ok = response_json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                            (
+                                if ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::BAD_GATEWAY },
+                                Json(serde_json::json!({
+                                    "ok": ok,
+                                    "test": test,
+                                    "dtype": dtype,
+                                    "source_peer": source_str,
+                                    "target_peer": target_str,
+                                    "payload_bytes": payload_len,
+                                    "latency_ms": started.elapsed().as_millis() as u64,
+                                    "chain_deadlock_guard_ms": pipeline_frame_deadline().as_millis() as u64,
+                                    "chain_open_ms": trace.stream_open_ms,
+                                    "chain_handshake_ms": trace.stream_open_ms,
+                                    "chain_send_ms": trace.stream_send_ms,
+                                    "chain_wait_ms": trace.stream_wait_response_ms,
+                                    "chain_roundtrip_ms": trace.stream_roundtrip_ms,
+                                    "chain_payload_bytes": payload_len,
+                                    "stream_reused": trace.stream_reused,
+                                    "frames_sent": trace.frames_sent,
+                                    "frames_received": trace.frames_received,
+                                    "response": response_json,
+                                })),
+                            )
+                        }
+                        Err(e) => (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "test": test,
+                                "dtype": dtype,
+                                "source_peer": source_str,
+                                "target_peer": target_str,
+                                "payload_bytes": payload_len,
+                                "error": e,
+                                "latency_ms": started.elapsed().as_millis() as u64,
+                                "chain_deadlock_guard_ms": pipeline_frame_deadline().as_millis() as u64,
+                            })),
+                        ),
+                    }
+                }
+            }))
             .route("/api/p2p/pipeline-stream", post(move |Json(payload): Json<serde_json::Value>| {
                 let control = Arc::clone(&pipeline_stream_control_axum);
                 let cache = Arc::clone(&pipeline_stream_cache_axum);
@@ -2406,7 +2886,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if dtype != "vryx.shard.pipeline" {
+                    if dtype != "vryx.shard.pipeline" && !dtype.starts_with("vryx.chain.") {
                         return (
                             axum::http::StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({"ok": false, "error": "pipeline_stream_dtype_not_allowed"})),
@@ -2442,6 +2922,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     )
                     .await
                     {
+                        Ok(Ok((response_frame, trace))) if dtype.starts_with("vryx.chain.") => {
+                            let response_json = serde_json::from_slice::<serde_json::Value>(&response_frame.payload)
+                                .unwrap_or_else(|_| serde_json::json!({"ok": false, "chain_type": "CHAIN_ERROR", "error": "bad_chain_response_json"}));
+                            let ok = response_json.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let trace_json = serde_json::json!({
+                                "dtype": dtype,
+                                "method": dtype,
+                                "protocol": PIPELINE_STREAM_PROTOCOL,
+                                "transport": "pipeline_stream",
+                                "p2p_transport": "pipeline_stream",
+                                "peer_id": peer.to_string(),
+                                "request_id": request_id,
+                                "session_id": session_id,
+                                "step_id": step_id,
+                                "payload_bytes": response_frame.payload.len(),
+                                "axum_ms": axum_started.elapsed().as_millis() as u64,
+                                "stream_open_ms": trace.stream_open_ms,
+                                "stream_reused": trace.stream_reused,
+                                "stream_send_ms": trace.stream_send_ms,
+                                "stream_wait_response_ms": trace.stream_wait_response_ms,
+                                "stream_roundtrip_ms": trace.stream_roundtrip_ms,
+                                "request_response_fallback": trace.request_response_fallback,
+                                "frames_sent": trace.frames_sent,
+                                "frames_received": trace.frames_received,
+                                "worker_seen_request": true,
+                            });
+                            (
+                                if ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::BAD_GATEWAY },
+                                Json(serde_json::json!({
+                                    "ok": ok,
+                                    "data": response_json,
+                                    "data_b64": general_purpose::STANDARD.encode(&response_frame.payload),
+                                    "relay_ms": trace.stream_roundtrip_ms,
+                                    "pipeline_stream": true,
+                                    "request_response_fallback": false,
+                                    "pipeline_stream_trace": trace_json,
+                                    "relay_trace": trace_json,
+                                })),
+                            )
+                        }
                         Ok(Ok((response_frame, trace))) => {
                             let resp = match serde_json::from_slice::<TensorResponse>(&response_frame.payload) {
                                 Ok(resp) => resp,
