@@ -4036,23 +4036,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     };
                     send_heartbeat(&http_client, api_url, &payload).await;
 
-                    // Initiator: fallback robuste de découverte depuis les heartbeats API.
-                    if args.mode == "initiator" {
-                        initiator_pull_workers_from_api_now(
-                            &mut swarm,
-                            &http_client,
-                            api_url,
-                            bootstrap_peer_id,
-                            args.bootstrap_node.as_ref(),
-                            my_peer_id,
-                            &mut discovered_peers,
-                            &active_peers,
-                            Some(&initiator_registry_workers),
-                            Some(&initiator_registry_worker_peers),
-                            "heartbeat",
-                        )
-                        .await;
-                    }
+                    // Tous les daemons apprennent les adresses relay publiées par l'API.
+                    // L'initiateur en a besoin pour orchestrer ; les workers en ont besoin
+                    // pour ouvrir un chain stream direct worker -> worker.
+                    let record_registry = args.mode == "initiator";
+                    initiator_pull_workers_from_api_now(
+                        &mut swarm,
+                        &http_client,
+                        api_url,
+                        bootstrap_peer_id,
+                        args.bootstrap_node.as_ref(),
+                        my_peer_id,
+                        &mut discovered_peers,
+                        &active_peers,
+                        if record_registry { Some(&initiator_registry_workers) } else { None },
+                        if record_registry { Some(&initiator_registry_worker_peers) } else { None },
+                        "heartbeat",
+                    )
+                    .await;
                 }
             }
 
