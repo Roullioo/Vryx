@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import inspect
 import json
 import os
 import copy
@@ -109,12 +110,17 @@ try:
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
     try:
         from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer, Qwen3_5MoeRMSNorm
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeDecoderLayer,
+            Qwen3_5MoeRMSNorm,
+            Qwen3_5MoeTextRotaryEmbedding,
+        )
         HAS_QWEN3_5_MOE = True
     except ImportError:
         Qwen3_5MoeTextConfig = None
         Qwen3_5MoeDecoderLayer = None
         Qwen3_5MoeRMSNorm = None
+        Qwen3_5MoeTextRotaryEmbedding = None
         HAS_QWEN3_5_MOE = False
     try:
         from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
@@ -159,6 +165,7 @@ except ImportError as _te:
     Qwen3_5MoeTextConfig = None
     Qwen3_5MoeDecoderLayer = None
     Qwen3_5MoeRMSNorm = None
+    Qwen3_5MoeTextRotaryEmbedding = None
     LlamaConfig = None
     LlamaDecoderLayer = None
     LlamaRMSNorm = None
@@ -1615,6 +1622,24 @@ def ephemeral_layer_forward(activation_bytes: bytes, layer_id: int, session_id: 
 
 # ── Pipeline Parallelism ────────────────────────────────────────────────────────
 
+def _layer_forward_accepts_kw(layer: Any, name: str) -> bool:
+    cache_name = f"_vryx_accepts_{name}"
+    cached = getattr(layer, cache_name, None)
+    if isinstance(cached, bool):
+        return cached
+    accepts = False
+    try:
+        params = inspect.signature(layer.forward).parameters
+        accepts = name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except Exception:
+        accepts = False
+    try:
+        setattr(layer, cache_name, accepts)
+    except Exception:
+        pass
+    return accepts
+
+
 class _Qwen3_5WorkerSlice(torch.nn.Module):
     def __init__(self, config, layer_start, layer_end, has_embedding, has_lm_head):
         super().__init__()
@@ -1651,7 +1676,10 @@ class _Qwen3_5MoeWorkerSlice(torch.nn.Module):
         if has_lm_head:
             self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.rotary_emb = None
+        if Qwen3_5MoeTextRotaryEmbedding is not None:
+            self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config=config)
+        else:
+            self.rotary_emb = None
 
 
 class _Qwen2WorkerSlice(torch.nn.Module):
@@ -2562,7 +2590,7 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
                     "position_ids": position_ids,
                     "use_cache": use_kv_cache,
                 }
-                if position_embeddings is not None:
+                if position_embeddings is not None and _layer_forward_accepts_kw(layer, "position_embeddings"):
                     kwargs["position_embeddings"] = position_embeddings
                 if use_kv_cache and shard.kv_cache is not None:
                     kwargs["past_key_values"] = shard.kv_cache
@@ -2575,6 +2603,9 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
                 except TypeError as type_error:
                     if "position_embeddings" in kwargs and "position_embeddings" in str(type_error):
                         kwargs.pop("position_embeddings", None)
+                        layer_out = layer(hidden_states, **kwargs)
+                    elif position_embeddings is not None and "position_embeddings" in str(type_error):
+                        kwargs["position_embeddings"] = position_embeddings
                         layer_out = layer(hidden_states, **kwargs)
                     else:
                         raise
