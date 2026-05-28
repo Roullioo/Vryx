@@ -93,6 +93,16 @@ def _prefetch_sort_key(name: str) -> tuple[int, int, int, str]:
     return (3, 10_000, 0, name)
 
 
+def _is_moe_expert_weight(name: str) -> bool:
+    return (
+        name.endswith(".weight")
+        and (
+            ".mlp.switch_mlp." in name
+            or ".mlp.shared_expert." in name
+        )
+    )
+
+
 def _range_ssl_context(source_url: str) -> ssl.SSLContext | None:
     if not source_url.startswith("https://"):
         return None
@@ -212,6 +222,16 @@ class LazyGgufWeights:
         self.cache: OrderedDict[str, tuple[Any, int]] = OrderedDict()
         self.cache_bytes = 0
         self.estimated_dense_bytes = 0
+        self.prefetch_required_tensor_count = 0
+        self.prefetch_cache_filled_count = 0
+        self.prefetch_cache_hit_count_after = 0
+        self.prefetch_filled_keys: set[str] = set()
+        self.second_forward_stats: dict[str, Any] = {}
+        self.quantized_expert_enabled = _truthy_env("VRYX_MLX_MOE_QUANTIZED_EXPERTS")
+        self.quantized_expert_count = 0
+        self.quantized_expert_bytes = 0
+        self.quantized_expert_dense_source_bytes = 0
+        self.quantized_expert_errors: list[str] = []
         self.prefetch_enabled = False
         self.prefetch_stats: dict[str, Any] = {
             "gguf_prefetch_enabled": False,
@@ -220,6 +240,14 @@ class LazyGgufWeights:
             "gguf_prefetch_bytes": 0,
             "gguf_prefetch_dense_bytes": 0,
             "gguf_prefetch_tensor_count": 0,
+            "prefetch_cache_filled_count": 0,
+            "prefetch_cache_hit_count_after": 0,
+            "dequant_cache_count": 0,
+            "lazy_misses_after_prefetch": 0,
+            "quantized_expert_path": bool(self.quantized_expert_enabled),
+            "quantized_expert_count": 0,
+            "quantized_expert_cache_bytes": 0,
+            "expert_dense_cache_gib": 0.0,
             "gguf_prefetch_errors": [],
         }
         self.stats: dict[str, Any] = {
@@ -385,6 +413,8 @@ class LazyGgufWeights:
         self.last_forward_stats = dict(active)
         if self.forward_count == 0:
             self.first_forward_stats = dict(active)
+        elif self.forward_count == 1:
+            self.second_forward_stats = dict(active)
         self.forward_count += 1
         self._active_forward = None
         return self.snapshot_stats()
@@ -445,6 +475,8 @@ class LazyGgufWeights:
             value, nbytes = self.cache.pop(mapped)
             self.cache[mapped] = (value, nbytes)
             self._bump("lazy_hits")
+            if _is_moe_expert_weight(mapped):
+                self._bump("expert_cache_hit_count")
             return value
         entry = self.entries.get(mapped)
         if not entry:
@@ -459,8 +491,68 @@ class LazyGgufWeights:
         self._bump("local_cache_hits" if metrics.get("local_cache_hit") else "local_cache_misses")
         self.cache[mapped] = (value, nbytes)
         self.cache_bytes += nbytes
+        if self._quantize_expert_cache_value(mapped):
+            cached = self.cache.get(mapped)
+            if cached is not None:
+                value = cached[0]
         self._evict_if_needed(protect=mapped)
         return value
+
+    def _replace_cache_value(self, key: str, value: Any) -> int:
+        try:
+            nbytes = int(getattr(value, "nbytes", 0) or 0)
+        except Exception:
+            nbytes = 0
+        old = self.cache.pop(key, None)
+        if old is not None:
+            self.cache_bytes -= int(old[1] or 0)
+        self.cache[key] = (value, nbytes)
+        self.cache_bytes += nbytes
+        return nbytes
+
+    def _quantize_expert_cache_value(self, key: str) -> bool:
+        if not self.quantized_expert_enabled or not _is_moe_expert_weight(key):
+            return False
+        cached = self.cache.get(key)
+        if cached is None:
+            return False
+        dense = cached[0]
+        if "uint32" in str(getattr(dense, "dtype", "")).lower():
+            return False
+        if getattr(dense, "ndim", 0) < 2:
+            return False
+        try:
+            group_size = _int_env("VRYX_MLX_MOE_EXPERT_GROUP_SIZE", 64)
+            bits = _int_env("VRYX_MLX_MOE_EXPERT_BITS", 4)
+            mode = os.environ.get("VRYX_MLX_MOE_EXPERT_QUANT_MODE", "affine").strip() or "affine"
+            q_w, scales, biases = self.mx.quantize(dense, group_size=group_size, bits=bits, mode=mode)
+            self.mx.eval(q_w, scales, biases)
+            dense_nbytes = int(cached[1] or getattr(dense, "nbytes", 0) or 0)
+            q_bytes = self._replace_cache_value(key, q_w)
+            q_bytes += self._replace_cache_value(f"{key[:-7]}.scales", scales)
+            q_bytes += self._replace_cache_value(f"{key[:-7]}.biases", biases)
+            self.entries[f"{key[:-7]}.scales"] = {"mapped_name": f"{key[:-7]}.scales", "shape": list(getattr(scales, "shape", []) or [])}
+            self.entries[f"{key[:-7]}.biases"] = {"mapped_name": f"{key[:-7]}.biases", "shape": list(getattr(biases, "shape", []) or [])}
+            self.quantized_expert_count += 1
+            self.quantized_expert_bytes += int(q_bytes)
+            self.quantized_expert_dense_source_bytes += dense_nbytes
+            return True
+        except Exception as exc:
+            if len(self.quantized_expert_errors) < 8:
+                self.quantized_expert_errors.append(f"{key}:{type(exc).__name__}:{exc}")
+            return False
+
+    def _expert_dense_cache_bytes(self) -> int:
+        total = 0
+        for key, (value, nbytes) in self.cache.items():
+            if not _is_moe_expert_weight(str(key)):
+                continue
+            # Quantized MLX weights are uint32 packed and have companion scales;
+            # only count fp16/fp32 dense expert weights as dense-cache pressure.
+            dtype = str(getattr(value, "dtype", "")).lower()
+            if "uint32" not in dtype:
+                total += int(nbytes or 0)
+        return total
 
     def _load_entry(self, entry: dict[str, Any]) -> tuple[Any, int, dict[str, Any]]:
         nbytes = int(entry.get("nbytes") or 0)
@@ -501,6 +593,21 @@ class LazyGgufWeights:
         self.prefetch_enabled = True
         t0 = time.perf_counter()
         ordered = list(keys or sorted(self.entries.keys(), key=_prefetch_sort_key))
+        self.prefetch_required_tensor_count = len(ordered)
+        pin_dequantized = os.environ.get("VRYX_GGUF_PREFETCH_PIN_DEQUANTIZED", "").strip().lower()
+        if not pin_dequantized:
+            pin_dequantized_enabled = _gguf_perf_path_required() or _truthy_env("VRYX_MLX_PREFETCH_SHARD_WEIGHTS") or _truthy_env("VRYX_MLX_PREFETCH_ON_BUILD")
+        else:
+            pin_dequantized_enabled = pin_dequantized in ("1", "true", "yes", "on")
+        if pin_dequantized_enabled and self.estimated_dense_bytes > 0:
+            # The hot forward uses the same LRU as prefetch.  If the cache budget
+            # is smaller than the assigned shard's dense footprint, prefetch can
+            # load every tensor and still evict the first layers before forward
+            # reaches them, yielding lazy_misses ~= required_tensor_count.  In
+            # perf mode we intentionally reserve enough cache for the complete
+            # assigned shard; if this is too large, callers can disable pinning
+            # and move to a per-layer prefetch/LRU strategy.
+            self.max_cache_bytes = max(self.max_cache_bytes, int(self.estimated_dense_bytes) + 512 * 1024 * 1024)
         max_tensors = _int_env("VRYX_MLX_PREFETCH_MAX_TENSORS", 0)
         max_source_bytes = int(max(0.0, _float_env("VRYX_MLX_PREFETCH_MAX_GB", 0.0)) * 1024**3)
         fetched = 0
@@ -516,8 +623,20 @@ class LazyGgufWeights:
             "gguf_prefetch_tensor_count": 0,
             "gguf_prefetch_total_tensors": len(ordered),
             "gguf_prefetch_last_key": None,
+            "gguf_prefetch_pin_dequantized": bool(pin_dequantized_enabled),
+            "prefetch_required_tensor_count": len(ordered),
+            "prefetch_cache_filled_count": 0,
+            "prefetch_cache_hit_count_after": 0,
+            "dequant_cache_count": len(self.cache),
+            "lazy_misses_after_prefetch": max(0, int(self.stats.get("lazy_misses") or 0)),
+            "quantized_expert_path": bool(self.quantized_expert_enabled),
+            "quantized_expert_count": int(self.quantized_expert_count),
+            "quantized_expert_cache_bytes": int(self.quantized_expert_bytes),
+            "expert_dense_cache_gib": round(self._expert_dense_cache_bytes() / 1024**3, 3),
+            "expert_cache_hit_count": int(self.stats.get("expert_cache_hit_count") or 0),
             "gguf_prefetch_errors": [],
         }
+        filled_keys: set[str] = set()
         for key in ordered:
             if max_tensors > 0 and fetched >= max_tensors:
                 break
@@ -530,6 +649,9 @@ class LazyGgufWeights:
             try:
                 before_dense = int(self.stats.get("lazy_dense_bytes") or 0)
                 self.get(key)
+                self._quantize_expert_cache_value(key)
+                if key in self.cache:
+                    filled_keys.add(key)
                 after_dense = int(self.stats.get("lazy_dense_bytes") or 0)
                 fetched += 1
                 source_bytes += entry_bytes
@@ -541,11 +663,23 @@ class LazyGgufWeights:
                     "gguf_prefetch_tensor_count": int(fetched),
                     "gguf_prefetch_total_tensors": len(ordered),
                     "gguf_prefetch_last_key": key,
+                    "prefetch_cache_filled_count": len(filled_keys),
+                    "prefetch_cache_hit_count_after": sum(1 for item in ordered if item in self.cache),
+                    "dequant_cache_count": len(self.cache),
+                    "lazy_misses_after_prefetch": max(0, int(self.stats.get("lazy_misses") or 0) - len(filled_keys)),
+                    "quantized_expert_path": bool(self.quantized_expert_enabled),
+                    "quantized_expert_count": int(self.quantized_expert_count),
+                    "quantized_expert_cache_bytes": int(self.quantized_expert_bytes),
+                    "expert_dense_cache_gib": round(self._expert_dense_cache_bytes() / 1024**3, 3),
+                    "expert_cache_hit_count": int(self.stats.get("expert_cache_hit_count") or 0),
                 })
             except Exception as exc:
                 if len(errors) < 8:
                     errors.append(f"{key}:{exc}")
                 self.prefetch_stats["gguf_prefetch_errors"] = list(errors)
+        self.prefetch_filled_keys = set(filled_keys)
+        self.prefetch_cache_filled_count = len(filled_keys)
+        self.prefetch_cache_hit_count_after = sum(1 for item in ordered if item in self.cache)
         self.prefetch_stats = {
             "gguf_prefetch_enabled": True,
             "gguf_prefetch_in_progress": False,
@@ -555,13 +689,29 @@ class LazyGgufWeights:
             "gguf_prefetch_tensor_count": int(fetched),
             "gguf_prefetch_total_tensors": len(ordered),
             "gguf_prefetch_last_key": ordered[min(fetched, len(ordered)) - 1] if fetched > 0 and ordered else None,
+            "gguf_prefetch_pin_dequantized": bool(pin_dequantized_enabled),
+            "prefetch_required_tensor_count": len(ordered),
+            "prefetch_cache_filled_count": int(self.prefetch_cache_filled_count),
+            "prefetch_cache_hit_count_after": int(self.prefetch_cache_hit_count_after),
+            "dequant_cache_count": len(self.cache),
+            "lazy_misses_after_prefetch": max(0, int(self.stats.get("lazy_misses") or 0) - int(self.prefetch_cache_filled_count)),
+            "quantized_expert_path": bool(self.quantized_expert_enabled),
+            "quantized_expert_count": int(self.quantized_expert_count),
+            "quantized_expert_cache_bytes": int(self.quantized_expert_bytes),
+            "quantized_expert_dense_source_bytes": int(self.quantized_expert_dense_source_bytes),
+            "expert_dense_cache_gib": round(self._expert_dense_cache_bytes() / 1024**3, 3),
+            "expert_cache_hit_count": int(self.stats.get("expert_cache_hit_count") or 0),
             "gguf_prefetch_errors": errors,
         }
+        if self.quantized_expert_errors:
+            self.prefetch_stats["gguf_prefetch_errors"] = [*errors, *self.quantized_expert_errors[:8]]
         print(
             "[mlx][gguf] prefetch "
             f"enabled=1 tensors={fetched}/{len(ordered)} "
             f"source={source_bytes / 1024**2:.1f}MiB dense={dense_bytes / 1024**2:.1f}MiB "
-            f"ms={self.prefetch_stats['gguf_prefetch_ms']} cache_bytes={self.cache_bytes / 1024**2:.1f}MiB "
+            f"ms={self.prefetch_stats['gguf_prefetch_ms']} cache_entries={len(self.cache)} "
+            f"cache_bytes={self.cache_bytes / 1024**2:.1f}MiB max_cache={self.max_cache_bytes / 1024**2:.1f}MiB "
+            f"q_experts={self.quantized_expert_count} expert_dense={self.prefetch_stats['expert_dense_cache_gib']}GiB "
             f"errors={errors[:2]}"
         )
         return dict(self.prefetch_stats)
@@ -571,14 +721,28 @@ class LazyGgufWeights:
         local_misses = int(self.stats.get("local_cache_misses") or 0)
         local_total = local_hits + local_misses
         first = self.first_forward_stats or {}
+        second = self.second_forward_stats or {}
         last = self.last_forward_stats or {}
+        lazy_misses = int(self.stats.get("lazy_misses") or 0)
+        prefetch_filled = int(self.prefetch_cache_filled_count or self.prefetch_stats.get("prefetch_cache_filled_count") or 0)
         return {
             **dict(self.prefetch_stats),
             "lazy_cache_bytes": int(self.cache_bytes),
             "lazy_cache_max_bytes": int(self.max_cache_bytes),
             "lazy_cache_entries": len(self.cache),
+            "dequant_cache_count": len(self.cache),
+            "quantized_expert_path": bool(self.quantized_expert_enabled),
+            "quantized_expert_count": int(self.quantized_expert_count),
+            "quantized_expert_cache_bytes": int(self.quantized_expert_bytes),
+            "quantized_expert_dense_source_bytes": int(self.quantized_expert_dense_source_bytes),
+            "expert_dense_cache_gib": round(self._expert_dense_cache_bytes() / 1024**3, 3),
+            "expert_cache_hit_count": int(self.stats.get("expert_cache_hit_count") or 0),
+            "prefetch_required_tensor_count": int(self.prefetch_required_tensor_count or self.prefetch_stats.get("prefetch_required_tensor_count") or len(self.entries)),
+            "prefetch_cache_filled_count": prefetch_filled,
+            "prefetch_cache_hit_count_after": int(self.prefetch_cache_hit_count_after or self.prefetch_stats.get("prefetch_cache_hit_count_after") or 0),
+            "lazy_misses_after_prefetch": max(0, lazy_misses - prefetch_filled),
             "lazy_total_hits": int(self.stats.get("lazy_hits") or 0),
-            "lazy_total_misses": int(self.stats.get("lazy_misses") or 0),
+            "lazy_total_misses": lazy_misses,
             "lazy_total_read_ms": int(self.stats.get("lazy_read_ms") or 0),
             "lazy_total_dequant_ms": int(self.stats.get("lazy_dequant_ms") or 0),
             "local_cache_enabled": bool(self.local_cache_enabled),
@@ -594,6 +758,11 @@ class LazyGgufWeights:
             "first_forward_dequant_ms": int(first.get("lazy_dequant_ms") or 0),
             "first_forward_materialize_ms": int(first.get("lazy_materialize_ms") or 0),
             "first_forward_wall_ms": int(first.get("forward_wall_ms") or 0),
+            "second_forward_lazy_misses": int(second.get("lazy_misses") or 0),
+            "second_forward_lazy_read_ms": int(second.get("lazy_read_ms") or 0),
+            "second_forward_dequant_ms": int(second.get("lazy_dequant_ms") or 0),
+            "second_forward_materialize_ms": int(second.get("lazy_materialize_ms") or 0),
+            "second_forward_wall_ms": int(second.get("forward_wall_ms") or 0),
             "last_forward_lazy_misses": int(last.get("lazy_misses") or 0),
             "last_forward_lazy_read_ms": int(last.get("lazy_read_ms") or 0),
             "last_forward_dequant_ms": int(last.get("lazy_dequant_ms") or 0),
@@ -603,11 +772,20 @@ class LazyGgufWeights:
         }
 
     def _evict_if_needed(self, *, protect: str) -> None:
+        protected = {protect}
+        if protect.endswith(".weight") and _is_moe_expert_weight(protect):
+            prefix = protect[:-7]
+            protected.update({f"{prefix}.scales", f"{prefix}.biases"})
+        protected_seen = 0
         while self.cache_bytes > self.max_cache_bytes and len(self.cache) > 1:
             key, (_value, nbytes) = next(iter(self.cache.items()))
-            if key == protect:
+            if key in protected:
                 self.cache.move_to_end(key)
+                protected_seen += 1
+                if protected_seen >= len(self.cache):
+                    break
                 continue
+            protected_seen = 0
             self.cache.pop(key, None)
             self.cache_bytes -= nbytes
         if self.cache_bytes > self.max_cache_bytes * 1.10:
@@ -762,6 +940,8 @@ class GGUFLazyMLXBackend(MLXBackend):
             "mapped_weight_sample_keys": list(self.weights.keys())[:40] if self.weights else [],
             "gguf_raw_mapped_samples": getattr(self.weights, "raw_mapped_samples", []),
             "gguf_raw_unmapped_samples": getattr(self.weights, "raw_unmapped_samples", []),
+            "last_layer_trace": getattr(self, "last_layer_trace", []),
+            "last_forward_memory_trace": getattr(self, "last_forward_memory_trace", {}),
             **lazy_stats,
         }
 

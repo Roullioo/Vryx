@@ -1,0 +1,39 @@
+name: Build Rust daemon Linux artifact
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'nodeAndWorker/rust-daemon/**'
+      - '.github/workflows/build-rust-daemon-linux.yml'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nodeAndWorker/rust-daemon
+      - name: Build daemon
+        working-directory: nodeAndWorker/rust-daemon
+        run: cargo build --release --locked
+      - name: Prepare artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp nodeAndWorker/rust-daemon/target/release/rust-daemon artifact/vryx-daemon-linux-x86_64
+          chmod +x artifact/vryx-daemon-linux-x86_64
+          git rev-parse --short HEAD > artifact/commit.txt
+          sha256sum artifact/vryx-daemon-linux-x86_64 > artifact/vryx-daemon-linux-x86_64.sha256
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vryx-daemon-linux-x86_64
+          path: artifact/*
+          if-no-files-found: error

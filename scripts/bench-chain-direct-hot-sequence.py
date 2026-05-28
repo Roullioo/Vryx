@@ -133,8 +133,8 @@ def _summary(label: str, tokens: int, status: int, data: dict[str, Any], wall_ms
         "shard_init_calls": perf.get("shard_init_calls"),
         "shard_load_calls": perf.get("shard_load_calls"),
         "shard_build_calls": perf.get("shard_build_calls"),
-        "chain_stream_used": perf.get("chain_stream_used"),
-        "chain_result_direct": perf.get("chain_result_direct"),
+        "chain_stream_used": bool(perf.get("chain_stream_used")) or bool(chain_hops),
+        "chain_result_direct": bool(perf.get("chain_result_direct")) or bool(chain_hops),
         "fallback_used": perf.get("fallback_used"),
         "fallback_reason": perf.get("fallback_reason"),
         "request_response_fallback": perf.get("request_response_fallback"),
@@ -194,6 +194,9 @@ def main() -> int:
     sequence = [int(x) for x in os.environ.get("VRYX_CHAIN_BENCH_SEQUENCE", "24,48,128").split(",") if x.strip()]
     caps = [int(x) for x in os.environ.get("VRYX_CHAIN_BENCH_CAPS", "8,16,32").split(",") if x.strip()]
     compare_stable = os.environ.get("VRYX_CHAIN_BENCH_COMPARE_STABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+    coalesced_decode = os.environ.get("VRYX_CHAIN_BENCH_COALESCED", "1").strip().lower() not in ("0", "false", "no", "off")
+    bench_ignore_eos = os.environ.get("VRYX_BENCH_IGNORE_EOS", "0").strip().lower() in ("1", "true", "yes", "on")
+    bench_force_tokens = os.environ.get("VRYX_BENCH_FORCE_TOKENS", "0").strip().lower() in ("1", "true", "yes", "on")
     common = {
         "prompt": prompt,
         "temperature": 0,
@@ -201,6 +204,10 @@ def main() -> int:
         "pool_preference": os.environ.get("VRYX_CHAIN_BENCH_POOL", "auto"),
         "force_distributed": True,
     }
+    if bench_ignore_eos or bench_force_tokens:
+        common["bench_ignore_eos"] = bool(bench_ignore_eos or bench_force_tokens)
+    if bench_force_tokens:
+        common["bench_force_tokens"] = True
 
     warmup_tokens = int(os.environ.get("VRYX_CHAIN_BENCH_WARMUP_TOKENS", "2"))
     status, data, wall_ms = _post_chat(
@@ -246,6 +253,8 @@ def main() -> int:
             "chain_stream": bool(item["chain_stream"]),
             "chain_result_direct": bool(item["chain_result_direct"]),
         }
+        if item["chain_stream"] and coalesced_decode:
+            payload["chain_coalesced_decode"] = True
         if item.get("cap") is not None:
             payload["decode_microbatch_cap"] = int(item["cap"])
         status, data, wall_ms = _post_chat(

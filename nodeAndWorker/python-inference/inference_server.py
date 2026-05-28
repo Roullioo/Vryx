@@ -496,6 +496,18 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("chain_coalesced_decode") is not None
                             else maybe_payload.get("chainCoalescedDecode")
                         )
+                    if maybe_payload.get("bench_ignore_eos") is not None or maybe_payload.get("benchIgnoreEos") is not None:
+                        request_options["bench_ignore_eos"] = bool(
+                            maybe_payload.get("bench_ignore_eos")
+                            if maybe_payload.get("bench_ignore_eos") is not None
+                            else maybe_payload.get("benchIgnoreEos")
+                        )
+                    if maybe_payload.get("bench_force_tokens") is not None or maybe_payload.get("benchForceTokens") is not None:
+                        request_options["bench_force_tokens"] = bool(
+                            maybe_payload.get("bench_force_tokens")
+                            if maybe_payload.get("bench_force_tokens") is not None
+                            else maybe_payload.get("benchForceTokens")
+                        )
                     if maybe_payload.get("decode_microbatch_cap") is not None or maybe_payload.get("decodeMicrobatchCap") is not None:
                         request_options["decode_microbatch_cap"] = (
                             maybe_payload.get("decode_microbatch_cap")

@@ -3679,6 +3679,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     for (snake, camel) in [
                         ("chain_stream", "chainStream"),
                         ("chain_result_direct", "chainResultDirect"),
+                        ("chain_coalesced_decode", "chainCoalescedDecode"),
+                        ("bench_ignore_eos", "benchIgnoreEos"),
+                        ("bench_force_tokens", "benchForceTokens"),
                     ] {
                         if let Some(value) = payload
                             .get(snake)
@@ -3834,6 +3837,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 for (snake, camel) in [
                     ("chain_stream", "chainStream"),
                     ("chain_result_direct", "chainResultDirect"),
+                    ("chain_coalesced_decode", "chainCoalescedDecode"),
+                    ("bench_ignore_eos", "benchIgnoreEos"),
+                    ("bench_force_tokens", "benchForceTokens"),
                 ] {
                     if let Some(value) = payload
                         .get(snake)

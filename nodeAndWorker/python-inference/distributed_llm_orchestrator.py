@@ -2792,7 +2792,14 @@ def _pipeline_micro_budget_from_payload(payload: dict[str, Any]) -> int:
         cap = max(1, int(payload.get("decode_microbatch_cap") or DECODE_MICROBATCH_CAP))
     except (TypeError, ValueError):
         cap = DECODE_MICROBATCH_CAP
-    return max(1, min(budget, cap, DECODE_MICROBATCH_CAP))
+    coalesced_requested = (
+        CHAIN_COALESCED_DECODE
+        or payload.get("chain_coalesced_decode_request") is True
+        or payload.get("chain_coalesced_decode") is True
+    )
+    hard_cap = max(DECODE_MICROBATCH_CAP, cap) if coalesced_requested else DECODE_MICROBATCH_CAP
+    hard_cap = max(1, min(64, hard_cap))
+    return max(1, min(budget, cap, hard_cap))
 
 
 def _pipeline_micro_decode_enabled(payload: dict[str, Any], peers: list[str]) -> bool:
@@ -4486,11 +4493,82 @@ def _query_worker_status(peer_id: str, session_id: str = "") -> dict:
     payload = json.dumps({"session_id": session_id}).encode()
     r = _relay_raw(peer_id, "vryx.shard.status", payload, timeout=min(SHARD_STATUS_TIMEOUT, TIMEOUT))
     if r.get("ok") is False:
-        return {"ok": False, "peer_id": peer_id, "error": r.get("error", "status indisponible")}
+        error = str(r.get("error") or "status indisponible")
+        out = {"ok": False, "peer_id": peer_id, "error": error}
+        if _is_compute_unavailable_error(error):
+            out.update({
+                "error_code": "p2p_visible_but_compute_unavailable",
+                "p2p_visible": True,
+                "compute_available": False,
+                "python_backend_alive": False,
+            })
+        return out
     status = _decode_relay_json(r)
     status.setdefault("ok", True)
     status["peer_id"] = peer_id
+    status.setdefault("p2p_visible", True)
+    status.setdefault("compute_available", bool(status.get("ok", True)))
+    status.setdefault("python_backend_alive", bool(status.get("ok", True)))
     return status
+
+
+def _is_compute_unavailable_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "connection refused",
+            "connect error",
+            "transport error",
+            "grpc",
+            "status indisponible",
+            "shard.status",
+            "relay_timeout",
+        )
+    )
+
+
+def _require_worker_compute_health() -> bool:
+    return os.environ.get("VRYX_REQUIRE_WORKER_COMPUTE_HEALTH", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _probe_workers_compute_health(peers: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    if not _require_worker_compute_health() or not peers:
+        return peers, []
+    healthy: list[str] = []
+    diagnostics: list[dict[str, Any]] = []
+    for peer in peers:
+        started = time.perf_counter()
+        status = _query_worker_status(peer, "")
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        ok = bool(status.get("ok", True))
+        compute_available = ok and bool(status.get("python_backend_alive", True)) and bool(status.get("compute_available", True))
+        reason = None
+        if not compute_available:
+            reason = str(status.get("error_code") or "p2p_visible_but_compute_unavailable")
+        diagnostics.append({
+            "peer_id": peer,
+            "peer_short": _short(peer),
+            "p2p_visible": True,
+            "python_backend_alive": compute_available,
+            "compute_available": compute_available,
+            "status_ok": ok,
+            "reason": reason,
+            "error": str(status.get("error") or "")[:500] if status.get("error") else None,
+            "elapsed_ms": elapsed_ms,
+            "shard_count": status.get("count"),
+        })
+        if compute_available:
+            healthy.append(peer)
+    if len(healthy) != len(peers):
+        print("[VPS][worker.compute_health] " + json.dumps({
+            "event": "worker.compute_health",
+            "required": True,
+            "healthy": len(healthy),
+            "total": len(peers),
+            "diagnostics": diagnostics,
+        }, ensure_ascii=False, default=str))
+    return healthy, diagnostics
 
 
 def _shard_ready_max_polls() -> int:
@@ -5689,6 +5767,16 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     request_chain_stream = _option_bool("chain_stream", CHAIN_STREAM)
     request_chain_result_direct = _option_bool("chain_result_direct", CHAIN_RESULT_DIRECT)
     request_chain_coalesced_decode = _option_bool("chain_coalesced_decode", CHAIN_COALESCED_DECODE)
+    request_bench_ignore_eos = _option_bool(
+        "bench_ignore_eos",
+        os.environ.get("VRYX_BENCH_IGNORE_EOS", "0").strip().lower() in ("1", "true", "yes", "on"),
+    )
+    request_bench_force_tokens = _option_bool(
+        "bench_force_tokens",
+        os.environ.get("VRYX_BENCH_FORCE_TOKENS", "0").strip().lower() in ("1", "true", "yes", "on"),
+    )
+    if request_bench_force_tokens:
+        request_bench_ignore_eos = True
     request_decode_microbatch_cap: int | None = None
     if options.get("decode_microbatch_cap") is not None or options.get("decodeMicrobatchCap") is not None:
         try:
@@ -5765,6 +5853,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     pool_fallback_reason = None
     incompatible_model_peers: list[dict[str, Any]] = []
     shared_accelerator_groups: list[dict[str, Any]] = []
+    compute_health_diagnostics: list[dict[str, Any]] = []
     worker_wait_timeout = DIST_WAIT_FOR_MIN_WORKERS_TIMEOUT_SEC
     if isinstance(options, dict) and options.get("stream_id"):
         worker_wait_timeout = min(worker_wait_timeout, ADMIN_STREAM_WORKER_WAIT_SEC)
@@ -5837,6 +5926,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         selection_latency_matrix = _refresh_latency_matrix(peers_sorted) if peers_sorted else {"vps_to_worker": {}, "worker_to_worker": {}}
         if not preserve_requested_order:
             peers_sorted = _order_peers_for_vps_latency(peers_sorted, catalog, selection_latency_matrix)
+        peers_sorted, compute_health_diagnostics = _probe_workers_compute_health(peers_sorted)
 
         if len(peers_sorted) >= min_workers_required:
             break
@@ -5891,6 +5981,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "preferred_workers_applied": preferred_workers_applied,
                 "preferred_workers_missing": preferred_workers_missing,
                 "incompatible_model_peers": incompatible_model_peers,
+                "compute_health_diagnostics": compute_health_diagnostics,
+                "p2p_visible_but_compute_unavailable": [
+                    d for d in compute_health_diagnostics
+                    if d.get("p2p_visible") and not d.get("compute_available")
+                ],
                 "shared_accelerator_groups": shared_accelerator_groups,
                 "peer_latency_matrix": selection_latency_matrix,
             },
@@ -6099,7 +6194,10 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     latency_matrix_for_decode = pool_info.get("peer_latency_matrix") or selection_latency_matrix
     dynamic_microbatch_cap = _microbatch_cap_for_rtt(peers, latency_matrix_for_decode)
     if request_decode_microbatch_cap is not None:
-        dynamic_microbatch_cap = max(1, min(dynamic_microbatch_cap, request_decode_microbatch_cap))
+        if request_chain_coalesced_decode:
+            dynamic_microbatch_cap = max(1, min(64, request_decode_microbatch_cap))
+        else:
+            dynamic_microbatch_cap = max(1, min(dynamic_microbatch_cap, request_decode_microbatch_cap))
     trace_ctx.phase_trace["microbatch_enabled"] = bool(DECODE_MICROBATCH and PIPELINE_DECODE_MICROBATCH)
     trace_ctx.phase_trace["microbatch_cap"] = int(dynamic_microbatch_cap)
     stream_open = {"ok": False, "results": []}
@@ -6186,6 +6284,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     formatted = formatted_prompt
     eos_id = tokenizer.eos_token_id
     stop_ids = _stop_token_ids(tokenizer)
+    if request_bench_ignore_eos:
+        eos_id = None
+        stop_ids = []
     routing_path = list(pool_info.get("routing_path") or peers)  # [w1, w2, w3]
     model_key = _model_fingerprint(model_config)
     session_cache_assignments = [
@@ -6266,6 +6367,9 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "pipeline_stream_mode": PIPELINE_STREAM_MODE,
         "use_kv_cache": WORKER_KV_CACHE,
         "stop_token_ids": stop_ids,
+        "eos_token_id": eos_id,
+        "bench_ignore_eos": request_bench_ignore_eos,
+        "bench_force_tokens": request_bench_force_tokens,
         "sampling": {
             "temperature": SAMPLING_TEMPERATURE,
             "top_p": SAMPLING_TOP_P,
@@ -6461,19 +6565,20 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             emitted_ids = accepted_ids[:]
             next_token_id = emitted_ids[-1]
 
-        stop_idx = next((idx for idx, token_id in enumerate(emitted_ids) if token_id in stop_ids), None)
-        if stop_idx is not None:
-            generated_ids.extend(emitted_ids[:stop_idx])
-            stop_reason = f"stop_token:{emitted_ids[stop_idx]}"
-            break
+        if not request_bench_ignore_eos:
+            stop_idx = next((idx for idx, token_id in enumerate(emitted_ids) if token_id in stop_ids), None)
+            if stop_idx is not None:
+                generated_ids.extend(emitted_ids[:stop_idx])
+                stop_reason = f"stop_token:{emitted_ids[stop_idx]}"
+                break
 
-        eos_pos = None
-        if eos_id is not None:
-            eos_pos = next((idx for idx, token_id in enumerate(emitted_ids) if token_id == eos_id), None)
-        if eos_pos is not None:
-            generated_ids.extend(emitted_ids[: eos_pos + 1])
-            stop_reason = f"eos:{eos_id}"
-            break
+            eos_pos = None
+            if eos_id is not None:
+                eos_pos = next((idx for idx, token_id in enumerate(emitted_ids) if token_id == eos_id), None)
+            if eos_pos is not None:
+                generated_ids.extend(emitted_ids[: eos_pos + 1])
+                stop_reason = f"eos:{eos_id}"
+                break
 
         generated_ids.extend(emitted_ids)
         if len(generated_ids) >= decode_cap:
@@ -6496,10 +6601,14 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                     },
                 )
                 streamed_text_sent = partial_text
-        if _detect_repetition_loop(partial_text):
+        if not request_bench_force_tokens and _detect_repetition_loop(partial_text):
             stop_reason = "repetition_guard"
             break
-        if len(generated_ids) >= 12 and any(partial_text.rstrip().endswith(mark) for mark in (".", "!", "?")):
+        if (
+            not request_bench_force_tokens
+            and len(generated_ids) >= 12
+            and any(partial_text.rstrip().endswith(mark) for mark in (".", "!", "?"))
+        ):
             stop_reason = "sentence_boundary"
             break
 
@@ -6544,6 +6653,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "stateful_required": stateful_decode,
             "stop_token_ids": stop_ids,
             "eos_token_id": eos_id,
+            "bench_ignore_eos": request_bench_ignore_eos,
+            "bench_force_tokens": request_bench_force_tokens,
             "sampling": {
                 "temperature": SAMPLING_TEMPERATURE,
                 "top_p": SAMPLING_TOP_P,
@@ -6785,6 +6896,11 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "preferred_worker_peer_ids": preferred_worker_peer_ids,
         "preferred_workers_applied": preferred_workers_applied,
         "preferred_workers_missing": preferred_workers_missing,
+        "compute_health_diagnostics": compute_health_diagnostics,
+        "p2p_visible_but_compute_unavailable": [
+            d for d in compute_health_diagnostics
+            if d.get("p2p_visible") and not d.get("compute_available")
+        ],
         "pool_status": pool_info.get("status"),
         "shard_init_tuning": {
             "ready_poll_fast_sec": _SHARD_READY_POLL_FAST,
@@ -6847,6 +6963,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "top_k": SAMPLING_TOP_K,
             "repetition_penalty": REPETITION_PENALTY,
             "repetition_guard": REPETITION_GUARD,
+            "bench_ignore_eos": request_bench_ignore_eos,
+            "bench_force_tokens": request_bench_force_tokens,
         },
         "prefill_token_accounting": {
             "total_prefill_tokens": len(input_ids),

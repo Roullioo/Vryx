@@ -39,6 +39,10 @@ def _rss_mb() -> float:
     return float(usage / (1024 * 1024) if usage > 10_000_000 else usage / 1024)
 
 
+def _trace_mlx_layer_enabled() -> bool:
+    return os.environ.get("VRYX_MLX_LAYER_TRACE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _mx_weight_dtype(mx: Any) -> Any:
     dtype = os.environ.get("VRYX_MLX_WEIGHT_DTYPE", "fp16").strip().lower()
     if dtype in ("fp32", "float32"):
@@ -534,21 +538,43 @@ class MLXBackend:
             self.weights.pop("embed_tokens.biases", None)
         return emb[token_ids]
 
-    def _moe_mlp(self, mx: Any, prefix: str, x: Any) -> Any:
+    def _moe_mlp(self, mx: Any, prefix: str, x: Any, trace: dict[str, Any] | None = None) -> Any:
+        moe_t0 = time.perf_counter()
+        trace_on = trace is not None
         gate_prefix = f"{prefix}.mlp.gate"
         switch_prefix = f"{prefix}.mlp.switch_mlp"
         shared_prefix = f"{prefix}.mlp.shared_expert"
         flat = x.reshape(-1, int(x.shape[-1]))
         compute_dtype = _mx_compute_dtype(mx)
+        router_t0 = time.perf_counter()
         logits = self._linear(flat, gate_prefix).astype(compute_dtype)
         top_k = max(1, min(int(self.shard.model_config.get("num_experts_per_tok") or 8), int(logits.shape[-1])))
         probs = mx.softmax(logits.astype(mx.float32), axis=-1)
         idxs = mx.argsort(probs, axis=-1)[:, -top_k:]
         vals = mx.take_along_axis(probs, idxs, axis=-1)
         vals = vals / mx.sum(vals, axis=-1, keepdims=True)
+        if trace_on:
+            mx.eval(idxs, vals)
+            try:
+                idx_np_trace = np.asarray(idxs, dtype=np.int64)
+                trace["selected_experts_count"] = int(np.unique(idx_np_trace).size)
+            except Exception:
+                trace["selected_experts_count"] = top_k
+            trace["top_k"] = int(top_k)
+            trace["router_ms"] = max(0, int((time.perf_counter() - router_t0) * 1000))
         gate_w = self._w(f"{switch_prefix}.gate_proj.weight")
         up_w = self._w(f"{switch_prefix}.up_proj.weight")
         down_w = self._w(f"{switch_prefix}.down_proj.weight")
+        if trace_on and gate_w is not None:
+            try:
+                trace["experts_total"] = int(gate_w.shape[0]) if getattr(gate_w, "ndim", 0) >= 3 else 1
+            except Exception:
+                trace["experts_total"] = None
+        quantized_expert_path = (
+            f"{switch_prefix}.gate_proj.scales" in self.weights
+            and f"{switch_prefix}.up_proj.scales" in self.weights
+            and f"{switch_prefix}.down_proj.scales" in self.weights
+        )
         expert_batched = (
             gate_w is not None
             and up_w is not None
@@ -557,7 +583,24 @@ class MLXBackend:
             and getattr(up_w, "ndim", 0) >= 3
             and getattr(down_w, "ndim", 0) >= 3
         )
-        if expert_batched and os.environ.get("VRYX_MLX_MOE_EXPERT_BATCH", "1").strip().lower() not in ("0", "false", "no", "off"):
+        if trace_on:
+            trace["expert_batched"] = bool(expert_batched)
+            trace["quantized_expert_path"] = bool(quantized_expert_path)
+            trace["expert_dense_fallback"] = not bool(quantized_expert_path)
+            trace["expert_quantized_matmul_ms"] = 0
+            trace["expert_block_dequant_ms"] = 0
+            trace.setdefault("expert_matmul_ms", 0)
+            trace.setdefault("shared_expert_ms", 0)
+            trace.setdefault("moe_total_ms", 0)
+        disable_shared_expert = os.environ.get("VRYX_MLX_DISABLE_SHARED_EXPERT", "0").strip().lower() in ("1", "true", "yes", "on")
+        topk_only_scalar = os.environ.get("VRYX_MLX_MOE_TOPK_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+        if (
+            expert_batched
+            and not topk_only_scalar
+            and os.environ.get("VRYX_MLX_MOE_EXPERT_BATCH", "1").strip().lower() not in ("0", "false", "no", "off")
+        ):
+            if trace_on:
+                trace["expert_execution_mode"] = "batched_topk_quantized" if quantized_expert_path else "batched_topk_dense"
             n_tokens = int(flat.shape[0])
             chunk_size = max(1, int(os.environ.get("VRYX_MLX_MOE_TOKEN_CHUNK", "1") or "1"))
             chunks = []
@@ -589,13 +632,21 @@ class MLXBackend:
                     token_chunk.reshape(end - start, 1, 1, int(flat.shape[-1])),
                     (end - start, top_k, 1, int(flat.shape[-1])),
                 )
+                expert_t0 = time.perf_counter()
                 gate_up = qlinear_many(x_many, f"{switch_prefix}.gate_proj", gate_w[idx_chunk], idx_chunk).astype(compute_dtype)
                 up = qlinear_many(x_many, f"{switch_prefix}.up_proj", up_w[idx_chunk], idx_chunk).astype(compute_dtype)
                 mid = _mx_silu(mx, gate_up) * up
                 down = qlinear_many(mid, f"{switch_prefix}.down_proj", down_w[idx_chunk], idx_chunk).astype(compute_dtype)
                 mixed = mx.sum(down * val_chunk.reshape(end - start, top_k, 1, 1), axis=1).reshape(end - start, int(x.shape[-1]))
+                if trace_on:
+                    mx.eval(mixed)
+                    delta_ms = max(0, int((time.perf_counter() - expert_t0) * 1000))
+                    trace["expert_matmul_ms"] = int(trace.get("expert_matmul_ms") or 0) + delta_ms
+                    if quantized_expert_path:
+                        trace["expert_quantized_matmul_ms"] = int(trace.get("expert_quantized_matmul_ms") or 0) + delta_ms
 
-                if f"{shared_prefix}.gate_proj.weight" in self.weights:
+                if not disable_shared_expert and f"{shared_prefix}.gate_proj.weight" in self.weights:
+                    shared_t0 = time.perf_counter()
                     shared = self._linear(
                         _mx_silu(mx, self._linear(token_chunk, f"{shared_prefix}.gate_proj"))
                         * self._linear(token_chunk, f"{shared_prefix}.up_proj"),
@@ -603,13 +654,25 @@ class MLXBackend:
                     )
                     shared_gate = mx.sigmoid(self._linear(token_chunk, f"{prefix}.mlp.shared_expert_gate"))
                     mixed = mixed + shared_gate * shared
+                    if trace_on:
+                        mx.eval(mixed)
+                        trace["shared_expert_ms"] = int(trace.get("shared_expert_ms") or 0) + max(0, int((time.perf_counter() - shared_t0) * 1000))
                 chunks.append(mixed)
-            return mx.concatenate(chunks, axis=0).reshape(x.shape)
+            out = mx.concatenate(chunks, axis=0).reshape(x.shape)
+            if trace_on:
+                mx.eval(out)
+                trace["shared_expert_enabled"] = bool(not disable_shared_expert and f"{shared_prefix}.gate_proj.weight" in self.weights)
+                trace["moe_total_ms"] = max(0, int((time.perf_counter() - moe_t0) * 1000))
+                trace["selected_expert_count"] = trace.get("selected_experts_count")
+            return out
 
         mx.eval(vals, idxs)
+        if trace_on:
+            trace["expert_execution_mode"] = "scalar_topk_quantized" if quantized_expert_path else "scalar_topk_dense"
         idx_np = np.asarray(idxs, dtype=np.int64)
         vals_np = np.asarray(vals, dtype=np.float32)
         rows = []
+        expert_t0 = time.perf_counter()
         for token_i in range(idx_np.shape[0]):
             token = flat[token_i:token_i + 1].astype(compute_dtype)
             experts = [int(idx_np[token_i, pos]) for pos in range(idx_np.shape[1])]
@@ -620,7 +683,15 @@ class MLXBackend:
                 down = self._linear(_mx_silu(mx, gate_up) * up, f"{switch_prefix}.down_proj", expert_idx=expert_idx)
                 contrib = down * float(vals_np[token_i, pos])
                 acc = contrib if acc is None else acc + contrib
-            if f"{shared_prefix}.gate_proj.weight" in self.weights:
+            if trace_on and acc is not None:
+                mx.eval(acc)
+            if not disable_shared_expert and f"{shared_prefix}.gate_proj.weight" in self.weights:
+                if trace_on:
+                    delta_ms = max(0, int((time.perf_counter() - expert_t0) * 1000))
+                    trace["expert_matmul_ms"] = int(trace.get("expert_matmul_ms") or 0) + delta_ms
+                    if quantized_expert_path:
+                        trace["expert_quantized_matmul_ms"] = int(trace.get("expert_quantized_matmul_ms") or 0) + delta_ms
+                shared_t0 = time.perf_counter()
                 shared = self._linear(
                     _mx_silu(mx, self._linear(token, f"{shared_prefix}.gate_proj"))
                     * self._linear(token, f"{shared_prefix}.up_proj"),
@@ -628,8 +699,22 @@ class MLXBackend:
                 )
                 shared_gate = mx.sigmoid(self._linear(token, f"{prefix}.mlp.shared_expert_gate"))
                 acc = (acc if acc is not None else mx.zeros_like(shared)) + shared_gate * shared
+                if trace_on:
+                    mx.eval(acc)
+                    trace["shared_expert_ms"] = int(trace.get("shared_expert_ms") or 0) + max(0, int((time.perf_counter() - shared_t0) * 1000))
+                    expert_t0 = time.perf_counter()
             rows.append(acc[0] if acc is not None else mx.zeros((int(x.shape[-1]),), dtype=compute_dtype))
-        return mx.stack(rows, axis=0).reshape(x.shape)
+        out = mx.stack(rows, axis=0).reshape(x.shape)
+        if trace_on:
+            mx.eval(out)
+            delta_ms = max(0, int((time.perf_counter() - expert_t0) * 1000))
+            trace["expert_matmul_ms"] = int(trace.get("expert_matmul_ms") or 0) + delta_ms
+            if quantized_expert_path:
+                trace["expert_quantized_matmul_ms"] = int(trace.get("expert_quantized_matmul_ms") or 0) + delta_ms
+            trace["shared_expert_enabled"] = bool(not disable_shared_expert and f"{shared_prefix}.gate_proj.weight" in self.weights)
+            trace["moe_total_ms"] = max(0, int((time.perf_counter() - moe_t0) * 1000))
+            trace["selected_expert_count"] = trace.get("selected_experts_count")
+        return out
 
     def _dense_mlp(self, mx: Any, prefix: str, x: Any) -> Any:
         gate = self._linear(x, f"{prefix}.mlp.gate_proj")
@@ -696,6 +781,9 @@ class MLXBackend:
                 lazy_tracker.begin_forward()
             except Exception:
                 lazy_tracker = None
+        layer_trace_enabled = _trace_mlx_layer_enabled()
+        memory_before_forward_mb = round(_rss_mb(), 1)
+        layer_traces: list[dict[str, Any]] = []
 
         def _finish_lazy_trace() -> dict[str, Any]:
             nonlocal lazy_finished
@@ -711,6 +799,44 @@ class MLXBackend:
                 return dict(lazy_tracker.end_forward())
             except Exception as exc:
                 return {"gguf_lazy_trace_error": str(exc)[:200]}
+
+        def _memory_trace() -> dict[str, Any]:
+            cache_dense_gib = 0.0
+            cache_entries = 0
+            if hasattr(self.weights, "cache_bytes"):
+                try:
+                    cache_dense_gib = round(float(getattr(self.weights, "cache_bytes", 0) or 0) / 1024**3, 3)
+                    cache_entries = int(len(getattr(self.weights, "cache", {}) or {}))
+                except Exception:
+                    pass
+            expert_cache_gib = 0.0
+            active_expert_cache_gib = 0.0
+            expert_dense_cache_gib = 0.0
+            if hasattr(self.weights, "cache"):
+                try:
+                    for key, (_value, nbytes) in getattr(self.weights, "cache", {}).items():
+                        key_s = str(key)
+                        if ".mlp.switch_mlp." in key_s or ".mlp.shared_expert" in key_s:
+                            expert_cache_gib += float(nbytes or 0) / 1024**3
+                        if ".mlp.switch_mlp." in key_s:
+                            active_expert_cache_gib += float(nbytes or 0) / 1024**3
+                except Exception:
+                    pass
+            if hasattr(self.weights, "_expert_dense_cache_bytes"):
+                try:
+                    expert_dense_cache_gib = float(self.weights._expert_dense_cache_bytes()) / 1024**3
+                except Exception:
+                    expert_dense_cache_gib = 0.0
+            return {
+                "memory_before_forward_mb": memory_before_forward_mb,
+                "memory_after_forward_mb": round(_rss_mb(), 1),
+                "peak_memory_gib": round(max(memory_before_forward_mb, _rss_mb()) / 1024, 3),
+                "cache_dense_gib": cache_dense_gib,
+                "dequant_cache_count": cache_entries,
+                "expert_cache_gib": round(expert_cache_gib, 3),
+                "active_expert_cache_gib": round(active_expert_cache_gib, 3),
+                "expert_dense_cache_gib": round(expert_dense_cache_gib, 3),
+            }
 
         # ── Obtenir hidden_states ────────────────────────────────────────────
         if self.shard.has_embedding and "token_ids" in payload:
@@ -789,6 +915,21 @@ class MLXBackend:
             for local_i in range(n_layers_here):
                 prefix = f"layers.{local_i}"
                 layer_t0 = time.perf_counter()
+                layer_trace: dict[str, Any] | None = {
+                    "layer_id": int(self.shard.layer_start + local_i),
+                    "local_layer_id": int(local_i),
+                    "layer_total_ms": 0,
+                    "attention_ms": 0,
+                    "linear_attn_ms": 0,
+                    "router_ms": 0,
+                    "moe_total_ms": 0,
+                    "selected_experts_count": 0,
+                    "top_k": 0,
+                    "expert_matmul_ms": 0,
+                    "shared_expert_ms": 0,
+                    "mlp_ms": 0,
+                    "output_proj_ms": 0,
+                } if layer_trace_enabled else None
                 norm1_w = self._w(f"{prefix}.input_layernorm.weight")
                 norm2_w = self._w(f"{prefix}.post_attention_layernorm.weight")
                 gate_w = self._w(f"{prefix}.mlp.gate_proj.weight")
@@ -811,12 +952,18 @@ class MLXBackend:
                 normed = _mx_rms_norm(mx, h, norm1_w, rms_eps)
                 if self._has_linear_attn(prefix):
                     try:
+                        attn_t0 = time.perf_counter()
                         attn_out, _state_meta = self._linear_attn_forward(mx, prefix, local_i, normed, use_kv, rms_eps)
+                        if layer_trace is not None:
+                            mx.eval(attn_out)
+                            layer_trace["linear_attn_ms"] = max(0, int((time.perf_counter() - attn_t0) * 1000))
+                            layer_trace["attention_ms"] = layer_trace["linear_attn_ms"]
                     except Exception as exc:
                         import traceback
                         print(f"[mlx] linear_attn error layer {local_i}: {exc}\n{traceback.format_exc()}")
                         return None
                 else:
+                    attn_t0 = time.perf_counter()
                     q_w = self._w(f"{prefix}.self_attn.q_proj.weight")
                     k_w = self._w(f"{prefix}.self_attn.k_proj.weight")
                     v_w = self._w(f"{prefix}.self_attn.v_proj.weight")
@@ -874,16 +1021,28 @@ class MLXBackend:
                             f"{prefix}.self_attn.o_proj",
                         ),
                     )
+                    if layer_trace is not None:
+                        mx.eval(attn_out)
+                        layer_trace["attention_ms"] = max(0, int((time.perf_counter() - attn_t0) * 1000))
                     if use_kv and new_k is not None:
                         self.kv_cache[local_i] = (new_k, new_v)  # type: ignore[index]
                 h = h + attn_out
                 normed2 = _mx_rms_norm(mx, h, norm2_w, rms_eps)
+                mlp_t0 = time.perf_counter()
                 if has_moe_mlp:
-                    h = h + self._moe_mlp(mx, prefix, normed2)
+                    h = h + self._moe_mlp(mx, prefix, normed2, layer_trace)
                 else:
                     h = h + self._dense_mlp(mx, prefix, normed2)
+                    if layer_trace is not None:
+                        mx.eval(h)
+                        layer_trace["mlp_ms"] = max(0, int((time.perf_counter() - mlp_t0) * 1000))
                 if eval_every and ((local_i + 1) % eval_every == 0 or local_i + 1 == n_layers_here):
                     mx.eval(h)
+                if layer_trace is not None:
+                    mx.eval(h)
+                    layer_trace["mlp_ms"] = layer_trace.get("moe_total_ms") or layer_trace.get("mlp_ms") or max(0, int((time.perf_counter() - mlp_t0) * 1000))
+                    layer_trace["layer_total_ms"] = max(0, int((time.perf_counter() - layer_t0) * 1000))
+                    layer_traces.append(layer_trace)
                 if progress_every and ((local_i + 1) % progress_every == 0 or local_i + 1 == n_layers_here):
                     print(
                         f"[mlx] layer {local_i + 1}/{n_layers_here} "
@@ -906,6 +1065,8 @@ class MLXBackend:
         if hx is None:
             reason = transformer_failure_reasons[-1] if transformer_failure_reasons else "unknown"
             lazy_trace = _finish_lazy_trace()
+            self.last_layer_trace = list(layer_traces)
+            self.last_forward_memory_trace = _memory_trace()
             return json.dumps({
                 "ok": False,
                 "error": f"mlx_run_transformer a échoué: {reason}",
@@ -1007,6 +1168,8 @@ class MLXBackend:
             compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
             self.shard.last_forward_ms = compute_ms
             lazy_trace = _finish_lazy_trace()
+            self.last_layer_trace = list(layer_traces)
+            self.last_forward_memory_trace = _memory_trace()
 
             if request_id != "default":
                 self._request_states[request_id] = {
@@ -1046,6 +1209,10 @@ class MLXBackend:
                     "hidden_transport_requested": str(payload.get("hidden_transport", HIDDEN_TRANSPORT)).lower(),
                     "hidden_transport_effective": "lm_head_only",
                     "python_mlx_pure_compute_ms": compute_ms,
+                    "layer_trace_enabled": bool(layer_trace_enabled),
+                    "layer_trace": layer_traces,
+                    "top_slowest_layers": sorted(layer_traces, key=lambda row: int(row.get("layer_total_ms") or 0), reverse=True)[:10],
+                    **self.last_forward_memory_trace,
                     **inbound_hidden_trace,
                     **lazy_trace,
                 },
@@ -1070,6 +1237,8 @@ class MLXBackend:
             hidden_encode_ms = max(0, int((time.perf_counter() - encode_t0) * 1000))
             hidden_metrics["hidden_encode_ms"] = hidden_encode_ms
             lazy_trace = _finish_lazy_trace()
+            self.last_layer_trace = list(layer_traces)
+            self.last_forward_memory_trace = _memory_trace()
 
             print(f"[mlx] forward {sid[:12]}… step={step} seq_pos={out_seq_pos} ({compute_ms}ms)")
             out = {
@@ -1097,6 +1266,10 @@ class MLXBackend:
                     "hidden_transport_requested": str(payload.get("hidden_transport", HIDDEN_TRANSPORT)).lower(),
                     "hidden_transport_effective": transport,
                     "python_mlx_pure_compute_ms": compute_ms,
+                    "layer_trace_enabled": bool(layer_trace_enabled),
+                    "layer_trace": layer_traces,
+                    "top_slowest_layers": sorted(layer_traces, key=lambda row: int(row.get("layer_total_ms") or 0), reverse=True)[:10],
+                    **self.last_forward_memory_trace,
                     **inbound_hidden_trace,
                     **hidden_metrics,
                     **lazy_trace,
@@ -1620,6 +1793,8 @@ class MLXBackend:
             "weight_dtype": os.environ.get("VRYX_MLX_WEIGHT_DTYPE", "fp16"),
             "compute_dtype": os.environ.get("VRYX_MLX_COMPUTE_DTYPE", "fp16"),
             "q4_hidden_transport_supported": bool(self.available),
+            "last_layer_trace": getattr(self, "last_layer_trace", []),
+            "last_forward_memory_trace": getattr(self, "last_forward_memory_trace", {}),
         }
 
     def capabilities(self) -> dict[str, Any]:
