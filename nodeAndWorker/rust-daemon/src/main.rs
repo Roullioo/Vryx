@@ -79,6 +79,7 @@ mod vryx_codec {
         }
     }
 
+    #[async_trait::async_trait]
     impl<Req, Resp> libp2p::request_response::Codec for Codec<Req, Resp>
     where
         Req: Send + Serialize + DeserializeOwned,
