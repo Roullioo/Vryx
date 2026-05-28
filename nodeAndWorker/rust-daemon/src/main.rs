@@ -2288,6 +2288,8 @@ pub mod vryx {
 use tonic::transport::Channel;
 use vryx::inference_service_client::InferenceServiceClient;
 
+static LOCAL_INFERENCE_CHANNELS: OnceLock<Mutex<HashMap<u16, Channel>>> = OnceLock::new();
+
 async fn connect_local_inference_channel(
     port: u16,
 ) -> Result<Channel, Box<dyn Error + Send + Sync>> {
@@ -2298,6 +2300,28 @@ async fn connect_local_inference_channel(
         .timeout(Duration::from_secs(900))
         .tcp_nodelay(true);
     Ok(endpoint.connect().await?)
+}
+
+async fn local_inference_channel(
+    port: u16,
+) -> Result<Channel, Box<dyn Error + Send + Sync>> {
+    let cache_enabled = env_bool_flag("VRYX_GRPC_CHANNEL_CACHE").unwrap_or(true);
+    if !cache_enabled {
+        return connect_local_inference_channel(port).await;
+    }
+    let cache = LOCAL_INFERENCE_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(channel) = cache.lock().unwrap().get(&port).cloned() {
+        return Ok(channel);
+    }
+    let channel = connect_local_inference_channel(port).await?;
+    cache.lock().unwrap().insert(port, channel.clone());
+    Ok(channel)
+}
+
+fn invalidate_local_inference_channel(port: u16) {
+    if let Some(cache) = LOCAL_INFERENCE_CHANNELS.get() {
+        cache.lock().unwrap().remove(&port);
+    }
 }
 
 // ============================================================
@@ -2435,7 +2459,7 @@ async fn call_local_inference_once(
     routing_path: Vec<String>,
     session_id: String,
 ) -> Result<(Vec<u8>, u64, u64, LlmMetrics, u64), Box<dyn Error + Send + Sync>> {
-    let channel = connect_local_inference_channel(port).await?;
+    let channel = local_inference_channel(port).await?;
     let mut client = InferenceServiceClient::new(channel)
         // Aligné avec `inference_server.py` (grpc.aio.server 1 Go) : un init shard / forward
         // peut dépasser 100 Mo (config, métriques, réponses protobuf) sous peine de « transport error » tonic.
@@ -2538,6 +2562,7 @@ async fn call_local_inference(
                     || s.contains("connection reset");
                 last_msg = msg.clone();
                 if retryable && attempt + 1 < MAX_ATTEMPTS {
+                    invalidate_local_inference_channel(port);
                     eprintln!(
                         "[!] gRPC local port {} : tentative {} — {}",
                         port,
