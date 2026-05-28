@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifact
-          cp nodeAndWorker/rust-daemon/target/release/rust-daemon artifact/vryx-daemon-linux-x86_64
+          cp nodeAndWorker/target/release/rust-daemon artifact/vryx-daemon-linux-x86_64
           chmod +x artifact/vryx-daemon-linux-x86_64
           git rev-parse --short HEAD > artifact/commit.txt
           sha256sum artifact/vryx-daemon-linux-x86_64 > artifact/vryx-daemon-linux-x86_64.sha256
