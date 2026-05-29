@@ -16,10 +16,25 @@ type HeroParticle = Point & {
   vy: number
   tx: number
   ty: number
+  ox: number
+  oy: number
+  oz: number
+  z: number
   size: number
   color: string
   phase: number
   drift: number
+  group: 'core' | 'ring1' | 'ring2' | 'ring3' | 'starfield'
+}
+
+type BlasterShot = {
+  from: HeroParticle
+  to: HeroParticle
+  progress: number // 0 to 1
+  speed: number
+  color: string
+  state: 'charging' | 'flying' | 'exploding'
+  explosionProgress: number
 }
 
 type WordParticle = Point & {
@@ -50,12 +65,10 @@ const modelColors = {
 }
 
 const palette = [
-  modelColors.nvidia,
-  modelColors.mistral,
-  modelColors.deepseek,
-  modelColors.qwen,
-  modelColors.llama,
-  modelColors.microsoft,
+  '#06B6D4', // Electric Cyan
+  '#8B5CF6', // Cyber Violet
+  '#4F46E5', // Deep Indigo
+  '#ffffff', // Pristine White
 ]
 
 const stats = [
@@ -412,42 +425,112 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
     let wordHeight = 1
     let heroParticles: HeroParticle[] = []
     let wordParticles: WordParticle[] = []
+    let blasterShots: BlasterShot[] = []
     let frame = 0
     const mouse = { x: -9999, y: -9999, wordX: -9999, wordY: -9999, wordActive: false }
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
-    function ring(i: number, total: number) {
-      const angle = (i / total) * Math.PI * 2
-      const centerX = heroWidth * 0.5
-      const centerY = heroHeight * 0.39
-      const radiusX = Math.min(heroWidth * 0.43, 560)
-      const radiusY = Math.min(heroHeight * 0.27, 265)
-      const wobble = Math.sin(i * 4.7) * 24 + Math.cos(i * 1.9) * 12
-      return {
-        x: centerX + Math.cos(angle) * (radiusX + wobble),
-        y: centerY + Math.sin(angle) * (radiusY + wobble * 0.75),
-        angle,
-      }
-    }
-
     function buildHero() {
       const count = heroWidth < 700 ? 820 : 1650
       heroParticles = []
-      for (let i = 0; i < count; i += 1) {
-        const target = ring(i, count)
-        const colorIndex = Math.floor(((target.angle + Math.PI) / (Math.PI * 2)) * palette.length) % palette.length
+
+      const coreCount = Math.floor(count * 0.35)
+      const ring1Count = Math.floor(count * 0.20)
+      const ring2Count = Math.floor(count * 0.20)
+      const ring3Count = Math.floor(count * 0.20)
+      const starfieldCount = count - coreCount - ring1Count - ring2Count - ring3Count
+
+      const coreRadius = 135
+      const ring1Radius = 380
+      const ring2Radius = 425
+      const ring3Radius = 330
+
+      function tiltedRingPoint(theta: number, radius: number, tiltX: number, tiltY: number) {
+        const rx = radius * Math.cos(theta)
+        const ry = radius * Math.sin(theta)
+        const rz = 0
+        const cosX = Math.cos(tiltX)
+        const sinX = Math.sin(tiltX)
+        const y1 = ry * cosX - rz * sinX
+        const z1 = ry * sinX + rz * cosX
+        const cosY = Math.cos(tiltY)
+        const sinY = Math.sin(tiltY)
+        const x2 = rx * cosY + z1 * sinY
+        const z2 = -rx * sinY + z1 * cosY
+        return { x: x2, y: y1, z: z2 }
+      }
+
+      function spherePoint(index: number, total: number, radius: number) {
+        const phi = Math.acos(1 - 2 * (index / (total - 1 || 1)))
+        const theta = index * 2.399963229728653
+        return {
+          x: radius * Math.sin(phi) * Math.cos(theta),
+          y: radius * Math.sin(phi) * Math.sin(theta),
+          z: radius * Math.cos(phi),
+        }
+      }
+
+      const pushParticle = (ox: number, oy: number, oz: number, size: number, color: string, group: 'core' | 'ring1' | 'ring2' | 'ring3' | 'starfield') => {
+        // Pre-project coordinates at static t=0 state to completely remove entry bounce
+        const scale = 800 / (800 + oz)
+        const tx = heroWidth * 0.5 + ox * scale
+        const ty = heroHeight * 0.39 + oy * scale
+        
         heroParticles.push({
-          x: target.x + (Math.random() - 0.5) * 280,
-          y: target.y + (Math.random() - 0.5) * 160,
+          x: tx,
+          y: ty,
           vx: 0,
           vy: 0,
-          tx: target.x,
-          ty: target.y,
-          size: Math.random() * 1.55 + 0.5,
-          color: palette[colorIndex],
+          tx,
+          ty,
+          ox,
+          oy,
+          oz,
+          z: oz,
+          size,
+          color,
           phase: Math.random() * Math.PI * 2,
           drift: 0.35 + Math.random() * 0.55,
+          group,
         })
+      }
+
+      // Generate Core: Pristine White and Electric Cyan
+      for (let i = 0; i < coreCount; i++) {
+        const pt = spherePoint(i, coreCount, coreRadius)
+        const ox = pt.x + (Math.random() - 0.5) * 6
+        const oy = pt.y + (Math.random() - 0.5) * 6
+        const oz = pt.z + (Math.random() - 0.5) * 6
+        const color = Math.random() > 0.45 ? '#ffffff' : '#06B6D4'
+        pushParticle(ox, oy, oz, Math.random() * 1.5 + 0.6, color, 'core')
+      }
+
+      // Generate Ring 1 (Inner): Electric Cyan (#06B6D4)
+      for (let i = 0; i < ring1Count; i++) {
+        const theta = (i / ring1Count) * Math.PI * 2
+        const pt = tiltedRingPoint(theta, ring1Radius, 0.7, 0.5)
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, '#06B6D4', 'ring1')
+      }
+
+      // Generate Ring 2 (Middle): Cyber Violet (#8B5CF6)
+      for (let i = 0; i < ring2Count; i++) {
+        const theta = (i / ring2Count) * Math.PI * 2
+        const pt = tiltedRingPoint(theta, ring2Radius, -0.8, -0.3)
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, '#8B5CF6', 'ring2')
+      }
+
+      // Generate Ring 3 (Outer): Deep Indigo (#4F46E5)
+      for (let i = 0; i < ring3Count; i++) {
+        const theta = (i / ring3Count) * Math.PI * 2
+        const pt = tiltedRingPoint(theta, ring3Radius, 0.3, 1.1)
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, '#4F46E5', 'ring3')
+      }
+
+      // Generate Starfield: Dimmable Cyans and Violets
+      for (let i = 0; i < starfieldCount; i++) {
+        const pt = spherePoint(i, starfieldCount, coreRadius + Math.random() * 320)
+        const color = palette[Math.floor(Math.random() * palette.length)]
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.0 + 0.4, color, 'starfield')
       }
     }
 
@@ -458,16 +541,18 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
       for (let i = 0; i < count; i += 1) {
         const target = targets[Math.floor((i / count) * targets.length)]
         if (!target) continue
+        
+        // Initialize x and y directly to targets to remove assembly bounce
         wordParticles.push({
-          x: target.x + (Math.random() - 0.5) * 70,
-          y: target.y + (Math.random() - 0.5) * 36,
+          x: target.x,
+          y: target.y,
           vx: 0,
           vy: 0,
           tx: target.x,
           ty: target.y,
           size: Math.random() * 1.18 + 0.72,
           phase: Math.random() * Math.PI * 2,
-          color: palette[Math.floor((i / Math.max(count, 1)) * palette.length) % palette.length],
+          color: Math.random() > 0.5 ? '#06B6D4' : '#8B5CF6',
         })
       }
     }
@@ -487,21 +572,26 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
     }
 
     function drawHeroLines() {
-      heroContext.lineWidth = 1
-      for (let i = 0; i < heroParticles.length; i += 8) {
-        const a = heroParticles[i]
-        for (let j = i + 9; j < Math.min(i + 100, heroParticles.length); j += 15) {
-          const b = heroParticles[j]
-          const dx = a.x - b.x
-          const dy = a.y - b.y
-          const dist = dx * dx + dy * dy
-          if (dist < 9200) {
-            heroContext.globalAlpha = (1 - dist / 9200) * 0.13
+      if (mouse.x !== -9999) {
+        let linesDrawn = 0
+        for (let i = 0; i < heroParticles.length; i += 2) {
+          const a = heroParticles[i]
+          if (a.z > 120) continue
+
+          const dx = a.x - mouse.x
+          const dy = a.y - mouse.y
+          const dist = Math.sqrt(dx * dx + dy * dy)
+          if (dist < 135) {
+            const depthFactor = Math.max(0.1, 1 - a.z / 500)
+            heroContext.globalAlpha = (1 - dist / 135) * 0.26 * depthFactor
             heroContext.strokeStyle = a.color
+            heroContext.lineWidth = 1.1
             heroContext.beginPath()
-            heroContext.moveTo(a.x, a.y)
-            heroContext.lineTo(b.x, b.y)
+            heroContext.moveTo(mouse.x, mouse.y)
+            heroContext.lineTo(a.x, a.y)
             heroContext.stroke()
+            linesDrawn++
+            if (linesDrawn > 24) break
           }
         }
       }
@@ -509,30 +599,261 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
     }
 
     function animate(timestamp: number) {
+      const D = 800
+      const centerX = heroWidth * 0.5
+      const centerY = heroHeight * 0.39
+
+      // Spawning Blaster Shots (0.7% chance per frame, max 4 active)
+      if (blasterShots.length < 4 && Math.random() < 0.007 && heroParticles.length > 100) {
+        const paths: [string, string][] = [
+          ['ring1', 'ring2'],
+          ['ring2', 'ring3'],
+          ['ring3', 'core'],
+          ['core', 'ring1']
+        ]
+        const path = paths[Math.floor(Math.random() * paths.length)]
+        const fromCandidates = heroParticles.filter(p => p.group === path[0])
+        const toCandidates = heroParticles.filter(p => p.group === path[1])
+        
+        if (fromCandidates.length > 0 && toCandidates.length > 0) {
+          const fromP = fromCandidates[Math.floor(Math.random() * fromCandidates.length)]
+          const toP = toCandidates[Math.floor(Math.random() * toCandidates.length)]
+          
+          blasterShots.push({
+            from: fromP,
+            to: toP,
+            progress: 0,
+            speed: 0.003 + Math.random() * 0.002, // slow slick speed (duration 200-330 frames)
+            color: toP.color,
+            state: 'charging',
+            explosionProgress: 0
+          })
+        }
+      }
+
+      const alpha = timestamp * 0.00014
+      const beta = timestamp * 0.00007
+      const gamma = timestamp * 0.00003
+
+      const cosA = Math.cos(alpha)
+      const sinA = Math.sin(alpha)
+      const cosB = Math.cos(beta)
+      const sinB = Math.sin(beta)
+      const cosG = Math.cos(gamma)
+      const sinG = Math.sin(gamma)
+
+      for (const particle of heroParticles) {
+        const wave = Math.sin(timestamp * 0.001 * particle.drift + particle.phase) * 8.5
+        const distCenter = Math.sqrt(particle.ox * particle.ox + particle.oy * particle.oy + particle.oz * particle.oz) || 1
+        const ox = particle.ox + (particle.ox / distCenter) * wave
+        const oy = particle.oy + (particle.oy / distCenter) * wave
+        const oz = particle.oz + (particle.oz / distCenter) * wave
+
+        const x1 = ox * cosA - oz * sinA
+        const z1 = ox * sinA + oz * cosA
+
+        const y2 = oy * cosB - z1 * sinB
+        let z2 = oy * sinB + z1 * cosB
+
+        let x3 = x1 * cosG - y2 * sinG
+        let y3 = x1 * sinG + y2 * cosG
+
+        if (mouse.x !== -9999) {
+          const dx = x3 - (mouse.x - centerX)
+          const dy = y3 - (mouse.y - centerY)
+          const d2 = dx * dx + dy * dy
+          if (d2 < 24000) {
+            const pull = (1 - d2 / 24000) * 12 * particle.drift
+            x3 -= (dx / (Math.sqrt(d2) || 1)) * pull
+            y3 -= (dy / (Math.sqrt(d2) || 1)) * pull
+            z2 -= pull * 3
+          }
+        }
+
+        particle.z = z2
+
+        const scale = D / (D + z2)
+        particle.tx = centerX + x3 * scale
+        particle.ty = centerY + y3 * scale
+      }
+
+      heroParticles.sort((a, b) => b.z - a.z)
+
       heroContext.clearRect(0, 0, heroWidth, heroHeight)
       drawHeroLines()
 
+      // Update and Draw 3D Blaster Shots
+      for (const blaster of blasterShots) {
+        if (blaster.state === 'charging') {
+          blaster.progress += blaster.speed * 1.6
+          if (blaster.progress >= 0.15) {
+            blaster.state = 'flying'
+          }
+
+          const f = Math.max(0, (0.15 - blaster.progress) / 0.15)
+          for (let j = 0; j < 4; j++) {
+            const theta = f * 6.5 + j * (Math.PI / 2)
+            const R = 35 * f
+            const dx = R * Math.cos(theta)
+            const dy = R * Math.sin(theta) * 0.5
+            const dz = R * Math.sin(theta) * 0.8
+
+            const ox = blaster.from.ox + dx
+            const oy = blaster.from.oy + dy
+            const oz = blaster.from.oz + dz
+
+            const x1 = ox * cosA - oz * sinA
+            const z1 = ox * sinA + oz * cosA
+            const y2 = oy * cosB - z1 * sinB
+            const z2 = oy * sinB + z1 * cosB
+            const rx = x1 * cosG - y2 * sinG
+            const ry = x1 * sinG + y2 * cosG
+
+            const scale = D / (D + z2)
+            const px = centerX + rx * scale
+            const py = centerY + ry * scale
+
+            heroContext.save()
+            heroContext.fillStyle = '#ffffff'
+            heroContext.shadowColor = blaster.from.color
+            heroContext.shadowBlur = 7 * scale
+            heroContext.beginPath()
+            heroContext.arc(px, py, 2.2 * scale * f, 0, Math.PI * 2)
+            heroContext.fill()
+            heroContext.restore()
+          }
+        } 
+        else if (blaster.state === 'flying') {
+          blaster.progress += blaster.speed
+          if (blaster.progress >= 1.0) {
+            blaster.state = 'exploding'
+            blaster.explosionProgress = 0
+            continue
+          }
+
+          const progress = blaster.progress
+          const backProgress = Math.max(0.15, progress - 0.08)
+
+          const ox_f = blaster.from.ox + (blaster.to.ox - blaster.from.ox) * progress
+          const oy_f = blaster.from.oy + (blaster.to.oy - blaster.from.oy) * progress
+          const oz_f = blaster.from.oz + (blaster.to.oz - blaster.from.oz) * progress
+
+          const ox_b = blaster.from.ox + (blaster.to.ox - blaster.from.ox) * backProgress
+          const oy_b = blaster.from.oy + (blaster.to.oy - blaster.from.oy) * backProgress
+          const oz_b = blaster.from.oz + (blaster.to.oz - blaster.from.oz) * backProgress
+
+          const x1_f = ox_f * cosA - oz_f * sinA
+          const z1_f = ox_f * sinA + oz_f * cosA
+          const y2_f = oy_f * cosB - z1_f * sinB
+          const z2_f = oy_f * sinB + z1_f * cosB
+          const rx_f = x1_f * cosG - y2_f * sinG
+          const ry_f = x1_f * sinG + y2_f * cosG
+
+          const x1_b = ox_b * cosA - oz_b * sinA
+          const z1_b = ox_b * sinA + oz_b * cosA
+          const y2_b = oy_b * cosB - z1_b * sinB
+          const z2_b = oy_b * sinB + z1_b * cosB
+          const rx_b = x1_b * cosG - y2_b * sinG
+          const ry_b = x1_b * sinG + y2_b * cosG
+
+          const scale_f = D / (D + z2_f)
+          const px_f = centerX + rx_f * scale_f
+          const py_f = centerY + ry_f * scale_f
+
+          const scale_b = D / (D + z2_b)
+          const px_b = centerX + rx_b * scale_b
+          const py_b = centerY + ry_b * scale_b
+
+          const avgZ = (z2_f + z2_b) / 2
+          const depthFactor = Math.max(0.15, Math.min(1.0, 1 - avgZ / 500))
+
+          const segmentFade = progress < 0.25 ? (progress - 0.15) / 0.10 : 1.0
+
+          heroContext.save()
+          heroContext.lineCap = 'round'
+          heroContext.lineWidth = 3.6 * scale_f * depthFactor
+          heroContext.strokeStyle = `rgba(255, 255, 255, ${segmentFade})`
+          heroContext.shadowColor = blaster.color
+          heroContext.shadowBlur = 12 * scale_f * depthFactor
+
+          heroContext.beginPath()
+          heroContext.moveTo(px_b, py_b)
+          heroContext.lineTo(px_f, py_f)
+          heroContext.stroke()
+          heroContext.restore()
+        } 
+        else if (blaster.state === 'exploding') {
+          blaster.explosionProgress += 0.04
+          const t_exp = blaster.explosionProgress
+          if (t_exp >= 1.0) continue
+
+          const R = 36 * Math.sin(t_exp * Math.PI) * (1 - t_exp)
+
+          for (let j = 0; j < 4; j++) {
+            const theta = t_exp * 8.5 + j * (Math.PI / 2)
+            const lx = R * Math.cos(theta)
+            const ly = R * Math.sin(theta) * Math.cos(j * (Math.PI / 2))
+            const lz = R * Math.sin(theta) * Math.sin(j * (Math.PI / 2))
+
+            const ox = blaster.to.ox + lx
+            const oy = blaster.to.oy + ly
+            const oz = blaster.to.oz + lz
+
+            const x1 = ox * cosA - oz * sinA
+            const z1 = ox * sinA + oz * cosA
+            const y2 = oy * cosB - z1 * sinB
+            const z2 = oy * sinB + z1 * cosB
+            const rx = x1 * cosG - y2 * sinG
+            const ry = x1 * sinG + y2 * cosG
+
+            const scale = D / (D + z2)
+            const px = centerX + rx * scale
+            const py = centerY + ry * scale
+
+            heroContext.save()
+            heroContext.fillStyle = '#ffffff'
+            heroContext.shadowColor = blaster.color
+            heroContext.shadowBlur = 8 * scale * (1 - t_exp)
+            heroContext.beginPath()
+            heroContext.arc(px, py, 2.5 * scale * (1 - t_exp), 0, Math.PI * 2)
+            heroContext.fill()
+            heroContext.restore()
+          }
+        }
+      }
+
+      // Cleanup finished blaster shots
+      blasterShots = blasterShots.filter(b => b.state !== 'exploding' || b.explosionProgress < 1.0)
+
       for (const particle of heroParticles) {
-        const targetX = particle.tx + Math.cos(timestamp * 0.00019 * particle.drift + particle.phase) * 18
-        const targetY = particle.ty + Math.sin(timestamp * 0.00022 * particle.drift + particle.phase) * 12
-        let ax = (targetX - particle.x) * 0.0072
-        let ay = (targetY - particle.y) * 0.0072
+        const targetX = particle.tx
+        const targetY = particle.ty
+        
+        let ax = (targetX - particle.x) * 0.007
+        let ay = (targetY - particle.y) * 0.007
+
         const dx = particle.x - mouse.x
         const dy = particle.y - mouse.y
         const dist = Math.sqrt(dx * dx + dy * dy)
-        if (dist < 155) {
-          const force = (1 - dist / 155) * 0.62
+        if (dist < 145) {
+          const force = (1 - dist / 145) * 0.18
           ax += (dx / (dist || 1)) * force
           ay += (dy / (dist || 1)) * force
         }
-        particle.vx = (particle.vx + ax) * 0.94
-        particle.vy = (particle.vy + ay) * 0.94
+
+        particle.vx = (particle.vx + ax) * 0.93
+        particle.vy = (particle.vy + ay) * 0.93
         particle.x += particle.vx
         particle.y += particle.vy
-        heroContext.globalAlpha = 0.72
+
+        const scale = D / (D + particle.z)
+        const size = particle.size * scale
+        const alpha = Math.max(0.08, Math.min(1.0, (1 - particle.z / 600) * 0.82))
+
+        heroContext.globalAlpha = alpha
         heroContext.fillStyle = particle.color
         heroContext.beginPath()
-        heroContext.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2)
+        heroContext.arc(particle.x, particle.y, size, 0, Math.PI * 2)
         heroContext.fill()
       }
       heroContext.globalAlpha = 1
@@ -540,50 +861,67 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
       wordContext.clearRect(0, 0, wordWidth, wordHeight)
       const localX = mouse.wordX
       const localY = mouse.wordY
-      const magnetX = mouse.wordActive ? ((localX - wordWidth / 2) / Math.max(wordWidth / 2, 1)) * 6 : 0
-      const magnetY = mouse.wordActive ? ((localY - wordHeight / 2) / Math.max(wordHeight / 2, 1)) * 5 : 0
+      const magnetX = mouse.wordActive ? ((localX - wordWidth / 2) / Math.max(wordWidth / 2, 1)) * 8 : 0
+      const magnetY = mouse.wordActive ? ((localY - wordHeight / 2) / Math.max(wordHeight / 2, 1)) * 6 : 0
+
+      const wavePos = (timestamp * 0.14) % (wordWidth + 400) - 200
 
       for (let i = 0; i < wordParticles.length; i += 1) {
         const particle = wordParticles[i]
-        const pulse = Math.sin(timestamp * 0.0018 + particle.phase) * 0.5 + 0.5
-        let targetX = particle.tx + Math.cos(timestamp * 0.0009 + particle.phase) * 1.7 + magnetX
-        let targetY = particle.ty + Math.sin(timestamp * 0.001 + particle.phase) * 1.7 + magnetY
-        let repelX = 0
-        let repelY = 0
+        
+        const dx = Math.abs(particle.tx - wavePos)
+        const sweepPulse = dx < 110 ? (1 - dx / 110) : 0
+        const pulse = Math.sin(timestamp * 0.0022 + particle.phase) * 0.5 + 0.5
+
+        let targetX = particle.tx + magnetX
+        let targetY = particle.ty + magnetY - sweepPulse * 10
+
+        let ax = 0
+        let ay = 0
+        let targetWeight = 1.0
 
         if (mouse.wordActive) {
-          const dx = particle.x - localX
-          const dy = particle.y - localY
-          const dist = Math.sqrt(dx * dx + dy * dy)
-          if (dist < 92) {
-            const force = (1 - dist / 92) * 1.95
-            repelX = (dx / (dist || 1)) * force
-            repelY = (dy / (dist || 1)) * force
-            targetX += repelX * 18
-            targetY += repelY * 12
+          const mdx = particle.x - localX
+          const mdy = particle.y - localY
+          const dist = Math.sqrt(mdx * mdx + mdy * mdy)
+          
+          if (dist < 130) {
+            const force = 1 - dist / 130
+            const tX = -mdy / (dist || 1)
+            const tY = mdx / (dist || 1)
+            
+            ax += tX * force * 1.6 - (mdx / (dist || 1)) * force * 0.5
+            ay += tY * force * 1.6 - (mdy / (dist || 1)) * force * 0.5
+            
+            targetWeight = 1 - force * 0.82
           }
         }
 
-        const ax = (targetX - particle.x) * 0.044 + repelX
-        const ay = (targetY - particle.y) * 0.044 + repelY
-        particle.vx = (particle.vx + ax) * 0.84
-        particle.vy = (particle.vy + ay) * 0.84
+        ax += (targetX - particle.x) * 0.014 * targetWeight
+        ay += (targetY - particle.y) * 0.014 * targetWeight
+
+        particle.vx = (particle.vx + ax) * 0.85
+        particle.vy = (particle.vy + ay) * 0.85
         particle.x += particle.vx
         particle.y += particle.vy
-        wordContext.globalAlpha = 0.78 + 0.22 * pulse
-        wordContext.fillStyle = particle.color
+
+        const extraSize = sweepPulse * 0.95 + pulse * 0.22
+        const alpha = Math.max(0.68, Math.min(1.0, 0.76 + sweepPulse * 0.24))
+
+        wordContext.globalAlpha = alpha
+        wordContext.fillStyle = sweepPulse > 0.45 ? '#ffffff' : particle.color
         wordContext.beginPath()
-        wordContext.arc(particle.x, particle.y, particle.size + pulse * 0.28, 0, Math.PI * 2)
+        wordContext.arc(particle.x, particle.y, particle.size + extraSize, 0, Math.PI * 2)
         wordContext.fill()
 
-        if (mouse.wordActive && i % 14 === 0) {
-          const dx = particle.x - localX
-          const dy = particle.y - localY
-          const dist = Math.sqrt(dx * dx + dy * dy)
-          if (dist < 120) {
-            wordContext.globalAlpha = (1 - dist / 120) * 0.24
+        if (mouse.wordActive && i % 9 === 0) {
+          const mdx = particle.x - localX
+          const mdy = particle.y - localY
+          const dist = Math.sqrt(mdx * mdx + mdy * mdy)
+          if (dist < 110) {
+            wordContext.globalAlpha = (1 - dist / 110) * 0.28
             wordContext.strokeStyle = particle.color
-            wordContext.lineWidth = 1
+            wordContext.lineWidth = 0.85
             wordContext.beginPath()
             wordContext.moveTo(localX, localY)
             wordContext.lineTo(particle.x, particle.y)
