@@ -32,12 +32,12 @@ export function VryxLogo({
 
   const mark = (
     <img
-      src="/logo-withoutbg.webp"
+      src="/logo.svg"
       alt=""
-      width={180}
-      height={180}
+      width={442}
+      height={464}
       decoding="async"
-      className={`shrink-0 object-contain ${markSizeClass[markSize]}`}
+      className={`vryx-logo-mark shrink-0 object-contain ${markSizeClass[markSize]}`}
     />
   )
 

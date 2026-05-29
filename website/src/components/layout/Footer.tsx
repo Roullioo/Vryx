@@ -13,18 +13,18 @@ export function Footer() {
           <div className="max-w-sm">
             <Link to="/" className="inline-flex w-fit items-center gap-3 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 focus-visible:ring-offset-2 focus-visible:ring-offset-bg">
               <img
-                src="/logo.webp"
+                src="/logo.svg"
                 alt="Vryx"
-                width={40}
-                height={40}
+                width={442}
+                height={464}
                 decoding="async"
-                className="h-10 w-10 rounded-lg object-cover sm:h-11 sm:w-11"
+                className="vryx-logo-mark h-10 w-10 object-contain sm:h-11 sm:w-11"
               />
               <span className="font-display text-lg font-semibold tracking-tight text-fg sm:text-xl">VryxAI</span>
             </Link>
             <p className="mt-4 text-sm leading-relaxed text-muted">
               Infrastructure d&apos;inférence distribuée, opérée en Europe. Tarifs en euros, virements SEPA,
-              alternative aux seuls hyperscalers pour amortir vos GPU et vos budgets.
+              alternative aux grands clouds pour amortir vos GPU et vos budgets.
             </p>
             <div className="mt-6 flex flex-col gap-2 sm:flex-row sm:gap-3">
               <Link to="/simulateur" className="btn-primary rounded-xl px-5 py-2.5 text-sm font-semibold">
@@ -49,7 +49,7 @@ export function Footer() {
               </li>
               <li>
                 <Link className="transition-colors hover:text-accent" to="/comparatif">
-                  Comparatif solo / pool
+                  Comparatif seul / collectif
                 </Link>
               </li>
               <li>
@@ -59,7 +59,7 @@ export function Footer() {
               </li>
               <li>
                 <Link className="transition-colors hover:text-accent" to="/race-pool">
-                  Race-Pool
+                  Groupe de calcul
                 </Link>
               </li>
             </ul>
@@ -70,7 +70,7 @@ export function Footer() {
             <ul className="mt-4 space-y-2.5 text-sm text-muted">
               <li>
                 <Link className="transition-colors hover:text-electric" to="/workers">
-                  Devenir worker
+                  Devenir nœud
                 </Link>
               </li>
               <li>
@@ -80,7 +80,7 @@ export function Footer() {
               </li>
               <li>
                 <Link className="transition-colors hover:text-electric" to="/workers#faq-workers">
-                  FAQ worker
+                  FAQ nœuds
                 </Link>
               </li>
             </ul>

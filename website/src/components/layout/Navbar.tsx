@@ -244,7 +244,7 @@ export function Navbar() {
           {!loading && user ? (
             <Link
               to="/compte"
-              className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${chromePrimaryClass}`}
+              className={`hidden rounded-lg px-4 py-2 text-sm font-semibold sm:inline-flex lg:hidden ${chromePrimaryClass}`}
               onClick={() => setMenuOpen(false)}
             >
               {t('nav.account')}
@@ -253,14 +253,14 @@ export function Navbar() {
             <Link
               to="/connexion"
               state={{ from: '/compte' }}
-              className={`inline-flex rounded-lg px-4 py-2 text-sm font-semibold lg:hidden ${chromePrimaryClass}`}
+              className={`hidden rounded-lg px-4 py-2 text-sm font-semibold sm:inline-flex lg:hidden ${chromePrimaryClass}`}
               onClick={() => setMenuOpen(false)}
             >
               {t('nav.account')}
             </Link>
           ) : (
             <span
-              className="inline-flex h-10 w-24 shrink-0 animate-pulse rounded-lg bg-card lg:hidden"
+              className="hidden h-10 w-24 shrink-0 animate-pulse rounded-lg bg-card sm:inline-flex lg:hidden"
               aria-hidden
             />
           )}

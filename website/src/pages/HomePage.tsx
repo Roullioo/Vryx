@@ -1,12 +1,6 @@
 import { useEffect } from 'react'
 import { useLocation } from 'react-router-dom'
-import { HeroSection } from '../components/sections/HeroSection'
-import { HomeWorkerPreviewSection } from '../components/sections/HomeWorkerPreviewSection'
-import { RacePoolSection } from '../components/sections/RacePoolSection'
-import { ClientsSection } from '../components/sections/ClientsSection'
-import { WorkersSection } from '../components/sections/WorkersSection'
-import { PrivacySection } from '../components/sections/PrivacySection'
-import { CTASection } from '../components/sections/CTASection'
+import { VryxLandingExperience } from '../components/sections/VryxLandingExperience'
 
 export function HomePage() {
   const { hash, pathname } = useLocation()
@@ -22,15 +16,5 @@ export function HomePage() {
     }
   }, [hash, pathname])
 
-  return (
-    <>
-      <HeroSection />
-      <HomeWorkerPreviewSection />
-      <RacePoolSection />
-      <ClientsSection />
-      <WorkersSection />
-      <PrivacySection />
-      <CTASection />
-    </>
-  )
+  return <VryxLandingExperience />
 }
