@@ -401,6 +401,10 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
     const heroCtx = hero?.getContext('2d', { alpha: true })
     const wordCtx = word?.getContext('2d', { alpha: true })
     if (!hero || !word || !heroCtx || !wordCtx) return
+    const heroCanvas: HTMLCanvasElement = hero
+    const wordCanvas: HTMLCanvasElement = word
+    const heroContext: CanvasRenderingContext2D = heroCtx
+    const wordContext: CanvasRenderingContext2D = wordCtx
 
     let heroWidth = 1
     let heroHeight = 1
@@ -469,21 +473,21 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
     }
 
     function resizeHero() {
-      const size = fitCanvas(hero, heroCtx)
+      const size = fitCanvas(heroCanvas, heroContext)
       heroWidth = size.width
       heroHeight = size.height
       buildHero()
     }
 
     function resizeWord() {
-      const size = fitCanvas(word, wordCtx)
+      const size = fitCanvas(wordCanvas, wordContext)
       wordWidth = size.width
       wordHeight = size.height
       buildWord()
     }
 
     function drawHeroLines() {
-      heroCtx.lineWidth = 1
+      heroContext.lineWidth = 1
       for (let i = 0; i < heroParticles.length; i += 8) {
         const a = heroParticles[i]
         for (let j = i + 9; j < Math.min(i + 100, heroParticles.length); j += 15) {
@@ -492,20 +496,20 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
           const dy = a.y - b.y
           const dist = dx * dx + dy * dy
           if (dist < 9200) {
-            heroCtx.globalAlpha = (1 - dist / 9200) * 0.13
-            heroCtx.strokeStyle = a.color
-            heroCtx.beginPath()
-            heroCtx.moveTo(a.x, a.y)
-            heroCtx.lineTo(b.x, b.y)
-            heroCtx.stroke()
+            heroContext.globalAlpha = (1 - dist / 9200) * 0.13
+            heroContext.strokeStyle = a.color
+            heroContext.beginPath()
+            heroContext.moveTo(a.x, a.y)
+            heroContext.lineTo(b.x, b.y)
+            heroContext.stroke()
           }
         }
       }
-      heroCtx.globalAlpha = 1
+      heroContext.globalAlpha = 1
     }
 
     function animate(timestamp: number) {
-      heroCtx.clearRect(0, 0, heroWidth, heroHeight)
+      heroContext.clearRect(0, 0, heroWidth, heroHeight)
       drawHeroLines()
 
       for (const particle of heroParticles) {
@@ -525,15 +529,15 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
         particle.vy = (particle.vy + ay) * 0.94
         particle.x += particle.vx
         particle.y += particle.vy
-        heroCtx.globalAlpha = 0.72
-        heroCtx.fillStyle = particle.color
-        heroCtx.beginPath()
-        heroCtx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2)
-        heroCtx.fill()
+        heroContext.globalAlpha = 0.72
+        heroContext.fillStyle = particle.color
+        heroContext.beginPath()
+        heroContext.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2)
+        heroContext.fill()
       }
-      heroCtx.globalAlpha = 1
+      heroContext.globalAlpha = 1
 
-      wordCtx.clearRect(0, 0, wordWidth, wordHeight)
+      wordContext.clearRect(0, 0, wordWidth, wordHeight)
       const localX = mouse.wordX
       const localY = mouse.wordY
       const magnetX = mouse.wordActive ? ((localX - wordWidth / 2) / Math.max(wordWidth / 2, 1)) * 6 : 0
@@ -566,35 +570,35 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
         particle.vy = (particle.vy + ay) * 0.84
         particle.x += particle.vx
         particle.y += particle.vy
-        wordCtx.globalAlpha = 0.78 + 0.22 * pulse
-        wordCtx.fillStyle = particle.color
-        wordCtx.beginPath()
-        wordCtx.arc(particle.x, particle.y, particle.size + pulse * 0.28, 0, Math.PI * 2)
-        wordCtx.fill()
+        wordContext.globalAlpha = 0.78 + 0.22 * pulse
+        wordContext.fillStyle = particle.color
+        wordContext.beginPath()
+        wordContext.arc(particle.x, particle.y, particle.size + pulse * 0.28, 0, Math.PI * 2)
+        wordContext.fill()
 
         if (mouse.wordActive && i % 14 === 0) {
           const dx = particle.x - localX
           const dy = particle.y - localY
           const dist = Math.sqrt(dx * dx + dy * dy)
           if (dist < 120) {
-            wordCtx.globalAlpha = (1 - dist / 120) * 0.24
-            wordCtx.strokeStyle = particle.color
-            wordCtx.lineWidth = 1
-            wordCtx.beginPath()
-            wordCtx.moveTo(localX, localY)
-            wordCtx.lineTo(particle.x, particle.y)
-            wordCtx.stroke()
+            wordContext.globalAlpha = (1 - dist / 120) * 0.24
+            wordContext.strokeStyle = particle.color
+            wordContext.lineWidth = 1
+            wordContext.beginPath()
+            wordContext.moveTo(localX, localY)
+            wordContext.lineTo(particle.x, particle.y)
+            wordContext.stroke()
           }
         }
       }
-      wordCtx.globalAlpha = 1
+      wordContext.globalAlpha = 1
 
       if (!reducedMotion) frame = window.requestAnimationFrame(animate)
     }
 
     function onPointerMove(event: PointerEvent) {
-      const heroRect = hero.getBoundingClientRect()
-      const wordRect = word.getBoundingClientRect()
+      const heroRect = heroCanvas.getBoundingClientRect()
+      const wordRect = wordCanvas.getBoundingClientRect()
       mouse.x = event.clientX - heroRect.left
       mouse.y = event.clientY - heroRect.top
       mouse.wordX = event.clientX - wordRect.left
@@ -613,8 +617,8 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
 
     const heroObserver = new ResizeObserver(resizeHero)
     const wordObserver = new ResizeObserver(resizeWord)
-    heroObserver.observe(hero)
-    wordObserver.observe(word)
+    heroObserver.observe(heroCanvas)
+    wordObserver.observe(wordCanvas)
     window.addEventListener('pointermove', onPointerMove, { passive: true })
     window.addEventListener('pointerleave', onPointerLeave)
     resizeHero()
@@ -636,6 +640,8 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
     const canvas = canvasRef.current
     const ctx = canvas?.getContext('2d', { alpha: true })
     if (!canvas || !ctx) return
+    const canvasEl: HTMLCanvasElement = canvas
+    const context: CanvasRenderingContext2D = ctx
 
     let width = 1
     let height = 1
@@ -665,7 +671,7 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
     }
 
     function resize() {
-      const size = fitCanvas(canvas, ctx)
+      const size = fitCanvas(canvasEl, context)
       width = size.width
       height = size.height
       const shape = makeFeatureTargets(kind, width, height)
@@ -675,22 +681,22 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
     }
 
     function animate(timestamp: number) {
-      ctx.clearRect(0, 0, width, height)
+      context.clearRect(0, 0, width, height)
       const active = hovering || pointer.active
 
       if (edges.length) {
-        ctx.save()
-        ctx.globalAlpha = active ? 0.28 : 0.18
-        ctx.strokeStyle = color
-        ctx.lineCap = 'round'
-        ctx.lineWidth = active ? 1.28 : 0.95
-        ctx.beginPath()
+        context.save()
+        context.globalAlpha = active ? 0.28 : 0.18
+        context.strokeStyle = color
+        context.lineCap = 'round'
+        context.lineWidth = active ? 1.28 : 0.95
+        context.beginPath()
         edges.forEach(([a, b]) => {
-          ctx.moveTo(a.x, a.y)
-          ctx.lineTo(b.x, b.y)
+          context.moveTo(a.x, a.y)
+          context.lineTo(b.x, b.y)
         })
-        ctx.stroke()
-        ctx.restore()
+        context.stroke()
+        context.restore()
       }
 
       const signalEvery = Math.max(3, Math.floor(edges.length / 26))
@@ -699,15 +705,15 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
         const t = (timestamp * 0.00018 + i * 0.017) % 1
         const x = a.x + (b.x - a.x) * t
         const y = a.y + (b.y - a.y) * t
-        ctx.globalAlpha = active ? 0.74 : 0.5
-        ctx.fillStyle = color
-        ctx.shadowBlur = active ? 11 : 4
-        ctx.shadowColor = color
-        ctx.beginPath()
-        ctx.arc(x, y, active ? 2.15 : 1.6, 0, Math.PI * 2)
-        ctx.fill()
+        context.globalAlpha = active ? 0.74 : 0.5
+        context.fillStyle = color
+        context.shadowBlur = active ? 11 : 4
+        context.shadowColor = color
+        context.beginPath()
+        context.arc(x, y, active ? 2.15 : 1.6, 0, Math.PI * 2)
+        context.fill()
       }
-      ctx.shadowBlur = 0
+      context.shadowBlur = 0
 
       for (const particle of particles) {
         const wander = active ? 1.2 : 14
@@ -730,27 +736,27 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
         particle.vy = (particle.vy + ay) * 0.88
         particle.x += particle.vx
         particle.y += particle.vy
-        ctx.globalAlpha = active ? 0.98 : 0.72
-        ctx.fillStyle = color
-        ctx.shadowBlur = active ? 6 : 1
-        ctx.shadowColor = color
-        ctx.beginPath()
-        ctx.arc(particle.x, particle.y, particle.size * (active ? 1.08 : 0.94), 0, Math.PI * 2)
-        ctx.fill()
+        context.globalAlpha = active ? 0.98 : 0.72
+        context.fillStyle = color
+        context.shadowBlur = active ? 6 : 1
+        context.shadowColor = color
+        context.beginPath()
+        context.arc(particle.x, particle.y, particle.size * (active ? 1.08 : 0.94), 0, Math.PI * 2)
+        context.fill()
       }
-      ctx.shadowBlur = 0
-      ctx.globalAlpha = 1
+      context.shadowBlur = 0
+      context.globalAlpha = 1
 
       if (!reducedMotion) frame = window.requestAnimationFrame(animate)
     }
 
-    const card = canvas.closest('.vryx-feature-card')
+    const card = canvasEl.closest('.vryx-feature-card')
     const onEnter = () => {
       hovering = true
     }
     const onMove = (event: Event) => {
       const pointerEvent = event as PointerEvent
-      const rect = canvas.getBoundingClientRect()
+      const rect = canvasEl.getBoundingClientRect()
       pointer.x = pointerEvent.clientX - rect.left
       pointer.y = pointerEvent.clientY - rect.top
       pointer.active = pointer.x >= 0 && pointer.x <= rect.width && pointer.y >= 0 && pointer.y <= rect.height
@@ -762,7 +768,7 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
       pointer.y = -9999
     }
     const observer = new ResizeObserver(resize)
-    observer.observe(canvas)
+    observer.observe(canvasEl)
     card?.addEventListener('pointerenter', onEnter)
     card?.addEventListener('pointermove', onMove, { passive: true })
     card?.addEventListener('pointerleave', onLeave)
@@ -784,6 +790,8 @@ function useMapCanvas(canvasRef: RefObject<HTMLCanvasElement | null>) {
     const canvas = canvasRef.current
     const ctx = canvas?.getContext('2d', { alpha: true })
     if (!canvas || !ctx) return
+    const canvasEl: HTMLCanvasElement = canvas
+    const context: CanvasRenderingContext2D = ctx
 
     type Node = Point & { color: string; radius: number; phase: number }
 
@@ -841,7 +849,7 @@ function useMapCanvas(canvasRef: RefObject<HTMLCanvasElement | null>) {
     }
 
     function resize() {
-      const size = fitCanvas(canvas, ctx)
+      const size = fitCanvas(canvasEl, context)
       width = size.width
       height = size.height
       buildMap()
@@ -851,27 +859,27 @@ function useMapCanvas(canvasRef: RefObject<HTMLCanvasElement | null>) {
       const pulse = Math.sin(timestamp * 0.0012 + a.phase + b.phase) * 0.5 + 0.5
       const midX = (a.x + b.x) / 2
       const midY = (a.y + b.y) / 2 - Math.min(95, 42 + Math.abs(a.x - b.x) * 0.08)
-      ctx.strokeStyle = color
-      ctx.globalAlpha = 0.12 + 0.2 * pulse
-      ctx.lineCap = 'round'
-      ctx.lineWidth = 1.25
-      ctx.beginPath()
-      ctx.moveTo(a.x, a.y)
-      ctx.quadraticCurveTo(midX, midY, b.x, b.y)
-      ctx.stroke()
+      context.strokeStyle = color
+      context.globalAlpha = 0.12 + 0.2 * pulse
+      context.lineCap = 'round'
+      context.lineWidth = 1.25
+      context.beginPath()
+      context.moveTo(a.x, a.y)
+      context.quadraticCurveTo(midX, midY, b.x, b.y)
+      context.stroke()
 
       const t = (timestamp * 0.00008 + a.phase) % 1
       const x = (1 - t) * (1 - t) * a.x + 2 * (1 - t) * t * midX + t * t * b.x
       const y = (1 - t) * (1 - t) * a.y + 2 * (1 - t) * t * midY + t * t * b.y
-      ctx.globalAlpha = 0.85
-      ctx.fillStyle = color
-      ctx.beginPath()
-      ctx.arc(x, y, 2.2, 0, Math.PI * 2)
-      ctx.fill()
+      context.globalAlpha = 0.85
+      context.fillStyle = color
+      context.beginPath()
+      context.arc(x, y, 2.2, 0, Math.PI * 2)
+      context.fill()
     }
 
     function animate(timestamp: number) {
-      ctx.clearRect(0, 0, width, height)
+      context.clearRect(0, 0, width, height)
       if (nodes.length) {
         for (let i = 1; i < nodes.length; i += 1) curve(nodes[0], nodes[i], nodes[i].color, timestamp)
         for (let i = 2; i < nodes.length; i += 2) curve(nodes[1], nodes[i], nodes[1].color, timestamp)
@@ -879,36 +887,36 @@ function useMapCanvas(canvasRef: RefObject<HTMLCanvasElement | null>) {
 
         for (const node of nodes) {
           const pulse = Math.sin(timestamp * 0.002 + node.phase) * 0.5 + 0.5
-          const glow = ctx.createRadialGradient(node.x, node.y, 0, node.x, node.y, node.radius * 7)
+          const glow = context.createRadialGradient(node.x, node.y, 0, node.x, node.y, node.radius * 7)
           glow.addColorStop(0, node.color)
           glow.addColorStop(1, 'transparent')
-          ctx.globalAlpha = 0.45
-          ctx.fillStyle = glow
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, node.radius * 7, 0, Math.PI * 2)
-          ctx.fill()
-          ctx.globalAlpha = 1
-          ctx.fillStyle = node.color
-          ctx.shadowBlur = 16
-          ctx.shadowColor = node.color
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, node.radius * 0.48 + pulse * 2, 0, Math.PI * 2)
-          ctx.fill()
-          ctx.shadowBlur = 0
-          ctx.globalAlpha = 0.55
-          ctx.strokeStyle = node.color
-          ctx.lineWidth = 1
-          ctx.beginPath()
-          ctx.arc(node.x, node.y, node.radius + 9 * pulse, 0, Math.PI * 2)
-          ctx.stroke()
+          context.globalAlpha = 0.45
+          context.fillStyle = glow
+          context.beginPath()
+          context.arc(node.x, node.y, node.radius * 7, 0, Math.PI * 2)
+          context.fill()
+          context.globalAlpha = 1
+          context.fillStyle = node.color
+          context.shadowBlur = 16
+          context.shadowColor = node.color
+          context.beginPath()
+          context.arc(node.x, node.y, node.radius * 0.48 + pulse * 2, 0, Math.PI * 2)
+          context.fill()
+          context.shadowBlur = 0
+          context.globalAlpha = 0.55
+          context.strokeStyle = node.color
+          context.lineWidth = 1
+          context.beginPath()
+          context.arc(node.x, node.y, node.radius + 9 * pulse, 0, Math.PI * 2)
+          context.stroke()
         }
       }
-      ctx.globalAlpha = 1
+      context.globalAlpha = 1
       if (!reducedMotion) frame = window.requestAnimationFrame(animate)
     }
 
     const observer = new ResizeObserver(resize)
-    observer.observe(canvas)
+    observer.observe(canvasEl)
     resize()
     frame = window.requestAnimationFrame(animate)
 
