@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react'
 import { Link } from 'react-router-dom'
+import { useTheme } from '../../context/ThemeContext'
+import { motion } from 'framer-motion'
 
 type FeatureKind = 'mesh' | 'speed' | 'modular' | 'secure'
 type ModelLogoId = 'nvidia' | 'mistral' | 'deepseek' | 'qwen' | 'llama' | 'gemini' | 'huggingface' | 'pytorch' | 'langchain'
@@ -53,6 +55,7 @@ type ShapeParticle = Point & {
   base: Point
   phase: number
   size: number
+  isChaotic?: boolean
 }
 
 const modelColors = {
@@ -64,20 +67,9 @@ const modelColors = {
   microsoft: '#00a4ef',
 }
 
-const palette = [
-  '#06B6D4', // Electric Cyan
-  '#8B5CF6', // Cyber Violet
-  '#4F46E5', // Deep Indigo
-  '#ffffff', // Pristine White
-]
 
-const stats = [
-  { value: '12,847', label: 'GPU en ligne', color: modelColors.nvidia },
-  { value: '3.21M', label: 'requêtes servies', color: modelColors.qwen },
-  { value: '238ms', label: 'latence médiane', color: modelColors.deepseek },
-  { value: '99.97%', label: 'disponibilité réseau', color: modelColors.mistral },
-  { value: '120+', label: 'pays couverts', color: modelColors.microsoft },
-]
+
+
 
 const features: { kind: FeatureKind; color: string; title: string; body: string }[] = [
   {
@@ -170,28 +162,6 @@ function addLine(pts: Point[], edges: Edge[], x1: number, y1: number, x2: number
   }
 }
 
-function addCurve(
-  pts: Point[],
-  edges: Edge[],
-  start: Point,
-  controlA: Point,
-  controlB: Point,
-  end: Point,
-  steps = 32,
-) {
-  let previous: Point | null = null
-  for (let i = 0; i <= steps; i += 1) {
-    const t = i / steps
-    const mt = 1 - t
-    const point = {
-      x: mt ** 3 * start.x + 3 * mt ** 2 * t * controlA.x + 3 * mt * t ** 2 * controlB.x + t ** 3 * end.x,
-      y: mt ** 3 * start.y + 3 * mt ** 2 * t * controlA.y + 3 * mt * t ** 2 * controlB.y + t ** 3 * end.y,
-    }
-    pts.push(point)
-    if (previous) edges.push([previous, point])
-    previous = point
-  }
-}
 
 function addRect(pts: Point[], edges: Edge[], x: number, y: number, width: number, height: number, steps = 8) {
   addLine(pts, edges, x, y, x + width, y, steps)
@@ -241,137 +211,138 @@ function makeFeatureTargets(kind: FeatureKind, width: number, height: number) {
     })
   }
 
-  function addPolygon(cx: number, cy: number, radius: number, sides: number, rotation = -Math.PI / 2) {
-    const path: Point[] = []
-    for (let i = 0; i <= sides; i += 1) {
-      const angle = rotation + (i / sides) * Math.PI * 2
-      path.push({ x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius })
-    }
-    addPolyline(path)
-  }
+
 
   if (kind === 'mesh') {
-    const boardX = width * 0.14
-    const boardY = height * 0.28
-    const boardW = width * 0.72
-    const boardH = height * 0.38
-    addRect(pts, edges, boardX, boardY, boardW, boardH, 24)
-    addRect(pts, edges, boardX + boardW * 0.12, boardY + boardH * 0.25, boardW * 0.2, boardH * 0.5, 12)
-    addCircle(pts, edges, boardX + boardW * 0.5, boardY + boardH * 0.5, unit * 0.12, 44)
-    addCircle(pts, edges, boardX + boardW * 0.5, boardY + boardH * 0.5, unit * 0.045, 24)
-    addCircle(pts, edges, boardX + boardW * 0.73, boardY + boardH * 0.5, unit * 0.105, 42)
-    addCircle(pts, edges, boardX + boardW * 0.73, boardY + boardH * 0.5, unit * 0.038, 22)
-    addRect(pts, edges, boardX + boardW * 0.1, boardY + boardH, boardW * 0.42, height * 0.06, 12)
-    addRect(pts, edges, boardX + boardW * 0.66, boardY - height * 0.08, boardW * 0.16, height * 0.08, 8)
-    addLine(pts, edges, boardX + boardW * 0.03, boardY + boardH * 0.18, boardX - width * 0.06, boardY + boardH * 0.18, 8)
-    addLine(pts, edges, boardX + boardW * 0.03, boardY + boardH * 0.82, boardX - width * 0.06, boardY + boardH * 0.82, 8)
-    addLine(pts, edges, boardX + boardW, boardY + boardH * 0.34, boardX + boardW + width * 0.06, boardY + boardH * 0.34, 8)
-    addLine(pts, edges, boardX + boardW, boardY + boardH * 0.66, boardX + boardW + width * 0.06, boardY + boardH * 0.66, 8)
-    for (let i = 0; i < 8; i += 1) {
-      const x = boardX + boardW * (0.16 + i * 0.075)
-      addLine(pts, edges, x, boardY + boardH, x, boardY + boardH + height * 0.06, 3)
+    // Beautiful concentric mesh radar, made larger (radius 0.36)
+    const r1 = unit * 0.12
+    const r2 = unit * 0.24
+    const r3 = unit * 0.36
+
+    // Concentric rings
+    addCircle(pts, edges, center.x, center.y, r1, 24)
+    addCircle(pts, edges, center.x, center.y, r2, 38)
+    addCircle(pts, edges, center.x, center.y, r3, 48)
+
+    // Diagonal and cardinal grid lines
+    const angles = [0, Math.PI / 4, Math.PI / 2, (3 * Math.PI) / 4]
+    angles.forEach((angle) => {
+      const x1 = center.x - Math.cos(angle) * r3
+      const y1 = center.y - Math.sin(angle) * r3
+      const x2 = center.x + Math.cos(angle) * r3
+      const y2 = center.y + Math.sin(angle) * r3
+      addLine(pts, edges, x1, y1, x2, y2, 16)
+    })
+
+    // Symmetrical satellite nodes
+    for (let i = 0; i < 4; i++) {
+      const angle = (i * Math.PI) / 2 + Math.PI / 4
+      const cx = center.x + Math.cos(angle) * r2
+      const cy = center.y + Math.sin(angle) * r2
+      addCircle(pts, edges, cx, cy, unit * 0.035, 12)
     }
-    const tracePoints = [
-      [0.29, 0.38, 0.42, 0.42],
-      [0.31, 0.56, 0.42, 0.52],
-      [0.58, 0.38, 0.66, 0.44],
-      [0.58, 0.58, 0.66, 0.53],
-    ]
-    tracePoints.forEach(([x1, y1, x2, y2]) => addLine(pts, edges, width * x1, height * y1, width * x2, height * y2, 10))
   }
 
   if (kind === 'speed') {
-    const routeNodes = [
-      [0.14, 0.52],
-      [0.3, 0.28],
-      [0.36, 0.72],
-      [0.52, 0.48],
-      [0.68, 0.25],
-      [0.78, 0.68],
-      [0.9, 0.45],
+    // Beautiful routing highway: 3 tracks merging from left into a central processing circle,
+    // then launching as a single high-speed speedway to the right with chevrons.
+    const cy = center.y
+    const xStart = width * 0.14
+    const xEnd = width * 0.86
+    
+    // Central circular node (made larger)
+    const rCore = unit * 0.09
+    addCircle(pts, edges, center.x, cy, rCore, 24)
+    addCircle(pts, edges, center.x, cy, unit * 0.04, 12)
+
+    // Left tracks: top, middle, bottom merging into the central node
+    addLine(pts, edges, xStart, cy - unit * 0.20, center.x - rCore, cy, 12)
+    addLine(pts, edges, xStart, cy, center.x - rCore, cy, 12)
+    addLine(pts, edges, xStart, cy + unit * 0.20, center.x - rCore, cy, 12)
+
+    // Right track: single high-speed speedway launching to the right
+    addLine(pts, edges, center.x + rCore, cy, xEnd, cy, 14)
+
+    // Symmetrical speed chevrons along the right highway
+    const rightSideW = xEnd - (center.x + rCore)
+    const chevronsX = [
+      center.x + rCore + rightSideW * 0.28,
+      center.x + rCore + rightSideW * 0.62,
     ]
-    const routes = [
-      [0, 1],
-      [0, 2],
-      [1, 3],
-      [2, 3],
-      [3, 4],
-      [3, 5],
-      [4, 6],
-      [5, 6],
-      [1, 4],
-      [2, 5],
-    ]
-    routes.forEach(([from, to]) => {
-      const a = routeNodes[from]
-      const b = routeNodes[to]
-      addCurve(
-        pts,
-        edges,
-        { x: width * a[0], y: height * a[1] },
-        { x: width * (a[0] * 0.7 + b[0] * 0.3), y: height * (a[1] - 0.12) },
-        { x: width * (a[0] * 0.26 + b[0] * 0.74), y: height * (b[1] + 0.12) },
-        { x: width * b[0], y: height * b[1] },
-        18,
-      )
+    chevronsX.forEach((cx) => {
+      const arrowPts = [
+        { x: cx - unit * 0.035, y: cy - unit * 0.05 },
+        { x: cx, y: cy },
+        { x: cx - unit * 0.035, y: cy + unit * 0.05 },
+      ]
+      addPolyline(arrowPts)
     })
-    routeNodes.forEach(([x, y], index) => {
-      addCircle(pts, edges, width * x, height * y, unit * (index === 3 ? 0.046 : 0.032), 20)
-      addCircle(pts, edges, width * x, height * y, unit * (index === 3 ? 0.021 : 0.014), 12)
-    })
-    addLine(pts, edges, width * 0.14, height * 0.52, width * 0.52, height * 0.48, 22)
-    addLine(pts, edges, width * 0.52, height * 0.48, width * 0.9, height * 0.45, 22)
-    addLine(pts, edges, width * 0.86, height * 0.43, width * 0.91, height * 0.45, 5)
-    addLine(pts, edges, width * 0.86, height * 0.49, width * 0.91, height * 0.45, 5)
   }
 
   if (kind === 'modular') {
-    addRect(pts, edges, width * 0.38, height * 0.36, width * 0.24, height * 0.28, 12)
-    const modules = [
-      [0.13, 0.16, 0.2, 0.16],
-      [0.67, 0.16, 0.2, 0.16],
-      [0.13, 0.68, 0.2, 0.16],
-      [0.67, 0.68, 0.2, 0.16],
-      [0.4, 0.12, 0.2, 0.14],
-      [0.4, 0.74, 0.2, 0.14],
-    ]
-    modules.forEach(([x, y, boxWidth, boxHeight]) => {
-      addRect(pts, edges, width * x, height * y, width * boxWidth, height * boxHeight, 8)
-      addLine(
-        pts,
-        edges,
-        width * (x + boxWidth / 2),
-        height * (y + boxHeight / 2),
-        center.x,
-        center.y,
-        18,
-      )
-    })
-    addCircle(pts, edges, center.x, center.y, unit * 0.055, 22)
+    // Beautiful decentralized modular star ecosystem
+    // Central node
+    addCircle(pts, edges, center.x, center.y, unit * 0.07, 16)
+    addCircle(pts, edges, center.x, center.y, unit * 0.03, 10)
+
+    // 6 peripheral nodes arranged in a large circle (radius 0.32)
+    const rOuter = unit * 0.32
+    const numNodes = 6
+    const nodeCoords: Point[] = []
+
+    for (let i = 0; i < numNodes; i++) {
+      const angle = (i * Math.PI * 2) / numNodes - Math.PI / 2
+      const px = center.x + Math.cos(angle) * rOuter
+      const py = center.y + Math.sin(angle) * rOuter
+      nodeCoords.push({ x: px, y: py })
+
+      // Small circle node at each tip
+      addCircle(pts, edges, px, py, unit * 0.04, 12)
+
+      // Radial lines connecting central node to each peripheral node
+      addLine(pts, edges, center.x, center.y, px, py, 10)
+    }
+
+    // Outer polygon lines forming a gorgeous closed hexagon ring
+    for (let i = 0; i < numNodes; i++) {
+      const p1 = nodeCoords[i]
+      const p2 = nodeCoords[(i + 1) % numNodes]
+      addLine(pts, edges, p1.x, p1.y, p2.x, p2.y, 10)
+    }
   }
 
   if (kind === 'secure') {
-    const shield = [
-      { x: width * 0.5, y: height * 0.12 },
-      { x: width * 0.76, y: height * 0.22 },
-      { x: width * 0.72, y: height * 0.58 },
-      { x: width * 0.5, y: height * 0.84 },
-      { x: width * 0.28, y: height * 0.58 },
-      { x: width * 0.24, y: height * 0.22 },
-      { x: width * 0.5, y: height * 0.12 },
+    // Beautiful highly detailed high-tech U-shackled Padlock (cadenas), taller and placed higher
+    const bodyW = unit * 0.26
+    const bodyH = unit * 0.22
+    const bodyTop = center.y - unit * 0.08
+
+    // 1. Padlock Body: Rounded rectangle at the bottom
+    addRect(pts, edges, center.x - bodyW, bodyTop, bodyW * 2, bodyH, 18)
+
+    // 2. Padlock Shackle (Anse U): An arch at the top (taller)
+    const shackleR = unit * 0.16
+    const shackleCenterY = bodyTop - unit * 0.08
+    
+    // Half circle arch
+    addCircle(pts, edges, center.x, shackleCenterY, shackleR, 20, Math.PI, Math.PI * 2)
+
+    // Vertical shackle legs connecting to padlock body (longer)
+    addLine(pts, edges, center.x - shackleR, shackleCenterY, center.x - shackleR, bodyTop, 10)
+    addLine(pts, edges, center.x + shackleR, shackleCenterY, center.x + shackleR, bodyTop, 10)
+
+    // 3. High-tech keyhole inside the padlock body
+    const khCY = bodyTop + bodyH * 0.45
+    addCircle(pts, edges, center.x, khCY, unit * 0.035, 12)
+    
+    // Triangular leg of the keyhole
+    const legPts = [
+      { x: center.x, y: khCY },
+      { x: center.x - unit * 0.016, y: khCY + unit * 0.06 },
+      { x: center.x + unit * 0.016, y: khCY + unit * 0.06 },
+      { x: center.x, y: khCY },
     ]
-    addPolyline(shield)
-    addPolygon(center.x, center.y, unit * 0.18, 6, Math.PI / 6)
-    addLine(pts, edges, width * 0.38, height * 0.5, width * 0.47, height * 0.6, 8)
-    addLine(pts, edges, width * 0.47, height * 0.6, width * 0.64, height * 0.4, 12)
-    addCircle(pts, edges, center.x, center.y, unit * 0.32, 70, Math.PI * 0.12, Math.PI * 1.88)
-    const sentinels = [
-      [0.32, 0.3],
-      [0.72, 0.34],
-      [0.68, 0.72],
-      [0.3, 0.68],
-    ]
-    sentinels.forEach(([x, y]) => addCircle(pts, edges, width * x, height * y, unit * 0.019, 12))
+    addPolyline(legPts)
   }
 
   return { pts, edges }
@@ -408,6 +379,9 @@ function textTargets(text: string, width: number, height: number) {
 }
 
 function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: RefObject<HTMLCanvasElement | null>) {
+  const { resolvedTheme } = useTheme()
+  const isLightMode = resolvedTheme === 'light'
+
   useEffect(() => {
     const hero = heroRef.current
     const word = wordRef.current
@@ -471,7 +445,6 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
       }
 
       const pushParticle = (ox: number, oy: number, oz: number, size: number, color: string, group: 'core' | 'ring1' | 'ring2' | 'ring3' | 'starfield') => {
-        // Pre-project coordinates at static t=0 state to completely remove entry bounce
         const scale = 800 / (800 + oz)
         const tx = heroWidth * 0.5 + ox * scale
         const ty = heroHeight * 0.39 + oy * scale
@@ -495,41 +468,43 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
         })
       }
 
-      // Generate Core: Pristine White and Electric Cyan
+      const corePrimaryColor = isLightMode ? '#4F46E5' : '#ffffff'
       for (let i = 0; i < coreCount; i++) {
         const pt = spherePoint(i, coreCount, coreRadius)
         const ox = pt.x + (Math.random() - 0.5) * 6
         const oy = pt.y + (Math.random() - 0.5) * 6
         const oz = pt.z + (Math.random() - 0.5) * 6
-        const color = Math.random() > 0.45 ? '#ffffff' : '#06B6D4'
+        const color = Math.random() > 0.45 ? corePrimaryColor : '#06B6D4'
         pushParticle(ox, oy, oz, Math.random() * 1.5 + 0.6, color, 'core')
       }
 
-      // Generate Ring 1 (Inner): Electric Cyan (#06B6D4)
+      const ring1Color = isLightMode ? '#0891B2' : '#06B6D4'
       for (let i = 0; i < ring1Count; i++) {
         const theta = (i / ring1Count) * Math.PI * 2
         const pt = tiltedRingPoint(theta, ring1Radius, 0.7, 0.5)
-        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, '#06B6D4', 'ring1')
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, ring1Color, 'ring1')
       }
 
-      // Generate Ring 2 (Middle): Cyber Violet (#8B5CF6)
+      const ring2Color = isLightMode ? '#7C3AED' : '#8B5CF6'
       for (let i = 0; i < ring2Count; i++) {
         const theta = (i / ring2Count) * Math.PI * 2
         const pt = tiltedRingPoint(theta, ring2Radius, -0.8, -0.3)
-        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, '#8B5CF6', 'ring2')
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, ring2Color, 'ring2')
       }
 
-      // Generate Ring 3 (Outer): Deep Indigo (#4F46E5)
+      const ring3Color = isLightMode ? '#4338CA' : '#4F46E5'
       for (let i = 0; i < ring3Count; i++) {
         const theta = (i / ring3Count) * Math.PI * 2
         const pt = tiltedRingPoint(theta, ring3Radius, 0.3, 1.1)
-        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, '#4F46E5', 'ring3')
+        pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.45 + 0.5, ring3Color, 'ring3')
       }
 
-      // Generate Starfield: Dimmable Cyans and Violets
+      const activePalette = isLightMode
+        ? ['#0891B2', '#7C3AED', '#4338CA', '#2563EB']
+        : ['#06B6D4', '#8B5CF6', '#4F46E5', '#ffffff']
       for (let i = 0; i < starfieldCount; i++) {
         const pt = spherePoint(i, starfieldCount, coreRadius + Math.random() * 320)
-        const color = palette[Math.floor(Math.random() * palette.length)]
+        const color = activePalette[Math.floor(Math.random() * activePalette.length)]
         pushParticle(pt.x, pt.y, pt.z, Math.random() * 1.0 + 0.4, color, 'starfield')
       }
     }
@@ -542,7 +517,6 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
         const target = targets[Math.floor((i / count) * targets.length)]
         if (!target) continue
         
-        // Initialize x and y directly to targets to remove assembly bounce
         wordParticles.push({
           x: target.x,
           y: target.y,
@@ -552,7 +526,9 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
           ty: target.y,
           size: Math.random() * 1.18 + 0.72,
           phase: Math.random() * Math.PI * 2,
-          color: Math.random() > 0.5 ? '#06B6D4' : '#8B5CF6',
+          color: Math.random() > 0.5
+            ? (isLightMode ? '#0891B2' : '#06B6D4')
+            : (isLightMode ? '#7C3AED' : '#8B5CF6'),
         })
       }
     }
@@ -583,7 +559,7 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
           const dist = Math.sqrt(dx * dx + dy * dy)
           if (dist < 135) {
             const depthFactor = Math.max(0.1, 1 - a.z / 500)
-            heroContext.globalAlpha = (1 - dist / 135) * 0.26 * depthFactor
+            heroContext.globalAlpha = (1 - dist / 135) * (isLightMode ? 0.42 : 0.26) * depthFactor
             heroContext.strokeStyle = a.color
             heroContext.lineWidth = 1.1
             heroContext.beginPath()
@@ -603,7 +579,6 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
       const centerX = heroWidth * 0.5
       const centerY = heroHeight * 0.39
 
-      // Spawning Blaster Shots (0.7% chance per frame, max 4 active)
       if (blasterShots.length < 4 && Math.random() < 0.007 && heroParticles.length > 100) {
         const paths: [string, string][] = [
           ['ring1', 'ring2'],
@@ -623,7 +598,7 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
             from: fromP,
             to: toP,
             progress: 0,
-            speed: 0.003 + Math.random() * 0.002, // slow slick speed (duration 200-330 frames)
+            speed: 0.003 + Math.random() * 0.002,
             color: toP.color,
             state: 'charging',
             explosionProgress: 0
@@ -682,7 +657,6 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
       heroContext.clearRect(0, 0, heroWidth, heroHeight)
       drawHeroLines()
 
-      // Update and Draw 3D Blaster Shots
       for (const blaster of blasterShots) {
         if (blaster.state === 'charging') {
           blaster.progress += blaster.speed * 1.6
@@ -714,7 +688,7 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
             const py = centerY + ry * scale
 
             heroContext.save()
-            heroContext.fillStyle = '#ffffff'
+            heroContext.fillStyle = isLightMode ? '#4F46E5' : '#ffffff'
             heroContext.shadowColor = blaster.from.color
             heroContext.shadowBlur = 7 * scale
             heroContext.beginPath()
@@ -772,7 +746,9 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
           heroContext.save()
           heroContext.lineCap = 'round'
           heroContext.lineWidth = 3.6 * scale_f * depthFactor
-          heroContext.strokeStyle = `rgba(255, 255, 255, ${segmentFade})`
+          heroContext.strokeStyle = isLightMode 
+            ? `rgba(79, 70, 229, ${segmentFade})` 
+            : `rgba(255, 255, 255, ${segmentFade})`
           heroContext.shadowColor = blaster.color
           heroContext.shadowBlur = 12 * scale_f * depthFactor
 
@@ -811,9 +787,8 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
             const py = centerY + ry * scale
 
             heroContext.save()
-            heroContext.fillStyle = '#ffffff'
-            heroContext.shadowColor = blaster.color
-            heroContext.shadowBlur = 8 * scale * (1 - t_exp)
+            heroContext.fillStyle = blaster.color
+            heroContext.globalAlpha = 1 - t_exp
             heroContext.beginPath()
             heroContext.arc(px, py, 2.5 * scale * (1 - t_exp), 0, Math.PI * 2)
             heroContext.fill()
@@ -822,7 +797,6 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
         }
       }
 
-      // Cleanup finished blaster shots
       blasterShots = blasterShots.filter(b => b.state !== 'exploding' || b.explosionProgress < 1.0)
 
       for (const particle of heroParticles) {
@@ -909,7 +883,7 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
         const alpha = Math.max(0.68, Math.min(1.0, 0.76 + sweepPulse * 0.24))
 
         wordContext.globalAlpha = alpha
-        wordContext.fillStyle = sweepPulse > 0.45 ? '#ffffff' : particle.color
+        wordContext.fillStyle = sweepPulse > 0.45 ? (isLightMode ? '#4338CA' : '#ffffff') : particle.color
         wordContext.beginPath()
         wordContext.arc(particle.x, particle.y, particle.size + extraSize, 0, Math.PI * 2)
         wordContext.fill()
@@ -970,7 +944,7 @@ function useHeroCanvases(heroRef: RefObject<HTMLCanvasElement | null>, wordRef: 
       window.removeEventListener('pointerleave', onPointerLeave)
       window.cancelAnimationFrame(frame)
     }
-  }, [heroRef, wordRef])
+  }, [heroRef, wordRef, resolvedTheme])
 }
 
 function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: FeatureKind, color: string) {
@@ -992,7 +966,8 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
 
     function buildParticles() {
-      const count = Math.min(kind === 'mesh' ? 480 : 430, Math.max(320, Math.round((width * height) / 650)))
+      // Increased particle count and high-density distribution
+      const count = Math.min(kind === 'mesh' ? 680 : 580, Math.max(420, Math.round((width * height) / 450)))
       particles = []
       for (let i = 0; i < count; i += 1) {
         const target = points[i % Math.max(points.length, 1)] || { x: width / 2, y: height / 2 }
@@ -1003,7 +978,8 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
           vy: 0,
           base: target,
           phase: Math.random() * Math.PI * 2,
-          size: Math.random() * 1.45 + 1.05,
+          size: Math.random() * 1.8 + 0.8, // More varied size for organic tech look
+          isChaotic: Math.random() > 0.95, // 5% of particles remain chaotic on hover
         })
       }
     }
@@ -1022,12 +998,25 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
       context.clearRect(0, 0, width, height)
       const active = hovering || pointer.active
 
-      if (edges.length) {
+      // Only draw the structural wireframe lines and flowing signals when hovered (active)
+      if (active && edges.length) {
         context.save()
-        context.globalAlpha = active ? 0.28 : 0.18
         context.strokeStyle = color
         context.lineCap = 'round'
-        context.lineWidth = active ? 1.28 : 0.95
+
+        // 1. Draw smooth underlying neon glow line
+        context.globalAlpha = 0.12
+        context.lineWidth = 4.0
+        context.beginPath()
+        edges.forEach(([a, b]) => {
+          context.moveTo(a.x, a.y)
+          context.lineTo(b.x, b.y)
+        })
+        context.stroke()
+
+        // 2. Draw sharp, crisp core line
+        context.globalAlpha = 0.42
+        context.lineWidth = 1.5
         context.beginPath()
         edges.forEach(([a, b]) => {
           context.moveTo(a.x, a.y)
@@ -1035,54 +1024,92 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
         })
         context.stroke()
         context.restore()
-      }
 
-      const signalEvery = Math.max(3, Math.floor(edges.length / 26))
-      for (let i = 0; i < edges.length; i += signalEvery) {
-        const [a, b] = edges[i]
-        const t = (timestamp * 0.00018 + i * 0.017) % 1
-        const x = a.x + (b.x - a.x) * t
-        const y = a.y + (b.y - a.y) * t
-        context.globalAlpha = active ? 0.74 : 0.5
-        context.fillStyle = color
-        context.shadowBlur = active ? 11 : 4
-        context.shadowColor = color
-        context.beginPath()
-        context.arc(x, y, active ? 2.15 : 1.6, 0, Math.PI * 2)
-        context.fill()
-      }
-      context.shadowBlur = 0
-
-      for (const particle of particles) {
-        const wander = active ? 1.2 : 14
-        const stiffness = active ? 0.06 : 0.018
-        const targetX = particle.base.x + Math.cos(timestamp * 0.001 + particle.phase) * wander
-        const targetY = particle.base.y + Math.sin(timestamp * 0.0012 + particle.phase) * wander
-        let ax = (targetX - particle.x) * stiffness
-        let ay = (targetY - particle.y) * stiffness
-        if (pointer.active) {
-          const dx = particle.x - pointer.x
-          const dy = particle.y - pointer.y
-          const dist = Math.sqrt(dx * dx + dy * dy)
-          if (dist < 110) {
-            const force = (1 - dist / 110) * 0.82
-            ax += (dx / (dist || 1)) * force
-            ay += (dy / (dist || 1)) * force
-          }
+        // Draw running signals as shooting stars with glow
+        const signalEvery = Math.max(2, Math.floor(edges.length / 32))
+        for (let i = 0; i < edges.length; i += signalEvery) {
+          const [a, b] = edges[i]
+          const t = (timestamp * 0.00024 + i * 0.013) % 1
+          const x = a.x + (b.x - a.x) * t
+          const y = a.y + (b.y - a.y) * t
+          
+          // Signal outer glow
+          context.globalAlpha = 0.35
+          context.fillStyle = color
+          context.beginPath()
+          context.arc(x, y, 5.5, 0, Math.PI * 2)
+          context.fill()
+          
+          // Signal core
+          context.globalAlpha = 0.95
+          context.fillStyle = '#ffffff'
+          context.beginPath()
+          context.arc(x, y, 2.5, 0, Math.PI * 2)
+          context.fill()
         }
-        particle.vx = (particle.vx + ax) * 0.88
-        particle.vy = (particle.vy + ay) * 0.88
+      }
+
+      // Update and draw particles
+      for (const particle of particles) {
+        let ax = 0
+        let ay = 0
+
+        if (active) {
+          if (particle.isChaotic) {
+            // 5% of particles drift randomly even when hovered, with movements reduced by 4x
+            ax = ((Math.random() - 0.5) * 0.15) / 4
+            ay = ((Math.random() - 0.5) * 0.15) / 4
+            particle.vx = (particle.vx + ax) * 0.98
+            particle.vy = (particle.vy + ay) * 0.98
+          } else {
+            // Assembling shape state: pull extremely slowly to the shape base coordinates
+            const targetX = particle.base.x + Math.cos(timestamp * 0.0018 + particle.phase) * 1.5
+            const targetY = particle.base.y + Math.sin(timestamp * 0.0018 + particle.phase) * 1.5
+            const stiffness = 0.0055 // Extremely slow cosmic glide
+            ax = (targetX - particle.x) * stiffness
+            ay = (targetY - particle.y) * stiffness
+
+            // Mouse pointer force when hovering
+            if (pointer.active) {
+              const dx = particle.x - pointer.x
+              const dy = particle.y - pointer.y
+              const dist = Math.sqrt(dx * dx + dy * dy)
+              if (dist < 120) {
+                const force = (1 - dist / 120) * 0.92
+                ax += (dx / (dist || 1)) * force * 1.8
+                ay += (dy / (dist || 1)) * force * 1.8
+              }
+            }
+            particle.vx = (particle.vx + ax) * 0.82
+            particle.vy = (particle.vy + ay) * 0.82
+          }
+        } else {
+          // Chaotic drift state: particles wander around randomly
+          ax = (Math.random() - 0.5) * 0.15
+          ay = (Math.random() - 0.5) * 0.15
+          particle.vx = (particle.vx + ax) * 0.98
+          particle.vy = (particle.vy + ay) * 0.98
+        }
+
+        // Soft boundary wrap-around
+        if (particle.x < 0) particle.x = width
+        if (particle.x > width) particle.x = 0
+        if (particle.y < 0) particle.y = height
+        if (particle.y > height) particle.y = 0
+
         particle.x += particle.vx
         particle.y += particle.vy
-        context.globalAlpha = active ? 0.98 : 0.72
+
+        const sizeMultiplier = active ? 1.35 : 0.92
+
+        // Particle crisp core (clean dot, no glow blur ring)
+        context.globalAlpha = active ? 0.95 : 0.45
         context.fillStyle = color
-        context.shadowBlur = active ? 6 : 1
-        context.shadowColor = color
         context.beginPath()
-        context.arc(particle.x, particle.y, particle.size * (active ? 1.08 : 0.94), 0, Math.PI * 2)
+        context.arc(particle.x, particle.y, particle.size * sizeMultiplier, 0, Math.PI * 2)
         context.fill()
       }
-      context.shadowBlur = 0
+
       context.globalAlpha = 1
 
       if (!reducedMotion) frame = window.requestAnimationFrame(animate)
@@ -1123,7 +1150,16 @@ function useParticleIcon(canvasRef: RefObject<HTMLCanvasElement | null>, kind: F
   }, [canvasRef, color, kind])
 }
 
+function IconCanvas({ kind, color }: { kind: FeatureKind; color: string }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  useParticleIcon(canvasRef, kind, color)
+  return <canvas ref={canvasRef} className="vryx-feature-canvas" aria-hidden />
+}
+
 function useMapCanvas(canvasRef: RefObject<HTMLCanvasElement | null>) {
+  const { resolvedTheme } = useTheme()
+  const isLight = resolvedTheme === 'light'
+
   useEffect(() => {
     const canvas = canvasRef.current
     const ctx = canvas?.getContext('2d', { alpha: true })
@@ -1131,144 +1167,441 @@ function useMapCanvas(canvasRef: RefObject<HTMLCanvasElement | null>) {
     const canvasEl: HTMLCanvasElement = canvas
     const context: CanvasRenderingContext2D = ctx
 
-    type Node = Point & { color: string; radius: number; phase: number }
-
     let width = 1
     let height = 1
-    let nodes: Node[] = []
     let frame = 0
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-    const mapRatio = 1000 / 520
-    const minLat = -58
-    const maxLat = 84
 
-    function mapFrame() {
-      const canvasRatio = width / Math.max(height, 1)
-      if (canvasRatio > mapRatio) {
-        const renderedHeight = height
-        const renderedWidth = renderedHeight * mapRatio
-        return { x: (width - renderedWidth) / 2, y: 0, width: renderedWidth, height: renderedHeight }
+    // 3D rotation state
+    let rx = -0.28 // Slightly tilted up (POV above equator, exposing the Northern hemisphere)
+    let ry = 0.0
+    let isDragging = false
+    let previousMousePosition = { x: 0, y: 0 }
+
+    type Point3D = {
+      x: number
+      y: number
+      z: number
+      isLand: boolean
+    }
+
+    type WorkerNode = {
+      name: string
+      lat: number // radians
+      lon: number // radians
+      color: string
+      pulse: number
+    }
+
+    const globeParticles: Point3D[] = []
+    let R_GLOBE = 255 // Double radius (enlarged Earth)
+
+    // Simplified continent boundaries to map dotted continents on the 3D globe
+    function checkIsLand(lat: number, lon: number): boolean {
+      const latDeg = lat * (180 / Math.PI)
+      const lonDeg = lon * (180 / Math.PI)
+
+      // North America
+      if (latDeg > 15 && latDeg < 75 && lonDeg > -168 && lonDeg < -52) return true
+      // South America
+      if (latDeg > -55 && latDeg < 12 && lonDeg > -82 && lonDeg < -34) return true
+      // Europe & Asia (Eurasia)
+      if (latDeg > 5 && latDeg < 78 && lonDeg > -10 && lonDeg < 148) return true
+      // Africa
+      if (latDeg > -35 && latDeg < 36 && lonDeg > -18 && lonDeg < 51) return true
+      // Australia / Oceania
+      if (latDeg > -44 && latDeg < -10 && lonDeg > 112 && lonDeg < 154) return true
+      // Greenland
+      if (latDeg > 60 && latDeg < 83 && lonDeg > -73 && lonDeg < -10) return true
+      
+      return false
+    }
+
+    // Generate Fibonacci sphere particles representing the Earth's surface
+    const particleCount = 1600
+    for (let i = 0; i < particleCount; i++) {
+      const y = 1 - (i / (particleCount - 1)) * 2 // y goes from 1 to -1
+      const radius = Math.sqrt(1 - y * y) // radius at y
+      const goldenRatio = (1 + Math.sqrt(5)) / 2
+      const theta = (2 * Math.PI * i) / (goldenRatio * goldenRatio) // Golden angle increment
+
+      const x = Math.cos(theta) * radius
+      const z = Math.sin(theta) * radius
+
+      // Compute lat and lon in radians
+      const lat = Math.asin(y)
+      const lon = Math.atan2(x, -z)
+
+      const isLand = checkIsLand(lat, lon)
+
+      globeParticles.push({
+        x: x * R_GLOBE,
+        y: y * R_GLOBE,
+        z: z * R_GLOBE,
+        isLand,
+      })
+    }
+
+    // Dynamic high-fidelity continent sampler from real SVG
+    const img = new Image()
+    img.src = '/world-map.svg'
+    img.onload = () => {
+      const offscreen = document.createElement('canvas')
+      offscreen.width = 360
+      offscreen.height = 180
+      const oCtx = offscreen.getContext('2d')
+      if (!oCtx) return
+      oCtx.clearRect(0, 0, 360, 180)
+      oCtx.drawImage(img, 0, 0, 360, 180)
+      try {
+        const imgData = oCtx.getImageData(0, 0, 360, 180).data
+        globeParticles.length = 0
+        for (let i = 0; i < particleCount; i++) {
+          const y = 1 - (i / (particleCount - 1)) * 2
+          const radius = Math.sqrt(1 - y * y)
+          const goldenRatio = (1 + Math.sqrt(5)) / 2
+          const theta = (2 * Math.PI * i) / (goldenRatio * goldenRatio)
+
+          const x = Math.cos(theta) * radius
+          const z = Math.sin(theta) * radius
+
+          const lat = Math.asin(y)
+          const lon = Math.atan2(x, -z)
+
+          // Map lat/lon to equirectangular offscreen canvas coordinates
+          // lon: -PI to PI -> x: 0 to 360
+          const mapX = Math.floor(((lon + Math.PI) / (2 * Math.PI)) * 360) % 360
+          // lat: PI/2 to -PI/2 -> y: 0 to 180
+          const mapY = Math.floor(((Math.PI / 2 - lat) / Math.PI) * 180) % 180
+
+          const idx = (mapY * 360 + mapX) * 4
+          // Check for opacity (alpha) or any color channel density
+          const isLand = imgData[idx + 3] > 15 || (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) > 15
+
+          globeParticles.push({
+            x: x * R_GLOBE,
+            y: y * R_GLOBE,
+            z: z * R_GLOBE,
+            isLand,
+          })
+        }
+      } catch (e) {
+        console.warn("Failed to sample high-fidelity world-map.svg for 3D Globe, using mathematical fallback:", e)
       }
-      const renderedWidth = width
-      const renderedHeight = renderedWidth / mapRatio
-      return { x: 0, y: (height - renderedHeight) / 2, width: renderedWidth, height: renderedHeight }
     }
 
-    function project(lon: number, lat: number) {
-      const frameBox = mapFrame()
-      return {
-        x: frameBox.x + ((lon + 180) / 360) * frameBox.width,
-        y: frameBox.y + ((35 + ((maxLat - lat) / (maxLat - minLat)) * 430) / 520) * frameBox.height,
-      }
-    }
+    // 12 Real Global Workers
+    const workers: WorkerNode[] = [
+      { name: 'San Francisco', lat: 37.77 * (Math.PI / 180), lon: -122.42 * (Math.PI / 180), color: '#06b6d4', pulse: Math.random() * Math.PI },
+      { name: 'New York', lat: 40.71 * (Math.PI / 180), lon: -74.00 * (Math.PI / 180), color: '#8b5cf6', pulse: Math.random() * Math.PI },
+      { name: 'Sao Paulo', lat: -23.55 * (Math.PI / 180), lon: -46.63 * (Math.PI / 180), color: '#4f46e5', pulse: Math.random() * Math.PI },
+      { name: 'London', lat: 51.50 * (Math.PI / 180), lon: -0.12 * (Math.PI / 180), color: '#06b6d4', pulse: Math.random() * Math.PI },
+      { name: 'Paris', lat: 48.85 * (Math.PI / 180), lon: 2.35 * (Math.PI / 180), color: '#8b5cf6', pulse: Math.random() * Math.PI },
+      { name: 'Frankfurt', lat: 50.11 * (Math.PI / 180), lon: 8.68 * (Math.PI / 180), color: '#4f46e5', pulse: Math.random() * Math.PI },
+      { name: 'Cape Town', lat: -33.92 * (Math.PI / 180), lon: 18.42 * (Math.PI / 180), color: '#06b6d4', pulse: Math.random() * Math.PI },
+      { name: 'Dubai', lat: 25.20 * (Math.PI / 180), lon: 55.27 * (Math.PI / 180), color: '#8b5cf6', pulse: Math.random() * Math.PI },
+      { name: 'Bangalore', lat: 12.97 * (Math.PI / 180), lon: 77.59 * (Math.PI / 180), color: '#4f46e5', pulse: Math.random() * Math.PI },
+      { name: 'Singapore', lat: 1.35 * (Math.PI / 180), lon: 103.82 * (Math.PI / 180), color: '#06b6d4', pulse: Math.random() * Math.PI },
+      { name: 'Tokyo', lat: 35.68 * (Math.PI / 180), lon: 139.69 * (Math.PI / 180), color: '#8b5cf6', pulse: Math.random() * Math.PI },
+      { name: 'Sydney', lat: -33.87 * (Math.PI / 180), lon: 151.21 * (Math.PI / 180), color: '#4f46e5', pulse: Math.random() * Math.PI },
+    ]
 
-    function buildMap() {
-      const base: [number, number, string, number][] = [
-        [-122.42, 37.77, modelColors.nvidia, 12],
-        [-73.57, 45.5, modelColors.qwen, 11],
-        [-46.63, -23.55, modelColors.mistral, 9],
-        [-0.12, 51.5, modelColors.deepseek, 10],
-        [2.35, 48.85, modelColors.microsoft, 12],
-        [8.68, 50.11, modelColors.nvidia, 10],
-        [55.27, 25.2, modelColors.qwen, 8],
-        [77.59, 12.97, modelColors.mistral, 10],
-        [103.82, 1.35, modelColors.deepseek, 11],
-        [139.69, 35.68, modelColors.llama, 10],
-        [151.21, -33.87, modelColors.microsoft, 9],
-        [3.38, 6.52, modelColors.nvidia, 8],
-        [28.04, -26.2, modelColors.qwen, 8],
-      ]
-      nodes = base.map(([lon, lat, color, radius]) => ({
-        ...project(lon, lat),
-        color,
-        radius,
-        phase: Math.random() * Math.PI * 2,
-      }))
-    }
+    // Set of P2P links between specific cities
+    const links: [number, number][] = [
+      [0, 1], // SF - NY
+      [1, 4], // NY - Paris
+      [3, 4], // London - Paris
+      [4, 5], // Paris - Frankfurt
+      [5, 7], // Frankfurt - Dubai
+      [7, 8], // Dubai - Bangalore
+      [8, 9], // Bangalore - Singapore
+      [9, 10], // Singapore - Tokyo
+      [10, 11], // Tokyo - Sydney
+      [0, 10], // SF - Tokyo
+      [2, 1], // Sao Paulo - NY
+      [2, 6], // Sao Paulo - Cape Town
+      [6, 7], // Cape Town - Dubai
+      [9, 11], // Singapore - Sydney
+    ]
 
     function resize() {
       const size = fitCanvas(canvasEl, context)
       width = size.width
       height = size.height
-      buildMap()
+      // Scale radius dynamically to be double size on desktop, fitting viewport nicely without clipping
+      R_GLOBE = Math.min(270, Math.max(140, Math.round(Math.min(width, height) * 0.44)))
     }
 
-    function curve(a: Node, b: Node, color: string, timestamp: number) {
-      const pulse = Math.sin(timestamp * 0.0012 + a.phase + b.phase) * 0.5 + 0.5
-      const midX = (a.x + b.x) / 2
-      const midY = (a.y + b.y) / 2 - Math.min(95, 42 + Math.abs(a.x - b.x) * 0.08)
-      context.strokeStyle = color
-      context.globalAlpha = 0.12 + 0.2 * pulse
-      context.lineCap = 'round'
-      context.lineWidth = 1.25
-      context.beginPath()
-      context.moveTo(a.x, a.y)
-      context.quadraticCurveTo(midX, midY, b.x, b.y)
-      context.stroke()
+    // 3D rotation and projection formula
+    function project3D(x: number, y: number, z: number) {
+      // Rotate Y (ry)
+      const x1 = x * Math.cos(ry) - z * Math.sin(ry)
+      const z1 = x * Math.sin(ry) + z * Math.cos(ry)
 
-      const t = (timestamp * 0.00008 + a.phase) % 1
-      const x = (1 - t) * (1 - t) * a.x + 2 * (1 - t) * t * midX + t * t * b.x
-      const y = (1 - t) * (1 - t) * a.y + 2 * (1 - t) * t * midY + t * t * b.y
-      context.globalAlpha = 0.85
-      context.fillStyle = color
-      context.beginPath()
-      context.arc(x, y, 2.2, 0, Math.PI * 2)
-      context.fill()
+      // Rotate X (rx)
+      const y2 = y * Math.cos(rx) - z1 * Math.sin(rx)
+      const z2 = y * Math.sin(rx) + z1 * Math.cos(rx)
+
+      // 2D projection centered on canvas
+      const scale = 360 / (360 + z2 * 0.15) // Slight perspective
+      return {
+        x: width * 0.5 + x1 * scale,
+        y: height * 0.5 - y2 * scale,
+        z: z2, // keep depth for back-to-front sorting
+      }
     }
 
     function animate(timestamp: number) {
       context.clearRect(0, 0, width, height)
-      if (nodes.length) {
-        for (let i = 1; i < nodes.length; i += 1) curve(nodes[0], nodes[i], nodes[i].color, timestamp)
-        for (let i = 2; i < nodes.length; i += 2) curve(nodes[1], nodes[i], nodes[1].color, timestamp)
-        for (let i = 4; i < nodes.length; i += 3) curve(nodes[4], nodes[i], nodes[4].color, timestamp)
 
-        for (const node of nodes) {
-          const pulse = Math.sin(timestamp * 0.002 + node.phase) * 0.5 + 0.5
-          const glow = context.createRadialGradient(node.x, node.y, 0, node.x, node.y, node.radius * 7)
-          glow.addColorStop(0, node.color)
-          glow.addColorStop(1, 'transparent')
-          context.globalAlpha = 0.45
-          context.fillStyle = glow
-          context.beginPath()
-          context.arc(node.x, node.y, node.radius * 7, 0, Math.PI * 2)
-          context.fill()
-          context.globalAlpha = 1
-          context.fillStyle = node.color
-          context.shadowBlur = 16
-          context.shadowColor = node.color
-          context.beginPath()
-          context.arc(node.x, node.y, node.radius * 0.48 + pulse * 2, 0, Math.PI * 2)
-          context.fill()
-          context.shadowBlur = 0
-          context.globalAlpha = 0.55
-          context.strokeStyle = node.color
-          context.lineWidth = 1
-          context.beginPath()
-          context.arc(node.x, node.y, node.radius + 9 * pulse, 0, Math.PI * 2)
-          context.stroke()
-        }
+      // Slow auto rotation if not dragging
+      if (!isDragging) {
+        ry += 0.0018
       }
+
+      const centerX = width * 0.5
+      const centerY = height * 0.5
+
+      // 1. Draw elegant background glow representing the atmosphere
+      const atmosphereGlow = context.createRadialGradient(centerX, centerY, R_GLOBE * 0.8, centerX, centerY, R_GLOBE * 1.35)
+      atmosphereGlow.addColorStop(0, 'transparent')
+      atmosphereGlow.addColorStop(0.65, isLight ? 'rgba(99, 102, 241, 0.025)' : 'rgba(6, 182, 212, 0.025)')
+      atmosphereGlow.addColorStop(1, 'transparent')
+      context.fillStyle = atmosphereGlow
+      context.beginPath()
+      context.arc(centerX, centerY, R_GLOBE * 1.4, 0, Math.PI * 2)
+      context.fill()
+
+      type Renderable = {
+        type: 'particle' | 'node' | 'link'
+        depth: number
+        draw: () => void
+      }
+
+      const renderList: Renderable[] = []
+
+      // Project Earth Dotted Particles
+      globeParticles.forEach((p) => {
+        const proj = project3D(p.x, p.y, p.z)
+        const isBack = proj.z > 0 // depth check (z positive is background)
+
+        renderList.push({
+          type: 'particle',
+          depth: proj.z,
+          draw: () => {
+            const opacity = isBack ? 0.075 : (p.isLand ? 0.58 : 0.14)
+            context.fillStyle = p.isLand
+              ? (isLight ? '#4f46e5' : '#06b6d4')
+              : (isLight ? '#94a3b8' : '#334155')
+
+            context.globalAlpha = opacity
+            context.beginPath()
+            context.arc(proj.x, proj.y, p.isLand ? 1.35 : 0.85, 0, Math.PI * 2)
+            context.fill()
+          },
+        })
+      })
+
+      // Project Worker Nodes
+      const projectedNodes: (Point & { depth: number; color: string; pulse: number; name: string })[] = []
+      workers.forEach((w) => {
+        // Convert spherical coords to 3D Cartesian coords
+        const x = R_GLOBE * Math.cos(w.lat) * Math.sin(w.lon)
+        const y = R_GLOBE * Math.sin(w.lat)
+        const z = -R_GLOBE * Math.cos(w.lat) * Math.cos(w.lon)
+
+        const proj = project3D(x, y, z)
+        projectedNodes.push({
+          x: proj.x,
+          y: proj.y,
+          depth: proj.z,
+          color: w.color,
+          pulse: Math.sin(timestamp * 0.0035 + w.pulse) * 0.5 + 0.5,
+          name: w.name,
+        })
+      })
+
+      projectedNodes.forEach((node) => {
+        const isBack = node.depth > 0
+
+        renderList.push({
+          type: 'node',
+          depth: node.depth,
+          draw: () => {
+            context.globalAlpha = isBack ? 0.15 : 1.0
+
+            // Pulsing ring
+            context.strokeStyle = node.color
+            context.lineWidth = 1.0
+            context.beginPath()
+            context.arc(node.x, node.y, 3 + node.pulse * 12, 0, Math.PI * 2)
+            context.stroke()
+
+            // Outer halo
+            context.fillStyle = node.color
+            context.globalAlpha = isBack ? 0.08 : 0.28
+            context.beginPath()
+            context.arc(node.x, node.y, 6, 0, Math.PI * 2)
+            context.fill()
+
+            // Core dot
+            context.globalAlpha = isBack ? 0.22 : 1.0
+            context.fillStyle = '#ffffff'
+            context.beginPath()
+            context.arc(node.x, node.y, 2.2, 0, Math.PI * 2)
+            context.fill()
+
+            // Label (Only front nodes)
+            if (!isBack) {
+              context.fillStyle = isLight ? '#4a5568' : '#a4b1c6'
+              context.font = '600 8.5px Inter, monospace'
+              context.textAlign = 'center'
+              context.globalAlpha = 0.88
+              context.fillText(node.name, node.x, node.y - 9)
+            }
+          },
+        })
+      })
+
+      // Project Curved 3D Arcs (P2P Links)
+      links.forEach(([idxA, idxB]) => {
+        const nodeA = workers[idxA]
+        const nodeB = workers[idxB]
+
+        // Spherical interpolation to draw 3D arcs lofted slightly into space
+        const steps = 18
+        const arcPoints: { x: number; y: number; z: number }[] = []
+
+        for (let i = 0; i <= steps; i++) {
+          const t = i / steps
+          // Intermediate lat/lon
+          const lat = nodeA.lat + (nodeB.lat - nodeA.lat) * t
+          const lon = nodeA.lon + (nodeB.lon - nodeA.lon) * t
+
+          // Loft factor (highest in the middle)
+          const loft = Math.sin(t * Math.PI) * 22
+
+          const x = (R_GLOBE + loft) * Math.cos(lat) * Math.sin(lon)
+          const y = (R_GLOBE + loft) * Math.sin(lat)
+          const z = -(R_GLOBE + loft) * Math.cos(lat) * Math.cos(lon)
+
+          arcPoints.push({ x, y, z })
+        }
+
+        // Project the arc points
+        const projArc = arcPoints.map((pt) => project3D(pt.x, pt.y, pt.z))
+
+        // Average depth of the arc
+        const avgDepth = projArc.reduce((acc, p) => acc + p.z, 0) / projArc.length
+        const isBack = avgDepth > 0
+
+        renderList.push({
+          type: 'link',
+          depth: avgDepth,
+          draw: () => {
+            // Draw connection line
+            context.save()
+            context.strokeStyle = nodeA.color
+            context.globalAlpha = isBack ? 0.05 : 0.28
+            context.lineWidth = 1.0
+            context.beginPath()
+            context.moveTo(projArc[0].x, projArc[0].y)
+            for (let i = 1; i < projArc.length; i++) {
+              context.lineTo(projArc[i].x, projArc[i].y)
+            }
+            context.stroke()
+            context.restore()
+
+            // Draw flying signal packet along the arc
+            const packetT = (timestamp * 0.00012 + idxA * 0.22) % 1
+            const ptIdx = Math.floor(packetT * steps)
+            const nextPtIdx = Math.min(steps, ptIdx + 1)
+            const remainder = (packetT * steps) % 1
+
+            if (ptIdx < projArc.length) {
+              const pA = projArc[ptIdx]
+              const pB = projArc[nextPtIdx] || pA
+              const x = pA.x + (pB.x - pA.x) * remainder
+              const y = pA.y + (pB.y - pA.y) * remainder
+
+              context.globalAlpha = isBack ? 0.12 : 0.95
+              context.fillStyle = '#ffffff'
+              context.beginPath()
+              context.arc(x, y, 1.8, 0, Math.PI * 2)
+              context.fill()
+
+              // Glow ring
+              context.strokeStyle = nodeA.color
+              context.globalAlpha = isBack ? 0.06 : 0.45
+              context.beginPath()
+              context.arc(x, y, 4, 0, Math.PI * 2)
+              context.stroke()
+            }
+          },
+        })
+      })
+
+      // Sort by depth (render back-to-front, higher depth value is further back)
+      renderList.sort((a, b) => b.depth - a.depth)
+
+      // Execute drawing in depth order
+      renderList.forEach((item) => item.draw())
+
       context.globalAlpha = 1
       if (!reducedMotion) frame = window.requestAnimationFrame(animate)
     }
 
+    // Drag-to-spin interaction logic
+    function onPointerDown(event: PointerEvent) {
+      isDragging = true
+      previousMousePosition = {
+        x: event.clientX,
+        y: event.clientY,
+      }
+    }
+
+    function onPointerMove(event: PointerEvent) {
+      if (!isDragging) return
+      const deltaMove = {
+        x: event.clientX - previousMousePosition.x,
+        y: event.clientY - previousMousePosition.y,
+      }
+
+      ry += deltaMove.x * 0.006 // Rotate Y based on horizontal drag
+      rx -= deltaMove.y * 0.006 // Rotate X based on vertical drag (corrected direction)
+
+      // Limit vertical tilt to avoid flipping completely upside down
+      rx = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, rx))
+
+      previousMousePosition = {
+        x: event.clientX,
+        y: event.clientY,
+      }
+    }
+
+    function onPointerUp() {
+      isDragging = false
+    }
+
     const observer = new ResizeObserver(resize)
     observer.observe(canvasEl)
+
+    canvasEl.style.cursor = 'grab'
+    canvasEl.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp)
+
     resize()
     frame = window.requestAnimationFrame(animate)
 
     return () => {
       observer.disconnect()
+      canvasEl.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
       window.cancelAnimationFrame(frame)
     }
-  }, [canvasRef])
-}
-
-function IconCanvas({ kind, color }: { kind: FeatureKind; color: string }) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  useParticleIcon(canvasRef, kind, color)
-  return <canvas ref={canvasRef} className="vryx-feature-canvas" aria-hidden />
+  }, [canvasRef, resolvedTheme])
 }
 
 function NetworkMap() {
@@ -1276,8 +1609,7 @@ function NetworkMap() {
   useMapCanvas(canvasRef)
 
   return (
-    <div className="vryx-map" aria-label="Carte animée du réseau VRYX">
-      <div className="vryx-world" aria-hidden />
+    <div className="vryx-map" aria-label="Globe 3D interactif du réseau VRYX">
       <canvas ref={canvasRef} className="vryx-map-canvas" aria-hidden />
     </div>
   )
@@ -1343,6 +1675,288 @@ function useDownloadTarget() {
   return downloadTarget
 }
 
+type GpuPreset = {
+  name: string
+  vram: string
+  monthlyEstimate: number
+  earnRate: number
+}
+
+const GPU_PRESETS: GpuPreset[] = [
+  { name: 'RTX 4090', vram: '24 Go GDDR6X', monthlyEstimate: 78.50, earnRate: 0.0000302 },
+  { name: 'Apple M3 Max', vram: '48 Go Unified', monthlyEstimate: 62.10, earnRate: 0.0000238 },
+  { name: 'RTX 4080', vram: '16 Go GDDR6X', monthlyEstimate: 48.20, earnRate: 0.0000185 },
+  { name: 'RTX 3080', vram: '10 Go GDDR6X', monthlyEstimate: 29.40, earnRate: 0.0000113 },
+]
+
+function MonetizeSection() {
+  const { resolvedTheme } = useTheme()
+  const isLight = resolvedTheme === 'light'
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  
+  const [selectedGpu, setSelectedGpu] = useState<GpuPreset>(GPU_PRESETS[0])
+  const [earnings, setEarnings] = useState(0.0)
+
+  // Live earning counter
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setEarnings(prev => prev + selectedGpu.earnRate * (0.8 + Math.random() * 0.4))
+    }, 120)
+    return () => clearInterval(interval)
+  }, [selectedGpu])
+
+  // Canvas particle animation
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    let width = canvas.width = canvas.offsetWidth
+    let height = canvas.height = canvas.offsetHeight
+
+    const handleResize = () => {
+      if (!canvas) return
+      width = canvas.width = canvas.offsetWidth
+      height = canvas.height = canvas.offsetHeight
+    }
+    window.addEventListener('resize', handleResize)
+
+    // Particles representing GPU nodes in the network
+    type GpuParticle = {
+      x: number
+      y: number
+      vx: number
+      vy: number
+      size: number
+      label: string
+      pulse: number
+      color: string
+    }
+
+    const gpuLabels = ['RTX 4090', 'H100 PCIe', 'RTX 3090', 'RX 7900 XTX', 'Apple M3 Max', 'A100 SXM', 'RTX 4080', 'L40S']
+    const particles: GpuParticle[] = []
+    
+    // Create particles
+    for (let i = 0; i < 15; i++) {
+      particles.push({
+        x: Math.random() * width,
+        y: Math.random() * height,
+        vx: (Math.random() - 0.5) * 0.5,
+        vy: (Math.random() - 0.5) * 0.5,
+        size: Math.random() * 4 + 2,
+        label: gpuLabels[i % gpuLabels.length],
+        pulse: Math.random() * Math.PI,
+        color: i % 3 === 0 ? '#06b6d4' : (i % 3 === 1 ? '#8b5cf6' : '#4f46e5')
+      })
+    }
+
+    let mouse = { x: -9999, y: -9999 }
+    const onMouseMove = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect()
+      mouse.x = e.clientX - rect.left
+      mouse.y = e.clientY - rect.top
+    }
+    const onMouseLeave = () => {
+      mouse.x = -9999
+      mouse.y = -9999
+    }
+    canvas.addEventListener('mousemove', onMouseMove)
+    canvas.addEventListener('mouseleave', onMouseLeave)
+
+    let animationId: number
+
+    const render = () => {
+      ctx.clearRect(0, 0, width, height)
+
+      // Draw connection lines
+      for (let i = 0; i < particles.length; i++) {
+        const p1 = particles[i]
+        for (let j = i + 1; j < particles.length; j++) {
+          const p2 = particles[j]
+          const dx = p1.x - p2.x
+          const dy = p1.y - p2.y
+          const dist = Math.sqrt(dx * dx + dy * dy)
+
+          if (dist < 150) {
+            const alpha = (1 - dist / 150) * 0.15
+            ctx.strokeStyle = isLight ? `rgba(99, 102, 241, ${alpha})` : `rgba(6, 182, 212, ${alpha})`
+            ctx.lineWidth = 1
+            ctx.beginPath()
+            ctx.moveTo(p1.x, p1.y)
+            ctx.lineTo(p2.x, p2.y)
+            ctx.stroke()
+          }
+        }
+      }
+
+      // Draw particles & labels
+      particles.forEach((p) => {
+        p.x += p.vx
+        p.y += p.vy
+        p.pulse += 0.015
+
+        // Bounce walls
+        if (p.x < 0 || p.x > width) p.vx *= -1
+        if (p.y < 0 || p.y > height) p.vy *= -1
+
+        // Mouse attraction
+        if (mouse.x !== -9999) {
+          const mdx = mouse.x - p.x
+          const mdy = mouse.y - p.y
+          const mdist = Math.sqrt(mdx * mdx + mdy * mdy)
+          if (mdist < 180) {
+            const force = (1 - mdist / 180) * 0.12
+            p.x += (mdx / mdist) * force
+            p.y += (mdy / mdist) * force
+          }
+        }
+
+        const currentSize = p.size + Math.sin(p.pulse) * 1.5
+
+        // Glow ring
+        ctx.fillStyle = p.color
+        ctx.globalAlpha = 0.15 + Math.sin(p.pulse) * 0.05
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, currentSize * 2.5, 0, Math.PI * 2)
+        ctx.fill()
+
+        // Core dot
+        ctx.globalAlpha = 0.8
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, currentSize, 0, Math.PI * 2)
+        ctx.fill()
+
+        // Label
+        ctx.fillStyle = isLight ? '#4a5568' : '#a4b1c6'
+        ctx.font = '600 9px monospace'
+        ctx.textAlign = 'center'
+        ctx.globalAlpha = 0.45 + Math.sin(p.pulse) * 0.15
+        ctx.fillText(p.label, p.x, p.y - currentSize - 5)
+      })
+
+      ctx.globalAlpha = 1
+      animationId = requestAnimationFrame(render)
+    }
+
+    animationId = requestAnimationFrame(render)
+
+    return () => {
+      cancelAnimationFrame(animationId)
+      window.removeEventListener('resize', handleResize)
+      if (canvas) {
+        canvas.removeEventListener('mousemove', onMouseMove)
+        canvas.removeEventListener('mouseleave', onMouseLeave)
+      }
+    }
+  }, [isLight])
+
+  return (
+    <section className="vryx-monetize-wrap" aria-labelledby="monetize-heading">
+      <motion.div
+        className="vryx-monetize-card"
+        initial={{ opacity: 0, y: 70 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ once: true, margin: "-120px" }}
+        transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+      >
+        {/* Background Canvas */}
+        <canvas ref={canvasRef} className="vryx-monetize-canvas" />
+
+        {/* Content Overlay */}
+        <div className="vryx-monetize-grid">
+          {/* Left Panel: Info & Marketing */}
+          <div className="vryx-monetize-left">
+            <h2 id="monetize-heading">Monétisez vos GPU</h2>
+            <p className="vryx-monetize-desc">
+              Louez la puissance de calcul inutilisée de votre carte graphique au premier réseau DePIN d'inférence d'IA décentralisé. Recevez des récompenses directes en temps réel, sans aucune friction.
+            </p>
+
+            <ul className="vryx-monetize-features">
+              <li>
+                <div>
+                  <strong>Zéro Friction</strong>
+                  <p>Un simple client desktop (macOS & Windows) à lancer en arrière-plan en un clic.</p>
+                </div>
+              </li>
+              <li>
+                <div>
+                  <strong>Sécurité Absolue</strong>
+                  <p>Inférence isolée par shards en RAM. Vos fichiers et données personnelles restent intouchables.</p>
+                </div>
+              </li>
+              <li>
+                <div>
+                  <strong>Rémunération Équitable</strong>
+                  <p>Revenus basés sur la VRAM allouée et la quantité de calculs effectifs traités.</p>
+                </div>
+              </li>
+            </ul>
+
+            <Link className="vryx-button vryx-button-primary mt-6" to="/workers">
+              Devenir Worker Vryx
+              <span aria-hidden>→</span>
+            </Link>
+          </div>
+
+          {/* Right Panel: Interactive Simulator Widget */}
+          <div className="vryx-monetize-right">
+            <div className="vryx-simulator-widget">
+              {/* Selector */}
+              <div className="gpu-selector-wrap">
+                <label className="selector-label">Choisissez votre matériel :</label>
+                <div className="gpu-presets-grid">
+                  {GPU_PRESETS.map((preset) => (
+                    <button
+                      key={preset.name}
+                      onClick={() => {
+                        setSelectedGpu(preset)
+                        setEarnings(0.0)
+                      }}
+                      className={`preset-btn ${selectedGpu.name === preset.name ? 'active' : ''}`}
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Live Counter Display */}
+              <div className="live-earnings-wrap">
+                <div className="earnings-label">REVENUS ESTIMÉS</div>
+                <div className="earnings-amount">
+                  <code>{earnings.toFixed(5)}</code>
+                  <span className="currency">€</span>
+                </div>
+              </div>
+
+              {/* Quick Specs */}
+              <div className="widget-specs">
+                <div className="spec-row">
+                  <span>Mémoire VRAM allouée :</span>
+                  <strong>{selectedGpu.vram}</strong>
+                </div>
+                <div className="spec-row">
+                  <span>Revenus est. mensuels :</span>
+                  <strong className="text-highlight">~ {selectedGpu.monthlyEstimate.toFixed(2)} €</strong>
+                </div>
+                <div className="spec-row">
+                  <span>Type de charge :</span>
+                  <span>Inférence Shard TP (gRPC)</span>
+                </div>
+              </div>
+
+              <div className="widget-footer">
+                * Les gains varient selon la demande globale et le temps de disponibilité effectif.
+              </div>
+            </div>
+          </div>
+        </div>
+      </motion.div>
+    </section>
+  )
+}
+
 export function VryxLandingExperience() {
   const heroCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const wordCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -1378,19 +1992,7 @@ export function VryxLandingExperience() {
         </div>
       </section>
 
-      <section className="vryx-stats-wrap" aria-label="Indicateurs réseau">
-        <div className="vryx-stats">
-          {stats.map((stat) => (
-            <article className="vryx-stat" key={stat.label}>
-              <div>
-                <span className="vryx-stat-pin" style={{ '--pin': stat.color } as CSSProperties} aria-hidden />
-                <strong>{stat.value}</strong>
-              </div>
-              <p>{stat.label}</p>
-            </article>
-          ))}
-        </div>
-      </section>
+      <MonetizeSection />
 
       <main className="vryx-landing-main">
         <section id="product" className="vryx-product" aria-labelledby="product-heading">
@@ -1426,24 +2028,6 @@ export function VryxLandingExperience() {
               Explorer le réseau
               <span aria-hidden>→</span>
             </Link>
-            <div className="vryx-legend" aria-label="Légende des nœuds réseau">
-              <span>
-                <i style={{ '--legend': modelColors.qwen } as CSSProperties} aria-hidden />
-                Nœud actif
-              </span>
-              <span>
-                <i style={{ '--legend': modelColors.mistral } as CSSProperties} aria-hidden />
-                Haute capacité
-              </span>
-              <span>
-                <i style={{ '--legend': modelColors.deepseek } as CSSProperties} aria-hidden />
-                Nœud périphérique
-              </span>
-              <span>
-                <i style={{ '--legend': modelColors.nvidia } as CSSProperties} aria-hidden />
-                En connexion
-              </span>
-            </div>
           </div>
           <NetworkMap />
         </section>

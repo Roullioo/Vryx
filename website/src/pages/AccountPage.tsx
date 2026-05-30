@@ -26,7 +26,386 @@ import { ThemeToggle } from '../components/layout/ThemeToggle'
 import { VryxLogo } from '../components/brand/VryxLogo'
 import { ChatMarkdown } from '../components/admin/ChatMarkdown'
 
-type PageId = 'overview' | 'chat' | 'api' | 'usage' | 'workers' | 'billing' | 'security' | 'settings'
+type ParticlePoint = { x: number; y: number }
+type ParticleEdge = [ParticlePoint, ParticlePoint]
+type ParticleShape = {
+  x: number
+  y: number
+  vx: number
+  vy: number
+  base: ParticlePoint
+  phase: number
+  size: number
+  isChaotic?: boolean
+}
+
+export type PageId = 'overview' | 'chat' | 'api' | 'usage' | 'workers' | 'billing' | 'security' | 'settings'
+
+export const pageColors: Record<PageId, string> = {
+  overview: '#38bdf8', // Light blue / Sky cyan
+  chat: '#a78bfa',     // Cosmic lavender purple
+  api: '#34d399',      // Bright mint emerald
+  usage: '#fbbf24',    // Radiant sun amber
+  workers: '#f472b6',  // Neon hot pink
+  billing: '#f87171',  // Warm vermilion red
+  security: '#22d3ee', // Cool cyan/teal
+  settings: '#94a3b8', // Sleek metallic slate
+}
+
+// Custom mathematical target shapes for the Account Navigation Tabs
+function makeAccountIconTargets(kind: PageId | 'toggle', width: number, height: number) {
+  const pts: ParticlePoint[] = []
+  const edges: ParticleEdge[] = []
+  const center = { x: width * 0.5, y: height * 0.5 }
+  const unit = Math.min(width, height)
+
+  function addLine(x1: number, y1: number, x2: number, y2: number, steps = 10) {
+    let prev: ParticlePoint | null = null
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps
+      const p = { x: x1 + (x2 - x1) * t, y: y1 + (y2 - y1) * t }
+      pts.push(p)
+      if (prev) edges.push([prev, p])
+      prev = p
+    }
+  }
+
+  function addCircle(cx: number, cy: number, r: number, steps = 20, start = 0, end = Math.PI * 2) {
+    let prev: ParticlePoint | null = null
+    let first: ParticlePoint | null = null
+    for (let i = 0; i <= steps; i++) {
+      const angle = start + ((end - start) * i) / steps
+      const p = { x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r }
+      pts.push(p)
+      if (prev) edges.push([prev, p])
+      else first = p
+      prev = p
+    }
+    if (first && prev && end - start >= Math.PI * 2 - 0.01) edges.push([prev, first])
+  }
+
+  if (kind === 'overview') {
+    // Elegant 2x2 grid quadrants representing global system overview
+    const s = unit * 0.22
+    const g = unit * 0.04 // gap
+    // Quad 1: Top-Left
+    addLine(center.x - s, center.y - s, center.x - g, center.y - s, 4)
+    addLine(center.x - g, center.y - s, center.x - g, center.y - g, 4)
+    addLine(center.x - g, center.y - g, center.x - s, center.y - g, 4)
+    addLine(center.x - s, center.y - g, center.x - s, center.y - s, 4)
+    // Quad 2: Top-Right
+    addLine(center.x + g, center.y - s, center.x + s, center.y - s, 4)
+    addLine(center.x + s, center.y - s, center.x + s, center.y - g, 4)
+    addLine(center.x + s, center.y - g, center.x + g, center.y - g, 4)
+    addLine(center.x + g, center.y - g, center.x + g, center.y - s, 4)
+    // Quad 3: Bottom-Left
+    addLine(center.x - s, center.y + g, center.x - g, center.y + g, 4)
+    addLine(center.x - g, center.y + g, center.x - g, center.y + s, 4)
+    addLine(center.x - g, center.y + s, center.x - s, center.y + s, 4)
+    addLine(center.x - s, center.y + s, center.x - s, center.y + g, 4)
+    // Quad 4: Bottom-Right
+    addLine(center.x + g, center.y + g, center.x + s, center.y + g, 4)
+    addLine(center.x + s, center.y + g, center.x + s, center.y + s, 4)
+    addLine(center.x + s, center.y + s, center.x + g, center.y + s, 4)
+    addLine(center.x + g, center.y + s, center.x + g, center.y + g, 4)
+  } else if (kind === 'chat') {
+    // Beautiful conversation bubble with inner message lines
+    const r = unit * 0.24
+    addCircle(center.x, center.y - unit * 0.03, r, 24)
+    // Speech bubble tail
+    addLine(center.x - r * 0.4, center.y + r * 0.7, center.x - r * 0.8, center.y + r * 1.1, 5)
+    addLine(center.x - r * 0.8, center.y + r * 1.1, center.x - r * 0.05, center.y + r * 0.85, 5)
+    // Inner chat text indicators
+    addLine(center.x - r * 0.4, center.y - unit * 0.04, center.x + r * 0.4, center.y - unit * 0.04, 4)
+    addLine(center.x - r * 0.4, center.y + unit * 0.03, center.x + r * 0.2, center.y + unit * 0.03, 4)
+  } else if (kind === 'api') {
+    // High-tech terminal chevron prompt >_
+    const s = unit * 0.20
+    // Chevron '>'
+    addLine(center.x - s * 1.1, center.y - s * 0.9, center.x - s * 0.1, center.y, 6)
+    addLine(center.x - s * 0.1, center.y, center.x - s * 1.1, center.y + s * 0.9, 6)
+    // Flashing prompt cursor '_'
+    addLine(center.x + s * 0.1, center.y + s * 0.8, center.x + s * 1.2, center.y + s * 0.8, 6)
+  } else if (kind === 'usage') {
+    // Energetic high-voltage lightning bolt
+    const w = unit * 0.16
+    const h = unit * 0.34
+    addLine(center.x + w * 0.9, center.y - h, center.x - w * 0.5, center.y + w * 0.1, 8)
+    addLine(center.x - w * 0.5, center.y + w * 0.1, center.x + w * 0.5, center.y + w * 0.1, 5)
+    addLine(center.x + w * 0.5, center.y + w * 0.1, center.x - w * 0.9, center.y + h, 8)
+  } else if (kind === 'workers') {
+    // Awesome GPU chipset processor circuit core
+    const s = unit * 0.22
+    // Chip central core
+    addLine(center.x - s, center.y - s, center.x + s, center.y - s, 6)
+    addLine(center.x + s, center.y - s, center.x + s, center.y + s, 6)
+    addLine(center.x + s, center.y + s, center.x - s, center.y + s, 6)
+    addLine(center.x - s, center.y + s, center.x - s, center.y - s, 6)
+    // Silicon inner die
+    addCircle(center.x, center.y, s * 0.45, 12)
+    // Connector pins
+    for (let offset = -s * 0.6; offset <= s * 0.61; offset += s * 0.6) {
+      addLine(center.x + offset, center.y - s, center.x + offset, center.y - s - unit * 0.08, 3)
+      addLine(center.x + offset, center.y + s, center.x + offset, center.y + s + unit * 0.08, 3)
+      addLine(center.x - s, center.y + offset, center.x - s - unit * 0.08, center.y + offset, 3)
+      addLine(center.x + s, center.y + offset, center.x + s + unit * 0.08, center.y + offset, 3)
+    }
+  } else if (kind === 'billing') {
+    // Gorgeous credit card with magnetic strip & chip details
+    const w = unit * 0.28
+    const h = unit * 0.19
+    // Outer card edge
+    addLine(center.x - w, center.y - h, center.x + w, center.y - h, 6)
+    addLine(center.x + w, center.y - h, center.x + w, center.y + h, 5)
+    addLine(center.x + w, center.y + h, center.x - w, center.y + h, 6)
+    addLine(center.x - w, center.y + h, center.x - w, center.y - h, 5)
+    // Magnetic swipe strip
+    addLine(center.x - w, center.y - h * 0.4, center.x + w, center.y - h * 0.4, 6)
+    // Small EMV chip box
+    const cs = unit * 0.06
+    const cx = center.x - w * 0.6
+    const cy = center.y + h * 0.2
+    addLine(cx - cs, cy - cs, cx + cs, cy - cs, 2)
+    addLine(cx + cs, cy - cs, cx + cs, cy + cs, 2)
+    addLine(cx + cs, cy + cs, cx - cs, cy + cs, 2)
+    addLine(cx - cs, cy + cs, cx - cs, cy - cs, 2)
+  } else if (kind === 'security') {
+    // High-tech rounded padlock
+    const w = unit * 0.20
+    const h = unit * 0.17
+    const topY = center.y + unit * 0.02
+    // Bottom lock box
+    addLine(center.x - w, topY - h, center.x + w, topY - h, 5)
+    addLine(center.x + w, topY - h, center.x + w, topY + h, 4)
+    addLine(center.x + w, topY + h, center.x - w, topY + h, 5)
+    addLine(center.x - w, topY + h, center.x - w, topY - h, 4)
+    // Padlock U-shackle arch
+    addCircle(center.x, topY - h, w * 0.72, 14, Math.PI, Math.PI * 2)
+    // Symmetrical keyhole dot
+    addCircle(center.x, topY, unit * 0.035, 8)
+  } else if (kind === 'settings') {
+    // Beautiful settings mechanics gear cogwheel
+    const rInner = unit * 0.10
+    const rOuter = unit * 0.22
+    addCircle(center.x, center.y, rInner, 12)
+    // 8 gear cog teeth
+    for (let i = 0; i < 8; i++) {
+      const angle = (i * Math.PI * 2) / 8
+      const cos = Math.cos(angle)
+      const sin = Math.sin(angle)
+      // Tooth root to tip
+      addLine(center.x + cos * rInner, center.y + sin * rInner, center.x + cos * rOuter, center.y + sin * rOuter, 3)
+      // Small horizontal tip notch
+      const notchW = unit * 0.04
+      const nx = -sin * notchW
+      const ny = cos * notchW
+      const tx = center.x + cos * rOuter
+      const ty = center.y + sin * rOuter
+      addLine(tx - nx, ty - ny, tx + nx, ty + ny, 2)
+    }
+  } else {
+    // kind === 'toggle'
+    // Beautiful double-chevron collapse/expand toggle indicator pointing left (<)
+    const s = unit * 0.18
+    addLine(center.x + s * 0.5, center.y - s, center.x - s * 0.5, center.y, 4)
+    addLine(center.x - s * 0.5, center.y, center.x + s * 0.5, center.y + s, 4)
+    addLine(center.x + s * 1.0, center.y - s, center.x, center.y, 4)
+    addLine(center.x, center.y, center.x + s * 1.0, center.y + s, 4)
+  }
+
+  return { pts, edges }
+}
+
+export function AccountIconCanvas({ kind, color }: { kind: PageId | 'toggle'; color: string }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    const ctx = canvas?.getContext('2d', { alpha: true })
+    if (!canvas || !ctx) return
+    const canvasEl: HTMLCanvasElement = canvas
+    const context: CanvasRenderingContext2D = ctx
+
+    let width = 1
+    let height = 1
+    let points: ParticlePoint[] = []
+    let edges: ParticleEdge[] = []
+    let particles: ParticleShape[] = []
+    let hovering = false
+    let frame = 0
+    const pointer = { x: -9999, y: -9999, active: false }
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+
+    function fit() {
+      const rect = canvasEl.getBoundingClientRect()
+      const ratio = Math.min(window.devicePixelRatio || 1, 2)
+      width = Math.max(1, rect.width)
+      height = Math.max(1, rect.height)
+      canvasEl.width = Math.round(width * ratio)
+      canvasEl.height = Math.round(height * ratio)
+      context.setTransform(ratio, 0, 0, ratio, 0, 0)
+    }
+
+    function build() {
+      const count = Math.min(125, Math.max(76, Math.round((width * height) / 13)))
+      particles = []
+      for (let i = 0; i < count; i++) {
+        const target = points[i % Math.max(points.length, 1)] || { x: width / 2, y: height / 2 }
+        particles.push({
+          x: target.x + (Math.random() - 0.5) * 1.5,
+          y: target.y + (Math.random() - 0.5) * 1.5,
+          vx: 0,
+          vy: 0,
+          base: target,
+          phase: Math.random() * Math.PI * 2,
+          size: Math.random() * 0.9 + 0.6,
+          isChaotic: Math.random() > 0.98,
+        })
+      }
+    }
+
+    function resize() {
+      fit()
+      const shape = makeAccountIconTargets(kind, width, height)
+      points = shape.pts
+      edges = shape.edges
+      build()
+    }
+
+    function animate(t: number) {
+      context.clearRect(0, 0, width, height)
+      const active = hovering || pointer.active
+
+      // The vector lines are ALWAYS drawn (DA is pre-drawn as requested)
+      if (edges.length) {
+        context.save()
+        context.strokeStyle = color
+        context.lineCap = 'round'
+
+        // Background soft blur line glow
+        context.globalAlpha = active ? 0.26 : 0.12
+        context.lineWidth = 3.6
+        context.beginPath()
+        edges.forEach(([a, b]) => {
+          context.moveTo(a.x, a.y)
+          context.lineTo(b.x, b.y)
+        })
+        context.stroke()
+
+        // Crisp vector wireframe core
+        context.globalAlpha = active ? 0.76 : 0.38
+        context.lineWidth = 1.2
+        context.beginPath()
+        edges.forEach(([a, b]) => {
+          context.moveTo(a.x, a.y)
+          context.lineTo(b.x, b.y)
+        })
+        context.stroke()
+        context.restore()
+
+        // Running laser spark signals
+        const every = Math.max(2, Math.floor(edges.length / 5))
+        for (let i = 0; i < edges.length; i += every) {
+          const [a, b] = edges[i]
+          const progress = (t * 0.00035 + i * 0.15) % 1
+          const x = a.x + (b.x - a.x) * progress
+          const y = a.y + (b.y - a.y) * progress
+          context.globalAlpha = active ? 0.95 : 0.55
+          context.fillStyle = '#ffffff'
+          context.beginPath()
+          context.arc(x, y, active ? 1.6 : 1.1, 0, Math.PI * 2)
+          context.fill()
+        }
+      }
+
+      for (const p of particles) {
+        let ax = 0
+        let ay = 0
+
+        // Assembled target pulling is active by default to lock in shapes
+        if (p.isChaotic) {
+          ax = (Math.random() - 0.5) * 0.02
+          ay = (Math.random() - 0.5) * 0.02
+          p.vx = (p.vx + ax) * 0.98
+          p.vy = (p.vy + ay) * 0.98
+        } else {
+          // Slow organic breathing frequency
+          const tx = p.base.x + Math.cos(t * 0.0016 + p.phase) * (active ? 0.9 : 0.4)
+          const ty = p.base.y + Math.sin(t * 0.0016 + p.phase) * (active ? 0.9 : 0.4)
+          const stiffness = active ? 0.076 : 0.046
+          ax = (tx - p.x) * stiffness
+          ay = (ty - p.y) * stiffness
+
+          if (active && pointer.active) {
+            const dx = p.x - pointer.x
+            const dy = p.y - pointer.y
+            const dist = Math.sqrt(dx * dx + dy * dy)
+            if (dist < 42) {
+              const force = (1 - dist / 42) * 0.38
+              ax += (dx / (dist || 1)) * force * 1.5
+              ay += (dy / (dist || 1)) * force * 1.5
+            }
+          }
+          p.vx = (p.vx + ax) * 0.82
+          p.vy = (p.vy + ay) * 0.82
+        }
+
+        if (p.x < 0) p.x = width
+        if (p.x > width) p.x = 0
+        if (p.y < 0) p.y = height
+        if (p.y > height) p.y = 0
+
+        p.x += p.vx
+        p.y += p.vy
+
+        // High contrast dot core (always visible and dynamic)
+        context.globalAlpha = active ? 0.98 : 0.52
+        context.fillStyle = color
+        context.beginPath()
+        context.arc(p.x, p.y, p.size * (active ? 1.25 : 0.9), 0, Math.PI * 2)
+        context.fill()
+      }
+
+      context.globalAlpha = 1
+      if (!reducedMotion) frame = window.requestAnimationFrame(animate)
+    }
+
+    const card = canvasEl.closest('a') || canvasEl.closest('button')
+    const onEnter = () => { hovering = true }
+    const onMove = (e: Event) => {
+      const pe = e as PointerEvent
+      const rect = canvasEl.getBoundingClientRect()
+      pointer.x = pe.clientX - rect.left
+      pointer.y = pe.clientY - rect.top
+      pointer.active = pointer.x >= 0 && pointer.x <= rect.width && pointer.y >= 0 && pointer.y <= rect.height
+    }
+    const onLeave = () => {
+      hovering = false
+      pointer.active = false
+      pointer.x = -9999
+      pointer.y = -9999
+    }
+
+    const obs = new ResizeObserver(resize)
+    obs.observe(canvasEl)
+    card?.addEventListener('pointerenter', onEnter)
+    card?.addEventListener('pointermove', onMove, { passive: true })
+    card?.addEventListener('pointerleave', onLeave)
+    resize()
+    frame = window.requestAnimationFrame(animate)
+
+    return () => {
+      obs.disconnect()
+      card?.removeEventListener('pointerenter', onEnter)
+      card?.removeEventListener('pointermove', onMove)
+      card?.removeEventListener('pointerleave', onLeave)
+      window.cancelAnimationFrame(frame)
+    }
+  }, [kind, color])
+
+  return <canvas ref={canvasRef} className="h-full w-full block bg-transparent" />
+}
+
 type ChatMessage = {
   id: string
   role: 'assistant' | 'user'
@@ -167,7 +546,7 @@ function currentPage(pathname: string) {
 
 function Panel({ children, className = '' }: { children: ReactNode; className?: string }) {
   return (
-    <div className={`liquid-card rounded-[1.6rem] text-neutral-950 dark:text-zinc-50 ${className}`}>
+    <div className={`rounded-2xl border border-[var(--landing-line)] bg-[var(--landing-card)] shadow-sm backdrop-blur-xl transition-all duration-300 hover:border-[rgba(99,102,241,0.32)] hover:shadow-md hover:shadow-blue-100/60 dark:hover:shadow-none text-[var(--landing-ink)] ${className}`}>
       {children}
     </div>
   )
@@ -185,18 +564,19 @@ function Kpi({
   tone?: 'cyan' | 'emerald' | 'violet' | 'amber'
 }) {
   const tones = {
-    cyan: 'from-cyan-400/24 via-sky-400/8 text-cyan-500',
-    emerald: 'from-emerald-400/24 via-teal-400/8 text-emerald-500',
-    violet: 'from-violet-400/24 via-fuchsia-400/8 text-violet-500',
-    amber: 'from-amber-400/24 via-orange-400/8 text-amber-500',
+    cyan: { bar: 'from-sky-400  via-cyan-400  to-blue-400', val: 'text-sky-600    dark:text-sky-400' },
+    emerald: { bar: 'from-emerald-400 via-teal-400 to-green-400', val: 'text-emerald-600 dark:text-emerald-400' },
+    violet: { bar: 'from-violet-400 via-purple-400 to-fuchsia-400', val: 'text-violet-600 dark:text-violet-400' },
+    amber: { bar: 'from-amber-400  via-orange-400 to-yellow-400', val: 'text-amber-600   dark:text-amber-400' },
   }
+  const { bar, val } = tones[tone]
   return (
     <Panel className="overflow-hidden">
-      <div className={`h-1.5 bg-gradient-to-r ${tones[tone]}`} />
+      <div className={`h-1 bg-gradient-to-r ${bar} opacity-90`} />
       <div className="p-5">
-        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted">{title}</p>
-        <p className="mt-3 font-display text-3xl font-bold tracking-tight text-fg">{value}</p>
-        <p className="mt-2 text-sm text-muted">{detail}</p>
+        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--landing-muted)]">{title}</p>
+        <p className={`mt-3 font-display text-3xl font-bold tracking-tight ${val}`}>{value}</p>
+        <p className="mt-2 text-sm text-[var(--landing-muted)]">{detail}</p>
       </div>
     </Panel>
   )
@@ -216,9 +596,9 @@ function PageHeader({
   return (
     <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
       <div>
-        <p className="text-xs font-semibold uppercase tracking-[0.28em] text-accent">{eyebrow}</p>
-        <h1 className="mt-3 max-w-4xl font-display text-4xl font-bold tracking-tight text-fg sm:text-5xl">{title}</h1>
-        <p className="mt-3 max-w-2xl text-sm leading-6 text-muted sm:text-base">{subtitle}</p>
+        <p className="text-xs font-semibold uppercase tracking-[0.28em] text-[var(--landing-accent)]">{eyebrow}</p>
+        <h1 className="mt-3 max-w-4xl font-display text-4xl font-bold tracking-tight text-[var(--landing-ink)] sm:text-5xl">{title}</h1>
+        <p className="mt-3 max-w-2xl text-sm leading-6 text-[var(--landing-muted)] sm:text-base">{subtitle}</p>
       </div>
       {action ? <div className="shrink-0">{action}</div> : null}
     </div>
@@ -326,8 +706,15 @@ export function AccountPage() {
   const [chatLiveStats, setChatLiveStats] = useState<{ tokens: number; tps: number; startedAt: number } | null>(null)
   const [activeConversationId, setActiveConversationId] = useState(`account-conv-${crypto.randomUUID()}`)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [chatSystemContext, setChatSystemContext] = useState(() => {
+    try { return localStorage.getItem('vryx-chat-context') || '' } catch { return '' }
+  })
+  const [chatContextPanelOpen, setChatContextPanelOpen] = useState(false)
+  const [chatContextDraft, setChatContextDraft] = useState('')
 
   const activePage = currentPage(location.pathname)
+  const activeColor = pageColors[activePage.id] || '#38bdf8'
   const digest = useMemo(() => digestSessions(sessions), [sessions])
   const usagePercent = overview ? Math.max(0, Math.min(100, overview.usagePercent || 0)) : 0
   const estimatedMonthly = overview ? (overview.spendThisMonth / Math.max(1, new Date().getDate())) * 30 : 0
@@ -402,7 +789,7 @@ export function AccountPage() {
     else errors.push(`Sessions: ${sessionsResult.error}`)
     if (workersResult.ok) setWorkers(Array.isArray(workersResult.data.workers) ? workersResult.data.workers : [])
     else errors.push(`Workers: ${workersResult.error}`)
-    if (modelsResult.ok) {
+    if (modelsResult.ok === true) {
       const nextModels = Array.isArray(modelsResult.data.models) ? modelsResult.data.models : []
       setModels(nextModels)
       setSelectedModel((current) => {
@@ -437,24 +824,24 @@ export function AccountPage() {
     if (!hasGoogleCode || googleHandledRef.current) return
     googleHandledRef.current = true
     const params = new URLSearchParams(window.location.search)
-    ;(async () => {
-      setGoogleStatus('processing')
-      const r = await apiJson<{ token?: string; desktop?: boolean; next?: string }>('/api/auth/google/finish', {
-        method: 'POST',
-        body: JSON.stringify({ code: params.get('code') || '', state: params.get('state') || '' }),
-      })
-      if (!r.ok) {
-        setGoogleError(r.error)
-        setGoogleStatus('error')
-        return
-      }
-      await refresh()
-      if (r.data.desktop && r.data.token) {
-        window.location.href = `vryx://auth?token=${encodeURIComponent(r.data.token)}`
-      }
-      window.history.replaceState({}, '', r.data.next && r.data.next.startsWith('/') ? r.data.next : '/compte')
-      setGoogleStatus('idle')
-    })()
+      ; (async () => {
+        setGoogleStatus('processing')
+        const r = await apiJson<{ token?: string; desktop?: boolean; next?: string }>('/api/auth/google/finish', {
+          method: 'POST',
+          body: JSON.stringify({ code: params.get('code') || '', state: params.get('state') || '' }),
+        })
+        if (r.ok === false) {
+          setGoogleError(r.error)
+          setGoogleStatus('error')
+          return
+        }
+        await refresh()
+        if (r.data.desktop && r.data.token) {
+          window.location.href = `vryx://auth?token=${encodeURIComponent(r.data.token)}`
+        }
+        window.history.replaceState({}, '', r.data.next && r.data.next.startsWith('/') ? r.data.next : '/compte')
+        setGoogleStatus('idle')
+      })()
   }, [hasGoogleCode, refresh])
 
   useEffect(() => {
@@ -572,6 +959,23 @@ export function AccountPage() {
     setChatLiveStats(null)
   }, [])
 
+  const deleteThread = useCallback(async (threadId: string) => {
+    setSessions((prev) => prev.filter((s) => (s.conversationId || s.id) !== threadId))
+    if (threadId === activeConversationId) {
+      setActiveConversationId(`account-conv-${crypto.randomUUID()}`)
+      setChatMessages([])
+      setChatLiveStats(null)
+    }
+    // Fire-and-forget: best-effort server delete
+    void apiJson<{ ok: true }>(`/api/account/sessions?conversationId=${encodeURIComponent(threadId)}`, { method: 'DELETE' }).catch(() => null)
+  }, [activeConversationId])
+
+  const saveContext = useCallback((ctx: string) => {
+    setChatSystemContext(ctx)
+    try { localStorage.setItem('vryx-chat-context', ctx) } catch { /* noop */ }
+    setChatContextPanelOpen(false)
+  }, [])
+
   const openConversation = useCallback((thread: ChatThread) => {
     const messages: ChatMessage[] = []
     for (const session of thread.sessions) {
@@ -673,13 +1077,13 @@ export function AccountPage() {
 
   const sendChat = useCallback(
     async (text?: string) => {
-	      const content = (text ?? chatInput).trim()
-	      if ((!content && chatAttachments.length === 0) || chatLoading) return
-	      if (!modelId) {
-	        setActionError('Aucun modèle exécutable pour le moment. Llama2 70B demande 2 workers compatibles en ligne ; relance le second worker ou choisis un modèle avec assez de workers.')
-	        return
-	      }
-	      setActionError('')
+      const content = (text ?? chatInput).trim()
+      if ((!content && chatAttachments.length === 0) || chatLoading) return
+      if (!modelId) {
+        setActionError('Aucun modèle exécutable pour le moment. Llama2 70B demande 2 workers compatibles en ligne ; relance le second worker ou choisis un modèle avec assez de workers.')
+        return
+      }
+      setActionError('')
       setChatInput('')
       const outgoingAttachments = [...chatAttachments]
       setChatAttachments([])
@@ -697,7 +1101,10 @@ export function AccountPage() {
       setChatLoading(true)
       const startedAt = Date.now()
       setChatLiveStats({ tokens: 0, tps: 0, startedAt })
-      const payloadMessages = nextMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }))
+      const payloadMessages = [
+        ...(chatSystemContext.trim() ? [{ role: 'system' as const, content: chatSystemContext.trim() }] : []),
+        ...nextMessages.slice(-12).map((message) => ({ role: message.role, content: message.content }))
+      ]
       let queued = ''
       let rendered = ''
       let tokenFragments = 0
@@ -785,7 +1192,7 @@ export function AccountPage() {
         setChatLoading(false)
       }
     },
-    [activeConversationId, chatAttachments, chatInput, chatLoading, chatMessages, modelId, refreshData],
+    [activeConversationId, chatAttachments, chatInput, chatLoading, chatMessages, chatSystemContext, modelId, refreshData],
   )
 
   const onChatKeyDown = useCallback(
@@ -797,19 +1204,146 @@ export function AccountPage() {
     [sendChat],
   )
 
-  if (googleStatus === 'processing' || loading || accountLoading) {
-    return (
-      <div className="vryx-loading-scene min-h-dvh px-4">
-        <div className="vryx-loading-orb">
-          <span className="vryx-loading-bubble vryx-loading-bubble-a" />
-          <span className="vryx-loading-bubble vryx-loading-bubble-b" />
-          <span className="vryx-loading-bubble vryx-loading-bubble-c" />
-          <div className="vryx-loading-ring">
-            <div className="vryx-loading-core" aria-label="Chargement Vryx" />
+function VryxLoadingScreen() {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    let animationFrameId: number
+    let width = (canvas.width = window.innerWidth)
+    let height = (canvas.height = window.innerHeight)
+
+    class Particle {
+      x: number
+      y: number
+      vx: number
+      vy: number
+      radius: number
+      color: string
+      alpha: number
+
+      constructor() {
+        this.x = Math.random() * width
+        this.y = Math.random() * height
+        this.vx = (Math.random() - 0.5) * 0.4
+        this.vy = (Math.random() - 0.5) * 0.4
+        this.radius = Math.random() * 2 + 0.5
+        this.color = Math.random() > 0.5 ? '167, 139, 250' : '56, 189, 248'
+        this.alpha = Math.random() * 0.5 + 0.2
+      }
+
+      update() {
+        this.x += this.vx
+        this.y += this.vy
+
+        if (this.x < 0) this.x = width
+        if (this.x > width) this.x = 0
+        if (this.y < 0) this.y = height
+        if (this.y > height) this.y = 0
+
+        this.alpha = Math.max(0.1, Math.min(0.8, this.alpha + (Math.random() - 0.5) * 0.02))
+      }
+
+      draw(c: CanvasRenderingContext2D) {
+        c.beginPath()
+        c.arc(this.x, this.y, this.radius, 0, Math.PI * 2)
+        c.fillStyle = `rgba(${this.color}, ${this.alpha})`
+        c.fill()
+      }
+    }
+
+    const particles: Particle[] = Array.from({ length: 80 }, () => new Particle())
+
+    const handleResize = () => {
+      if (!canvas) return
+      width = canvas.width = window.innerWidth
+      height = canvas.height = window.innerHeight
+    }
+    window.addEventListener('resize', handleResize)
+
+    const animate = () => {
+      ctx.clearRect(0, 0, width, height)
+
+      const grad = ctx.createRadialGradient(width * 0.5, height * 0.5, 0, width * 0.5, height * 0.5, Math.max(width, height))
+      grad.addColorStop(0, '#060a17')
+      grad.addColorStop(0.5, '#04060f')
+      grad.addColorStop(1, '#020307')
+      ctx.fillStyle = grad
+      ctx.fillRect(0, 0, width, height)
+
+      for (let i = 0; i < particles.length; i++) {
+        for (let j = i + 1; j < particles.length; j++) {
+          const p1 = particles[i]
+          const p2 = particles[j]
+          const dx = p1.x - p2.x
+          const dy = p1.y - p2.y
+          const dist = Math.hypot(dx, dy)
+
+          if (dist < 130) {
+            const alpha = (1 - dist / 130) * 0.14
+            ctx.beginPath()
+            ctx.moveTo(p1.x, p1.y)
+            ctx.lineTo(p2.x, p2.y)
+            ctx.strokeStyle = `rgba(99, 102, 241, ${alpha})`
+            ctx.lineWidth = 0.8
+            ctx.stroke()
+          }
+        }
+      }
+
+      particles.forEach((p) => {
+        p.update()
+        p.draw(ctx)
+      })
+
+      animationFrameId = requestAnimationFrame(animate)
+    }
+
+    animate()
+
+    return () => {
+      cancelAnimationFrame(animationFrameId)
+      window.removeEventListener('resize', handleResize)
+    }
+  }, [])
+
+  return (
+    <div className="relative w-full h-dvh flex flex-col items-center justify-center overflow-hidden bg-[#020307]">
+      <canvas ref={canvasRef} className="absolute inset-0 block w-full h-full pointer-events-none" />
+      <div className="relative z-10 flex flex-col items-center justify-center animate-[fadeIn_.8s_ease-out]">
+        <div className="relative flex items-center justify-center">
+          <div className="absolute w-56 h-56 rounded-full bg-gradient-to-tr from-sky-400 via-indigo-500 to-purple-600 blur-[80px] opacity-25 animate-pulse" />
+          
+          <div className="relative w-44 h-44 rounded-full border border-white/10 bg-white/[0.02] backdrop-blur-xl shadow-[0_0_50px_rgba(99,102,241,0.25)] flex items-center justify-center hover:scale-105 transition-transform duration-500">
+            <div className="absolute inset-2 rounded-full border border-white/5 bg-gradient-to-tr from-cyan-500/10 via-transparent to-purple-500/10 animate-[spin_8s_linear_infinite]" />
+            <div className="absolute inset-4 rounded-full border border-white/5 animate-[spin_12s_linear_infinite_reverse]" />
+            
+            <VryxLogo variant="mark" tone="light" markSize="lg" className="scale-110 drop-shadow-[0_0_24px_rgba(168,85,247,0.6)]" />
+          </div>
+        </div>
+        
+        <div className="mt-8 flex flex-col items-center gap-2">
+          <h2 className="font-display text-xl font-bold tracking-[0.2em] uppercase text-white bg-clip-text text-transparent bg-gradient-to-r from-sky-400 via-indigo-300 to-purple-400">
+            VryxAI
+          </h2>
+          <div className="flex items-center gap-1.5 mt-1">
+            <span className="h-1.5 w-1.5 rounded-full bg-sky-400 animate-ping" />
+            <span className="text-[11px] font-semibold tracking-[0.3em] uppercase text-sky-400/80 font-mono">
+              Initialisation du DePIN
+            </span>
           </div>
         </div>
       </div>
-    )
+    </div>
+  )
+}
+
+  if (googleStatus === 'processing' || loading || accountLoading) {
+    return <VryxLoadingScreen />
   }
 
   if (googleStatus === 'error') {
@@ -833,118 +1367,181 @@ export function AccountPage() {
   )
 
   return (
-    <div className="liquid-page min-h-dvh bg-[radial-gradient(circle_at_18%_0%,rgba(14,165,233,0.18),transparent_32%),radial-gradient(circle_at_88%_10%,rgba(168,85,247,0.14),transparent_34%),linear-gradient(135deg,#f8fafc,#eef2ff)] text-neutral-950 dark:bg-[radial-gradient(circle_at_18%_0%,rgba(34,211,238,0.13),transparent_32%),radial-gradient(circle_at_88%_10%,rgba(168,85,247,0.16),transparent_34%),linear-gradient(135deg,#05070d,#0b1020)] dark:text-zinc-50">
-      <aside className="liquid-card fixed inset-y-0 left-0 z-40 hidden w-72 rounded-none border-y-0 border-l-0 px-4 py-5 xl:flex xl:flex-col">
-        <div className="flex items-center gap-3 px-2">
-          <VryxLogo to="/" markSize="sm" />
+    <div
+      className="vryx-landing min-h-dvh text-[var(--landing-ink)] relative overflow-hidden transition-all duration-700 ease-out"
+      style={{
+        marginTop: 0,
+        background: `
+          radial-gradient(circle at 15% 15%, ${activeColor}24, transparent 48rem),
+          radial-gradient(circle at 85% 30%, ${activeColor}1a, transparent 42rem),
+          radial-gradient(circle at 50% 55%, ${activeColor}12, transparent 45rem),
+          linear-gradient(180deg, var(--landing-bg) 0%, var(--landing-bg-soft) 44%, var(--landing-bg) 100%)
+        `
+      }}
+    >
+      {/* Dynamic Galactic Active Tab Glow backdrop */}
+      <div
+        className="pointer-events-none absolute left-1/2 top-0 -translate-x-1/2 -z-10 h-[600px] w-full max-w-[1400px] rounded-full blur-[140px] opacity-[0.12] dark:opacity-[0.11] transition-all duration-700 ease-out"
+        style={{
+          background: `radial-gradient(circle, ${activeColor} 0%, transparent 70%)`
+        }}
+      />
+
+      <aside className={`fixed inset-y-0 left-0 z-40 hidden rounded-none border-y-0 border-r border-[var(--landing-line)] bg-[var(--landing-card-strong)] py-5 xl:flex xl:flex-col backdrop-blur-xl transition-all duration-300 shadow-[1px_0_24px_rgba(147,197,253,0.18)] dark:shadow-none ${sidebarCollapsed ? 'w-20 px-2' : 'w-72 px-4'}`}>
+        <div className={`flex transition-all duration-300 ${sidebarCollapsed ? 'flex-col items-center gap-4 px-0' : 'items-center justify-between gap-3 px-2'}`}>
+          {!sidebarCollapsed ? <VryxLogo to="/" markSize="sm" /> : <VryxLogo variant="mark" to="/" markSize="sm" />}
+          <button
+            type="button"
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            className={`hidden xl:flex items-center justify-center rounded-lg border border-[var(--landing-line)] bg-white/5 hover:bg-white/10 text-[var(--landing-muted)] hover:text-[var(--landing-ink)] transition-all relative overflow-hidden ${sidebarCollapsed ? 'h-11 w-11' : 'h-9 w-9'
+              }`}
+            title={sidebarCollapsed ? "Agrandir la sidebar" : "Replier la sidebar"}
+          >
+            <span className={`w-7 h-7 transition-transform duration-300 ${sidebarCollapsed ? 'rotate-180' : 'rotate-0'}`}>
+              <AccountIconCanvas kind="toggle" color="#94a3b8" />
+            </span>
+          </button>
         </div>
         <nav className="mt-8 flex flex-1 flex-col gap-2" aria-label="Compte">
           {pages.map((page) => {
-            const Icon = page.icon
             const active = page.id === activePage.id
+            const pageColor = pageColors[page.id]
             return (
               <Link
                 key={page.id}
                 to={page.path}
-                className={`group flex items-center gap-3 rounded-2xl px-3 py-3 transition ${
+                className={`group flex items-center gap-3 rounded-xl transition-all duration-300 border ${sidebarCollapsed ? 'justify-center px-0 py-3' : 'px-3 py-3'
+                  } ${active
+                    ? 'text-[var(--landing-ink)] font-semibold shadow-md shadow-black/5'
+                    : 'text-[var(--landing-muted)] hover:bg-blue-50/70 dark:hover:bg-white/[0.04] hover:text-[var(--landing-ink)] border-transparent hover:border-blue-100/80 dark:hover:border-transparent'
+                  }`}
+                style={
                   active
-                    ? 'liquid-lens text-white'
-                    : 'text-muted hover:bg-black/5 hover:text-fg dark:hover:bg-white/10'
-                }`}
+                    ? {
+                      backgroundColor: `${pageColor}22`,
+                      borderColor: `${pageColor}55`,
+                      boxShadow: `0 2px 16px -2px ${pageColor}2e`,
+                    }
+                    : {}
+                }
               >
-                <span className="liquid-chip flex h-10 w-10 items-center justify-center rounded-xl">
-                  <Icon className="h-5 w-5" aria-hidden />
+                <span
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg overflow-hidden relative border bg-white/5"
+                  style={{
+                    borderColor: active ? `${pageColor}44` : 'var(--landing-line)',
+                    boxShadow: active ? `0 0 12px -2px ${pageColor}33, inset 0 1px 0 rgba(255,255,255,0.1)` : 'inset 0 1px 0 rgba(255,255,255,0.05)'
+                  }}
+                >
+                  <AccountIconCanvas
+                    kind={page.id}
+                    color={pageColor}
+                  />
                 </span>
-                <span>
-                  <span className="block text-sm font-semibold">{page.label}</span>
-                  <span className={`block text-xs ${active ? 'text-white/75' : 'text-muted'}`}>{page.hint}</span>
-                </span>
+                {!sidebarCollapsed && (
+                  <span className="truncate">
+                    <span className="block text-sm font-semibold">{page.label}</span>
+                    <span className="block text-xs text-[var(--landing-muted)] group-hover:text-[var(--landing-ink)] transition-colors">{page.hint}</span>
+                  </span>
+                )}
               </Link>
             )
           })}
         </nav>
         <div className="space-y-3">
-          <div className="liquid-chip rounded-2xl p-3">
-            <p className="truncate font-mono text-xs text-muted">{user.email}</p>
-            <p className="mt-1 text-xs font-semibold text-accent">{overview?.plan ?? 'Scale'}</p>
+          <div className={`rounded-xl p-3 border border-[var(--landing-line)] bg-[var(--landing-card)] backdrop-blur-sm shadow-sm transition-all ${sidebarCollapsed ? 'text-center px-1' : ''}`}>
+            {!sidebarCollapsed ? (
+              <>
+                <p className="truncate font-mono text-xs text-[var(--landing-muted)]">{user.email}</p>
+                <p className="mt-1 text-xs font-bold text-[var(--landing-accent)]">{overview?.plan ?? 'Scale'}</p>
+              </>
+            ) : (
+              <span className="text-xs font-bold text-[var(--landing-accent)]">{overview?.plan?.slice(0, 2) ?? 'Sc'}</span>
+            )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className={`flex gap-2 transition-all ${sidebarCollapsed ? 'flex-col items-center' : 'items-center'}`}>
             <ThemeToggle menuPlacement="up" menuAlign="left" />
             <button
               type="button"
               onClick={() => void handleLogout()}
-              className="flex h-12 flex-1 items-center justify-center gap-2 rounded-2xl border border-alert/20 text-sm font-semibold text-alert transition hover:bg-alert/10"
+              className={`flex h-12 items-center justify-center gap-2 rounded-xl border border-red-400/25 text-sm font-semibold text-red-500 transition hover:bg-red-50 dark:hover:bg-red-500/10 ${sidebarCollapsed ? 'w-12 px-0' : 'flex-1'}`}
+              title="Déconnexion"
             >
               <IconLock className="h-4 w-4" aria-hidden />
-              Déconnexion
+              {!sidebarCollapsed && "Déconnexion"}
             </button>
           </div>
         </div>
       </aside>
 
-      <main className="xl:pl-72">
-        <div className="mx-auto min-h-dvh max-w-7xl px-4 py-4 sm:px-6 lg:px-8 lg:py-7">
-          <div className="sticky top-3 z-30 mb-5 xl:hidden">
-            <div className="liquid-card flex items-center justify-between gap-4 rounded-[1.45rem] px-3 py-2.5">
-              <VryxLogo to="/" markSize="sm" />
-              <div className="flex items-center gap-2">
-                <span className="hidden max-w-[12rem] truncate font-mono text-xs text-muted sm:block">{activePage.label}</span>
-                <button
-                  type="button"
-                  onClick={() => setMobileMenuOpen((open) => !open)}
-                  className="liquid-chip flex h-11 w-11 items-center justify-center rounded-2xl text-fg"
-                  aria-label={mobileMenuOpen ? 'Fermer le menu' : 'Ouvrir le menu'}
-                  aria-expanded={mobileMenuOpen}
-                >
-                  <span className="relative block h-4 w-5">
-                    <span className={`absolute left-0 h-0.5 w-5 rounded-full bg-current transition ${mobileMenuOpen ? 'top-2 rotate-45' : 'top-0'}`} />
-                    <span className={`absolute left-0 top-2 h-0.5 w-5 rounded-full bg-current transition ${mobileMenuOpen ? 'opacity-0' : 'opacity-100'}`} />
-                    <span className={`absolute left-0 h-0.5 w-5 rounded-full bg-current transition ${mobileMenuOpen ? 'top-2 -rotate-45' : 'top-4'}`} />
-                  </span>
-                </button>
-              </div>
-            </div>
-            {mobileMenuOpen ? (
-              <div className="liquid-mobile-menu mt-3 rounded-[1.7rem] p-3">
-                <div className="grid gap-2">
-                  {pages.map((page) => {
-                    const Icon = page.icon
-                    const active = page.id === activePage.id
-                    return (
-                      <Link
-                        key={page.id}
-                        to={page.path}
-                        className={`flex items-center gap-3 rounded-2xl px-3 py-3 text-sm font-semibold transition ${
-                          active ? 'liquid-lens text-white' : 'liquid-chip text-muted hover:text-fg'
-                        }`}
-                      >
-                        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10">
-                          <Icon className="h-4.5 w-4.5" aria-hidden />
-                        </span>
-                        <span className="flex-1">
-                          <span className="block">{page.label}</span>
-                          <span className={`block text-xs font-medium ${active ? 'text-white/75' : 'text-muted'}`}>{page.hint}</span>
-                        </span>
-                      </Link>
-                    )
-                  })}
-                </div>
-                <div className="mt-3 grid grid-cols-[auto_1fr] gap-2">
-                  <ThemeToggle menuPlacement="down" menuAlign="right" />
+      <main className={`transition-all duration-300 ${sidebarCollapsed ? 'xl:pl-20' : 'xl:pl-72'}`}>
+        <div className={`${activePage.id === 'chat' ? 'h-dvh overflow-hidden' : 'mx-auto min-h-dvh max-w-7xl px-4 py-10 sm:px-6 lg:px-8 lg:py-14'}`}>
+          {activePage.id !== 'chat' && (
+            <div className="sticky top-3 z-30 mb-5 xl:hidden">
+              <div className="flex items-center justify-between gap-4 rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card-strong)] px-3 py-2.5 shadow-sm shadow-blue-100/40 dark:shadow-none backdrop-blur-xl">
+                <VryxLogo to="/" markSize="sm" />
+                <div className="flex items-center gap-2">
+                  <span className="hidden max-w-[12rem] truncate font-mono text-xs text-[var(--landing-muted)] sm:block">{activePage.label}</span>
                   <button
                     type="button"
-                    onClick={() => void handleLogout()}
-                    className="flex h-12 items-center justify-center gap-2 rounded-2xl border border-alert/20 text-sm font-semibold text-alert transition hover:bg-alert/10"
+                    onClick={() => setMobileMenuOpen((open) => !open)}
+                    className="flex h-11 w-11 items-center justify-center rounded-xl border border-[var(--landing-line)] bg-white/5 text-[var(--landing-ink)]"
+                    aria-label={mobileMenuOpen ? 'Fermer le menu' : 'Ouvrir le menu'}
+                    aria-expanded={mobileMenuOpen}
                   >
-                    <IconLock className="h-4 w-4" aria-hidden />
-                    Déconnexion
+                    <span className="relative block h-4 w-5">
+                      <span className={`absolute left-0 h-0.5 w-5 rounded-full bg-current transition ${mobileMenuOpen ? 'top-2 rotate-45' : 'top-0'}`} />
+                      <span className={`absolute left-0 top-2 h-0.5 w-5 rounded-full bg-current transition ${mobileMenuOpen ? 'opacity-0' : 'opacity-100'}`} />
+                      <span className={`absolute left-0 h-0.5 w-5 rounded-full bg-current transition ${mobileMenuOpen ? 'top-2 -rotate-45' : 'top-4'}`} />
+                    </span>
                   </button>
                 </div>
               </div>
-            ) : null}
-          </div>
+              {mobileMenuOpen ? (
+                <div className="mt-3 rounded-xl p-3 border border-[var(--landing-line)] bg-[var(--landing-card-strong)] shadow-2xl backdrop-blur-lg animate-[fadeIn_.2s_ease-out]">
+                  <div className="grid gap-2">
+                    {pages.map((page) => {
+                      const active = page.id === activePage.id
+                      return (
+                        <Link
+                          key={page.id}
+                          to={page.path}
+                          className={`flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition ${active
+                              ? 'bg-[var(--landing-accent)] text-white shadow-lg'
+                              : 'border border-[var(--landing-line)] bg-white/5 text-[var(--landing-muted)] hover:text-[var(--landing-ink)]'
+                            }`}
+                        >
+                          <span className="flex h-9 w-9 items-center justify-center rounded-lg overflow-hidden relative border border-[var(--landing-line)] bg-white/5">
+                            <AccountIconCanvas
+                              kind={page.id}
+                              color={pageColors[page.id]}
+                            />
+                          </span>
+                          <span className="flex-1">
+                            <span className="block">{page.label}</span>
+                            <span className={`block text-xs font-medium ${active ? 'text-white/80' : 'text-[var(--landing-muted)]'}`}>{page.hint}</span>
+                          </span>
+                        </Link>
+                      )
+                    })}
+                  </div>
+                  <div className="mt-3 grid grid-cols-[auto_1fr] gap-2">
+                    <ThemeToggle menuPlacement="down" menuAlign="right" />
+                    <button
+                      type="button"
+                      onClick={() => void handleLogout()}
+                      className="flex h-12 items-center justify-center gap-2 rounded-xl border border-red-500/20 text-sm font-semibold text-red-500 transition hover:bg-red-500/10"
+                    >
+                      <IconLock className="h-4 w-4" aria-hidden />
+                      Déconnexion
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          )}
 
-          {(accountError || actionError) && <div className="mb-5 space-y-2">{alerts}</div>}
+          {(accountError || actionError) && activePage.id !== 'chat' && <div className="mb-5 space-y-2">{alerts}</div>}
+
 
           {activePage.id === 'overview' ? (
             <section>
@@ -957,7 +1554,7 @@ export function AccountPage() {
                     type="button"
                     onClick={() => void refreshData()}
                     disabled={reloading}
-                    className="rounded-2xl border border-border bg-surface px-5 py-3 text-sm font-semibold text-fg transition hover:border-accent/50 disabled:opacity-60"
+                    className="rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-5 py-3 text-sm font-semibold text-[var(--landing-ink)] transition hover:border-[var(--landing-accent)] disabled:opacity-60"
                   >
                     {reloading ? 'Actualisation...' : 'Actualiser'}
                   </button>
@@ -996,54 +1593,54 @@ export function AccountPage() {
               </div>
               <div className="mt-5 grid gap-5 lg:grid-cols-[1fr_22rem]">
                 <Panel className="p-6">
-                  <div className="flex items-center justify-between gap-4">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <p className="font-display text-2xl font-bold text-fg">Forfait {overview?.plan ?? 'Scale'}</p>
-                      <p className="mt-1 text-sm text-muted">Usage mensuel, clés actives et endpoint prêt pour Cursor.</p>
+                      <p className="font-display text-2xl font-bold text-[var(--landing-ink)]">Forfait {overview?.plan ?? 'Scale'}</p>
+                      <p className="mt-1 text-sm text-[var(--landing-muted)]">Usage mensuel, clés actives et endpoint prêt pour Cursor.</p>
                     </div>
-                    <Link to="/compte/chat" className="btn-primary rounded-2xl px-5 py-3 text-sm font-semibold">
+                    <Link to="/compte/chat" className="inline-flex h-12 items-center justify-center rounded-xl bg-[var(--landing-accent)] px-5 text-sm font-semibold text-white shadow-md shadow-cyan-500/10 transition hover:-translate-y-0.5">
                       Ouvrir le chat
                     </Link>
                   </div>
-                  <div className="mt-6 h-4 overflow-hidden rounded-full bg-border">
-                    <div className="h-full rounded-full bg-gradient-to-r from-sky-400 via-cyan-300 to-emerald-300" style={{ width: `${usagePercent}%` }} />
+                  <div className="mt-6 h-4 overflow-hidden rounded-full bg-[var(--landing-line)]">
+                    <div className="h-full rounded-full bg-gradient-to-r from-[var(--landing-accent)] via-cyan-400 to-emerald-400" style={{ width: `${usagePercent}%` }} />
                   </div>
                   <div className="mt-5 grid gap-3 sm:grid-cols-3">
-                    <div className="rounded-2xl bg-surface p-4"><p className="text-sm text-muted">Usage</p><p className="mt-1 font-mono text-lg font-semibold">{Math.round(usagePercent)}%</p></div>
-                    <div className="rounded-2xl bg-surface p-4"><p className="text-sm text-muted">Clés</p><p className="mt-1 font-mono text-lg font-semibold">{apiKeys.length}</p></div>
-                    <div className="rounded-2xl bg-surface p-4"><p className="text-sm text-muted">Requêtes</p><p className="mt-1 font-mono text-lg font-semibold">{integer(overview?.requestsThisMonth ?? 0)}</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-sm text-[var(--landing-muted)]">Usage</p><p className="mt-1 font-mono text-lg font-semibold">{Math.round(usagePercent)}%</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-sm text-[var(--landing-muted)]">Clés</p><p className="mt-1 font-mono text-lg font-semibold">{apiKeys.length}</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-sm text-[var(--landing-muted)]">Requêtes</p><p className="mt-1 font-mono text-lg font-semibold">{integer(overview?.requestsThisMonth ?? 0)}</p></div>
                   </div>
                 </Panel>
                 <Panel className="p-6">
-                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted">Configuration rapide</p>
-                  <button type="button" onClick={() => void copyWithFeedback('overview-api-base', apiBase)} className="mt-4 block w-full rounded-2xl bg-surface p-4 text-left">
-                    <span className="block text-xs text-muted">Base URL</span>
-                    <span className="mt-1 block break-all font-mono text-sm text-accent">{copiedKey === 'overview-api-base' ? 'Copié' : apiBase}</span>
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--landing-muted)]">Configuration rapide</p>
+                  <button type="button" onClick={() => void copyWithFeedback('overview-api-base', apiBase)} className="mt-4 block w-full rounded-xl border border-[var(--landing-line)] bg-white/5 p-4 text-left hover:border-[var(--landing-accent)] transition">
+                    <span className="block text-xs text-[var(--landing-muted)]">Base URL</span>
+                    <span className="mt-1 block break-all font-mono text-sm text-[var(--landing-accent)]">{copiedKey === 'overview-api-base' ? 'Copié' : apiBase}</span>
                   </button>
-                  <div className="mt-3 rounded-2xl bg-surface p-4">
+                  <div className="mt-3 rounded-xl border border-[var(--landing-line)] bg-white/5 p-4">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-muted">Modèle</span>
-                      <button type="button" onClick={() => void copyWithFeedback('overview-model', modelId)} className="copy-feedback text-xs font-semibold text-accent disabled:opacity-40" disabled={!modelId}>
+                      <span className="text-xs text-[var(--landing-muted)]">Modèle</span>
+                      <button type="button" onClick={() => void copyWithFeedback('overview-model', modelId)} className="text-xs font-semibold text-[var(--landing-accent)] disabled:opacity-40" disabled={!modelId}>
                         {copiedKey === 'overview-model' ? 'Copié' : 'Copier'}
                       </button>
                     </div>
                     <select
                       value={modelId}
                       onChange={(event) => setSelectedModel(event.target.value)}
-                      className="liquid-chip mt-2 h-12 w-full rounded-2xl px-3 font-mono text-sm text-fg outline-none"
+                      className="mt-2 h-12 w-full rounded-xl border border-[var(--landing-line)] bg-transparent px-3 font-mono text-sm text-[var(--landing-ink)] outline-none transition focus:border-[var(--landing-accent)]"
                     >
                       {models.length === 0 ? <option value="">Aucun modèle détecté</option> : null}
                       {models.map((model) => {
                         const required = Math.max(1, Number(model.requiredWorkers || 1))
                         const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
                         return (
-                        <option key={model.id} value={model.id} disabled={!runnable}>
-                          {model.id}{runnable ? '' : ` — attente ${model.workersOnline}/${required} worker(s)`}
-                        </option>
+                          <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                            {model.id}{runnable ? '' : ` — attente ${model.workersOnline}/${required} worker(s)`}
+                          </option>
                         )
                       })}
                     </select>
-                    <p className="mt-2 text-xs text-muted">
+                    <p className="mt-2 text-xs text-[var(--landing-muted)]">
                       {selectedModelInfo
                         ? `${selectedModelInfo.family} · ${selectedModelInfo.local ? 'présent sur le VPS' : 'déclaré par worker'} · ${selectedModelInfo.workersOnline}/${selectedModelInfo.requiredWorkers || 1} worker(s) requis`
                         : 'La liste se met à jour automatiquement depuis le VPS.'}
@@ -1055,160 +1652,254 @@ export function AccountPage() {
           ) : null}
 
           {activePage.id === 'chat' ? (
-            <section className="liquid-chat-shell flex flex-col">
-              <div className="mx-auto grid w-full max-w-7xl flex-1 gap-5 lg:grid-cols-[18rem_1fr]">
-                <aside className="chat-history-panel liquid-card liquid-static order-1 overflow-hidden rounded-[1.7rem] p-3 lg:sticky lg:top-7 lg:max-h-[calc(100dvh-3.5rem)]">
-                  <div className="flex items-center justify-between gap-2 px-2 py-2">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted">Historique</p>
-                      <p className="mt-1 text-xs text-muted">{chatThreads.length} conversation(s)</p>
+            <section className="flex flex-col h-full w-full">
+              {/* Context Settings Panel */}
+              {chatContextPanelOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-[fadeIn_.2s_ease-out]">
+                  <div className="w-full max-w-lg rounded-2xl border border-[var(--landing-line)] bg-[var(--landing-card-strong)] shadow-2xl backdrop-blur-xl p-6">
+                    <div className="flex items-center justify-between mb-4">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[var(--landing-accent)]">Contexte système</p>
+                        <h2 className="mt-1 font-display text-xl font-bold text-[var(--landing-ink)]">Instructions personnalisées</h2>
+                      </div>
+                      <button type="button" onClick={() => setChatContextPanelOpen(false)} className="h-9 w-9 flex items-center justify-center rounded-xl border border-[var(--landing-line)] bg-white/5 text-[var(--landing-muted)] hover:text-[var(--landing-ink)] transition text-lg leading-none">×</button>
                     </div>
-                    <button type="button" onClick={startNewConversation} className="liquid-lens rounded-2xl px-3 py-2 text-xs font-semibold text-white">
-                      Nouveau
+                    <p className="mb-3 text-sm text-[var(--landing-muted)]">Ce contexte est envoyé comme message système au début de chaque conversation. Définissez un rôle, un ton, ou des règles métier.</p>
+                    <textarea
+                      value={chatContextDraft}
+                      onChange={(e) => setChatContextDraft(e.target.value)}
+                      rows={8}
+                      placeholder="Ex: Tu es un assistant expert en GPU et en DePIN. Tu réponds toujours en français, de manière concise et technique..."
+                      className="w-full rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-4 py-3 text-sm text-[var(--landing-ink)] placeholder:text-[var(--landing-muted)] outline-none focus:border-[var(--landing-accent)] resize-none transition"
+                    />
+                    <div className="mt-4 flex gap-3 justify-end">
+                      <button type="button" onClick={() => { setChatContextDraft(''); saveContext('') }} className="px-4 py-2 rounded-xl border border-[var(--landing-line)] text-sm font-semibold text-[var(--landing-muted)] hover:text-[var(--landing-ink)] transition">Effacer</button>
+                      <button type="button" onClick={() => saveContext(chatContextDraft)} className="px-5 py-2 rounded-xl bg-[var(--landing-accent)] text-sm font-semibold text-white transition">Enregistrer</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex h-[calc(100dvh-0px)] min-h-0" style={{ height: 'calc(100dvh - 0px)' }}>
+                {/* Sidebar Conversations */}
+                <aside className="hidden lg:flex w-72 shrink-0 flex-col border-r border-[var(--landing-line)] bg-[var(--landing-card-strong)] backdrop-blur-xl overflow-hidden">
+                  {/* Sidebar header */}
+                  <div className="flex items-center justify-between gap-2 px-4 py-4 border-b border-[var(--landing-line)]">
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-[0.18em] text-[var(--landing-muted)]">Conversations</p>
+                      <p className="mt-0.5 text-xs text-[var(--landing-muted)]">{chatThreads.length} thread(s)</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={startNewConversation}
+                      className="inline-flex h-9 items-center justify-center rounded-xl bg-[var(--landing-accent)] px-3 text-xs font-semibold text-white shadow-sm transition"
+                    >
+                      + Nouveau
                     </button>
                   </div>
-                  <div className="chat-history-list mt-2 flex gap-2 overflow-x-auto pb-1 lg:max-h-[calc(100dvh-10rem)] lg:flex-col lg:overflow-x-hidden lg:overflow-y-auto lg:pr-1">
+                  {/* Threads list */}
+                  <div className="flex-1 overflow-y-auto p-2 space-y-1">
                     {chatThreads.length === 0 ? (
-                      <p className="min-w-64 rounded-2xl border border-white/10 px-3 py-4 text-sm text-muted lg:min-w-0">Aucune conversation sauvegardée pour le moment.</p>
+                      <div className="flex flex-col items-center justify-center gap-3 py-12 text-center px-4">
+                        <span className="w-12 h-12 rounded-xl border border-[var(--landing-line)] flex items-center justify-center overflow-hidden">
+                          <AccountIconCanvas kind="chat" color={pageColors.chat} />
+                        </span>
+                        <p className="text-sm text-[var(--landing-muted)]">Aucune conversation.</p>
+                      </div>
                     ) : (
-                      chatThreads.map((thread) => (
-                        <button
-                          key={thread.id}
-                          type="button"
-                          onClick={() => openConversation(thread)}
-                          className={`chat-history-item min-w-[15rem] text-left transition lg:min-w-0 ${
-                            thread.id === activeConversationId ? 'chat-history-item-active' : ''
-                          }`}
-                        >
-                          <span className="chat-history-title">{thread.title}</span>
-                          <span className={`mt-2 block font-mono text-[11px] ${thread.id === activeConversationId ? 'text-white/75' : 'text-muted'}`}>
-                            {thread.turns} tour(s) · {compact(thread.totalTokens)} tokens
-                          </span>
-                        </button>
-                      ))
+                      chatThreads.map((thread) => {
+                        const isActive = thread.id === activeConversationId
+                        return (
+                          <div
+                            key={thread.id}
+                            className={`group relative flex items-start gap-2.5 rounded-xl p-3 transition cursor-pointer border ${isActive
+                                ? 'border-[var(--landing-accent)]/40 bg-[var(--landing-accent)]/10 text-[var(--landing-ink)]'
+                                : 'border-transparent hover:border-[var(--landing-line)] hover:bg-white/5 text-[var(--landing-muted)]'
+                              }`}
+                            onClick={() => openConversation(thread)}
+                          >
+                            <span className="w-8 h-8 shrink-0 rounded-lg border border-[var(--landing-line)] bg-white/5 overflow-hidden flex items-center justify-center">
+                              <AccountIconCanvas kind="chat" color={isActive ? pageColors.chat : '#64748b'} />
+                            </span>
+                            <div className="flex-1 min-w-0 pr-6">
+                              <p className="truncate text-xs font-semibold text-[var(--landing-ink)]">{thread.title}</p>
+                              <p className="mt-0.5 font-mono text-[10px] text-[var(--landing-muted)]">{thread.turns} msg · {compact(thread.totalTokens)} tok</p>
+                            </div>
+                            {/* Delete button — visible on hover */}
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); void deleteThread(thread.id) }}
+                              className="absolute right-2 top-1/2 -translate-y-1/2 h-7 w-7 flex items-center justify-center rounded-lg text-[var(--landing-muted)] hover:text-red-500 hover:bg-red-500/10 opacity-0 group-hover:opacity-100 transition-all duration-150 text-base leading-none"
+                              title="Supprimer cette conversation"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        )
+                      })
                     )}
                   </div>
                 </aside>
-                <div className="order-2 flex min-w-0 flex-col">
-                <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-                  <div>
-                    <p className="text-xs font-semibold uppercase tracking-[0.28em] text-sky-600 dark:text-sky-300">Chat Vryx</p>
-                    <h1 className="mt-3 font-display text-4xl font-bold tracking-tight text-fg sm:text-5xl">Vryx.</h1>
-                  </div>
-                  <div className="liquid-card flex flex-wrap items-center gap-2 rounded-3xl px-3 py-2 font-mono text-xs">
-                    <span className="liquid-chip rounded-full px-3 py-1.5 text-sky-600 dark:text-sky-300">
-                      {chatLiveStats ? `${chatLiveStats.tps.toFixed(2)} TPS` : 'stream prêt'}
-                    </span>
-                    <span className="liquid-chip rounded-full px-3 py-1.5 text-emerald-600 dark:text-emerald-300">
-                      {chatLiveStats ? `${integer(chatLiveStats.tokens)} tokens` : '0 token'}
-                    </span>
-                  </div>
-                </div>
 
-                <Panel className="liquid-chat-stream flex min-h-[68dvh] flex-1 flex-col overflow-hidden rounded-[2rem]">
-                <div className="border-b border-white/20 px-4 py-3 sm:px-6">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <p className="text-sm font-semibold text-fg">Vryx Assistant</p>
-                    <p className="truncate font-mono text-xs text-muted">{modelId || 'Modèle auto'}</p>
-                  </div>
-                </div>
-                <div className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
-                  <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-                  {chatMessages.map((message) => (
-                    <div key={message.id} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'} animate-[fadeIn_.28s_ease-out]`}>
-                      <div
-                        className={`max-w-[min(42rem,92%)] px-5 py-4 text-[15px] leading-7 ${
-                          message.role === 'user'
-                            ? 'liquid-lens rounded-[1.6rem] rounded-br-md text-white'
-                            : 'liquid-card rounded-[1.6rem] rounded-bl-md'
-                        }`}
-                      >
-                        <ChatMarkdown text={message.content} tone={message.role === 'user' ? 'self' : 'default'} />
-                        {message.role === 'assistant' && (message.tps || message.totalTokens) ? (
-                          <span className="mt-3 block border-t border-black/8 pt-2 font-mono text-[11px] text-muted dark:border-white/10">
-                            {message.tps ? `${message.tps.toFixed(2)} TPS` : 'TPS —'} · {integer(message.totalTokens ?? 0)} tokens · {integer(message.latencyMs ?? 0)} ms
-                          </span>
-                        ) : null}
-                      </div>
-                    </div>
-                  ))}
-                  {chatLoading ? (
-                    <div className="flex justify-start">
-                      <div className="liquid-card rounded-[1.35rem] px-5 py-4 text-sm text-muted">
-                        <span className="inline-flex items-center gap-2">
-                          <span className="vryx-mini-loader shrink-0" aria-hidden />
-                          Génération en cours...
-                        </span>
-                      </div>
-                    </div>
-                  ) : null}
-                  <div ref={chatEndRef} />
-                  </div>
-                </div>
-                <div className="border-t border-white/20 p-3 sm:p-4">
-                  <div className="mx-auto max-w-3xl">
-                  <div className="mb-3 flex gap-2 overflow-x-auto">
-                    {['Qui es-tu ?', 'Résume mes dernières sessions', 'Donne-moi un test court pour Cursor'].map((suggestion) => (
-                      <button
-	                        key={suggestion}
-	                        type="button"
-	                        onClick={() => void sendChat(suggestion)}
-	                        disabled={chatLoading || !modelId}
-	                        className="liquid-chip whitespace-nowrap rounded-full px-3 py-2 text-xs font-semibold text-muted transition hover:-translate-y-0.5 hover:text-fg"
-	                      >
-                        {suggestion}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="liquid-card flex items-end gap-3 rounded-[1.6rem] p-2">
-                    <input ref={uploadInputRef} type="file" multiple accept={uploadAccept} onChange={handleUploadFiles} className="hidden" />
-                    <button
-                      type="button"
-                      onClick={() => uploadInputRef.current?.click()}
-                      disabled={chatLoading || chatAttachments.length >= 6}
-                      className="liquid-chip mb-1 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl text-lg font-semibold text-fg disabled:cursor-not-allowed disabled:opacity-40"
-                      title={selectedModelSupportsVision ? 'Joindre images et fichiers texte' : 'Joindre fichiers texte seulement'}
-                    >
-                      +
-                    </button>
-                    <textarea
-                      value={chatInput}
-                      onChange={(event) => setChatInput(event.target.value)}
-                      onKeyDown={onChatKeyDown}
-                      rows={1}
-                      placeholder="Message Vryx..."
-                      className="max-h-40 min-h-12 flex-1 resize-none bg-transparent px-3 py-3 text-sm text-neutral-950 outline-none placeholder:text-muted dark:text-zinc-50"
-                    />
-                    <button
-	                      type="button"
-	                      onClick={() => void sendChat()}
-	                      disabled={chatLoading || !modelId || (!chatInput.trim() && chatAttachments.length === 0)}
-                      className="liquid-lens h-12 rounded-2xl px-5 text-sm font-semibold text-white transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      Envoyer
-                    </button>
-                  </div>
-                  {chatAttachments.length > 0 || !selectedModelSupportsVision ? (
-                    <div className="mt-3 flex flex-wrap items-center gap-2">
-                      {chatAttachments.map((attachment) => (
-                        <button
-                          key={attachment.id}
-                          type="button"
-                          onClick={() => removeAttachment(attachment.id)}
-                          className="liquid-chip rounded-full px-3 py-2 text-xs font-semibold text-muted hover:text-fg"
-                          title="Cliquer pour retirer"
-                        >
-                          {attachment.kind === 'image' ? 'Image' : 'Fichier'} · {attachment.name} · {Math.max(1, Math.round(attachment.size / 1024))} Ko
-                        </button>
-                      ))}
-                      <span className="rounded-full border border-white/12 px-3 py-2 text-xs text-muted">
-                        {selectedModelSupportsVision ? 'Images autorisées par ce modèle.' : 'Modèle texte: fichiers texte uniquement.'}
+                {/* Main chat area */}
+                <div className="flex flex-1 min-w-0 flex-col">
+                  {/* Chat top bar */}
+                  <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-[var(--landing-line)] bg-[var(--landing-card-strong)] backdrop-blur-xl shrink-0">
+                    <div className="flex items-center gap-3">
+                      <span className="w-8 h-8 rounded-lg border border-[var(--landing-line)] overflow-hidden flex items-center justify-center bg-white/5">
+                        <AccountIconCanvas kind="chat" color={pageColors.chat} />
                       </span>
+                      <div>
+                        <p className="text-sm font-bold text-[var(--landing-ink)]">Vryx Assistant</p>
+                        <p className="text-[11px] text-[var(--landing-muted)] font-mono">
+                          {chatLiveStats ? `${chatLiveStats.tps.toFixed(1)} TPS · ${integer(chatLiveStats.tokens)} tokens` : 'Prêt'}
+                        </p>
+                      </div>
                     </div>
-                  ) : null}
+                    <div className="flex items-center gap-2">
+                      {/* Model selector */}
+                      <select
+                        value={modelId}
+                        onChange={(e) => setSelectedModel(e.target.value)}
+                        className="h-9 rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-3 font-mono text-xs text-[var(--landing-ink)] outline-none transition focus:border-[var(--landing-accent)] max-w-[16rem] truncate"
+                      >
+                        {models.length === 0 && <option value="">Aucun modèle</option>}
+                        {models.map((model) => {
+                          const required = Math.max(1, Number(model.requiredWorkers || 1))
+                          const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
+                          return (
+                            <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                              {runnable ? '● ' : '○ '}{model.id}
+                            </option>
+                          )
+                        })}
+                      </select>
+                      {/* Context settings button */}
+                      <button
+                        type="button"
+                        onClick={() => { setChatContextDraft(chatSystemContext); setChatContextPanelOpen(true) }}
+                        className={`h-9 px-3 rounded-xl border text-xs font-semibold transition flex items-center gap-1.5 ${chatSystemContext.trim()
+                            ? 'border-violet-400/40 bg-violet-400/10 text-violet-500 dark:text-violet-400'
+                            : 'border-[var(--landing-line)] bg-white/5 text-[var(--landing-muted)] hover:text-[var(--landing-ink)]'
+                          }`}
+                        title="Configurer le contexte système"
+                      >
+                        <span className="w-4 h-4 inline-block overflow-hidden relative">
+                          <AccountIconCanvas kind="settings" color={chatSystemContext.trim() ? '#a78bfa' : '#94a3b8'} />
+                        </span>
+                        <span className="hidden sm:inline">Contexte</span>
+                        {chatSystemContext.trim() && <span className="h-1.5 w-1.5 rounded-full bg-violet-400 shrink-0" />}
+                      </button>
+                      {/* New chat button (mobile) */}
+                      <button
+                        type="button"
+                        onClick={startNewConversation}
+                        className="lg:hidden h-9 px-3 rounded-xl border border-[var(--landing-line)] bg-white/5 text-xs font-semibold text-[var(--landing-muted)] hover:text-[var(--landing-ink)] transition"
+                      >
+                        + Nouveau
+                      </button>
+                    </div>
                   </div>
-                </div>
-              </Panel>
+
+                  {/* Messages area */}
+                  <div className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
+                    <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+                      {chatMessages.length === 0 && !chatLoading && (
+                        <div className="flex flex-col items-center justify-center gap-4 py-20 text-center">
+                          <span className="w-16 h-16 rounded-2xl border border-[var(--landing-line)] overflow-hidden flex items-center justify-center bg-white/5 shadow-lg">
+                            <AccountIconCanvas kind="chat" color={pageColors.chat} />
+                          </span>
+                          <div>
+                            <p className="font-display text-2xl font-bold text-[var(--landing-ink)]">Vryx.</p>
+                            <p className="mt-2 text-sm text-[var(--landing-muted)]">Modèle sélectionné : <span className="font-mono text-[var(--landing-accent)]">{modelId || 'aucun'}</span></p>
+                            {chatSystemContext.trim() && (
+                              <p className="mt-1 text-xs text-violet-500 dark:text-violet-400">✓ Contexte système actif</p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      {chatMessages.map((message) => {
+                        const isUser = message.role === 'user'
+                        return (
+                          <div key={message.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'} animate-[fadeIn_.28s_ease-out]`}>
+                            <div
+                              className={`max-w-[min(42rem,92%)] px-5 py-4 text-[15px] leading-7 rounded-2xl ${isUser
+                                  ? 'bg-[var(--landing-accent)] text-white shadow-md'
+                                  : 'border border-[var(--landing-line)] bg-[var(--landing-card)] shadow-sm backdrop-blur-sm'
+                                }`}
+                            >
+                              <ChatMarkdown text={message.content} tone={isUser ? 'self' : 'default'} />
+                              {message.role === 'assistant' && (message.tps || message.totalTokens) ? (
+                                <span className="mt-3 block border-t border-[var(--landing-line)] pt-2 font-mono text-[11px] text-[var(--landing-muted)]">
+                                  {message.tps ? `${message.tps.toFixed(2)} TPS` : '—'} · {integer(message.totalTokens ?? 0)} tokens · {integer(message.latencyMs ?? 0)} ms
+                                </span>
+                              ) : null}
+                            </div>
+                          </div>
+                        )
+                      })}
+                      {chatLoading ? (
+                        <div className="flex justify-start">
+                          <div className="rounded-2xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-5 py-4 text-sm text-[var(--landing-muted)] shadow-sm">
+                            <span className="inline-flex items-center gap-2">
+                              <span className="vryx-mini-loader shrink-0" aria-hidden />
+                              Génération en cours...
+                            </span>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div ref={chatEndRef} />
+                    </div>
+                  </div>
+
+                  {/* Input bar */}
+                  <div className="shrink-0 border-t border-[var(--landing-line)] bg-[var(--landing-card-strong)] backdrop-blur-xl px-4 py-3 sm:px-6">
+                    <div className="mx-auto max-w-3xl">
+                      <div className="flex items-end gap-3 rounded-2xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-3 py-2 shadow-sm transition focus-within:border-[var(--landing-accent)]/50 focus-within:shadow-md">
+                        <input ref={uploadInputRef} type="file" multiple accept={uploadAccept} onChange={handleUploadFiles} className="hidden" />
+                        <button
+                          type="button"
+                          onClick={() => uploadInputRef.current?.click()}
+                          disabled={chatLoading || chatAttachments.length >= 6}
+                          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[var(--landing-line)] bg-white/5 text-lg font-semibold text-[var(--landing-muted)] hover:text-[var(--landing-ink)] hover:bg-white/10 transition disabled:cursor-not-allowed disabled:opacity-40"
+                          title={selectedModelSupportsVision ? 'Joindre images et fichiers' : 'Joindre fichiers texte'}
+                        >
+                          +
+                        </button>
+                        <textarea
+                          value={chatInput}
+                          onChange={(event) => setChatInput(event.target.value)}
+                          onKeyDown={onChatKeyDown}
+                          rows={1}
+                          placeholder="Message Vryx..."
+                          className="max-h-40 min-h-10 flex-1 resize-none bg-transparent px-2 py-2.5 text-sm text-[var(--landing-ink)] outline-none placeholder:text-[var(--landing-muted)]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void sendChat()}
+                          disabled={chatLoading || !modelId || (!chatInput.trim() && chatAttachments.length === 0)}
+                          className="h-10 rounded-xl bg-[var(--landing-accent)] px-5 text-sm font-semibold text-white shadow-sm transition disabled:cursor-not-allowed disabled:opacity-45"
+                        >
+                          Envoyer
+                        </button>
+                      </div>
+                      {chatAttachments.length > 0 && (
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          {chatAttachments.map((attachment) => (
+                            <button
+                              key={attachment.id}
+                              type="button"
+                              onClick={() => removeAttachment(attachment.id)}
+                              className="rounded-full border border-[var(--landing-line)] bg-white/5 px-3 py-1.5 text-xs font-semibold text-[var(--landing-muted)] hover:text-red-500 hover:border-red-500/30 transition"
+                              title="Cliquer pour retirer"
+                            >
+                              {attachment.kind === 'image' ? '🖼' : '📄'} {attachment.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             </section>
@@ -1227,65 +1918,65 @@ export function AccountPage() {
                 <Panel className="p-5 sm:p-6">
                   <form onSubmit={createKey} className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
                     <label className="block">
-                      <span className="text-sm font-semibold text-fg">Nom de la clé</span>
+                      <span className="text-sm font-semibold text-[var(--landing-ink)]">Nom de la clé</span>
                       <input
                         id={`${formId}-key-name`}
                         value={newKeyName}
                         onChange={(event) => setNewKeyName(event.target.value)}
-                        className="mt-2 h-12 w-full rounded-2xl border border-border bg-surface px-4 font-mono text-sm text-fg outline-none transition focus:border-accent focus:ring-4 focus:ring-accent/15"
+                        className="mt-2 h-12 w-full rounded-xl border border-[var(--landing-line)] bg-white/5 px-4 font-mono text-sm text-[var(--landing-ink)] outline-none transition focus:border-[var(--landing-accent)]"
                         autoComplete="off"
                       />
                     </label>
-                    <button type="submit" disabled={creatingKey} className="btn-primary h-12 rounded-2xl px-5 text-sm font-semibold disabled:opacity-60">
+                    <button type="submit" disabled={creatingKey} className="h-12 rounded-xl bg-[var(--landing-accent)] px-5 text-sm font-semibold text-white transition hover:-translate-y-0.5 disabled:opacity-60">
                       {creatingKey ? 'Création...' : 'Générer'}
                     </button>
                   </form>
                   {generatedKey ? (
-                    <div className="mt-5 rounded-3xl border border-emerald-400/30 bg-emerald-400/10 p-4">
+                    <div className="mt-5 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 animate-[fadeIn_.2s_ease-out]">
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                         <div>
-                          <p className="text-sm font-semibold text-emerald-500">Clé générée</p>
-                          <p className="mt-1 text-xs text-muted">Elle ne sera plus affichée après fermeture/rechargement.</p>
+                          <p className="text-sm font-semibold text-emerald-400">Clé générée</p>
+                          <p className="mt-1 text-xs text-[var(--landing-muted)]">Elle ne sera plus affichée après fermeture/rechargement.</p>
                         </div>
-                        <button type="button" onClick={() => void copyWithFeedback('generated-key', generatedKey)} className="copy-feedback rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white">
+                        <button type="button" onClick={() => void copyWithFeedback('generated-key', generatedKey)} className="rounded-xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-white shadow-md shadow-emerald-500/10 transition hover:-translate-y-0.5">
                           {copiedKey === 'generated-key' ? 'Clé copiée' : 'Copier la clé'}
                         </button>
                       </div>
-                      <input ref={newKeyRef} value={generatedKey} readOnly onFocus={(event) => event.currentTarget.select()} className="mt-4 w-full select-all rounded-2xl border border-emerald-400/30 bg-bg px-4 py-3 font-mono text-xs text-fg outline-none" />
+                      <input ref={newKeyRef} value={generatedKey} readOnly onFocus={(event) => event.currentTarget.select()} className="mt-4 w-full select-all rounded-xl border border-[var(--landing-line)] bg-white/5 px-4 py-3 font-mono text-xs text-[var(--landing-ink)] outline-none" />
                     </div>
                   ) : null}
                   <div className="mt-6 grid gap-3 md:grid-cols-2">
-                    <button type="button" onClick={() => void copyWithFeedback('api-base', apiBase)} className="rounded-2xl border border-border bg-surface p-4 text-left">
-                      <p className="text-xs font-semibold uppercase tracking-wide text-muted">Base URL</p>
-                      <p className="mt-2 break-all font-mono text-sm text-accent">{copiedKey === 'api-base' ? 'Copié' : apiBase}</p>
+                    <button type="button" onClick={() => void copyWithFeedback('api-base', apiBase)} className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4 text-left hover:border-[var(--landing-accent)] transition">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">Base URL</p>
+                      <p className="mt-2 break-all font-mono text-sm text-[var(--landing-accent)]">{copiedKey === 'api-base' ? 'Copié' : apiBase}</p>
                     </button>
-                    <div className="rounded-2xl border border-border bg-surface p-4">
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4">
                       <div className="flex items-center justify-between gap-3">
-                        <p className="text-xs font-semibold uppercase tracking-wide text-muted">Modèle</p>
-                        <button type="button" onClick={() => void copyWithFeedback('api-model', modelId)} className="copy-feedback text-xs font-semibold text-accent disabled:opacity-40" disabled={!modelId}>
+                        <p className="text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">Modèle</p>
+                        <button type="button" onClick={() => void copyWithFeedback('api-model', modelId)} className="text-xs font-semibold text-[var(--landing-accent)] disabled:opacity-40" disabled={!modelId}>
                           {copiedKey === 'api-model' ? 'Copié' : 'Copier'}
                         </button>
                       </div>
                       <select
                         value={modelId}
                         onChange={(event) => setSelectedModel(event.target.value)}
-                        className="liquid-chip mt-2 h-11 w-full rounded-2xl px-3 font-mono text-sm text-fg outline-none"
+                        className="mt-2 h-11 w-full rounded-xl border border-[var(--landing-line)] bg-transparent px-3 font-mono text-sm text-[var(--landing-ink)] outline-none"
                       >
                         {models.length === 0 ? <option value="">Aucun modèle détecté</option> : null}
                         {models.map((model) => {
                           const required = Math.max(1, Number(model.requiredWorkers || 1))
                           const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
                           return (
-                          <option key={model.id} value={model.id} disabled={!runnable}>
-                            {model.id}{runnable ? '' : ` — attente ${model.workersOnline}/${required} worker(s)`}
-                          </option>
+                            <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                              {model.id}{runnable ? '' : ` — attente ${model.workersOnline}/${required} worker(s)`}
+                            </option>
                           )
                         })}
                       </select>
                     </div>
                   </div>
                 </Panel>
-                <Panel className="bg-neutral-950 p-5 text-slate-100">
+                <Panel className="bg-neutral-950 p-5 text-slate-100 border-none shadow-lg">
                   <p className="text-xs font-semibold uppercase tracking-wide text-cyan-300">Exemple OpenAI-compatible</p>
                   <pre className="mt-4 overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs leading-6 text-slate-300">{`curl ${apiBase}/chat/completions \\
   -H "Authorization: Bearer vel_sk_live_..." \\
@@ -1294,27 +1985,27 @@ export function AccountPage() {
                 </Panel>
               </div>
               <Panel className="mt-5 overflow-hidden">
-                <div className="grid grid-cols-[1fr_auto] gap-3 border-b border-border bg-surface px-5 py-4 text-xs font-semibold uppercase tracking-wide text-muted">
+                <div className="grid grid-cols-[1fr_auto] gap-3 border-b border-[var(--landing-line)] bg-white/5 px-5 py-4 text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">
                   <span>Clés actives</span>
                   <span>{apiKeys.length}</span>
                 </div>
                 {apiKeys.length === 0 ? (
-                  <p className="px-5 py-8 text-center text-sm text-muted">Aucune clé active.</p>
+                  <p className="px-5 py-8 text-center text-sm text-[var(--landing-muted)]">Aucune clé active.</p>
                 ) : (
-                  <div className="divide-y divide-border">
+                  <div className="divide-y divide-[var(--landing-line)]">
                     {apiKeys.map((key) => (
-                      <div key={key.id} className="grid gap-3 px-5 py-4 sm:grid-cols-[1fr_auto] sm:items-center">
+                      <div key={key.id} className="grid gap-3 px-5 py-4 sm:grid-cols-[1fr_auto] sm:items-center hover:bg-white/5 transition">
                         <div>
-                          <p className="font-semibold text-fg">{key.name}</p>
-                          <p className="mt-1 font-mono text-xs text-muted">{key.keyPrefix}</p>
-                          <p className="mt-1 text-xs text-muted">Créée {dateTime(key.createdAt)} · Dernier usage {dateTime(key.lastUsedAt)}</p>
+                          <p className="font-semibold text-[var(--landing-ink)]">{key.name}</p>
+                          <p className="mt-1 font-mono text-xs text-[var(--landing-muted)]">{key.keyPrefix}</p>
+                          <p className="mt-1 text-xs text-[var(--landing-muted)]">Créée {dateTime(key.createdAt)} · Dernier usage {dateTime(key.lastUsedAt)}</p>
                         </div>
                         <div className="grid grid-cols-3 gap-2 text-right font-mono text-xs sm:min-w-72">
-                          <span><span className="block text-muted">req</span>{integer(key.requestCount ?? 0)}</span>
-                          <span><span className="block text-muted">tokens</span>{compact(key.totalTokens ?? 0)}</span>
-                          <span><span className="block text-muted">€</span>{money(key.costEur ?? 0, 6)}</span>
+                          <span><span className="block text-[var(--landing-muted)]">req</span>{integer(key.requestCount ?? 0)}</span>
+                          <span><span className="block text-[var(--landing-muted)]">tokens</span>{compact(key.totalTokens ?? 0)}</span>
+                          <span><span className="block text-[var(--landing-muted)]">€</span>{money(key.costEur ?? 0, 6)}</span>
                         </div>
-                        <button type="button" onClick={() => void revokeKey(key.id)} className="rounded-xl border border-alert/30 px-3 py-2 text-xs font-semibold text-alert transition hover:bg-alert/10">
+                        <button type="button" onClick={() => void revokeKey(key.id)} className="rounded-xl border border-red-500/20 px-3 py-2 text-xs font-semibold text-red-500 transition hover:bg-red-500/10">
                           Révoquer
                         </button>
                       </div>
@@ -1334,23 +2025,23 @@ export function AccountPage() {
                 <Kpi title="Ping moyen" value={digest.avgPingMs == null ? '—' : `${Math.round(digest.avgPingMs)} ms`} detail="Sur les sessions mesurées" tone="violet" />
                 <Kpi title="ms/token" value={digest.avgMsPerToken == null ? '—' : digest.avgMsPerToken.toFixed(2)} detail={`${digest.avgTps.toFixed(2)} TPS moyen`} tone="amber" />
               </div>
-              <Panel className="liquid-static mt-5 overflow-hidden">
+              <Panel className="mt-5 overflow-hidden">
                 {sessions.length === 0 ? (
-                  <p className="px-5 py-10 text-center text-sm text-muted">Aucune session enregistrée.</p>
+                  <p className="px-5 py-10 text-center text-sm text-[var(--landing-muted)]">Aucune session enregistrée.</p>
                 ) : (
-                  <div className="divide-y divide-border">
+                  <div className="divide-y divide-[var(--landing-line)]">
                     {visibleSessions.map((session) => {
                       const latency = session.latencyMs || session.computeTimeMs || 0
                       const tps = session.completionTokens > 0 && latency > 0 ? session.completionTokens / (latency / 1000) : 0
                       return (
-                        <div key={session.id} className="grid gap-3 px-5 py-4 transition hover:bg-white/16 dark:hover:bg-white/[.045] lg:grid-cols-[1fr_auto_auto_auto] lg:items-center">
+                        <div key={session.id} className="grid gap-3 px-5 py-4 transition hover:bg-[var(--landing-line)] lg:grid-cols-[1fr_auto_auto_auto] lg:items-center">
                           <div>
-                            <p className="font-mono text-xs text-muted">{dateTime(session.createdAt)}</p>
-                            <p className="mt-1 truncate text-sm font-semibold text-fg">{session.model ?? 'Modèle inconnu'}</p>
+                            <p className="font-mono text-xs text-[var(--landing-muted)]">{dateTime(session.createdAt)}</p>
+                            <p className="mt-1 truncate text-sm font-semibold text-[var(--landing-ink)]">{session.model ?? 'Modèle inconnu'}</p>
                           </div>
-                          <span className="font-mono text-sm text-fg">{integer(session.totalTokens)} tok</span>
-                          <span className="font-mono text-sm text-accent">{tps.toFixed(2)} TPS</span>
-                          <span className="font-mono text-sm text-muted">{Math.round(latency)} ms</span>
+                          <span className="font-mono text-sm text-[var(--landing-ink)]">{integer(session.totalTokens)} tok</span>
+                          <span className="font-mono text-sm text-[var(--landing-accent)]">{tps.toFixed(2)} TPS</span>
+                          <span className="font-mono text-sm text-[var(--landing-muted)]">{Math.round(latency)} ms</span>
                         </div>
                       )
                     })}
@@ -1358,8 +2049,8 @@ export function AccountPage() {
                 )}
               </Panel>
               {sessions.length > usagePageSize ? (
-                <div className="mt-5 flex flex-col gap-3 rounded-[1.4rem] border border-white/12 bg-white/10 p-3 backdrop-blur-xl dark:bg-white/[.035] sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-sm text-muted">
+                <div className="mt-5 flex flex-col gap-3 rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card)] p-3 backdrop-blur-md sm:flex-row sm:items-center sm:justify-between shadow-md">
+                  <p className="text-sm text-[var(--landing-muted)]">
                     Page {usagePage} / {usageTotalPages} · {integer(sessions.length)} sessions
                   </p>
                   <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
@@ -1367,7 +2058,7 @@ export function AccountPage() {
                       type="button"
                       onClick={() => setUsagePage((page) => Math.max(1, page - 1))}
                       disabled={usagePage <= 1}
-                      className="liquid-chip rounded-2xl px-4 py-2 text-sm font-semibold text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded-xl border border-[var(--landing-line)] bg-white/5 px-4 py-2 text-sm font-semibold text-[var(--landing-ink)] disabled:cursor-not-allowed disabled:opacity-40 hover:bg-[var(--landing-line)] transition"
                     >
                       Précédent
                     </button>
@@ -1377,19 +2068,22 @@ export function AccountPage() {
                           key={item}
                           type="button"
                           onClick={() => setUsagePage(item)}
-                          className={`h-10 min-w-10 rounded-2xl px-3 font-mono text-sm font-semibold ${item === usagePage ? 'liquid-lens text-white' : 'liquid-chip text-muted'}`}
+                          className={`h-10 min-w-10 rounded-xl px-3 font-mono text-sm font-semibold ${item === usagePage
+                              ? 'bg-[var(--landing-accent)] text-white shadow-md'
+                              : 'border border-[var(--landing-line)] bg-white/5 text-[var(--landing-muted)] hover:bg-[var(--landing-line)]'
+                            }`}
                         >
                           {item}
                         </button>
                       ) : (
-                        <span key={item} className="px-1 font-mono text-sm text-muted">...</span>
+                        <span key={item} className="px-1 font-mono text-sm text-[var(--landing-muted)]">...</span>
                       ),
                     )}
                     <button
                       type="button"
                       onClick={() => setUsagePage((page) => Math.min(usageTotalPages, page + 1))}
                       disabled={usagePage >= usageTotalPages}
-                      className="liquid-chip rounded-2xl px-4 py-2 text-sm font-semibold text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded-xl border border-[var(--landing-line)] bg-white/5 px-4 py-2 text-sm font-semibold text-[var(--landing-ink)] disabled:cursor-not-allowed disabled:opacity-40 hover:bg-[var(--landing-line)] transition"
                     >
                       Suivant
                     </button>
@@ -1411,8 +2105,8 @@ export function AccountPage() {
               <div className="mt-5 grid gap-4">
                 {workers.length === 0 ? (
                   <Panel className="p-8 text-center">
-                    <p className="font-semibold text-fg">Aucun worker lié à ce compte.</p>
-                    <p className="mt-2 text-sm text-muted">Connectez-vous dans l’application worker avec ce compte pour voir apparaître vos machines ici.</p>
+                    <p className="font-semibold text-[var(--landing-ink)]">Aucun worker lié à ce compte.</p>
+                    <p className="mt-2 text-sm text-[var(--landing-muted)]">Connectez-vous dans l’application worker avec ce compte pour voir apparaître vos machines ici.</p>
                   </Panel>
                 ) : (
                   visibleWorkers.map((worker) => (
@@ -1421,17 +2115,17 @@ export function AccountPage() {
                         <div>
                           <div className="flex flex-wrap items-center gap-2">
                             <span className={`h-2.5 w-2.5 rounded-full ${worker.online ? 'bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,.8)]' : 'bg-zinc-400'}`} />
-                            <p className="font-display text-xl font-bold text-fg">{worker.gpuName || 'GPU inconnu'}</p>
-                            <span className="rounded-full bg-sky-500/10 px-2.5 py-1 text-xs font-semibold text-sky-600 dark:text-sky-300">{worker.runtimeBackend || 'runtime ?'}</span>
+                            <p className="font-display text-xl font-bold text-[var(--landing-ink)]">{worker.gpuName || 'GPU inconnu'}</p>
+                            <span className="rounded-full border border-[var(--landing-line)] bg-sky-500/10 px-2.5 py-1 text-xs font-semibold text-[var(--landing-accent)]">{worker.runtimeBackend || 'runtime ?'}</span>
                           </div>
-                          <p className="mt-2 break-all font-mono text-xs text-muted">{worker.peerId}</p>
-                          <p className="mt-2 text-sm text-muted">{worker.model || 'Aucun modèle déclaré'} · heartbeat {worker.secondsSinceHeartbeat}s</p>
+                          <p className="mt-2 break-all font-mono text-xs text-[var(--landing-muted)]">{worker.peerId}</p>
+                          <p className="mt-2 text-sm text-[var(--landing-muted)]">{worker.model || 'Aucun modèle déclaré'} · heartbeat {worker.secondsSinceHeartbeat}s</p>
                         </div>
                         <div className="grid gap-3 sm:grid-cols-4 lg:min-w-[34rem]">
-                          <div className="rounded-2xl bg-black/5 p-3 dark:bg-white/6"><p className="text-xs text-muted">VRAM</p><p className="mt-1 font-mono font-semibold">{money(worker.allocatedVramMb / 1024, 1)} / {money(worker.gpuVramMb / 1024, 1)} Go</p></div>
-                          <div className="rounded-2xl bg-black/5 p-3 dark:bg-white/6"><p className="text-xs text-muted">Allocation</p><p className="mt-1 font-mono font-semibold">{worker.memoryLimitPercent || 0}%</p></div>
-                          <div className="rounded-2xl bg-black/5 p-3 dark:bg-white/6"><p className="text-xs text-muted">Tokens</p><p className="mt-1 font-mono font-semibold">{compact(worker.tokensGenerated)}</p></div>
-                          <div className="rounded-2xl bg-black/5 p-3 dark:bg-white/6"><p className="text-xs text-muted">Quant</p><p className="mt-1 font-mono font-semibold">{worker.weightQuantization || '—'}</p></div>
+                          <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-3"><p className="text-xs text-[var(--landing-muted)]">VRAM</p><p className="mt-1 font-mono font-semibold text-sm">{money(worker.allocatedVramMb / 1024, 1)} / {money(worker.gpuVramMb / 1024, 1)} Go</p></div>
+                          <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-3"><p className="text-xs text-[var(--landing-muted)]">Allocation</p><p className="mt-1 font-mono font-semibold text-sm">{worker.memoryLimitPercent || 0}%</p></div>
+                          <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-3"><p className="text-xs text-[var(--landing-muted)]">Tokens</p><p className="mt-1 font-mono font-semibold text-sm">{compact(worker.tokensGenerated)}</p></div>
+                          <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-3"><p className="text-xs text-[var(--landing-muted)]">Quant</p><p className="mt-1 font-mono font-semibold text-sm">{worker.weightQuantization || '—'}</p></div>
                         </div>
                       </div>
                     </Panel>
@@ -1439,8 +2133,8 @@ export function AccountPage() {
                 )}
               </div>
               {workers.length > workerPageSize ? (
-                <div className="mt-5 flex flex-col gap-3 rounded-[1.4rem] border border-white/12 bg-white/10 p-3 backdrop-blur-xl dark:bg-white/[.035] sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-sm text-muted">
+                <div className="mt-5 flex flex-col gap-3 rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card)] p-3 backdrop-blur-md sm:flex-row sm:items-center sm:justify-between shadow-md">
+                  <p className="text-sm text-[var(--landing-muted)]">
                     Page {workersPage} / {workersTotalPages} · {integer(workers.length)} workers
                   </p>
                   <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
@@ -1448,7 +2142,7 @@ export function AccountPage() {
                       type="button"
                       onClick={() => setWorkersPage((page) => Math.max(1, page - 1))}
                       disabled={workersPage <= 1}
-                      className="liquid-chip rounded-2xl px-4 py-2 text-sm font-semibold text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded-xl border border-[var(--landing-line)] bg-white/5 px-4 py-2 text-sm font-semibold text-[var(--landing-ink)] disabled:cursor-not-allowed disabled:opacity-40 hover:bg-[var(--landing-line)] transition"
                     >
                       Précédent
                     </button>
@@ -1458,19 +2152,22 @@ export function AccountPage() {
                           key={item}
                           type="button"
                           onClick={() => setWorkersPage(item)}
-                          className={`h-10 min-w-10 rounded-2xl px-3 font-mono text-sm font-semibold ${item === workersPage ? 'liquid-lens text-white' : 'liquid-chip text-muted'}`}
+                          className={`h-10 min-w-10 rounded-xl px-3 font-mono text-sm font-semibold ${item === workersPage
+                              ? 'bg-[var(--landing-accent)] text-white shadow-md'
+                              : 'border border-[var(--landing-line)] bg-white/5 text-[var(--landing-muted)] hover:bg-[var(--landing-line)]'
+                            }`}
                         >
                           {item}
                         </button>
                       ) : (
-                        <span key={item} className="px-1 font-mono text-sm text-muted">...</span>
+                        <span key={item} className="px-1 font-mono text-sm text-[var(--landing-muted)]">...</span>
                       ),
                     )}
                     <button
                       type="button"
                       onClick={() => setWorkersPage((page) => Math.min(workersTotalPages, page + 1))}
                       disabled={workersPage >= workersTotalPages}
-                      className="liquid-chip rounded-2xl px-4 py-2 text-sm font-semibold text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded-xl border border-[var(--landing-line)] bg-white/5 px-4 py-2 text-sm font-semibold text-[var(--landing-ink)] disabled:cursor-not-allowed disabled:opacity-40 hover:bg-[var(--landing-line)] transition"
                     >
                       Suivant
                     </button>
@@ -1496,10 +2193,10 @@ export function AccountPage() {
                 <Panel className="p-5">
                   <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                     <div>
-                      <p className="font-display text-2xl font-bold text-fg">Recharger des crédits</p>
-                      <p className="mt-1 text-sm text-muted">Packs prépayés utilisables par les clés API. Les factures Stripe apparaissent après paiement.</p>
+                      <p className="font-display text-2xl font-bold text-[var(--landing-ink)]">Recharger des crédits</p>
+                      <p className="mt-1 text-sm text-[var(--landing-muted)]">Packs prépayés utilisables par les clés API. Les factures Stripe apparaissent après paiement.</p>
                     </div>
-                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${billing?.checkoutEnabled ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300' : 'bg-amber-500/10 text-amber-600 dark:text-amber-300'}`}>
+                    <span className={`rounded-full px-3 py-1 text-xs font-semibold ${billing?.checkoutEnabled ? 'bg-emerald-500/10 text-emerald-600' : 'bg-amber-500/10 text-amber-600'}`}>
                       {billing?.checkoutEnabled ? 'Checkout actif' : 'Stripe à configurer'}
                     </span>
                   </div>
@@ -1510,43 +2207,43 @@ export function AccountPage() {
                         type="button"
                         onClick={() => void startCheckout(amount)}
                         disabled={checkoutLoadingAmount != null}
-                        className="rounded-2xl border border-border bg-surface p-4 text-left transition hover:border-accent/40 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4 text-left transition hover:border-[var(--landing-accent)] disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        <span className="block text-xs font-semibold uppercase tracking-wide text-muted">Pack crédits</span>
-                        <span className="mt-2 block font-display text-3xl font-bold text-fg">{money(amount, 0)} €</span>
-                        <span className="mt-2 block text-xs text-muted">{checkoutLoadingAmount === amount ? 'Ouverture...' : 'Paiement carte'}</span>
+                        <span className="block text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">Pack crédits</span>
+                        <span className="mt-2 block font-display text-3xl font-bold text-[var(--landing-ink)]">{money(amount, 0)} €</span>
+                        <span className="mt-2 block text-xs text-[var(--landing-muted)]">{checkoutLoadingAmount === amount ? 'Ouverture...' : 'Paiement carte'}</span>
                       </button>
                     ))}
                   </div>
                   <div className="mt-5 grid gap-3 sm:grid-cols-3">
-                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Projection</p><p className="mt-1 font-mono font-semibold">{money(estimatedMonthly)} € / mois</p></div>
-                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6">
-                      <p className="text-xs text-muted">Prix actuel</p>
-                      <p className="mt-1 font-mono font-semibold">
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-xs text-[var(--landing-muted)]">Projection</p><p className="mt-1 font-mono font-semibold">{money(estimatedMonthly)} € / mois</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4">
+                      <p className="text-xs text-[var(--landing-muted)]">Prix actuel</p>
+                      <p className="mt-1 font-mono font-semibold text-sm">
                         {billing?.pricing?.minInputEurPerMillion != null && billing?.pricing?.minOutputEurPerMillion != null
                           ? `${money(billing.pricing.minInputEurPerMillion, 4)} / ${money(billing.pricing.minOutputEurPerMillion, 4)} €/M`
                           : 'Sur devis'}
                       </p>
                     </div>
-                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Marge estimée</p><p className="mt-1 font-mono font-semibold">{money(investor?.estimatedGrossMarginPercent ?? 0, 0)}%</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-xs text-[var(--landing-muted)]">Marge estimée</p><p className="mt-1 font-mono font-semibold">{money(investor?.estimatedGrossMarginPercent ?? 0, 0)}%</p></div>
                   </div>
                 </Panel>
                 <Panel className="p-5">
                   <div className="flex items-center justify-between gap-3">
-                    <p className="font-semibold text-fg">Ledger crédits</p>
-                    <span className="rounded-full bg-surface px-2.5 py-1 text-xs font-semibold text-muted">{billing?.ledger.length ?? 0}</span>
+                    <p className="font-semibold text-[var(--landing-ink)]">Ledger crédits</p>
+                    <span className="rounded-full border border-[var(--landing-line)] bg-white/5 px-2.5 py-1 text-xs font-semibold text-[var(--landing-muted)]">{billing?.ledger.length ?? 0}</span>
                   </div>
                   <div className="mt-4 space-y-3">
                     {billing?.ledger.length ? (
                       billing.ledger.slice(0, 8).map((entry) => (
-                        <div key={entry.id} className="rounded-2xl bg-black/5 p-3 dark:bg-white/6">
+                        <div key={entry.id} className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-3">
                           <div className="flex items-center justify-between gap-3">
-                            <p className="truncate text-sm font-semibold text-fg">{entry.description || entry.type}</p>
-                            <span className={`font-mono text-sm font-semibold ${entry.amountEur >= 0 ? 'text-emerald-600 dark:text-emerald-300' : 'text-fg'}`}>
+                            <p className="truncate text-sm font-semibold text-[var(--landing-ink)]">{entry.description || entry.type}</p>
+                            <span className="font-mono text-sm font-semibold text-emerald-400">
                               {entry.amountEur >= 0 ? '+' : ''}{money(entry.amountEur, 6)} €
                             </span>
                           </div>
-                          <p className="mt-1 text-xs text-muted">
+                          <p className="mt-1 text-xs text-[var(--landing-muted)]">
                             {dateTime(entry.createdAt)} · {entry.type}
                             {entry.pricing?.rates?.inputEurPerMillion != null && entry.pricing?.rates?.outputEurPerMillion != null
                               ? ` · ${money(entry.pricing.rates.inputEurPerMillion, 4)}/${money(entry.pricing.rates.outputEurPerMillion, 4)} €/M`
@@ -1555,7 +2252,7 @@ export function AccountPage() {
                         </div>
                       ))
                     ) : (
-                      <p className="rounded-2xl bg-black/5 p-4 text-sm text-muted dark:bg-white/6">Aucun mouvement de crédits pour le moment.</p>
+                      <p className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4 text-sm text-[var(--landing-muted)]">Aucun mouvement pour le moment.</p>
                     )}
                   </div>
                 </Panel>
@@ -1563,17 +2260,17 @@ export function AccountPage() {
               {billing?.invoices?.length ? (
                 <Panel className="mt-5 p-5">
                   <div className="flex items-center justify-between gap-3">
-                    <p className="font-semibold text-fg">Paiements et factures Stripe</p>
-                    <span className="rounded-full bg-surface px-2.5 py-1 text-xs font-semibold text-muted">{billing.invoices.length}</span>
+                    <p className="font-semibold text-[var(--landing-ink)]">Paiements et factures Stripe</p>
+                    <span className="rounded-full border border-[var(--landing-line)] bg-white/5 px-2.5 py-1 text-xs font-semibold text-[var(--landing-muted)]">{billing.invoices.length}</span>
                   </div>
                   <div className="mt-4 grid gap-3 lg:grid-cols-2">
                     {billing.invoices.slice(0, 6).map((invoice) => (
-                      <div key={`${invoice.provider}:${invoice.providerSessionId}`} className="rounded-2xl bg-black/5 p-4 dark:bg-white/6">
+                      <div key={`${invoice.provider}:${invoice.providerSessionId}`} className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4">
                         <div className="flex items-center justify-between gap-3">
-                          <p className="font-mono text-xs text-muted">{invoice.providerSessionId || invoice.provider}</p>
-                          <p className="font-mono text-sm font-semibold text-fg">{money(invoice.amountEur, 2)} €</p>
+                          <p className="font-mono text-xs text-[var(--landing-muted)]">{invoice.providerSessionId || invoice.provider}</p>
+                          <p className="font-mono text-sm font-semibold text-[var(--landing-ink)]">{money(invoice.amountEur, 2)} €</p>
                         </div>
-                        <p className="mt-1 text-xs text-muted">{dateTime(invoice.createdAt)} · {invoice.status}</p>
+                        <p className="mt-1 text-xs text-[var(--landing-muted)]">{dateTime(invoice.createdAt)} · {invoice.status}</p>
                       </div>
                     ))}
                   </div>
@@ -1586,9 +2283,9 @@ export function AccountPage() {
             <section>
               <PageHeader eyebrow="Sécurité" title="Accès, session et clés actives." subtitle="Une lecture simple de ce qui protège ton compte et ton API." />
               <div className="grid gap-5 lg:grid-cols-3">
-                <Panel className="p-5"><p className="text-xs font-semibold uppercase tracking-wide text-muted">Compte</p><p className="mt-3 break-all font-mono text-sm text-fg">{user.email}</p></Panel>
-                <Panel className="p-5"><p className="text-xs font-semibold uppercase tracking-wide text-muted">Dernière connexion</p><p className="mt-3 text-sm text-fg">{dateTime(overview?.lastLoginAt)}</p></Panel>
-                <Panel className="p-5"><p className="text-xs font-semibold uppercase tracking-wide text-muted">Clés actives</p><p className="mt-3 font-display text-3xl font-bold text-fg">{apiKeys.length}</p></Panel>
+                <Panel className="p-5"><p className="text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">Compte</p><p className="mt-3 break-all font-mono text-sm text-[var(--landing-ink)]">{user.email}</p></Panel>
+                <Panel className="p-5"><p className="text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">Dernière connexion</p><p className="mt-3 text-sm text-[var(--landing-ink)]">{dateTime(overview?.lastLoginAt)}</p></Panel>
+                <Panel className="p-5"><p className="text-xs font-semibold uppercase tracking-wide text-[var(--landing-muted)]">Clés actives</p><p className="mt-3 font-display text-3xl font-bold text-[var(--landing-ink)]">{apiKeys.length}</p></Panel>
               </div>
             </section>
           ) : null}
@@ -1600,30 +2297,30 @@ export function AccountPage() {
                 <Panel className="p-5">
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <p className="font-semibold text-fg">Apparence</p>
-                      <p className="mt-2 text-sm text-muted">Choisissez clair, sombre ou suivez le thème de l’OS.</p>
+                      <p className="font-semibold text-[var(--landing-ink)]">Apparence</p>
+                      <p className="mt-2 text-sm text-[var(--landing-muted)]">Choisissez clair, sombre ou suivez le thème de l’OS.</p>
                     </div>
                     <ThemeToggle menuPlacement="up" />
                   </div>
                 </Panel>
                 <Panel className="p-5">
-                  <p className="font-semibold text-fg">Historique</p>
-                  <p className="mt-2 text-sm text-muted">Supprimer les sessions stockées sur votre compte.</p>
-                  <button type="button" onClick={() => void clearSessions()} className="mt-4 rounded-2xl border border-alert/30 px-4 py-2 text-sm font-semibold text-alert hover:bg-alert/10">
+                  <p className="font-semibold text-[var(--landing-ink)]">Historique</p>
+                  <p className="mt-2 text-sm text-[var(--landing-muted)]">Supprimer les sessions stockées sur votre compte.</p>
+                  <button type="button" onClick={() => void clearSessions()} className="mt-4 rounded-xl border border-red-500/30 px-4 py-2 text-sm font-semibold text-red-500 hover:bg-red-500/10 transition">
                     Vider l'historique
                   </button>
                 </Panel>
                 <Panel className="p-5">
-                  <p className="font-semibold text-fg">Streaming</p>
-                  <p className="mt-2 text-sm text-muted">Le chat utilise le flux distribué quand il est disponible, avec rendu caractère par caractère côté interface.</p>
-                  <div className="mt-4 rounded-2xl bg-emerald-500/10 p-4 text-sm font-semibold text-emerald-600 dark:text-emerald-300">Activé par défaut</div>
+                  <p className="font-semibold text-[var(--landing-ink)]">Streaming</p>
+                  <p className="mt-2 text-sm text-[var(--landing-muted)]">Le chat utilise le flux distribué quand il est disponible, avec rendu caractère par caractère côté interface.</p>
+                  <div className="mt-4 rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 text-sm font-semibold text-emerald-400">Activé par défaut</div>
                 </Panel>
                 <Panel className="p-5">
-                  <p className="font-semibold text-fg">Limites API</p>
-                  <p className="mt-2 text-sm text-muted">Plafond de génération actuel côté serveur.</p>
+                  <p className="font-semibold text-[var(--landing-ink)]">Limites API</p>
+                  <p className="mt-2 text-sm text-[var(--landing-muted)]">Plafond de génération actuel côté serveur.</p>
                   <div className="mt-4 grid grid-cols-2 gap-3">
-                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Max tokens</p><p className="mt-1 font-mono font-semibold">32 768</p></div>
-                    <div className="rounded-2xl bg-black/5 p-4 dark:bg-white/6"><p className="text-xs text-muted">Modèle</p><p className="mt-1 truncate font-mono text-xs font-semibold">{modelId || 'Auto VPS'}</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-xs text-[var(--landing-muted)]">Max tokens</p><p className="mt-1 font-mono font-semibold">32 768</p></div>
+                    <div className="rounded-xl border border-[var(--landing-line)] bg-white/5 p-4"><p className="text-xs text-[var(--landing-muted)]">Modèle</p><p className="mt-1 truncate font-mono text-xs font-semibold">{modelId || 'Auto VPS'}</p></div>
                   </div>
                 </Panel>
               </div>
