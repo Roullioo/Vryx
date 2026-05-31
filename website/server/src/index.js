@@ -1671,17 +1671,18 @@ function modelPlanFor(modelId, workers = [], requestedMode = 'auto') {
       ? 'full'
       : loadMode === 'shard'
         ? 'shard'
-        : fullCandidates.length > 0
+        : (fullCandidates.length > 0 || liveWorkers.length === 1)
           ? 'full'
           : 'shard'
+  const candidates = fullCandidates.length > 0 ? fullCandidates : liveWorkers
   const requiredWorkers = mode === 'unsupported'
     ? 0
     : mode === 'full'
       ? 1
       : Math.max(requiredWorkersForModel(model), Math.min(totalLayers, Math.max(2, liveWorkers.length || 2)))
   const chosen = mode === 'full'
-    ? fullCandidates.sort((a, b) => b.health.score - a.health.score)[0]
-      ? [fullCandidates.sort((a, b) => b.health.score - a.health.score)[0]]
+    ? candidates.sort((a, b) => b.health.score - a.health.score)[0]
+      ? [candidates.sort((a, b) => b.health.score - a.health.score)[0]]
       : []
     : mode === 'unsupported'
       ? []
