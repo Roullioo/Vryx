@@ -1346,14 +1346,6 @@ function workerCompatibilityIssue(worker, requestedModel) {
   if (!modelKeyMatches(worker.model, requestedModel)) {
     return `model_mismatch:${worker.model || 'unknown'}`
   }
-  const runtime = String(worker.runtimeBackend || worker.runtime_backend || '').toLowerCase()
-  const requested = normalizeP2pModelKey(requestedModel || '') || ''
-  if ((requested.includes('gemma') || requested.includes('llama')) && !runtime.includes('llama')) {
-    return `runtime_mismatch:${runtime || 'unknown'}`
-  }
-  if (requested.includes('qwen') && !(runtime.includes('mlx') || runtime.includes('vllm'))) {
-    return `runtime_mismatch:${runtime || 'unknown'}`
-  }
   const quant = String(worker.weightQuantization || worker.weight_quantization || '').toLowerCase()
   const supportsQ4 = Boolean(worker.supportsQ4Weights ?? worker.supports_q4_weights)
   if ((requested.includes('gemma') || requested.includes('llama')) && !runtime.includes('llama') && !supportsQ4 && !quant.includes('q4')) {
