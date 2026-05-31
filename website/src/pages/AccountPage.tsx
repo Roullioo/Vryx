@@ -1805,15 +1805,22 @@ function VryxLoadingScreen() {
                   <div className="flex-1 overflow-y-auto px-4 py-8 sm:px-6">
                     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
                       {chatMessages.length === 0 && !chatLoading && (
-                        <div className="flex flex-col items-center justify-center gap-4 py-20 text-center">
-                          <span className="w-16 h-16 rounded-2xl border border-[var(--landing-line)] overflow-hidden flex items-center justify-center bg-white/5 shadow-lg">
-                            <AccountIconCanvas kind="chat" color={pageColors.chat} />
-                          </span>
+                        <div className="flex flex-col items-center justify-center gap-6 py-20 text-center animate-[fadeIn_.6s_ease-out]">
+                          <div className="relative flex items-center justify-center mb-2">
+                            {/* Glowing backdrop */}
+                            <div className="absolute w-32 h-32 rounded-full bg-gradient-to-tr from-sky-400 via-indigo-500 to-purple-600 blur-[35px] opacity-20 animate-pulse" />
+                            
+                            {/* Glassmorphic ring */}
+                            <div className="relative w-24 h-24 rounded-full border border-white/10 bg-white/[0.02] backdrop-blur-md shadow-[0_0_30px_rgba(99,102,241,0.2)] flex items-center justify-center hover:scale-105 transition-transform duration-500">
+                              <div className="absolute inset-1 rounded-full border border-white/5 bg-gradient-to-tr from-cyan-500/5 via-transparent to-purple-500/5 animate-[spin_10s_linear_infinite]" />
+                              <VryxLogo variant="mark" tone="light" markSize="lg" className="scale-[0.8] drop-shadow-[0_0_16px_rgba(168,85,247,0.5)]" />
+                            </div>
+                          </div>
                           <div>
-                            <p className="font-display text-2xl font-bold text-[var(--landing-ink)]">Vryx.</p>
+                            <h2 className="font-display text-2xl font-bold tracking-[0.1em] text-white">Vryx</h2>
                             <p className="mt-2 text-sm text-[var(--landing-muted)]">Modèle sélectionné : <span className="font-mono text-[var(--landing-accent)]">{modelId || 'aucun'}</span></p>
                             {chatSystemContext.trim() && (
-                              <p className="mt-1 text-xs text-violet-500 dark:text-violet-400">✓ Contexte système actif</p>
+                              <p className="mt-1.5 text-xs text-violet-400 font-medium">✓ Contexte système actif</p>
                             )}
                           </div>
                         </div>
