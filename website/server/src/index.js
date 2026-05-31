@@ -651,10 +651,6 @@ function workerSchedulabilityIssue(workerLike) {
   if (desired !== 'active') return `desired_${desired}`
   const runtimeState = String(workerLike?.runtimeState || workerLike?.runtime_state || 'idle').toLowerCase()
   if (WORKER_UNSCHEDULABLE_RUNTIME_STATES.has(runtimeState)) return `runtime_${runtimeState}`
-  const commandStatus = String(workerLike?.lastCommandStatus || workerLike?.last_command_status || '')
-  if (commandStatus === 'pending' || commandStatus === 'pending_worker_offline') {
-    return `command_${commandStatus}`
-  }
   const reservedUntil = workerLike?.reservedUntil || workerLike?.reserved_until || null
   if (reservedUntil && new Date(reservedUntil).getTime() > Date.now()) return 'reserved'
   return ''
@@ -1760,7 +1756,6 @@ async function loadSchedulerWorkers(modelId = null, options = {}) {
      WHERE w.mode = 'worker'
        AND w.desired_state = 'active'
        AND COALESCE(w.runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed','cooldown')
-       AND COALESCE(w.last_command_status, '') NOT IN ('pending','pending_worker_offline')
        AND TIMESTAMPDIFF(SECOND, w.last_heartbeat_at, NOW()) <= :offline
      ORDER BY w.last_heartbeat_at DESC
      LIMIT 200`,
@@ -1799,7 +1794,6 @@ async function reserveWorkersForJob({ modelId, loadMode = 'auto', createdBy = nu
          AND desired_state = 'active'
          AND TIMESTAMPDIFF(SECOND, last_heartbeat_at, NOW()) <= :liveSec
          AND COALESCE(runtime_state, 'idle') NOT IN ('loading','downloading','reserved','running','busy','failed','cooldown')
-         AND COALESCE(last_command_status, '') NOT IN ('pending','pending_worker_offline')
          AND (reserved_until IS NULL OR reserved_until < NOW() OR current_job_id = :jobId)`,
       { jobId, peerId: assignment.peerId, ttl: WORKER_RESERVATION_TTL_SEC, liveSec: WORKER_LIVE_SEC },
     )
