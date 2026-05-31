@@ -212,12 +212,12 @@ const csrfProtection = createCsrfProtection({
 
 /** Sessions chat P2P admin actives (animation « pipeline » sur le graphe). */
 let pipelineChatSessions = 0
-const activeUserChatSessions = new Set()
+const activeUserChatSessions = new Map()
 
 function pipelineChatBegin(userId = null) {
   pipelineChatSessions += 1
   if (userId) {
-    activeUserChatSessions.add(String(userId))
+    activeUserChatSessions.set(String(userId), Date.now())
   }
 }
 function pipelineChatEnd(userId = null) {
@@ -230,7 +230,14 @@ function isPipelineChatActive() {
   return pipelineChatSessions > 0
 }
 function isUserPipelineChatActive(userId) {
-  return userId ? activeUserChatSessions.has(String(userId)) : false
+  if (!userId) return false
+  const startedAt = activeUserChatSessions.get(String(userId))
+  if (!startedAt) return false
+  if (Date.now() - startedAt > 60000) {
+    activeUserChatSessions.delete(String(userId))
+    return false
+  }
+  return true
 }
 
 const WORKER_SECRET = String(
@@ -1319,7 +1326,7 @@ function normalizeP2pModelId(value) {
   if (!model || model.length > 120) return null
   if (!/^[A-Za-z0-9._/:-]+$/.test(model)) return null
   const lower = model.toLowerCase()
-  if (lower.includes('qwen3.6-35b-a3b')) model = 'Qwen/Qwen3.6-35B-A3B'
+  if (lower.includes('qwen3.6-35b-a3b') || lower.includes('qwen3-6-35b-a3b') || lower.includes('qwen36-35b-a3b')) model = 'Qwen/Qwen3.6-35B-A3B'
   else if (lower.includes('qwen3.5-9b')) model = 'Qwen/Qwen3.5-9B'
   else if (lower.includes('qwen2-0.5b-instruct')) model = 'Qwen/Qwen2-0.5B-Instruct'
   else if ((lower.includes('llama-2') || lower.includes('llama2')) && lower.includes('70b')) model = 'meta-llama/Llama-2-70b-hf'

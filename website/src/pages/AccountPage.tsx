@@ -1634,7 +1634,7 @@ function VryxLoadingScreen() {
                         const required = Math.max(1, Number(model.requiredWorkers || 1))
                         const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
                         return (
-                          <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                          <option key={model.id} value={model.id} className="bg-[var(--landing-card-strong)]">
                             {model.id}{runnable ? '' : ` — attente ${model.workersOnline}/${required} worker(s)`}
                           </option>
                         )
@@ -1779,7 +1779,7 @@ function VryxLoadingScreen() {
                             const required = Math.max(1, Number(model.requiredWorkers || 1))
                             const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
                             return (
-                              <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                              <option key={model.id} value={model.id} className="bg-[var(--landing-card-strong)]">
                                 {runnable ? '● ' : '○ '}{model.id}
                               </option>
                             )
@@ -1985,7 +1985,7 @@ function VryxLoadingScreen() {
                           const required = Math.max(1, Number(model.requiredWorkers || 1))
                           const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
                           return (
-                            <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                            <option key={model.id} value={model.id} className="bg-[var(--landing-card-strong)]">
                               {model.id}{runnable ? '' : ` — attente ${model.workersOnline}/${required} worker(s)`}
                             </option>
                           )
