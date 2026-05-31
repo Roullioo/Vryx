@@ -1764,15 +1764,26 @@ function VryxLoadingScreen() {
                         className="h-9 rounded-xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-3 font-mono text-xs text-[var(--landing-ink)] outline-none transition focus:border-[var(--landing-accent)] max-w-[16rem] truncate"
                       >
                         {models.length === 0 && <option value="">Aucun modèle</option>}
-                        {models.map((model) => {
-                          const required = Math.max(1, Number(model.requiredWorkers || 1))
-                          const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
-                          return (
-                            <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
-                              {runnable ? '● ' : '○ '}{model.id}
-                            </option>
-                          )
-                        })}
+                        {models
+                          .filter((model) => {
+                            const lower = model.id.toLowerCase()
+                            return !lower.startsWith('vryx') &&
+                                   !lower.startsWith('prefix-cache') &&
+                                   !lower.includes('split') &&
+                                   !lower.includes('sources') &&
+                                   !lower.includes('proof-') &&
+                                   !lower.includes('auto-perf') &&
+                                   !lower.includes('candidate')
+                          })
+                          .map((model) => {
+                            const required = Math.max(1, Number(model.requiredWorkers || 1))
+                            const runnable = Boolean(model.runnable) || Number(model.workersOnline || 0) >= required
+                            return (
+                              <option key={model.id} value={model.id} disabled={!runnable} className="bg-[var(--landing-card-strong)]">
+                                {runnable ? '● ' : '○ '}{model.id}
+                              </option>
+                            )
+                          })}
                       </select>
                       {/* Context settings button */}
                       <button
@@ -1848,8 +1859,8 @@ function VryxLoadingScreen() {
                       {chatLoading ? (
                         <div className="flex justify-start">
                           <div className="rounded-2xl border border-[var(--landing-line)] bg-[var(--landing-card)] px-5 py-4 text-sm text-[var(--landing-muted)] shadow-sm">
-                            <span className="inline-flex items-center gap-2">
-                              <span className="vryx-mini-loader shrink-0" aria-hidden />
+                            <span className="inline-flex items-center gap-3">
+                              <VryxLogo variant="mark" tone="light" markSize="sm" className="!h-5 !w-5 animate-pulse drop-shadow-[0_0_8px_rgba(168,85,247,0.6)] shrink-0" />
                               Génération en cours...
                             </span>
                           </div>
