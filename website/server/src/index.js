@@ -1540,7 +1540,8 @@ function modelRequiresDistributedShards(value) {
 
 function requiredWorkersForModel(value) {
   const model = normalizeP2pModelKey(value)
-  if (model.includes('qwen/qwen3.6-35b') || model.includes('qwen3.6-35b-a3b')) return 2
+  // Qwen3.6-35B can run on a single worker (full MLX mode with 37GB unified memory)
+  if (model.includes('qwen/qwen3.6-35b') || model.includes('qwen3.6-35b-a3b')) return 1
   return modelRequiresDistributedShards(value) ? 2 : 1
 }
 
@@ -1550,7 +1551,7 @@ const CURATED_MODEL_CATALOG = [
     label: 'Qwen3.6 35B A3B',
     family: 'Qwen',
     source: 'catalog',
-    requiredWorkers: 2,
+    requiredWorkers: 1,
     totalLayers: 40,
     paramsB: 35,
     activeParamsB: 3,
