@@ -60,7 +60,8 @@ type RegisteredWorker = {
     cpu?: string
     gpuName?: string
     gpuVendor?: string
-    controllers?: Array<{ model?: string; vendor?: string; vramMb?: number; bus?: string }>
+    hardware?: { cudaComputeCapability?: string; cudaMultiprocessors?: number; cudaCores?: number }
+    controllers?: Array<{ model?: string; vendor?: string; vramMb?: number; bus?: string; computeCapability?: string; cudaCores?: number }>
     unifiedMemory?: boolean
     totalMemoryGb?: number
     availableMemoryGb?: number
@@ -984,6 +985,8 @@ export function AdminWorkerDetailPage() {
     { label: 'OS', value: [worker.machineInfo?.os, worker.machineInfo?.arch].filter(Boolean).join(' · ') || '—' },
     { label: 'Mémoire système', value: worker.machineInfo?.totalMemoryGb ? `${worker.machineInfo.totalMemoryGb} Go total · ${worker.machineInfo.availableMemoryGb ?? '—'} Go libres` : '—' },
     { label: 'Mémoire unifiée', value: worker.machineInfo?.unifiedMemory ? 'Oui' : 'Non / inconnue' },
+    { label: 'CUDA cores', value: worker.machineInfo?.hardware?.cudaCores ? worker.machineInfo.hardware.cudaCores.toLocaleString('fr-FR') : '—' },
+    { label: 'Compute capability', value: worker.machineInfo?.hardware?.cudaComputeCapability || '—' },
     { label: 'Backends possibles', value: worker.machineInfo?.backendCandidates?.join(', ') || worker.runtimeBackend || '—' },
   ]
 
@@ -1107,15 +1110,16 @@ export function AdminWorkerDetailPage() {
           </div>
           {Array.isArray(worker.machineInfo?.controllers) && worker.machineInfo.controllers.length > 0 && (
             <div className="mt-4 overflow-hidden rounded-2xl border border-border/70">
-              <div className="grid grid-cols-[1fr_100px_80px] bg-surface px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-muted">
-                <span>GPU détecté</span><span>VRAM</span><span>Bus</span>
+              <div className="grid grid-cols-[1fr_100px_80px_88px] bg-surface px-3 py-2 text-[10px] font-bold uppercase tracking-wide text-muted">
+                <span>GPU détecté</span><span>VRAM</span><span>CUDA</span><span>Bus</span>
               </div>
               {worker.machineInfo.controllers.map((gpu, index) => (
-                <div key={`${gpu.model || 'gpu'}-${index}`} className="grid grid-cols-[1fr_100px_80px] border-t border-border/60 px-3 py-2 text-[11px]">
+                <div key={`${gpu.model || 'gpu'}-${index}`} className="grid grid-cols-[1fr_100px_80px_88px] border-t border-border/60 px-3 py-2 text-[11px]">
                   <span className="truncate text-fg" title={[gpu.vendor, gpu.model].filter(Boolean).join(' ')}>
                     {[gpu.vendor, gpu.model].filter(Boolean).join(' ') || 'GPU'}
                   </span>
                   <span className="text-muted">{fmtVramMb(gpu.vramMb, worker.runtimeBackend) || '—'}</span>
+                  <span className="truncate text-muted">{gpu.cudaCores ? gpu.cudaCores.toLocaleString('fr-FR') : gpu.computeCapability || '—'}</span>
                   <span className="truncate text-muted">{gpu.bus || '—'}</span>
                 </div>
               ))}

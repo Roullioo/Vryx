@@ -21,6 +21,9 @@ export type PoolGraphNode = {
   publicIp?: string | null
   model?: string | null
   runtimeBackend?: string | null
+  gpuVendor?: string | null
+  cudaCores?: number | null
+  computeCapability?: string | null
   tokensGeneratedTotal?: number
   tokensGenerated1h?: number
   tokensGenerated24h?: number
@@ -550,6 +553,20 @@ export function PoolNetworkGraph({ nodes: incomingNodes, links: incomingLinks, p
                 <dt className="text-muted">VRAM</dt>
                 <dd className="max-w-[58%] text-right text-fg">{fmtVramFromNode(selected)}</dd>
               </div>
+              {selected.cudaCores && (
+                <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                  <dt className="text-muted">CUDA cores</dt>
+                  <dd className="text-right font-mono text-[11px] text-fg">
+                    {selected.cudaCores.toLocaleString('fr-FR')}
+                  </dd>
+                </div>
+              )}
+              {selected.computeCapability && (
+                <div className="flex justify-between gap-4 border-b border-border/50 pb-2">
+                  <dt className="text-muted">Compute capability</dt>
+                  <dd className="text-right font-mono text-[11px] text-fg">{selected.computeCapability}</dd>
+                </div>
+              )}
               {selected.id !== ORCH_ID && (
                 <>
                   <div className="flex justify-between gap-4 border-b border-border/50 pb-2">

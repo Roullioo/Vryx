@@ -166,6 +166,7 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             direct_disabled = os.environ.get("VRYX_DISABLE_MLX_LM_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
             shard_only = os.environ.get("VRYX_WORKER_SHARD_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
             llama_cpp_direct = os.environ.get("VRYX_LLAMA_CPP_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
+            cuda_direct = os.environ.get("VRYX_CUDA_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
             model_id = os.environ.get("VRYX_WORKER_MODEL") or os.environ.get("VRYX_MLX_LM_MODEL_ID") or self.model
             if llama_cpp_direct:
                 llama_model = os.environ.get("VRYX_LLAMA_CPP_MODEL") or model_id
@@ -194,6 +195,29 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                         except Exception as exc:
                             print(f"[!] Préwarm llama.cpp/Ollama ignoré : {exc}")
                     threading.Thread(target=_prewarm_llama_cpp, daemon=True).start()
+            elif cuda_direct:
+                print(f"[*] Stage 2 (worker) — backend CUDA direct draft actif : {model_id}.")
+                prewarm_cuda = os.environ.get("VRYX_CUDA_PREWARM", "0").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+                if prewarm_cuda:
+                    def _prewarm_cuda_direct() -> None:
+                        try:
+                            print(f"[*] Préwarm CUDA direct : chargement résident de {model_id}…")
+                            payload = json.dumps({
+                                "model_id": model_id,
+                                "prompt": "Réponds uniquement OK.",
+                                "max_new_tokens": 1,
+                                "temperature": 0,
+                            }, ensure_ascii=False).encode("utf-8")
+                            shard_runtime.cuda_direct_generate(payload)
+                            print("[+] Préwarm CUDA direct terminé : modèle draft résident.")
+                        except Exception as exc:
+                            print(f"[!] Préwarm CUDA direct ignoré : {exc}")
+                    threading.Thread(target=_prewarm_cuda_direct, daemon=True).start()
             elif shard_only:
                 print(f"[*] Stage 2 (worker) — mode shard-only : exécution de couches distribuées pour {model_id}.")
             else:
@@ -205,7 +229,7 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                 "no",
                 "off",
             )
-            if not llama_cpp_direct and not direct_disabled and not shard_only and prewarm_enabled:
+            if not llama_cpp_direct and not cuda_direct and not direct_disabled and not shard_only and prewarm_enabled:
                 def _prewarm_direct_mlx() -> None:
                     try:
                         print(f"[*] Préwarm worker MLX : chargement résident de {model_id} en arrière-plan…")
@@ -220,7 +244,7 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                     except Exception as exc:
                         print(f"[!] Préwarm worker MLX ignoré : {exc}")
                 threading.Thread(target=_prewarm_direct_mlx, daemon=True).start()
-            elif not llama_cpp_direct and not direct_disabled and not shard_only:
+            elif not llama_cpp_direct and not cuda_direct and not direct_disabled and not shard_only:
                 print(
                     "[*] Préwarm worker MLX désactivé : le modèle sera chargé au premier appel "
                     "ou basculé en shard si la mémoire allouée ne suffit pas."
@@ -361,6 +385,19 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                 pass
             return _proto_from_bytes(out_bytes, start, compute_ms, sid=session_id or "")
 
+        # ── Génération directe CUDA petits modèles draft/auxiliaires ──────────
+        if dtype == "vryx.cuda.generate":
+            t0 = time.perf_counter()
+            out_bytes = await asyncio.to_thread(shard_runtime.cuda_direct_generate, raw)
+            compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            try:
+                direct_meta = json.loads(out_bytes.decode("utf-8", errors="replace"))
+                if isinstance(direct_meta, dict) and int(direct_meta.get("generation_ms") or 0) > 0:
+                    compute_ms = int(direct_meta.get("generation_ms") or compute_ms)
+            except Exception:
+                pass
+            return _proto_from_bytes(out_bytes, start, compute_ms, sid=session_id or "")
+
         # ── vryx.shard.init ───────────────────────────────────────────────────
         if dtype == "vryx.shard.init":
             result = shard_runtime.pipeline_shard_init(raw)
@@ -452,15 +489,28 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                 if isinstance(maybe_payload, dict) and isinstance(maybe_payload.get("prompt"), str):
                     prompt = maybe_payload.get("prompt", "")
                     request_options = {
-                        "hidden_transport": maybe_payload.get("hidden_transport") or maybe_payload.get("quantization"),
-                        "quantization": maybe_payload.get("quantization") or maybe_payload.get("hidden_transport"),
+                        "hidden_transport": (
+                            maybe_payload.get("hidden_transport")
+                            or maybe_payload.get("hiddenTransport")
+                            or maybe_payload.get("activation_quantization")
+                            or maybe_payload.get("activationQuantization")
+                        ),
+                        "quantization": (
+                            maybe_payload.get("weight_quantization")
+                            or maybe_payload.get("weightQuantization")
+                            or maybe_payload.get("quantization")
+                        ),
                         "pool_preference": maybe_payload.get("pool_preference"),
                         "stream_id": maybe_payload.get("stream_id"),
                         "stream_secret": maybe_payload.get("stream_secret"),
                         "stream_callback_url": maybe_payload.get("stream_callback_url"),
                     }
-                    if maybe_payload.get("model_id") or maybe_payload.get("modelId"):
-                        request_options["model_id"] = maybe_payload.get("model_id") or maybe_payload.get("modelId")
+                    if maybe_payload.get("model_id") or maybe_payload.get("modelId") or maybe_payload.get("model"):
+                        request_options["model_id"] = (
+                            maybe_payload.get("model_id")
+                            or maybe_payload.get("modelId")
+                            or maybe_payload.get("model")
+                        )
                     preferred_workers = maybe_payload.get("preferred_worker_peer_ids") or maybe_payload.get("preferredWorkerPeerIds")
                     if isinstance(preferred_workers, list):
                         request_options["preferred_worker_peer_ids"] = [
@@ -496,6 +546,30 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("chain_coalesced_decode") is not None
                             else maybe_payload.get("chainCoalescedDecode")
                         )
+                    if maybe_payload.get("decode_owner_final_peer") is not None or maybe_payload.get("decodeOwnerFinalPeer") is not None:
+                        request_options["decode_owner_final_peer"] = bool(
+                            maybe_payload.get("decode_owner_final_peer")
+                            if maybe_payload.get("decode_owner_final_peer") is not None
+                            else maybe_payload.get("decodeOwnerFinalPeer")
+                        )
+                    if maybe_payload.get("decode_owner_fallback_chain") is not None or maybe_payload.get("decodeOwnerFallbackChain") is not None:
+                        request_options["decode_owner_fallback_chain"] = bool(
+                            maybe_payload.get("decode_owner_fallback_chain")
+                            if maybe_payload.get("decode_owner_fallback_chain") is not None
+                            else maybe_payload.get("decodeOwnerFallbackChain")
+                        )
+                    if maybe_payload.get("quality_trace") is not None or maybe_payload.get("qualityTrace") is not None:
+                        request_options["quality_trace"] = bool(
+                            maybe_payload.get("quality_trace")
+                            if maybe_payload.get("quality_trace") is not None
+                            else maybe_payload.get("qualityTrace")
+                        )
+                    if maybe_payload.get("debug_top_logits") is not None or maybe_payload.get("debugTopLogits") is not None:
+                        request_options["debug_top_logits"] = bool(
+                            maybe_payload.get("debug_top_logits")
+                            if maybe_payload.get("debug_top_logits") is not None
+                            else maybe_payload.get("debugTopLogits")
+                        )
                     if maybe_payload.get("bench_ignore_eos") is not None or maybe_payload.get("benchIgnoreEos") is not None:
                         request_options["bench_ignore_eos"] = bool(
                             maybe_payload.get("bench_ignore_eos")
@@ -514,6 +588,32 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
                             if maybe_payload.get("decode_microbatch_cap") is not None
                             else maybe_payload.get("decodeMicrobatchCap")
                         )
+                    first_layers = (
+                        maybe_payload.get("first_worker_layers")
+                        if maybe_payload.get("first_worker_layers") is not None
+                        else maybe_payload.get("firstWorkerLayers")
+                    )
+                    if first_layers is None:
+                        first_layers = (
+                            maybe_payload.get("pipeline_first_worker_layers")
+                            if maybe_payload.get("pipeline_first_worker_layers") is not None
+                            else maybe_payload.get("pipelineFirstWorkerLayers")
+                        )
+                    if first_layers is not None:
+                        request_options["first_worker_layers"] = first_layers
+                    prepared_split_id = (
+                        maybe_payload.get("prepared_split_id")
+                        if maybe_payload.get("prepared_split_id") is not None
+                        else maybe_payload.get("preparedSplitId")
+                    )
+                    if prepared_split_id is None:
+                        prepared_split_id = (
+                            maybe_payload.get("prepared_gguf_split_id")
+                            if maybe_payload.get("prepared_gguf_split_id") is not None
+                            else maybe_payload.get("preparedGgufSplitId")
+                        )
+                    if prepared_split_id is not None:
+                        request_options["prepared_split_id"] = prepared_split_id
                     if maybe_payload.get("warmup_only") is not None or maybe_payload.get("warmupOnly") is not None:
                         request_options["warmup_only"] = bool(
                             maybe_payload.get("warmup_only")
@@ -532,6 +632,36 @@ class InferenceService(vryx_pb2_grpc.InferenceServiceServicer):
             prompt = f"Contexte :\n{inner}\n\nRéponse :"
 
         if self.stage == 2:
+            if os.environ.get("VRYX_CUDA_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on"):
+                payload = json.dumps({
+                    "model_id": os.environ.get("VRYX_WORKER_MODEL") or self.model,
+                    "prompt": prompt,
+                    "max_new_tokens": request_options.get("max_new_tokens") or 16,
+                    "temperature": 0,
+                }, ensure_ascii=False).encode("utf-8")
+                t0 = time.perf_counter()
+                out_bytes = await asyncio.to_thread(shard_runtime.cuda_direct_generate, payload)
+                compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+                try:
+                    direct_meta = json.loads(out_bytes.decode("utf-8", errors="replace"))
+                    text = str(direct_meta.get("text") or "")
+                    metrics = {
+                        "prompt_tokens": int(direct_meta.get("prompt_tokens") or 0),
+                        "completion_tokens": int(direct_meta.get("completion_tokens") or 0),
+                        "total_tokens": int(direct_meta.get("total_tokens") or 0),
+                        "vps_delegate_ms": 0,
+                    }
+                    if int(direct_meta.get("generation_ms") or 0) > 0:
+                        compute_ms = int(direct_meta.get("generation_ms") or compute_ms)
+                    return _proto_from_text(
+                        text or json.dumps(direct_meta, ensure_ascii=False),
+                        start,
+                        metrics,
+                        pipeline_trace_json=json.dumps(direct_meta, ensure_ascii=False),
+                        compute_time_ms=compute_ms,
+                    )
+                except Exception:
+                    return _proto_from_bytes(out_bytes, start, compute_ms)
             return _proto_from_text(
                 "[Vryx] Ce worker exécute seulement des couches gRPC. "
                 "Envoyez vryx.shard.pipeline, pas du texte direct.",
@@ -886,7 +1016,13 @@ async def serve(port: int, stage: int):
         InferenceService(stage),
         server,
     )
-    server.add_insecure_port(f"[::]:{port}")
+    bound_port = server.add_insecure_port(f"[::]:{port}")
+    if not bound_port:
+        bound_port = server.add_insecure_port(f"0.0.0.0:{port}")
+    if not bound_port:
+        bound_port = server.add_insecure_port(f"127.0.0.1:{port}")
+    if not bound_port:
+        raise RuntimeError(f"Impossible de binder le serveur gRPC worker sur le port {port}")
 
     # Pour les workers (stage 2), démarrer le serveur HTTP admin pour le hot-reload.
     if stage == 2:
@@ -894,6 +1030,7 @@ async def serve(port: int, stage: int):
         _start_admin_http_server(admin_port)
 
     await server.start()
+    print(f"[*] gRPC inference server stage={stage} sur port {bound_port}", flush=True)
     await server.wait_for_termination()
 
 

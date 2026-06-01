@@ -1147,6 +1147,35 @@ function killPortUnixSync(port) {
   }
 }
 
+function cleanupLegacyWorkerLaunchAgentsSync() {
+  if (process.platform !== 'darwin') return;
+  const script = `
+    set +e
+    uid="$(id -u)"
+    for label in \
+      com.vryx.gemma.worker1.python \
+      com.vryx.gemma.worker1.rust \
+      com.vryx.gemma.worker2.python \
+      com.vryx.gemma.worker2.rust \
+      com.vryx.m4.python.manual \
+      com.vryx.m4.python.llama70b-shard \
+      com.vryx.m4.mlx-lm-server.manual \
+      com.vryx.m4.rust.manual; do
+      launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || launchctl remove "$label" >/dev/null 2>&1 || true
+      launchctl disable "gui/$uid/$label" >/dev/null 2>&1 || true
+    done
+    for file in "$HOME"/Library/LaunchAgents/com.vryx.gemma.worker*.plist "$HOME"/Library/LaunchAgents/com.vryx.m4.*.plist; do
+      [ -f "$file" ] || continue
+      mv "$file" "$file.disabled-legacy" >/dev/null 2>&1 || true
+    done
+  `;
+  try {
+    execFileSync('bash', ['-lc', script], { stdio: 'ignore' });
+  } catch {
+    /* ignore: cleanup is best-effort and the port cleanup below remains authoritative */
+  }
+}
+
 function stopWorker() {
   clearStartupWatchdog();
   if (workerProcess) {
@@ -1214,6 +1243,7 @@ function prepareModelResidency(config, validation) {
 function spawnWorker(config, hardware) {
   if (workerProcess) return { ok: true, alreadyRunning: true };
   copyRuntimeIfNeeded();
+  cleanupLegacyWorkerLaunchAgentsSync();
   const validation = validateConfig(config, hardware);
   if (validation.hardIssues?.length) {
     return { ok: false, error: validation.hardIssues.join(' ') };
@@ -1494,6 +1524,7 @@ function fetchJsonPost(url, body = {}, headers = {}, timeoutMs = 8000) {
 app.whenReady().then(() => {
   app.setAsDefaultProtocolClient('vryx');
   copyRuntimeIfNeeded();
+  cleanupLegacyWorkerLaunchAgentsSync();
   ipcMain.handle('get-hardware-stats', () => getHardwareStats());
   ipcMain.handle('get-config', () => readConfig());
   ipcMain.handle('save-config', (_event, config) => writeConfig(config));

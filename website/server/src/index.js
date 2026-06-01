@@ -660,6 +660,7 @@ function workerCapabilities(workerLike) {
   const runtimeBackend = String(workerLike?.runtimeBackend || workerLike?.runtime_backend || '')
   const supportsMlx = Boolean(workerLike?.supportsMlx ?? workerLike?.supports_mlx)
   const supportsVllm = Boolean(workerLike?.supportsVllm ?? workerLike?.supports_vllm)
+  const roles = normalizeWorkerRoles(workerLike?.workerRoles ?? workerLike?.worker_roles ?? machineInfo.workerRoles ?? machineInfo.worker_roles)
   const model = normalizeP2pModelId(workerLike?.model || '') || ''
   const reportedQuantization = String(workerLike?.weightQuantization ?? workerLike?.weight_quantization ?? '').toLowerCase()
   const supportsQ4 = Boolean(workerLike?.supportsQ4Weights ?? workerLike?.supports_q4_weights)
@@ -678,9 +679,12 @@ function workerCapabilities(workerLike) {
       q4: supportsQ4,
       mlx: supportsMlx || runtimeBackend.toLowerCase().includes('mlx'),
       vllm: supportsVllm || runtimeBackend.toLowerCase().includes('vllm'),
+      cuda: runtimeBackend.toLowerCase().includes('cuda'),
+      draft: roles.includes('draft_worker') || roles.includes('draft'),
       fullLoad: allocatedVramMb >= 24 * 1024 || gpuVramMb >= 24 * 1024,
       shard: allocatedVramMb >= 8 * 1024 || gpuVramMb >= 8 * 1024,
     },
+    roles,
     warnings: supportsQ4 && !Boolean(workerLike?.supportsQ4Weights ?? workerLike?.supports_q4_weights)
       ? ['q4 derived from llama.cpp runtime; worker should upgrade to report native capabilities']
       : [],
@@ -1337,6 +1341,33 @@ function modelKeyMatches(actual, requested) {
   const actualKey = normalizeP2pModelKey(actual || '')
   const requestedKey = normalizeP2pModelKey(requested || '')
   return Boolean(actualKey && requestedKey && actualKey === requestedKey)
+}
+
+const WORKER_ROLES = new Set([
+  'verifier',
+  'draft',
+  'draft_worker',
+  'prefill',
+  'embedding',
+  'rerank',
+  'fallback_shard',
+  'control',
+])
+
+function normalizeWorkerRoles(value) {
+  const input = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : []
+  const roles = []
+  for (const item of input) {
+    let role = String(item || '').trim().toLowerCase().replaceAll('-', '_')
+    if (!role) continue
+    if (role === 'draftworker') role = 'draft_worker'
+    if (WORKER_ROLES.has(role) && !roles.includes(role)) roles.push(role)
+  }
+  return roles
 }
 
 function workerCompatibilityIssue(worker, requestedModel) {
@@ -6006,6 +6037,23 @@ function buildPoolGraphPayload({
     (w) => w.mode === 'worker' && Number(w.secondsSinceHeartbeat) <= WORKER_LIVE_SEC && w.desiredState === 'active',
   )
   for (const w of workerRows) {
+    const machineInfo = w.machineInfo || {}
+    const primaryController = Array.isArray(machineInfo.controllers) ? machineInfo.controllers[0] || null : null
+    const machineHardware = machineInfo.hardware && typeof machineInfo.hardware === 'object' ? machineInfo.hardware : {}
+    const machineGpuName =
+      (w.gpuName && String(w.gpuName).trim()) ||
+      (machineInfo.gpuName && String(machineInfo.gpuName).trim()) ||
+      (primaryController?.model && String(primaryController.model).trim()) ||
+      ''
+    const gpuVendor =
+      (machineInfo.gpuVendor && String(machineInfo.gpuVendor).trim()) ||
+      (primaryController?.vendor && String(primaryController.vendor).trim()) ||
+      (machineGpuName.toLowerCase().includes('nvidia') ? 'NVIDIA' : null)
+    const cudaCores = Number(machineHardware.cudaCores || primaryController?.cudaCores || 0) || null
+    const computeCapability =
+      machineHardware.cudaComputeCapability ||
+      primaryController?.computeCapability ||
+      null
     const totalVramMb = Number(w.gpuVramMb) || 0
     const allocatedVramMb = Number(w.allocatedVramMb || totalVramMb) || 0
     const hasVram = allocatedVramMb > 0
@@ -6015,7 +6063,7 @@ function buildPoolGraphPayload({
         .toLowerCase()
         .includes('mlx') || Boolean(w.supportsMlx)
     const hardware =
-      (w.gpuName && String(w.gpuName).trim()) ||
+      machineGpuName ||
       (mlxish ? 'Apple Silicon (Metal / MLX)' : null) ||
       'Matériel non renseigné'
     const assign = assignList.find((a) => a.peer === w.peerId)
@@ -6047,6 +6095,9 @@ function buildPoolGraphPayload({
       publicIp: w.publicIp ?? null,
       model: w.model ?? null,
       runtimeBackend: w.runtimeBackend ?? null,
+      gpuVendor,
+      cudaCores,
+      computeCapability,
       tokensGeneratedTotal: Number(w.tokensGenerated || 0) || 0,
       tokensGenerated1h: Number(w.tokensGenerated1h || 0) || 0,
       tokensGenerated24h: Number(w.tokensGenerated24h || 0) || 0,
@@ -6096,6 +6147,7 @@ const heartbeatBodySchema = z.object({
   supports_q4_weights: z.boolean().optional().default(false),
   supports_mlx: z.boolean().optional().default(false),
   supports_vllm: z.boolean().optional().default(false),
+  worker_roles: z.array(z.string().max(40)).max(16).optional().default([]),
   machine_info: z.record(z.string(), z.unknown()).nullable().optional(),
   runtime_state: z.enum(['idle', 'updating', 'restarting', 'loading_shard', 'ready', 'reserved', 'running', 'cooldown', 'failed']).optional(),
   command_ack: z
@@ -6134,6 +6186,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     supports_q4_weights,
     supports_mlx,
     supports_vllm,
+    worker_roles,
     machine_info,
     runtime_state,
     command_ack,
@@ -6183,6 +6236,13 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
     const heartbeatRuntimeState = runtime_state || (
       mode === 'worker' && normalizedModel ? 'ready' : 'idle'
     )
+    const normalizedWorkerRoles = normalizeWorkerRoles(worker_roles)
+    const effectiveMachineInfo = hasMachineInfo
+      ? { ...machine_info, workerRoles: normalizedWorkerRoles }
+      : normalizedWorkerRoles.length
+        ? { workerRoles: normalizedWorkerRoles }
+        : null
+    const hasEffectiveMachineInfo = Boolean(effectiveMachineInfo)
     const capabilitySnapshot = workerCapabilities({
       model: normalizedModel,
       gpuName: gpu_name,
@@ -6193,7 +6253,8 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
       supportsQ4Weights: normalizedSupportsQ4,
       supportsMlx: supports_mlx,
       supportsVllm: supports_vllm,
-      machineInfo: machine_info ? JSON.stringify(machine_info) : null,
+      workerRoles: normalizedWorkerRoles,
+      machineInfo: effectiveMachineInfo ? JSON.stringify(effectiveMachineInfo) : null,
     })
     const healthSnapshot = workerHealthScore({
       secondsSinceHeartbeat: 0,
@@ -6219,6 +6280,7 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
       routeMode: machine_info?.network?.routeMode || machine_info?.connectivity?.routeMode || 'unknown',
       healthScore: healthSnapshot.score,
       runtimeState: heartbeatRuntimeState,
+      workerRoles: normalizedWorkerRoles,
       lastHeartbeatAt: new Date().toISOString(),
     }, 90).catch((e) => console.warn('[redis] worker live cache skipped', e?.message || e))
 
@@ -6291,8 +6353,8 @@ app.post('/api/workers/heartbeat', requireWorkerSecret, workerLimiter, async (re
         supports_q4_weights: normalizedSupportsQ4 ? 1 : 0,
         supports_mlx: supports_mlx ? 1 : 0,
         supports_vllm: supports_vllm ? 1 : 0,
-        machine_info: hasMachineInfo ? JSON.stringify(machine_info) : null,
-        has_machine_info: hasMachineInfo ? 1 : 0,
+        machine_info: effectiveMachineInfo ? JSON.stringify(effectiveMachineInfo) : null,
+        has_machine_info: hasEffectiveMachineInfo ? 1 : 0,
         health_score: healthSnapshot.score,
         runtime_state: heartbeatRuntimeState,
         capabilities_json: JSON.stringify(capabilitySnapshot),
@@ -9451,7 +9513,8 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
   const chatModelId = await resolveP2pChatModelId(req.body?.model_id ?? req.body?.modelId)
   const requestedLoadMode = ['auto', 'full', 'shard'].includes(req.body?.load_mode || req.body?.loadMode)
     ? (req.body?.load_mode || req.body?.loadMode)
-    : 'shard'
+    : 'auto'
+  let effectiveLoadMode = requestedLoadMode
   const requestId = req.requestId || crypto.randomUUID()
   const startedAt = Date.now()
   let firstTokenAt = null
@@ -9484,9 +9547,13 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
     })
     return res.end()
   }
-  const reservation = chatModelId
+  let reservation = chatModelId
     ? await reserveWorkersForJob({ modelId: chatModelId, loadMode: requestedLoadMode, createdBy: req.user.id })
     : { ok: true, jobId: null, plan: null, reservations: [] }
+  if (!reservation.ok && chatModelId && requestedLoadMode === 'shard') {
+    reservation = await reserveWorkersForJob({ modelId: chatModelId, loadMode: 'auto', createdBy: req.user.id })
+    if (reservation.ok) effectiveLoadMode = 'auto'
+  }
   if (!reservation.ok) {
     await recordInferenceRequestLog(buildInferenceLog({
       requestId,
@@ -9624,8 +9691,8 @@ adminRouter.post('/p2p/chat/stream', chatLimiter, async (req, res) => {
       quantization: requestedQuantization,
       hidden_transport: requestedQuantization,
       pool_preference: poolPreference,
-      load_mode: requestedLoadMode,
-      force_distributed: requestedLoadMode === 'shard' || reservation.reservations.length > 1,
+      load_mode: effectiveLoadMode,
+      force_distributed: effectiveLoadMode === 'shard' || reservation.reservations.length > 1,
       temperature: 0,
       top_p: 0.65,
       top_k: 20,

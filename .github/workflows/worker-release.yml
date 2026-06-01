@@ -91,4 +91,5 @@ jobs:
             AppMacos/release/*.exe
             AppMacos/release/*.blockmap
             AppMacos/release/SHA256SUMS-windows.txt
+            nodeAndWorker/bin/win32-x64/rust-daemon.exe
             nodeAndWorker/runtime-release-manifest.json

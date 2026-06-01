@@ -17,18 +17,22 @@ Variables worker (sélection backend) :
   VRYX_MLX_STRICT=1 — avec mlx demandé : **aucun** fallback PyTorch silencieux ; échec explicite si MLX indisponible.
   VRYX_DISABLE_PYTORCH_FALLBACK=1 — même effet que MLX strict pour le refus de fallback (historique).
   VRYX_ENABLE_MLX_RUNTIME / VRYX_ENABLE_MLX_KERNELS — requis pour activer MLXBackend (voir mlx_backend.py).
+  VRYX_CUDA_DIRECT=1 — active la génération CUDA directe pour petits modèles draft/auxiliaires.
 """
 from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib
 import importlib.metadata
 import inspect
 import json
 import os
 import copy
 import queue
+import subprocess
 import ssl
+import tempfile
 import threading
 import time
 import warnings
@@ -47,6 +51,100 @@ warnings.filterwarnings("ignore")
 # Téléchargement du manifeste shard depuis le VPS (HTTPS) : éviter 120 s trop court sur lien lent.
 MANIFEST_FETCH_TIMEOUT_SEC = max(600.0, float(os.environ.get("VRYX_SHARD_MANIFEST_FETCH_TIMEOUT_SEC", "600")))
 SHARD_BINARY_FETCH_TIMEOUT_SEC = max(600.0, float(os.environ.get("VRYX_SHARD_BINARY_FETCH_TIMEOUT_SEC", "600")))
+
+
+def _worker_shard_cache_dir() -> str:
+    return os.environ.get(
+        "VRYX_WORKER_SHARD_CACHE_DIR",
+        os.path.join(tempfile.gettempdir(), "vryx-worker-shards"),
+    )
+
+
+def _wire_numpy_dtype(dtype: str | np.dtype) -> np.dtype:
+    parsed = np.dtype(dtype)
+    if parsed.kind == "f" and parsed.itemsize == 2:
+        return np.dtype("<f2")
+    if parsed.kind == "f" and parsed.itemsize == 4:
+        return np.dtype("<f4")
+    return parsed
+
+
+def _torch_numpy_le(hidden_states: torch.Tensor, dtype: torch.dtype, wire_dtype: str) -> np.ndarray:
+    arr = hidden_states.detach().contiguous().to(dtype).cpu().numpy()
+    return np.ascontiguousarray(arr).astype(_wire_numpy_dtype(wire_dtype), copy=False)
+
+
+def _runtime_flag_enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _torch_hidden_checksum(hidden_states: torch.Tensor) -> dict[str, Any]:
+    arr = _torch_numpy_le(hidden_states, torch.float16, "<f2")
+    has_nan = bool(np.isnan(arr).any()) if arr.size else False
+    has_inf = bool(np.isinf(arr).any()) if arr.size else False
+    return {
+        "checksum": hashlib.sha256(arr.tobytes()).hexdigest()[:24],
+        "dtype": "fp16",
+        "shape": [int(x) for x in arr.shape],
+        "bytes": int(arr.nbytes),
+        "has_nan": has_nan,
+        "has_inf": has_inf,
+    }
+
+
+def _sharding_proof_trace(
+    shard: "PipelineShard",
+    *,
+    backend: str,
+    received_hidden: dict[str, Any] | None,
+    output_hidden: dict[str, Any] | None,
+    compute_ms: int,
+    step: int,
+    seq_pos: int,
+    kv_cache_created: bool,
+    kv_cache_reused: bool,
+) -> dict[str, Any]:
+    return {
+        "worker_peer": str(getattr(shard, "peer_id", "") or os.environ.get("VRYX_PEER_ID", "")),
+        "group_id": str(getattr(shard, "group_id", "") or ""),
+        "backend": str(backend or getattr(shard.backend, "name", "") or getattr(shard, "runtime_backend", "")),
+        "runtime_backend": str(getattr(shard.backend, "name", "") or getattr(shard, "runtime_backend", "")),
+        "layer_start": int(shard.layer_start),
+        "layer_end": int(shard.layer_end),
+        "model_format": str(getattr(shard, "model_format", "") or getattr(shard, "weight_load_mode", "") or "memory"),
+        "local_model_path": str(getattr(shard, "local_model_path", "") or ""),
+        "next_peer_id": str(getattr(shard, "next_peer_id", "") or ""),
+        "received_hidden_checksum": (received_hidden or {}).get("checksum"),
+        "received_hidden_shape": (received_hidden or {}).get("shape"),
+        "received_hidden_dtype": (received_hidden or {}).get("dtype"),
+        "received_hidden_has_nan": bool((received_hidden or {}).get("has_nan", False)),
+        "output_hidden_checksum": (output_hidden or {}).get("checksum"),
+        "output_hidden_shape": (output_hidden or {}).get("shape"),
+        "output_hidden_dtype": (output_hidden or {}).get("dtype"),
+        "output_hidden_has_nan": bool((output_hidden or {}).get("has_nan", False)),
+        "compute_ms": int(compute_ms),
+        "transfer_to_next_ms": 0,
+        "kv_cache_created": bool(kv_cache_created),
+        "kv_cache_reused": bool(kv_cache_reused),
+        "fallback": False,
+        "step": int(step),
+        "seq_pos": int(seq_pos),
+    }
+
+
+def _attach_sharding_proof(response: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any]:
+    response["sharding_proof"] = proof
+    trace = response.get("transport_trace")
+    if not isinstance(trace, dict):
+        trace = {}
+    trace["sharding_proof"] = proof
+    trace.setdefault("worker_peer", proof.get("worker_peer"))
+    trace.setdefault("backend", proof.get("backend"))
+    trace.setdefault("layer_start", proof.get("layer_start"))
+    trace.setdefault("layer_end", proof.get("layer_end"))
+    trace.setdefault("fallback", False)
+    response["transport_trace"] = trace
+    return response
 
 
 def _is_download_dns_error(exc: BaseException) -> bool:
@@ -285,6 +383,516 @@ class PyTorchBackend:
         }
 
 
+class CUDABackend(PyTorchBackend):
+    """Backend shard-only CUDA via PyTorch fp16.
+
+    The current GGUF/Q4 Llama path still needs a real llama.cpp shard-forward
+    engine. Refusing GGUF here keeps CUDA workers out of the hot path unless the
+    backend can actually execute the assigned shard.
+    """
+
+    name = "cuda"
+
+    def __init__(self, shard: PipelineShard, requested_backend: str = "cuda"):
+        super().__init__(shard, requested_backend=requested_backend)
+
+    def build(self) -> dict[str, Any]:
+        if str(getattr(self.shard, "weight_load_mode", "") or "").lower() == "gguf_ranges":
+            if not (
+                _runtime_flag_enabled("VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD")
+                or bool(getattr(self.shard, "experimental_multi_backend_shard", False))
+            ):
+                return {
+                    "ok": False,
+                    "error": "cuda_gguf_shard_backend_unavailable:llama_cpp_shard_forward_required",
+                    "runtime_backend": self.name,
+                    "runtime_backend_detail": "pytorch_cuda_fp16_no_gguf_q4",
+                    "supports_q4_weights": False,
+                }
+            try:
+                materialized = _materialize_gguf_ranges_for_pytorch(self.shard)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"cuda_gguf_proof_materialize_failed:{type(exc).__name__}:{exc}",
+                    "runtime_backend": self.name,
+                    "runtime_backend_detail": "pytorch_cuda_fp16_gguf_proof",
+                    "supports_q4_weights": False,
+                    "experimental_multi_backend_shard": True,
+                }
+            print(
+                f"[cuda-proof] matérialisé GGUF -> PyTorch fp16 "
+                f"{materialized.get('weights_loaded')} tensors "
+                f"{materialized.get('dense_gb')}GB pour {self.shard.session_id[:12]}…"
+            )
+        if not torch.cuda.is_available():
+            return {
+                "ok": False,
+                "error": "cuda_unavailable:torch.cuda.is_available_false",
+                "runtime_backend": self.name,
+                "runtime_backend_detail": "pytorch_cuda_fp16",
+            }
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        result = super().build()
+        result["runtime_backend"] = self.name
+        result["runtime_backend_detail"] = (
+            "pytorch_cuda_fp16_gguf_proof"
+            if bool(getattr(self.shard, "cuda_gguf_proof_source_bytes", 0))
+            else "pytorch_cuda_fp16"
+        )
+        result["experimental_multi_backend_shard"] = bool(getattr(self.shard, "experimental_multi_backend_shard", False))
+        if torch.cuda.is_available():
+            try:
+                result["cuda_allocated_mb"] = int(torch.cuda.memory_allocated() / (1024 * 1024))
+                result["cuda_reserved_mb"] = int(torch.cuda.memory_reserved() / (1024 * 1024))
+                result["cuda_peak_allocated_mb"] = int(torch.cuda.max_memory_allocated() / (1024 * 1024))
+            except Exception:
+                pass
+        return result
+
+    def forward(self, data: bytes, session_id: str) -> bytes:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        t0 = time.perf_counter()
+        out = _pytorch_pipeline_shard_forward(data, session_id)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+        self.shard.last_forward_ms = compute_ms
+        try:
+            payload = json.loads(out.decode("utf-8", errors="replace"))
+            if isinstance(payload, dict):
+                payload["compute_time_ms"] = compute_ms
+                payload["runtime_backend"] = self.name
+                payload["runtime_backend_detail"] = "pytorch_cuda_fp16"
+                if torch.cuda.is_available():
+                    try:
+                        payload["cuda_allocated_mb"] = int(torch.cuda.memory_allocated() / (1024 * 1024))
+                        payload["cuda_reserved_mb"] = int(torch.cuda.memory_reserved() / (1024 * 1024))
+                        payload["cuda_peak_allocated_mb"] = int(torch.cuda.max_memory_allocated() / (1024 * 1024))
+                    except Exception:
+                        pass
+                return json.dumps(payload).encode()
+        except Exception:
+            pass
+        return out
+
+    def unload(self) -> None:
+        super().unload()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+    def status(self) -> dict[str, Any]:
+        status = super().status()
+        status["runtime_backend"] = self.name
+        status["runtime_backend_detail"] = "pytorch_cuda_fp16"
+        status["attention_backend"] = "cuda_sdpa" if torch.cuda.is_available() else "cuda_unavailable"
+        status["cuda_available"] = bool(torch.cuda.is_available())
+        if torch.cuda.is_available():
+            try:
+                status["cuda_allocated_mb"] = int(torch.cuda.memory_allocated() / (1024 * 1024))
+                status["cuda_reserved_mb"] = int(torch.cuda.memory_reserved() / (1024 * 1024))
+                status["cuda_peak_allocated_mb"] = int(torch.cuda.max_memory_allocated() / (1024 * 1024))
+                status["cuda_device_name"] = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+        return status
+
+    def capabilities(self) -> dict[str, Any]:
+        caps = super().capabilities()
+        caps.update({
+            "runtime_backend": self.name,
+            "supports_mlx": False,
+            "supports_vllm": False,
+            "supports_q4_weights": False,
+            "attention_backend": "cuda_sdpa" if torch.cuda.is_available() else "cuda_unavailable",
+            "compute_dtype": "fp16",
+            "flash_attention": bool(torch.cuda.is_available()),
+        })
+        return caps
+
+
+class LlamaCppCudaShardBackend:
+    """Strict GGUF/Q4 CUDA shard adapter backed by an external llama.cpp engine.
+
+    The public llama.cpp/Ollama generate APIs cannot execute only layers N..M
+    from an incoming hidden state.  VRYX therefore treats native Q4 CUDA shard
+    execution as an explicit engine contract instead of silently reusing the
+    PyTorch fp16 proof bridge.  The engine can be a local HTTP service
+    (VRYX_LLAMA_CPP_SHARD_URL) or a local executable (VRYX_LLAMA_CPP_SHARD_BIN)
+    that accepts JSON on stdin and returns a VRYX-compatible JSON payload.
+    """
+
+    name = "llama_cpp_cuda"
+
+    def __init__(self, shard: PipelineShard, requested_backend: str = "llama_cpp_cuda"):
+        self.shard = shard
+        self.requested_backend = requested_backend
+        self.engine_url = os.environ.get("VRYX_LLAMA_CPP_SHARD_URL", "").strip().rstrip("/")
+        self.engine_bin = os.environ.get("VRYX_LLAMA_CPP_SHARD_BIN", "").strip()
+        self.experimental_torch_bridge = (
+            _runtime_flag_enabled("VRYX_LLAMA_CPP_CUDA_EXPERIMENTAL_TORCH_BRIDGE")
+            or bool(getattr(shard, "experimental_multi_backend_shard", False))
+        )
+        self.bridge_backend: CUDABackend | None = None
+        self.local_model_path = ""
+        self.last_error = ""
+        self.last_status: dict[str, Any] = {}
+
+    def _engine_payload(self, mode: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "session_id": self.shard.session_id,
+            "model_path": self.local_model_path or _gguf_local_source_for_shard(self.shard),
+            "model_id": self.shard.model_id,
+            "group_id": getattr(self.shard, "group_id", ""),
+            "peer_id": getattr(self.shard, "peer_id", ""),
+            "next_peer_id": getattr(self.shard, "next_peer_id", ""),
+            "layer_start": int(self.shard.layer_start),
+            "layer_end": int(self.shard.layer_end),
+            "has_embedding": bool(self.shard.has_embedding),
+            "has_lm_head": bool(self.shard.has_lm_head),
+            "hidden_size": int(self.shard.hidden_size),
+            "vocab_size": int(self.shard.vocab_size),
+            "model_config": self.shard.model_config,
+            "hidden_transport": getattr(self.shard, "hidden_transport", HIDDEN_TRANSPORT),
+            "weight_quantization": "gguf_q4_native",
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def _call_engine(self, mode: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.engine_url:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.engine_url}/v1/shard/{mode}",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(
+                req,
+                timeout=float(os.environ.get("VRYX_LLAMA_CPP_SHARD_TIMEOUT_SEC", "1800")),
+            ) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        if self.engine_bin:
+            completed = subprocess.run(
+                [self.engine_bin, mode],
+                input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=float(os.environ.get("VRYX_LLAMA_CPP_SHARD_TIMEOUT_SEC", "1800")),
+                check=False,
+            )
+            if completed.returncode != 0:
+                err = completed.stderr.decode("utf-8", errors="replace")[:1000]
+                raise RuntimeError(f"llama_cpp_shard_bin_failed:{completed.returncode}:{err}")
+            return json.loads(completed.stdout.decode("utf-8", errors="replace") or "{}")
+        raise RuntimeError("llama_cpp_cuda_shard_engine_missing:set_VRYX_LLAMA_CPP_SHARD_URL_or_BIN")
+
+    def _bridge_build(self, t0: float) -> dict[str, Any]:
+        """Experimental proof path: real CUDA layers from assigned GGUF ranges.
+
+        This is deliberately opt-in and reported separately from native llama.cpp
+        Q4 shard-forward. It exists to validate the hidden-state pipeline while
+        the native llama.cpp hidden-state API is still being built.
+        """
+        bridge = CUDABackend(self.shard, requested_backend="llama_cpp_cuda_experimental_torch_bridge")
+        result = bridge.build()
+        self.bridge_backend = bridge
+        ok = bool(result.get("ok", False))
+        self.shard.build_ms = int(result.get("build_ms") or max(1, int((time.perf_counter() - t0) * 1000)))
+        setattr(self.shard, "gguf_backend_ready", ok)
+        setattr(self.shard, "build_ready", ok)
+        self.last_error = "" if ok else str(result.get("error") or "")
+        self.last_status = dict(result)
+        self.last_status.update({
+            "runtime_backend": self.name,
+            "runtime_backend_detail": "llama_cpp_cuda_experimental_torch_bridge",
+            "attention_backend": "cuda_sdpa_torch_bridge",
+            "weight_quantization": "gguf_q4_source_fp16_bridge",
+            "compute_dtype": "fp16",
+            "native_q4_shard_forward": False,
+            "experimental_torch_bridge": True,
+            "fallback": False,
+        })
+        return {
+            **self.last_status,
+            "ok": ok,
+            "build_ms": self.shard.build_ms,
+            "runtime_fallback_disabled": True,
+            "supports_q4_weights": True,
+        }
+
+    def build(self) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        if str(getattr(self.shard, "weight_load_mode", "") or "").lower() != "gguf_ranges":
+            return {
+                "ok": False,
+                "error": "llama_cpp_cuda_requires_gguf_ranges",
+                "runtime_backend": self.name,
+                "runtime_backend_detail": "llama_cpp_cuda_q4_native",
+                "runtime_fallback_disabled": True,
+            }
+        if self.experimental_torch_bridge and _runtime_flag_enabled("VRYX_LLAMA_CPP_CUDA_BRIDGE_PRIORITY", "1"):
+            return self._bridge_build(t0)
+        self.local_model_path = _gguf_local_source_for_shard(self.shard)
+        if not self.local_model_path:
+            if self.experimental_torch_bridge:
+                return self._bridge_build(t0)
+            return {
+                "ok": False,
+                "error": "llama_cpp_cuda_local_gguf_missing",
+                "runtime_backend": self.name,
+                "runtime_backend_detail": "llama_cpp_cuda_q4_native",
+                "runtime_fallback_disabled": True,
+                "hint": "Set VRYX_GGUF_LOCAL_SOURCE_PATH/local_model_path to the complete GGUF on this CUDA worker.",
+            }
+        try:
+            result = self._call_engine("init", self._engine_payload("init"))
+        except Exception as exc:
+            if self.experimental_torch_bridge:
+                return self._bridge_build(t0)
+            self.last_error = f"{type(exc).__name__}:{exc}"
+            return {
+                "ok": False,
+                "error": self.last_error,
+                "runtime_backend": self.name,
+                "runtime_backend_detail": "llama_cpp_cuda_q4_native",
+                "runtime_fallback_disabled": True,
+                "supports_q4_weights": True,
+                "local_model_path_present": True,
+            }
+        ok = bool(result.get("ok", True))
+        self.shard.build_ms = int(result.get("build_ms") or max(1, int((time.perf_counter() - t0) * 1000)))
+        self.shard.weights_loaded = int(result.get("weights_loaded") or len(getattr(self.shard, "gguf_tensor_index", []) or []))
+        self.shard.weight_bytes = int(result.get("resident_weight_bytes") or result.get("weight_bytes") or self.shard.weight_bytes)
+        setattr(self.shard, "gguf_backend_ready", ok)
+        setattr(self.shard, "build_ready", ok)
+        self.last_status = dict(result)
+        return {
+            **result,
+            "ok": ok,
+            "runtime_backend": self.name,
+            "runtime_backend_detail": result.get("runtime_backend_detail") or "llama_cpp_cuda_q4_native",
+            "attention_backend": result.get("attention_backend") or "llama_cpp_cuda",
+            "build_ms": self.shard.build_ms,
+            "weight_load_mode": "gguf_ranges",
+            "weight_quantization": "gguf_q4_native",
+            "supports_q4_weights": True,
+            "local_model_path_present": True,
+            "runtime_fallback_disabled": True,
+        }
+
+    def forward(self, data: bytes, session_id: str) -> bytes:
+        t0 = time.perf_counter()
+        payload = json.loads(data.decode("utf-8", errors="replace") or "{}")
+        if self.bridge_backend is not None:
+            out = self.bridge_backend.forward(data, session_id)
+            compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            self.shard.last_forward_ms = compute_ms
+            try:
+                result = json.loads(out.decode("utf-8", errors="replace") or "{}")
+                if isinstance(result, dict):
+                    result["compute_time_ms"] = int(result.get("compute_time_ms") or compute_ms)
+                    result["runtime_backend"] = self.name
+                    result["runtime_backend_detail"] = "llama_cpp_cuda_experimental_torch_bridge"
+                    result["attention_backend"] = result.get("attention_backend") or "cuda_sdpa_torch_bridge"
+                    result["fallback"] = False
+                    result["native_q4_shard_forward"] = False
+                    result["experimental_torch_bridge"] = True
+                    result["weight_quantization"] = "gguf_q4_source_fp16_bridge"
+                    return json.dumps(result, ensure_ascii=False).encode("utf-8")
+            except Exception:
+                pass
+            return out
+        engine_payload = self._engine_payload("forward", {"payload": payload})
+        result = self._call_engine("forward", engine_payload)
+        compute_ms = int(result.get("compute_time_ms") or max(1, int((time.perf_counter() - t0) * 1000)))
+        self.shard.last_forward_ms = compute_ms
+        result.setdefault("ok", True)
+        result["compute_time_ms"] = compute_ms
+        result["runtime_backend"] = self.name
+        result.setdefault("runtime_backend_detail", "llama_cpp_cuda_q4_native")
+        result.setdefault("fallback", False)
+        result.setdefault("weight_quantization", "gguf_q4_native")
+        return json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+    def unload(self) -> None:
+        if self.bridge_backend is not None:
+            try:
+                self.bridge_backend.unload()
+            except Exception:
+                pass
+            self.bridge_backend = None
+        try:
+            self._call_engine("unload", self._engine_payload("unload"))
+        except Exception:
+            pass
+        setattr(self.shard, "gguf_backend_ready", False)
+        self.last_status = {}
+
+    def status(self) -> dict[str, Any]:
+        ready = bool(getattr(self.shard, "gguf_backend_ready", False))
+        if self.bridge_backend is not None:
+            bridge_status = self.bridge_backend.status()
+            ready = bool(bridge_status.get("ready", ready))
+        else:
+            bridge_status = {}
+        status = {
+            "runtime_backend": self.name,
+            "runtime_backend_detail": "llama_cpp_cuda_experimental_torch_bridge" if self.bridge_backend is not None else "llama_cpp_cuda_q4_native",
+            "requested_runtime_backend": self.requested_backend,
+            "runtime_fallback_reason": self.last_error or None,
+            "ready": ready,
+            "attention_backend": "cuda_sdpa_torch_bridge" if self.bridge_backend is not None else "llama_cpp_cuda",
+            "batch_forward": True,
+            "weight_dtype": "gguf_q4_source_fp16_bridge" if self.bridge_backend is not None else "gguf_q4_native",
+            "compute_dtype": "fp16" if self.bridge_backend is not None else "q4_native",
+            "q4_hidden_transport_supported": True,
+            "local_model_path_present": bool(self.local_model_path or _gguf_local_source_for_shard(self.shard)),
+            "engine_url_configured": bool(self.engine_url),
+            "engine_bin_configured": bool(self.engine_bin),
+            "runtime_fallback_disabled": True,
+            "native_q4_shard_forward": self.bridge_backend is None,
+            "experimental_torch_bridge": self.bridge_backend is not None or self.experimental_torch_bridge,
+        }
+        status.update(bridge_status)
+        status.update(self.last_status)
+        status["runtime_backend"] = self.name
+        status["ready"] = ready
+        return status
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "runtime_backend": self.name,
+            "runtime_backend_detail": "llama_cpp_cuda_q4_native",
+            "supports_mlx": False,
+            "supports_vllm": False,
+            "supports_q4_weights": True,
+            "weight_quantization": "gguf_q4_source_fp16_bridge" if self.bridge_backend is not None else "gguf_q4_native",
+            "attention_backend": "cuda_sdpa_torch_bridge" if self.bridge_backend is not None else "llama_cpp_cuda",
+            "compute_dtype": "fp16" if self.bridge_backend is not None else "q4_native",
+            "flash_attention": True,
+            "batch_forward": True,
+            "q4_hidden_transport_supported": True,
+            "runtime_fallback_disabled": True,
+            "native_q4_shard_forward": self.bridge_backend is None,
+            "experimental_torch_bridge": self.bridge_backend is not None or self.experimental_torch_bridge,
+        }
+
+
+def _gguf_local_source_for_shard(shard: PipelineShard) -> str:
+    candidates = [
+        str(getattr(shard, "local_model_path", "") or ""),
+        os.environ.get("VRYX_GGUF_LOCAL_SOURCE_PATH", ""),
+        os.environ.get("VRYX_MLX_LOCAL_GGUF_SOURCE_PATH", ""),
+    ]
+    for candidate in candidates:
+        path = os.path.abspath(os.path.expanduser(str(candidate).strip()))
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def _read_gguf_entry_bytes(entry: dict[str, Any], shard: PipelineShard, ctx: Any) -> bytes:
+    nbytes = int(entry.get("nbytes") or 0)
+    if nbytes <= 0:
+        raise RuntimeError(f"gguf_entry_nbytes_invalid:{entry.get('name')}")
+    local_path = _gguf_local_source_for_shard(shard)
+    if local_path:
+        source_offset = int(entry.get("source_offset") if entry.get("source_offset") is not None else entry.get("offset") or 0)
+        with open(local_path, "rb") as fp:
+            fp.seek(source_offset)
+            data = fp.read(nbytes)
+        if len(data) != nbytes:
+            raise RuntimeError(f"local_gguf_range_incomplete:{len(data)}/{nbytes}:{entry.get('name')}")
+        return data
+    source_url = str(entry.get("source_url") or "")
+    source_offset = int(entry.get("source_offset") or 0)
+    if not source_url:
+        raise RuntimeError(f"gguf_range_source_missing:{entry.get('name')}")
+    req = urllib.request.Request(source_url, method="GET")
+    req.add_header("Range", f"bytes={source_offset}-{source_offset + nbytes - 1}")
+    with _urlopen_worker_download(req, timeout=SHARD_BINARY_FETCH_TIMEOUT_SEC, context=ctx) as resp:
+        data = resp.read()
+    if len(data) != nbytes:
+        raise RuntimeError(f"http_gguf_range_incomplete:{len(data)}/{nbytes}:{entry.get('name')}")
+    return data
+
+
+def _materialize_gguf_ranges_for_pytorch(shard: PipelineShard) -> dict[str, Any]:
+    """Proof-only bridge: dequantize the assigned GGUF tensors into fp16 PyTorch weights.
+
+    This is intentionally gated by VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD and exists
+    only to prove CUDA workers can execute real assigned Llama layers before a native
+    llama.cpp CUDA shard-forward path exists.
+    """
+    entries = list(getattr(shard, "gguf_tensor_index", []) or [])
+    if not entries:
+        raise RuntimeError("gguf_tensor_index_empty")
+    try:
+        from gguf_mlx_backend import _dequantize, _map_gguf_name
+    except Exception as exc:
+        raise RuntimeError(f"gguf_helpers_import_failed:{exc}") from exc
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    loaded = 0
+    dense_bytes = 0
+    source_bytes = 0
+    read_ms = 0
+    dequant_ms = 0
+    for entry in entries:
+        raw_name = str(entry.get("name") or "")
+        mapped = str(entry.get("mapped_name") or "") or _map_gguf_name(raw_name, int(shard.layer_start))
+        if not mapped:
+            continue
+        t_read = time.perf_counter()
+        data = _read_gguf_entry_bytes(entry, shard, ctx)
+        read_ms += max(0, int((time.perf_counter() - t_read) * 1000))
+        source_bytes += len(data)
+        raw = np.frombuffer(data, dtype=np.uint8)
+        shape = tuple(int(x) for x in (entry.get("shape") or []))
+        t_dequant = time.perf_counter()
+        dense = _dequantize(raw, entry.get("ggml_type"), shape)
+        dequant_ms += max(0, int((time.perf_counter() - t_dequant) * 1000))
+        shard.weight_arrays[mapped] = np.ascontiguousarray(dense.astype(_wire_numpy_dtype("<f2"), copy=False))
+        dense_bytes += int(shard.weight_arrays[mapped].nbytes)
+        loaded += 1
+    if loaded <= 0:
+        raise RuntimeError("gguf_no_mapped_tensors_for_cuda_proof")
+    shard.weights_loaded = loaded
+    shard.weight_bytes = dense_bytes
+    setattr(shard, "weight_load_mode", "gguf_ranges_cuda_proof_fp16")
+    setattr(shard, "model_format", "gguf-ranges-v1")
+    setattr(shard, "cuda_gguf_proof_source_bytes", source_bytes)
+    setattr(shard, "cuda_gguf_proof_read_ms", read_ms)
+    setattr(shard, "cuda_gguf_proof_dequant_ms", dequant_ms)
+    return {
+        "weights_loaded": loaded,
+        "source_gb": round(source_bytes / 1024**3, 3),
+        "dense_gb": round(dense_bytes / 1024**3, 3),
+        "read_ms": read_ms,
+        "dequant_ms": dequant_ms,
+    }
+
+
 def _mlx_strict_no_fallback() -> bool:
     return os.environ.get("VRYX_MLX_STRICT", "0").lower() in ("1", "true", "yes")
 
@@ -296,7 +904,7 @@ def _select_backend(shard: PipelineShard, meta: dict[str, Any]) -> RuntimeBacken
     requested = worker_env_backend or meta_backend or "pytorch"
     if worker_env_backend == "mlx_lm" and meta_backend == "mlx":
         requested = "mlx"
-    print(f"[backend] select: worker_env={worker_env_backend!r} meta={meta_backend!r} → {requested!r}")
+    print(f"[backend] select: worker_env={worker_env_backend!r} meta={meta_backend!r} -> {requested!r}")
     if requested == "mlx":
         if str(getattr(shard, "weight_load_mode", "") or "").lower() == "gguf_ranges":
             try:
@@ -345,10 +953,18 @@ def _select_backend(shard: PipelineShard, meta: dict[str, Any]) -> RuntimeBacken
             return VLLMBackend(shard)
         except Exception as e:
             return PyTorchBackend(shard, requested_backend="vllm", fallback_reason=f"vllm_import_failed:{e}")
+    if requested in ("llama_cpp_cuda", "llamacpp_cuda", "llama_cpp_shard", "llama_cpp_cuda_shard"):
+        return LlamaCppCudaShardBackend(shard, requested_backend=requested)
+    if requested in ("cuda", "pytorch_cuda"):
+        return CUDABackend(shard, requested_backend=requested)
     return PyTorchBackend(shard)
 
 
 _shards: Dict[str, PipelineShard] = {}
+_cuda_direct_models: Dict[str, Any] = {}
+_cuda_direct_tokenizers: Dict[str, Any] = {}
+_cuda_direct_locks: Dict[str, threading.Lock] = {}
+_cuda_direct_stats: Dict[str, dict[str, Any]] = {}
 _mlx_lm_models: Dict[str, Any] = {}
 _mlx_lm_tokenizers: Dict[str, Any] = {}
 _mlx_lm_lock = threading.Lock()
@@ -472,10 +1088,10 @@ def _attention_backend(device: torch.device) -> str:
 
 
 def _quantize_hidden_int8(hidden_states: torch.Tensor) -> dict[str, Any]:
-    hs = hidden_states.detach().float().cpu().numpy()
+    hs = _torch_numpy_le(hidden_states, torch.float32, "<f4")
     max_abs = float(np.max(np.abs(hs))) if hs.size else 1.0
     scale = max(max_abs / 127.0, 1e-8)
-    q = np.clip(np.round(hs / scale), -127, 127).astype(np.int8)
+    q = np.ascontiguousarray(np.clip(np.round(hs / scale), -127, 127).astype(np.int8))
     return {
         "hidden_q_b64": base64.b64encode(q.tobytes()).decode(),
         "hidden_scale": scale,
@@ -486,15 +1102,15 @@ def _quantize_hidden_int8(hidden_states: torch.Tensor) -> dict[str, Any]:
 
 
 def _quantize_hidden_q4(hidden_states: torch.Tensor) -> dict[str, Any]:
-    hs = hidden_states.detach().float().cpu().numpy()
+    hs = _torch_numpy_le(hidden_states, torch.float32, "<f4")
     max_abs = float(np.max(np.abs(hs))) if hs.size else 1.0
     scale = max(max_abs / 7.0, 1e-8)
-    q = np.clip(np.round(hs / scale), -7, 7).astype(np.int8).reshape(-1)
+    q = np.ascontiguousarray(np.clip(np.round(hs / scale), -7, 7).astype(np.int8)).reshape(-1)
     n = q.size
     if n % 2:
         q = np.pad(q, (0, 1), mode="constant")
     nibbles = (q.astype(np.int16) + 8).astype(np.uint8)
-    packed = (nibbles[0::2] & 0x0F) | ((nibbles[1::2] & 0x0F) << 4)
+    packed = np.ascontiguousarray((nibbles[0::2] & 0x0F) | ((nibbles[1::2] & 0x0F) << 4))
     return {
         "hidden_q4_b64": base64.b64encode(packed.tobytes()).decode(),
         "hidden_scale": scale,
@@ -511,35 +1127,35 @@ def _decode_hidden_payload(payload: dict[str, Any], shard: PipelineShard, device
         shape = tuple(int(x) for x in payload.get("hidden_shape", []))
         scale = float(payload.get("hidden_scale") or 1.0)
         total = int(payload.get("hidden_q4_len") or np.prod(shape))
-        packed = np.frombuffer(raw, dtype=np.uint8)
+        packed = np.frombuffer(raw, dtype=np.uint8).copy()
         lo = (packed & 0x0F).astype(np.int8) - 8
         hi = ((packed >> 4) & 0x0F).astype(np.int8) - 8
         q = np.empty(packed.size * 2, dtype=np.int8)
         q[0::2] = lo
         q[1::2] = hi
         q = q[:total].reshape(shape)
-        hs = q.astype(np.float32) * scale
+        hs = q.astype(_wire_numpy_dtype("<f4"), copy=False) * scale
         return torch.from_numpy(hs).to(device=device, dtype=dtype)
 
     if payload.get("hidden_q_b64"):
         raw = base64.b64decode(payload.get("hidden_q_b64", ""))
         shape = tuple(int(x) for x in payload.get("hidden_shape", []))
         scale = float(payload.get("hidden_scale") or 1.0)
-        q = np.frombuffer(raw, dtype=np.int8).reshape(shape)
-        hs = q.astype(np.float32) * scale
+        q = np.frombuffer(raw, dtype=np.int8).reshape(shape).copy()
+        hs = q.astype(_wire_numpy_dtype("<f4"), copy=False) * scale
         return torch.from_numpy(hs).to(device=device, dtype=dtype)
 
     if payload.get("hidden_fp16_b64"):
         raw = base64.b64decode(payload.get("hidden_fp16_b64", ""))
         shape = tuple(int(x) for x in payload.get("hidden_shape", []))
-        hs = np.frombuffer(raw, dtype=np.float16).reshape(shape)
+        hs = np.frombuffer(raw, dtype=_wire_numpy_dtype("<f2")).reshape(shape).copy()
         return torch.from_numpy(hs).to(device=device, dtype=dtype)
 
     hidden_b64 = payload.get("hidden_b64", "")
     if not hidden_b64:
         return None
     hs_bytes = base64.b64decode(hidden_b64)
-    hs_flat = np.frombuffer(hs_bytes, dtype=np.float32)
+    hs_flat = np.frombuffer(hs_bytes, dtype=_wire_numpy_dtype("<f4")).copy()
     seq_len_inferred = len(hs_flat) // shard.hidden_size
     hidden_states = torch.from_numpy(hs_flat)
     return hidden_states.reshape(1, seq_len_inferred, shard.hidden_size).to(device=device, dtype=dtype)
@@ -633,6 +1249,13 @@ def _env_truthy(name: str, default: str = "0") -> bool:
 
 _RUNTIME_DIAG_ENV_KEYS = (
     "VRYX_RUNTIME_BACKEND",
+    "VRYX_LLAMA_CPP_SHARD_URL",
+    "VRYX_LLAMA_CPP_SHARD_BIN",
+    "VRYX_LLAMA_CPP_SHARD_TIMEOUT_SEC",
+    "VRYX_LLAMA_CPP_RPC_SERVERS",
+    "VRYX_LLAMA_CPP_RPC_PORT",
+    "VRYX_LLAMA_CPP_CUDA_EXPERIMENTAL_TORCH_BRIDGE",
+    "VRYX_LLAMA_CPP_CUDA_BRIDGE_PRIORITY",
     "VRYX_ENABLE_MLX_RUNTIME",
     "VRYX_ENABLE_MLX_KERNELS",
     "VRYX_MLX_SCAN_BACKEND",
@@ -660,6 +1283,8 @@ _RUNTIME_DIAG_ENV_KEYS = (
     "VRYX_HIDDEN_TRANSPORT",
     "VRYX_WEIGHT_QUANTIZATION",
     "VRYX_WORKER_SHARD_ONLY",
+    "VRYX_FORCE_ALL_WORKERS_SHARD",
+    "VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD",
     "VRYX_EXPECT_MODEL_SHARDS_ONLY",
     "VRYX_DISABLE_MLX_LM_DIRECT",
     "VRYX_MLX_PREWARM",
@@ -1213,6 +1838,225 @@ def llama_cpp_direct_generate(raw: bytes) -> bytes:
     }, ensure_ascii=False).encode()
 
 
+def _cuda_direct_memory() -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        return {"cuda_available": False}
+    try:
+        free_b, total_b = torch.cuda.mem_get_info()
+    except Exception:
+        free_b, total_b = 0, 0
+    out: dict[str, Any] = {
+        "cuda_available": True,
+        "cuda_device_name": torch.cuda.get_device_name(0),
+        "cuda_allocated_mb": int(torch.cuda.memory_allocated() / (1024 * 1024)),
+        "cuda_reserved_mb": int(torch.cuda.memory_reserved() / (1024 * 1024)),
+        "cuda_peak_allocated_mb": int(torch.cuda.max_memory_allocated() / (1024 * 1024)),
+    }
+    if total_b:
+        out["cuda_total_mb"] = int(total_b / (1024 * 1024))
+        out["cuda_free_mb"] = int(free_b / (1024 * 1024))
+    return out
+
+
+def _cuda_direct_model_dtype() -> torch.dtype:
+    raw = os.environ.get("VRYX_CUDA_DIRECT_DTYPE", "float16").strip().lower()
+    if raw in ("bf16", "bfloat16") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _cuda_direct_model_id(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("load_model_id")
+        or payload.get("model_id")
+        or payload.get("model")
+        or os.environ.get("VRYX_CUDA_DRAFT_MODEL")
+        or os.environ.get("VRYX_WORKER_MODEL")
+        or "Qwen/Qwen2.5-1.5B-Instruct"
+    ).strip()
+
+
+def _cuda_direct_messages(payload: dict[str, Any], prompt: str) -> list[dict[str, str]]:
+    raw_messages = payload.get("messages")
+    if isinstance(raw_messages, list):
+        messages: list[dict[str, str]] = []
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "user").strip() or "user"
+            content = str(item.get("content") or "").strip()
+            if content:
+                messages.append({"role": role, "content": content})
+        if messages:
+            return messages
+    system = str(payload.get("system") or os.environ.get("VRYX_CUDA_DRAFT_SYSTEM_PROMPT") or "").strip()
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def _cuda_direct_inputs(tokenizer: Any, payload: dict[str, Any]) -> tuple[Any, int, str]:
+    prompt = str(payload.get("prompt") or payload.get("text") or "Bonjour.").strip() or "Bonjour."
+    use_chat_template = str(payload.get("use_chat_template", os.environ.get("VRYX_CUDA_DIRECT_CHAT_TEMPLATE", "1"))).lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    rendered = prompt
+    if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+        try:
+            rendered = tokenizer.apply_chat_template(
+                _cuda_direct_messages(payload, prompt),
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            rendered = prompt
+    inputs = tokenizer(rendered, return_tensors="pt")
+    prompt_tokens = int(inputs["input_ids"].shape[-1])
+    return inputs, prompt_tokens, rendered
+
+
+def _load_cuda_direct_model(model_id: str) -> tuple[Any, Any, int, bool]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuda_direct_unavailable:torch.cuda.is_available_false")
+    lock = _cuda_direct_locks.setdefault(model_id, threading.Lock())
+    with lock:
+        if model_id in _cuda_direct_models and model_id in _cuda_direct_tokenizers:
+            return _cuda_direct_models[model_id], _cuda_direct_tokenizers[model_id], 0, True
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        t0 = time.perf_counter()
+        dtype = _cuda_direct_model_dtype()
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+        model.to("cuda")
+        model.eval()
+        _cuda_direct_models[model_id] = model
+        _cuda_direct_tokenizers[model_id] = tokenizer
+        load_ms = int((time.perf_counter() - t0) * 1000)
+        _cuda_direct_stats[model_id] = {
+            "loads": int((_cuda_direct_stats.get(model_id) or {}).get("loads") or 0) + 1,
+            "last_load_ms": load_ms,
+            "dtype": str(dtype).replace("torch.", ""),
+        }
+        return model, tokenizer, load_ms, False
+
+
+def cuda_direct_generate(raw: bytes) -> bytes:
+    """Direct CUDA generation for small draft/auxiliary models.
+
+    This path is intentionally separate from GGUF shard execution. It is for
+    draft-worker benchmarks and later speculative decoding only.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+        if not isinstance(payload, dict):
+            raise ValueError("payload_not_object")
+    except Exception:
+        return json.dumps({"ok": False, "error": "payload JSON invalide", "runtime_backend": "cuda_direct"}).encode()
+
+    model_id = _cuda_direct_model_id(payload)
+    if not model_id:
+        return json.dumps({"ok": False, "error": "cuda_direct_missing_model_id", "runtime_backend": "cuda_direct"}).encode()
+    max_new_tokens = max(1, min(512, int(payload.get("max_new_tokens") or payload.get("max_tokens") or 16)))
+    temperature = float(payload.get("temperature", 0) or 0)
+    top_p = float(payload.get("top_p", 1.0) or 1.0)
+    do_sample = temperature > 0
+
+    started = time.perf_counter()
+    try:
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        model, tokenizer, load_ms, cache_hit = _load_cuda_direct_model(model_id)
+        inputs, prompt_tokens, rendered_prompt = _cuda_direct_inputs(tokenizer, payload)
+        inputs = {k: v.to("cuda") if hasattr(v, "to") else v for k, v in inputs.items()}
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "use_cache": True,
+            "pad_token_id": tokenizer.eos_token_id,
+        }
+        if do_sample:
+            gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": top_p})
+        else:
+            gen_kwargs["do_sample"] = False
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        gen_t0 = time.perf_counter()
+        with torch.inference_mode():
+            output_ids = model.generate(**inputs, **gen_kwargs)
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        generation_ms = max(1, int((time.perf_counter() - gen_t0) * 1000))
+        prompt_len = int(inputs["input_ids"].shape[-1])
+        generated_ids = output_ids[0, prompt_len:]
+        completion_tokens = int(generated_ids.numel())
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        total_ms = max(1, int((time.perf_counter() - started) * 1000))
+        actual_tps = round(completion_tokens * 1000.0 / generation_ms, 3) if completion_tokens else 0.0
+        stats = _cuda_direct_stats.setdefault(model_id, {})
+        stats.update({
+            "last_generation_ms": generation_ms,
+            "last_completion_tokens": completion_tokens,
+            "last_tps": actual_tps,
+            "last_cache_hit": cache_hit,
+        })
+        result: dict[str, Any] = {
+            "ok": True,
+            "runtime_backend": "cuda_direct",
+            "runtime_backend_detail": "transformers_cuda_fp16",
+            "worker_role": "draft_worker",
+            "fallback": False,
+            "model_id": model_id,
+            "load_model_id": model_id,
+            "cache_hit": cache_hit,
+            "load_ms": load_ms,
+            "generation_ms": generation_ms,
+            "total_ms": total_ms,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "actual_tps": actual_tps,
+            "ms_per_token": int(generation_ms / max(1, completion_tokens)),
+            "requested_max_tokens": max_new_tokens,
+            "effective_max_tokens": max_new_tokens,
+            "draft_acceptance_rate": None,
+            "decode_mode": "cuda_direct_transformers_generate",
+            "sampling": {"temperature": temperature, "top_p": top_p, "do_sample": do_sample},
+            "text": text,
+        }
+        if bool(payload.get("return_rendered_prompt")):
+            result["rendered_prompt"] = rendered_prompt
+        result.update(_cuda_direct_memory())
+        return json.dumps(result, ensure_ascii=False).encode()
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "runtime_backend": "cuda_direct",
+            "runtime_backend_detail": "transformers_cuda_fp16",
+            "fallback": False,
+            "model_id": model_id,
+            "error": f"cuda_direct_generate_failed:{type(exc).__name__}:{exc}",
+            "total_ms": max(1, int((time.perf_counter() - started) * 1000)),
+        }
+        result.update(_cuda_direct_memory())
+        return json.dumps(result, ensure_ascii=False).encode()
+
+
 def mlx_lm_direct_generate(raw: bytes) -> bytes:
     """Génération locale via mlx-lm officiel, sans shard custom VRYX."""
     try:
@@ -1221,7 +2065,13 @@ def mlx_lm_direct_generate(raw: bytes) -> bytes:
         return json.dumps({"ok": False, "error": "payload JSON invalide"}).encode()
 
     model_id = str(payload.get("model_id") or os.environ.get("VRYX_WORKER_MODEL") or "Qwen/Qwen3.5-9B")
-    if _requires_distributed_shards(model_id):
+    allow_distributed_direct = (
+        _env_truthy("VRYX_MLX_LM_DIRECT_ALLOW_DISTRIBUTED")
+        or _env_truthy("VRYX_MLX_LM_DIRECT_M4_ONLY")
+        or bool(payload.get("allow_distributed_direct"))
+        or bool(payload.get("m4_only_direct"))
+    )
+    if _requires_distributed_shards(model_id) and not allow_distributed_direct:
         return json.dumps({
             "ok": False,
             "error": "mlx_lm_direct_disabled: ce modele est reserve au pipeline distribue shard-only",
@@ -1260,6 +2110,92 @@ def mlx_lm_direct_generate(raw: bytes) -> bytes:
     stream_callback_queue: queue.Queue[tuple[str | None, int, int]] = queue.Queue(maxsize=4096)
     stream_callback_done = threading.Event()
     stream_callback_worker: threading.Thread | None = None
+
+    server_url = str(
+        payload.get("mlx_lm_server_url")
+        or payload.get("server_url")
+        or os.environ.get("VRYX_MLX_LM_SERVER_URL")
+        or ""
+    ).strip().rstrip("/")
+    if server_url:
+        try:
+            temperature = float(payload.get("temperature", SAMPLING_TEMPERATURE))
+        except (TypeError, ValueError):
+            temperature = SAMPLING_TEMPERATURE
+        try:
+            top_p = float(payload.get("top_p", SAMPLING_TOP_P))
+        except (TypeError, ValueError):
+            top_p = SAMPLING_TOP_P
+        try:
+            top_k = int(payload.get("top_k", SAMPLING_TOP_K))
+        except (TypeError, ValueError):
+            top_k = SAMPLING_TOP_K
+        messages = []
+        if not payload.get("formatted_prompt"):
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        body = {
+            "model": load_model_id,
+            "messages": messages,
+            "temperature": max(0.0, min(2.0, temperature)),
+            "top_p": max(0.0, min(1.0, top_p)),
+            "top_k": max(0, min(200, top_k)),
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        t0 = time.perf_counter()
+        try:
+            req = urllib.request.Request(
+                f"{server_url}/v1/chat/completions",
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=MLX_LM_MAX_SECONDS) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            generation_ms = max(1, int((time.perf_counter() - t0) * 1000))
+            choice = (data.get("choices") or [{}])[0] if isinstance(data.get("choices"), list) else {}
+            msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            text = str(msg.get("content") or choice.get("text") or "")
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            completion_tokens = int(usage.get("completion_tokens") or max(1, len(text.split())))
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            return json.dumps({
+                "ok": True,
+                "runtime_backend": "mlx_lm",
+                "model_id": model_id,
+                "load_model_id": load_model_id,
+                "text": text.strip(),
+                "completion_tokens": completion_tokens,
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "load_ms": 0,
+                "mlx_lm_load_ms": 0,
+                "cache_hit": True,
+                "cache_status": "server",
+                "resident_model": True,
+                "model_cache_size": 1,
+                "generation_ms": generation_ms,
+                "ttft_ms": None,
+                "token_events": [],
+                "requested_max_tokens": requested_max_tokens,
+                "effective_max_tokens": max_tokens,
+                "stop_reason": choice.get("finish_reason") or "unknown",
+                "actual_tps": round(completion_tokens * 1000.0 / generation_ms, 3),
+                "decode_mode": "mlx_lm_server_chat_completions",
+                "prompt_format": "server_chat_template",
+                "sampling": body,
+                "mlx_lm_server_url": server_url,
+            }, ensure_ascii=False).encode()
+        except Exception as exc:
+            return json.dumps({
+                "ok": False,
+                "error": f"mlx_lm_server_generate_failed:{type(exc).__name__}:{exc}",
+                "runtime_backend": "mlx_lm",
+                "model_id": model_id,
+                "load_model_id": load_model_id,
+                "mlx_lm_server_url": server_url,
+            }, ensure_ascii=False).encode()
 
     def _post_stream_token(piece: str, index: int, elapsed_ms: int, timeout_sec: float = 2.0) -> None:
         try:
@@ -1715,8 +2651,23 @@ def shard_init(session_id: str, ttl_sec: int, layer_start: int, layer_end: int, 
 def shard_unload(session_id: str) -> str:
     _sessions.pop(session_id, None)
     s = _shards.pop(session_id, None)
-    if s and s.model_slice is not None:
-        del s.model_slice
+    if s is not None:
+        backend = getattr(s, "backend", None)
+        if backend is not None:
+            try:
+                backend.unload()
+            except Exception:
+                pass
+        if s.model_slice is not None:
+            del s.model_slice
+        s.kv_cache = None
+        s.weight_arrays.clear()
+    try:
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
     return f"ok unload {session_id}"
 
 
@@ -1724,11 +2675,11 @@ def ephemeral_layer_forward(activation_bytes: bytes, layer_id: int, session_id: 
     """Fallback shard forward — retourne les bytes tels quels avec compute fictif."""
     t0 = time.perf_counter()
     if not activation_bytes:
-        out = np.zeros(1, dtype=np.float16).tobytes()
+        out = np.zeros(1, dtype=_wire_numpy_dtype("<f2")).tobytes()
     else:
         try:
-            arr = np.frombuffer(activation_bytes, dtype=np.float16).copy()
-            out = (arr * 1.0).tobytes()  # identité
+            arr = np.frombuffer(activation_bytes, dtype=_wire_numpy_dtype("<f2")).copy()
+            out = np.ascontiguousarray(arr * 1.0, dtype=_wire_numpy_dtype("<f2")).tobytes()  # identité
         except Exception:
             out = activation_bytes
     compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
@@ -2047,10 +2998,10 @@ def _array_from_raw_file(path: str, dtype_name: str, offset: int, shape: tuple[i
     """
     dtype_norm = str(dtype_name or "float16").lower()
     if dtype_norm in ("bfloat16", "bf16"):
-        raw = np.memmap(path, dtype=np.uint16, mode="r", offset=offset, shape=shape)
+        raw = np.memmap(path, dtype=np.dtype("<u2"), mode="r", offset=offset, shape=shape)
         fp32 = (np.asarray(raw, dtype=np.uint32) << np.uint32(16)).view(np.float32)
-        return fp32.astype(np.float16, copy=False)
-    mm = np.memmap(path, dtype=np.dtype(dtype_norm), mode="r", offset=offset, shape=shape)
+        return np.ascontiguousarray(fp32.astype(_wire_numpy_dtype("<f2"), copy=False))
+    mm = np.memmap(path, dtype=_wire_numpy_dtype(dtype_norm), mode="r", offset=offset, shape=shape)
     return np.array(mm, copy=True)
 
 
@@ -2088,6 +3039,21 @@ def pipeline_shard_init(meta_json: bytes) -> str:
     setattr(_shards[sid], "hidden_transport", str(meta.get("hidden_transport") or HIDDEN_TRANSPORT))
     setattr(_shards[sid], "weight_quantization", str(meta.get("weight_quantization") or "fp16"))
     setattr(_shards[sid], "runtime_backend", str(meta.get("runtime_backend") or "pytorch"))
+    setattr(_shards[sid], "peer_id", str(meta.get("peer_id") or meta.get("worker_peer") or os.environ.get("VRYX_PEER_ID", "")))
+    setattr(_shards[sid], "group_id", str(meta.get("group_id") or meta.get("pool_id") or ""))
+    setattr(_shards[sid], "next_peer_id", str(meta.get("next_peer_id") or ""))
+    setattr(_shards[sid], "model_format", str(meta.get("model_format") or ""))
+    setattr(_shards[sid], "local_model_path", str(meta.get("local_model_path") or ""))
+    setattr(
+        _shards[sid],
+        "force_all_workers_shard",
+        bool(meta.get("force_all_workers_shard") or _runtime_flag_enabled("VRYX_FORCE_ALL_WORKERS_SHARD")),
+    )
+    setattr(
+        _shards[sid],
+        "experimental_multi_backend_shard",
+        bool(meta.get("experimental_multi_backend_shard") or _runtime_flag_enabled("VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD")),
+    )
     setattr(_shards[sid], "supports_q4_weights", bool(meta.get("supports_q4_weights", False)))
     setattr(_shards[sid], "supports_mlx", bool(meta.get("supports_mlx", False)))
     setattr(_shards[sid], "supports_vllm", bool(meta.get("supports_vllm", False)))
@@ -2135,6 +3101,14 @@ def pipeline_shard_init(meta_json: bytes) -> str:
 
             shard = _shards[sid]
             n_weights = 0
+            for key in ("group_id", "peer_id", "next_peer_id", "model_format", "local_model_path"):
+                value = shard_data.get(key)
+                if value not in (None, ""):
+                    setattr(shard, key, str(value))
+            if shard_data.get("format") and not getattr(shard, "model_format", ""):
+                setattr(shard, "model_format", str(shard_data.get("format") or ""))
+            if shard_data.get("backend") and not getattr(shard, "runtime_backend", ""):
+                setattr(shard, "runtime_backend", str(shard_data.get("backend") or ""))
 
             # Format binaire compact (manifest .json + .bin séparé) avec download chunké + retry
             bin_url = shard_data.get("binary_url")
@@ -2150,7 +3124,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                     f"{len(tensor_sources)} tenseurs ({expected / 1e6:.1f} MB)"
                 )
 
-                cache_dir = os.environ.get("VRYX_WORKER_SHARD_CACHE_DIR", "/tmp/vryx-worker-shards")
+                cache_dir = _worker_shard_cache_dir()
                 os.makedirs(cache_dir, exist_ok=True)
                 model_cache_key = "".join(
                     ch if ch.isalnum() or ch in ("-", "_") else "_"
@@ -2277,7 +3251,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                 print(f"[shard] Téléchargement binaire depuis {bin_url} ({expected / 1e6:.1f} MB)")
 
                 # Download direct vers SSD + memmap : évite bytearray -> bytes -> copies RAM.
-                cache_dir = os.environ.get("VRYX_WORKER_SHARD_CACHE_DIR", "/tmp/vryx-worker-shards")
+                cache_dir = _worker_shard_cache_dir()
                 os.makedirs(cache_dir, exist_ok=True)
                 model_cache_key = "".join(
                     ch if ch.isalnum() or ch in ("-", "_") else "_"
@@ -2340,7 +3314,7 @@ def pipeline_shard_init(meta_json: bytes) -> str:
                     try:
                         arr_bytes = base64.b64decode(w["b64"])
                         shape = tuple(int(x) for x in w["shape"])
-                        dtype = np.dtype(w["dtype"])
+                        dtype = _wire_numpy_dtype(w["dtype"])
                         arr = np.frombuffer(arr_bytes, dtype=dtype).reshape(shape).copy()
                         shard.weight_arrays[param_name] = arr
                         n_weights += 1
@@ -2418,7 +3392,7 @@ def pipeline_shard_load(load_json: bytes) -> str:
     dtype_str = str(meta.get("dtype", "float16"))
     data_b64 = meta.get("data_b64", "")
     raw = base64.b64decode(data_b64)
-    dtype = np.dtype(dtype_str)
+    dtype = _wire_numpy_dtype(dtype_str)
     arr = np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
     shard.weight_arrays[param_name] = arr
     shard.weights_loaded = len(shard.weight_arrays)
@@ -2449,7 +3423,7 @@ def pipeline_shard_build(sid: str) -> str:
                 result["runtime_fallback_disabled"] = True
                 result["runtime_fallback_reason"] = reason
                 return json.dumps(result)
-            print(f"[backend] fallback {getattr(shard.backend, 'name', 'unknown')} → pytorch : {reason}")
+            print(f"[backend] fallback {getattr(shard.backend, 'name', 'unknown')} -> pytorch : {reason}")
             shard.backend = PyTorchBackend(shard, requested_backend=getattr(shard, "runtime_backend", "mlx"), fallback_reason=reason)
             result = shard.backend.build()
             result["runtime_fallback_reason"] = reason
@@ -2609,10 +3583,12 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
     use_kv_cache = bool(payload.get("use_kv_cache", getattr(shard, "worker_kv_cache", WORKER_KV_CACHE)))
     requested_decode_mode = str(payload.get("decode_mode") or ("prefill_full_context" if step == 0 else "full_context_fallback"))
     stateful_required = bool(payload.get("stateful_required") or requested_decode_mode == "single_token_stateful")
+    kv_cache_ready_before = shard.kv_cache is not None
     if step == 0:
         shard.kv_cache = None
         if request_id != "default":
             kv_caches.pop(request_id, None)
+        kv_cache_ready_before = False
 
     with torch.no_grad():
         is_gpt2 = _is_gpt2(shard)
@@ -2635,6 +3611,12 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
             if hidden_states.dim() == 2:
                 hidden_states = hidden_states.unsqueeze(0)
             current_seq_len = int(hidden_states.shape[1])
+        received_hidden_trace = _torch_hidden_checksum(hidden_states)
+
+        if step > 0 and requested_decode_mode == "full_context_fallback":
+            use_kv_cache = False
+            stateful_required = False
+            seq_pos = 0
 
         if step > 0 and use_kv_cache and requested_decode_mode == "single_token_stateful" and current_seq_len != 1:
             return json.dumps({
@@ -2646,15 +3628,42 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
                 "decode_mode": "full_context_fallback",
             }).encode()
         if step > 0 and stateful_required and use_kv_cache and shard.kv_cache is None:
-            return json.dumps({
-                "ok": False,
-                "error": "KV cache stateful manquant : refus du full prefill fallback",
-                "session_id": sid,
-                "step": step,
-                "seq_pos": seq_pos,
-                "decode_mode": "single_token_stateful",
-                "kv_cache": False,
-            }).encode()
+            history_ids = payload.get("history_token_ids")
+            if shard.has_embedding and isinstance(history_ids, list) and history_ids:
+                try:
+                    token_ids = torch.tensor([int(x) for x in history_ids], dtype=torch.long, device=device)
+                    if is_gpt2:
+                        pos = torch.arange(0, len(token_ids), dtype=torch.long, device=device)
+                        tok_emb = model.wte(token_ids).to(dtype)
+                        pos_emb = model.wpe(pos).to(dtype)
+                        hidden_states = (tok_emb + pos_emb).unsqueeze(0)
+                    else:
+                        hidden_states = model.embed_tokens(token_ids).to(dtype).unsqueeze(0)
+                    current_seq_len = len(token_ids)
+                    seq_pos = 0
+                    use_kv_cache = False
+                    stateful_required = False
+                    requested_decode_mode = "full_context_fallback"
+                except Exception as fallback_error:
+                    return json.dumps({
+                        "ok": False,
+                        "error": f"KV cache stateful manquant et fallback full-context impossible : {fallback_error}",
+                        "session_id": sid,
+                        "step": step,
+                        "seq_pos": seq_pos,
+                        "decode_mode": "single_token_stateful",
+                        "kv_cache": False,
+                    }).encode()
+            else:
+                return json.dumps({
+                    "ok": False,
+                    "error": "KV cache stateful manquant : refus du full prefill fallback",
+                    "session_id": sid,
+                    "step": step,
+                    "seq_pos": seq_pos,
+                    "decode_mode": "single_token_stateful",
+                    "kv_cache": False,
+                }).encode()
         decode_mode = (
             "prefill_full_context"
             if step == 0
@@ -2771,6 +3780,18 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
         shard.seq_position = seq_pos + current_seq_len
         compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
         shard.last_forward_ms = compute_ms
+        output_hidden_trace = _torch_hidden_checksum(hidden_states)
+        proof_trace = _sharding_proof_trace(
+            shard,
+            backend=getattr(shard.backend, "name", getattr(shard, "runtime_backend", "pytorch")),
+            received_hidden=received_hidden_trace,
+            output_hidden=output_hidden_trace,
+            compute_ms=compute_ms,
+            step=step,
+            seq_pos=out_seq_pos,
+            kv_cache_created=bool(use_kv_cache and shard.kv_cache is not None and not kv_cache_ready_before),
+            kv_cache_reused=bool(use_kv_cache and step > 0 and kv_cache_ready_before),
+        )
 
         # ── Sortie ─────────────────────────────────────────────────────────────
         if shard.has_lm_head:
@@ -2806,6 +3827,7 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
                 "hidden_quic": bool(payload.get("hidden_quic", getattr(shard, "hidden_quic", HIDDEN_QUIC))),
                 "quic_used": False,
             }
+            _attach_sharding_proof(response, proof_trace)
             debug_top_logits = _debug_top_logits_torch(logits)
             if debug_top_logits:
                 response["debug_top_logits"] = debug_top_logits
@@ -2820,7 +3842,7 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
             elif transport == "int8":
                 hidden_payload = _quantize_hidden_int8(hidden_states)
             elif transport == "fp16":
-                hs_out = hidden_states.detach().to(torch.float16).cpu().numpy()
+                hs_out = _torch_numpy_le(hidden_states, torch.float16, "<f2")
                 hidden_payload = {
                     "hidden_fp16_b64": base64.b64encode(hs_out.tobytes()).decode(),
                     "hidden_shape": list(hs_out.shape),
@@ -2845,12 +3867,14 @@ def _pytorch_pipeline_shard_forward(data: bytes, session_id: str) -> bytes:
                 "effective_quantization": transport,
                 "quantization_fallback_reason": fallback_reason,
                 "kv_cache": bool(use_kv_cache),
+                "use_kv_cache": bool(use_kv_cache),
                 "decode_mode": decode_mode,
                 "attention_backend": getattr(model, "vryx_attention_backend", "unknown"),
                 "hidden_quic": bool(payload.get("hidden_quic", getattr(shard, "hidden_quic", HIDDEN_QUIC))),
                 "quic_used": False,
             }
             out.update(hidden_payload)
+            _attach_sharding_proof(out, proof_trace)
             return json.dumps(out).encode()
 
     # Unreachable but satisfies type checker
@@ -2951,6 +3975,9 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "session_id": sid,
             "model_id": shard.model_id,
             "pool_id": shard.pool_id,
+            "group_id": getattr(shard, "group_id", ""),
+            "peer_id": getattr(shard, "peer_id", ""),
+            "next_peer_id": getattr(shard, "next_peer_id", ""),
             "layer_start": shard.layer_start,
             "layer_end": shard.layer_end,
             "num_layers": max(0, shard.layer_end - shard.layer_start + 1),
@@ -2969,6 +3996,8 @@ def pipeline_shard_status(status_json: bytes = b"") -> str:
             "load_error": str(getattr(shard, "load_error", "") or ""),
             "build_error": str(getattr(shard, "build_error", "") or ""),
             "weight_load_mode": getattr(shard, "weight_load_mode", "memory"),
+            "model_format": getattr(shard, "model_format", ""),
+            "local_model_path": getattr(shard, "local_model_path", ""),
             "download_ms": shard.download_ms,
             "build_ms": shard.build_ms,
             "last_forward_ms": shard.last_forward_ms,

@@ -125,6 +125,7 @@ def _summary(label: str, tokens: int, status: int, data: dict[str, Any], wall_ms
         "tokens_requested": tokens,
         "http_status": status,
         "ok": bool(data.get("ok")) and status < 400,
+        "text": str(data.get("response") or data.get("text") or "")[:160],
         "completion_tokens": data.get("completion_tokens"),
         "client_wall_ms": wall_ms,
         "session_id": trace.get("session_id"),
@@ -204,6 +205,9 @@ def main() -> int:
         "pool_preference": os.environ.get("VRYX_CHAIN_BENCH_POOL", "auto"),
         "force_distributed": True,
     }
+    prepared_split_id = os.environ.get("VRYX_CHAIN_BENCH_PREPARED_SPLIT_ID", "").strip()
+    if prepared_split_id:
+        common["prepared_split_id"] = prepared_split_id
     if bench_ignore_eos or bench_force_tokens:
         common["bench_ignore_eos"] = bool(bench_ignore_eos or bench_force_tokens)
     if bench_force_tokens:

@@ -84,6 +84,7 @@ def _summary(label: str, status: int, data: dict[str, Any], wall_ms: int) -> dic
         "http_status": status,
         "client_wall_ms": wall_ms,
         "latency_ms": data.get("latency_ms"),
+        "text": str(data.get("response") or data.get("text") or "")[:160],
         "completion_tokens": data.get("completion_tokens"),
         "session_id": trace.get("session_id"),
         "session_reused": trace.get("session_reused"),
@@ -113,6 +114,9 @@ def main() -> int:
         "decode_microbatch_cap": 1,
         "temperature": 0,
     }
+    prepared_split_id = os.environ.get("VRYX_MLX_PREFETCH_SMOKE_PREPARED_SPLIT_ID", "").strip()
+    if prepared_split_id:
+        base_payload["prepared_split_id"] = prepared_split_id
     first_status, first_data, first_wall = _post(url, base_payload, timeout)
     first = _summary("first_forward", first_status, first_data, first_wall)
     if not first["ok"] and os.environ.get("VRYX_MLX_PREFETCH_SMOKE_RUN_SECOND_ON_FIRST_FAIL", "0").strip().lower() not in ("1", "true", "yes", "on"):

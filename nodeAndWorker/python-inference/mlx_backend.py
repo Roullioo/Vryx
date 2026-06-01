@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import base64
 import gc
+import hashlib
 import json
 import os
-import resource
 import time
 from typing import Any
 
 import numpy as np
+
+try:
+    import resource  # type: ignore
+except Exception:
+    resource = None
 
 try:
     from mlx_state_pages import StatePageAllocator
@@ -32,8 +37,96 @@ _SCAN_BACKEND_ENV = "VRYX_MLX_SCAN_BACKEND"
 _SCAN_BACKENDS = {"python", "chunked", "metal"}
 
 
+def _wire_numpy_dtype(dtype: str | np.dtype) -> np.dtype:
+    parsed = np.dtype(dtype)
+    if parsed.kind == "f" and parsed.itemsize == 2:
+        return np.dtype("<f2")
+    if parsed.kind == "f" and parsed.itemsize == 4:
+        return np.dtype("<f4")
+    return parsed
+
+
+def _mlx_wire_numpy(arr: Any, dtype: str | np.dtype) -> np.ndarray:
+    return np.ascontiguousarray(np.array(arr, copy=True)).astype(_wire_numpy_dtype(dtype), copy=False)
+
+
+def _mlx_hidden_checksum(mx: Any, tensor: Any) -> dict[str, Any]:
+    tensor_f16 = tensor.astype(mx.float16)
+    mx.eval(tensor_f16)
+    arr = _mlx_wire_numpy(tensor_f16, "<f2")
+    return {
+        "checksum": hashlib.sha256(arr.tobytes()).hexdigest()[:24],
+        "dtype": "fp16",
+        "shape": [int(x) for x in arr.shape],
+        "bytes": int(arr.nbytes),
+        "has_nan": bool(np.isnan(arr).any()) if arr.size else False,
+        "has_inf": bool(np.isinf(arr).any()) if arr.size else False,
+    }
+
+
+def _mlx_sharding_proof_trace(
+    shard: Any,
+    *,
+    backend: str,
+    received_hidden: dict[str, Any] | None,
+    output_hidden: dict[str, Any] | None,
+    compute_ms: int,
+    step: int,
+    seq_pos: int,
+    kv_cache_created: bool,
+    kv_cache_reused: bool,
+) -> dict[str, Any]:
+    return {
+        "worker_peer": str(getattr(shard, "peer_id", "") or os.environ.get("VRYX_PEER_ID", "")),
+        "group_id": str(getattr(shard, "group_id", "") or ""),
+        "backend": backend,
+        "runtime_backend": "mlx",
+        "layer_start": int(getattr(shard, "layer_start", 0)),
+        "layer_end": int(getattr(shard, "layer_end", 0)),
+        "model_format": str(getattr(shard, "model_format", "") or getattr(shard, "weight_load_mode", "") or "memory"),
+        "local_model_path": str(getattr(shard, "local_model_path", "") or ""),
+        "next_peer_id": str(getattr(shard, "next_peer_id", "") or ""),
+        "received_hidden_checksum": (received_hidden or {}).get("checksum"),
+        "received_hidden_shape": (received_hidden or {}).get("shape"),
+        "received_hidden_dtype": (received_hidden or {}).get("dtype"),
+        "received_hidden_has_nan": bool((received_hidden or {}).get("has_nan", False)),
+        "output_hidden_checksum": (output_hidden or {}).get("checksum"),
+        "output_hidden_shape": (output_hidden or {}).get("shape"),
+        "output_hidden_dtype": (output_hidden or {}).get("dtype"),
+        "output_hidden_has_nan": bool((output_hidden or {}).get("has_nan", False)),
+        "compute_ms": int(compute_ms),
+        "transfer_to_next_ms": 0,
+        "kv_cache_created": bool(kv_cache_created),
+        "kv_cache_reused": bool(kv_cache_reused),
+        "fallback": False,
+        "step": int(step),
+        "seq_pos": int(seq_pos),
+    }
+
+
+def _attach_mlx_sharding_proof(response: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any]:
+    response["sharding_proof"] = proof
+    trace = response.get("transport_trace")
+    if not isinstance(trace, dict):
+        trace = {}
+    trace["sharding_proof"] = proof
+    trace.setdefault("worker_peer", proof.get("worker_peer"))
+    trace.setdefault("backend", proof.get("backend"))
+    trace.setdefault("layer_start", proof.get("layer_start"))
+    trace.setdefault("layer_end", proof.get("layer_end"))
+    trace.setdefault("fallback", False)
+    response["transport_trace"] = trace
+    return response
+
+
 def _rss_mb() -> float:
     """RSS approximatif du process courant, en MB."""
+    if resource is None:
+        try:
+            import psutil  # type: ignore
+            return float(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024))
+        except Exception:
+            return 0.0
     usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # macOS retourne des octets, Linux des KB.
     return float(usage / (1024 * 1024) if usage > 10_000_000 else usage / 1024)
@@ -118,16 +211,20 @@ def _mx_rope_freqs(mx, head_dim: int, max_len: int, theta: float = 1_000_000.0) 
 
 def _mx_apply_rope(mx, q: Any, k: Any, pos_ids: Any, cos: Any, sin: Any) -> tuple:
     """Apply RoPE to q and k — both [B, num_heads, L, head_dim]."""
-    half = q.shape[-1] // 2
+    half = int(cos.shape[-1])
+    rotary_dim = half * 2
     cos_pos = cos[pos_ids]   # [B, L, half] or [L, half]
     sin_pos = sin[pos_ids]
 
     def rotate(x: Any) -> Any:
-        x1, x2 = x[..., :half], x[..., half:]
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
+        x1, x2 = x_rot[..., :half], x_rot[..., half:]
         # broadcast cos/sin over heads dimension
         c = mx.expand_dims(cos_pos, axis=-3) if x.ndim == 4 else cos_pos
         s = mx.expand_dims(sin_pos, axis=-3) if x.ndim == 4 else sin_pos
-        return mx.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1)
+        x_embed = mx.concatenate([x1 * c - x2 * s, x1 * s + x2 * c], axis=-1)
+        return mx.concatenate([x_embed, x_pass], axis=-1) if int(x_pass.shape[-1]) > 0 else x_embed
 
     return rotate(q), rotate(k)
 
@@ -258,6 +355,50 @@ def _mx_sigmoid(mx, x: Any) -> Any:
     return mx.sigmoid(x)
 
 
+def _sanitize_nonfinite_enabled() -> bool:
+    return os.environ.get("VRYX_MLX_SANITIZE_NONFINITE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _mx_sanitize_nonfinite(mx: Any, x: Any, label: str, *, replacement: float = 0.0) -> tuple[Any, dict[str, Any]]:
+    if not _sanitize_nonfinite_enabled():
+        return x, {}
+    try:
+        finite = mx.isfinite(x)
+        total = int(np.prod([int(dim) for dim in getattr(x, "shape", [])]) or 0)
+        finite_count_mx = mx.sum(finite.astype(mx.int32))
+        mx.eval(finite_count_mx)
+        finite_count = int(np.array(finite_count_mx, copy=False))
+        bad_count = max(0, total - finite_count)
+        if bad_count <= 0:
+            return x, {f"{label}_nonfinite_count": 0}
+        repl = mx.zeros_like(x) + replacement
+        cleaned = mx.where(finite, x, repl)
+        mx.eval(cleaned)
+        print(f"[mlx] nonfinite-sanitize label={label} count={bad_count}/{total}")
+        return cleaned, {f"{label}_nonfinite_count": bad_count, f"{label}_sanitized": True}
+    except Exception as exc:
+        return x, {f"{label}_sanitize_error": f"{type(exc).__name__}:{exc}"}
+
+
+def _hidden_clip_abs() -> float:
+    try:
+        return max(0.0, float(os.environ.get("VRYX_MLX_HIDDEN_CLIP_ABS", "0") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mx_clip_hidden(mx: Any, x: Any, label: str) -> tuple[Any, dict[str, Any]]:
+    clip_abs = _hidden_clip_abs()
+    if clip_abs <= 0:
+        return x, {}
+    try:
+        clipped = mx.clip(x, -clip_abs, clip_abs)
+        mx.eval(clipped)
+        return clipped, {f"{label}_clip_abs": clip_abs}
+    except Exception as exc:
+        return x, {f"{label}_clip_error": f"{type(exc).__name__}:{exc}"}
+
+
 def _causal_conv1d_mlx(mx, x_bcl: Any, weight: Any, bias: Any | None = None) -> Any:
     """Depthwise causal Conv1d via mx.conv1d (évite la boucle Python sur le kernel)."""
     bsz, channels, seq_len = x_bcl.shape
@@ -301,14 +442,75 @@ def _linear_attn_shapes(weights: dict[str, Any], prefix: str) -> dict[str, Any]:
     return {k: tuple(weights[f"{prefix}.linear_attn.{k}"].shape) for k in keys if f"{prefix}.linear_attn.{k}" in weights}
 
 
-def _debug_top_logits_mx(mx: Any, logits: Any, k: int = 10) -> list[dict[str, float | int]]:
-    if os.environ.get("VRYX_DEBUG_TOP_LOGITS", "0").lower() not in ("1", "true", "yes"):
-        return []
-    arr = np.asarray(mx.array(logits).tolist(), dtype=np.float32).reshape(-1)
-    k = max(1, min(k, int(arr.size)))
-    idx = np.argpartition(-arr, k - 1)[:k]
-    idx = idx[np.argsort(-arr[idx])]
-    return [{"id": int(i), "logit": float(arr[i])} for i in idx]
+def _debug_logits_mx(mx: Any, logits: Any, k: int = 10, *, force: bool = False) -> dict[str, Any]:
+    if not force and os.environ.get("VRYX_DEBUG_TOP_LOGITS", "0").lower() not in ("1", "true", "yes"):
+        return {}
+    try:
+        arr = np.asarray(mx.array(logits).tolist(), dtype=np.float32).reshape(-1)
+        if arr.size <= 0:
+            return {"debug_logits_error": "empty_logits"}
+        finite = np.isfinite(arr)
+        k = max(1, min(k, int(arr.size)))
+        idx = np.argpartition(-arr, k - 1)[:k]
+        idx = idx[np.argsort(-arr[idx])]
+        return {
+            "debug_top_logits": [{"id": int(i), "logit": float(arr[i])} for i in idx],
+            "debug_logits_stats": {
+                "vocab_size": int(arr.size),
+                "finite_count": int(finite.sum()),
+                "nan_count": int(np.isnan(arr).sum()),
+                "inf_count": int(np.isinf(arr).sum()),
+                "min": float(np.nanmin(arr)),
+                "max": float(np.nanmax(arr)),
+                "mean": float(np.nanmean(arr)),
+                "std": float(np.nanstd(arr)),
+                "argmax_id": int(idx[0]),
+                "argmax_logit": float(arr[idx[0]]),
+            },
+        }
+    except Exception as exc:
+        return {"debug_logits_error": f"{type(exc).__name__}:{exc}"}
+
+
+def _quality_trace_enabled(payload: dict[str, Any]) -> bool:
+    if bool(payload.get("quality_trace")):
+        return True
+    return os.environ.get("VRYX_QUALITY_TRACE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _quality_tensor_trace(mx: Any, tensor: Any, label: str, *, max_values: int = 4096) -> dict[str, Any]:
+    """Cheap deterministic tensor fingerprint for shard/full quality comparisons."""
+    try:
+        mx.eval(tensor)
+        arr = np.asarray(tensor, dtype=np.float32).reshape(-1)
+        total = int(arr.size)
+        if total <= 0:
+            return {f"{label}_numel": 0, f"{label}_checksum": "empty"}
+        if total > max_values:
+            idx = np.linspace(0, total - 1, max_values, dtype=np.int64)
+            sample = arr[idx]
+        else:
+            sample = arr
+        finite = np.isfinite(sample)
+        import hashlib
+        digest = hashlib.sha256(np.ascontiguousarray(sample).tobytes()).hexdigest()[:16]
+        out: dict[str, Any] = {
+            f"{label}_checksum": digest,
+            f"{label}_numel": total,
+            f"{label}_sample_count": int(sample.size),
+            f"{label}_nan_count": int(np.isnan(sample).sum()),
+            f"{label}_inf_count": int(np.isinf(sample).sum()),
+        }
+        if finite.any():
+            finite_values = sample[finite]
+            out.update({
+                f"{label}_mean": float(np.mean(finite_values)),
+                f"{label}_std": float(np.std(finite_values)),
+                f"{label}_max_abs": float(np.max(np.abs(finite_values))),
+            })
+        return out
+    except Exception as exc:
+        return {f"{label}_checksum_error": f"{type(exc).__name__}:{exc}"}
 
 
 # ── Principal ─────────────────────────────────────────────────────────────────
@@ -500,16 +702,39 @@ class MLXBackend:
                 dense_bias = dense_bias[expert_idx]
         if scales is not None:
             cfg = self._quant_cfg(prefix)
-            y = mx.quantized_matmul(
-                x,
-                w,
-                scales=scales,
-                biases=biases,
-                transpose=True,
-                group_size=int(cfg.get("group_size") or 64),
-                bits=int(cfg.get("bits") or 4),
-                mode=str(cfg.get("mode") or "affine"),
-            )
+            if (
+                prefix == "lm_head"
+                and os.environ.get("VRYX_MLX_DENSE_LM_HEAD", "1").strip().lower() in ("1", "true", "yes", "on")
+            ):
+                self._last_lm_head_dense = True
+                dense_key = "_dense_cache.lm_head.weight"
+                dense_w = self.weights.get(dense_key)
+                if dense_w is None:
+                    dense_w = mx.dequantize(
+                        w,
+                        scales=scales,
+                        biases=biases,
+                        group_size=int(cfg.get("group_size") or 64),
+                        bits=int(cfg.get("bits") or 4),
+                        mode=str(cfg.get("mode") or "affine"),
+                        dtype=_mx_compute_dtype(mx),
+                    )
+                    mx.eval(dense_w)
+                    self.weights[dense_key] = dense_w
+                y = x @ dense_w.T
+            else:
+                if prefix == "lm_head":
+                    self._last_lm_head_dense = False
+                y = mx.quantized_matmul(
+                    x,
+                    w,
+                    scales=scales,
+                    biases=biases,
+                    transpose=True,
+                    group_size=int(cfg.get("group_size") or 64),
+                    bits=int(cfg.get("bits") or 4),
+                    mode=str(cfg.get("mode") or "affine"),
+                )
         else:
             y = x @ w.T
         if dense_bias is not None:
@@ -552,7 +777,14 @@ class MLXBackend:
         probs = mx.softmax(logits.astype(mx.float32), axis=-1)
         idxs = mx.argsort(probs, axis=-1)[:, -top_k:]
         vals = mx.take_along_axis(probs, idxs, axis=-1)
-        vals = vals / mx.sum(vals, axis=-1, keepdims=True)
+        model_type = str(self.shard.model_config.get("model_type") or "").lower()
+        norm_topk_prob = (
+            bool(self.shard.model_config.get("norm_topk_prob", False))
+            or "qwen3_5" in model_type
+            or self.shard.model_config.get("shared_expert_intermediate_size") is not None
+        )
+        if norm_topk_prob:
+            vals = vals / mx.sum(vals, axis=-1, keepdims=True)
         if trace_on:
             mx.eval(idxs, vals)
             try:
@@ -561,6 +793,7 @@ class MLXBackend:
             except Exception:
                 trace["selected_experts_count"] = top_k
             trace["top_k"] = int(top_k)
+            trace["norm_topk_prob"] = bool(norm_topk_prob)
             trace["router_ms"] = max(0, int((time.perf_counter() - router_t0) * 1000))
         gate_w = self._w(f"{switch_prefix}.gate_proj.weight")
         up_w = self._w(f"{switch_prefix}.up_proj.weight")
@@ -593,10 +826,14 @@ class MLXBackend:
             trace.setdefault("shared_expert_ms", 0)
             trace.setdefault("moe_total_ms", 0)
         disable_shared_expert = os.environ.get("VRYX_MLX_DISABLE_SHARED_EXPERT", "0").strip().lower() in ("1", "true", "yes", "on")
-        topk_only_scalar = os.environ.get("VRYX_MLX_MOE_TOPK_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+        topk_only_enabled = os.environ.get("VRYX_MLX_MOE_TOPK_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+        force_scalar_topk = os.environ.get("VRYX_MLX_MOE_FORCE_SCALAR_TOPK", "0").strip().lower() in ("1", "true", "yes", "on")
+        if trace_on:
+            trace["topk_only_enabled"] = bool(topk_only_enabled)
+            trace["force_scalar_topk"] = bool(force_scalar_topk)
         if (
             expert_batched
-            and not topk_only_scalar
+            and not force_scalar_topk
             and os.environ.get("VRYX_MLX_MOE_EXPERT_BATCH", "1").strip().lower() not in ("0", "false", "no", "off")
         ):
             if trace_on:
@@ -750,6 +987,7 @@ class MLXBackend:
             self.kv_cache = saved_state.get("kv_cache")
             if "linear_states" in saved_state:
                 self.linear_states = saved_state.get("linear_states")
+        kv_cache_ready_before = self.kv_cache is not None
         print(
             f"[mlx] forward-start sid={sid[:16]} step={step} "
             f"embed={self.shard.has_embedding} head={self.shard.has_lm_head} "
@@ -773,6 +1011,7 @@ class MLXBackend:
             if request_id != "default":
                 self.linear_states = [{} for _ in range(max(0, self.shard.layer_end - self.shard.layer_start + 1))]
                 self._request_states.pop(request_id, None)
+            kv_cache_ready_before = False
 
         lazy_tracker = self.weights if hasattr(self.weights, "begin_forward") and hasattr(self.weights, "end_forward") else None
         lazy_finished = False
@@ -865,6 +1104,22 @@ class MLXBackend:
 
         compute_dtype = _mx_compute_dtype(mx)
         hidden = hidden.astype(compute_dtype)
+        received_hidden_trace = _mlx_hidden_checksum(mx, hidden)
+        quality_trace_enabled = _quality_trace_enabled(payload)
+        quality_trace: dict[str, Any] = {}
+        if quality_trace_enabled:
+            quality_trace.update({
+                "quality_trace": True,
+                "session_id": sid,
+                "request_id": request_id,
+                "step": int(step),
+                "seq_pos": int(seq_pos),
+                "token_ids": [int(t) for t in payload.get("token_ids", []) if isinstance(t, (int, float))],
+                "history_token_count": len(payload.get("history_token_ids") or []),
+                "hidden_shape": [int(dim) for dim in getattr(hidden, "shape", [])],
+                "hidden_transport_requested": str(payload.get("hidden_transport", HIDDEN_TRANSPORT)).lower(),
+            })
+            quality_trace.update(_quality_tensor_trace(mx, hidden, "hidden_input"))
         B = int(hidden.shape[0])
         if step > 0 and use_kv and requested_decode_mode == "single_token_stateful" and seq_len != 1:
             return json.dumps({
@@ -902,6 +1157,17 @@ class MLXBackend:
         def mlx_run_transformer(hidden_in: Any, seq_pos_run: int, seq_len_run: int, causal_here: Any) -> Any | None:
             """Passe Transformer (attention + MLP) ; met à jour kv_cache et shard.seq_position."""
             pos_ids_here = mx.arange(seq_pos_run, seq_pos_run + seq_len_run, dtype=mx.int32)
+            if quality_trace_enabled:
+                quality_trace.update({
+                    "position_ids_start": int(seq_pos_run),
+                    "position_ids_end": int(seq_pos_run + max(0, seq_len_run - 1)),
+                    "position_ids_len": int(seq_len_run),
+                    "cache_position_start": int(seq_pos_run),
+                    "cache_position_end": int(seq_pos_run + max(0, seq_len_run - 1)),
+                    "kv_cache_step_start": int(seq_pos_run),
+                    "kv_cache_layers_before": int(len(self.kv_cache or [])),
+                })
+                quality_trace.update(_quality_tensor_trace(mx, pos_ids_here, "position_ids", max_values=256))
             h = hidden_in.astype(compute_dtype)
             n_layers_here = self.shard.layer_end - self.shard.layer_start + 1
             if self.kv_cache is None:
@@ -911,6 +1177,8 @@ class MLXBackend:
             num_kv_heads_here = num_kv_heads
             eval_default = str(n_layers_here) if seq_len_run == 1 else "2"
             eval_every = max(1, int(os.environ.get("VRYX_MLX_EVAL_EVERY_LAYERS", eval_default)))
+            clear_every = max(0, int(os.environ.get("VRYX_MLX_CLEAR_CACHE_EVERY_LAYERS", "0")))
+            clear_dequant_every = max(0, int(os.environ.get("VRYX_MLX_CLEAR_DEQUANT_CACHE_EVERY_LAYERS", "0")))
             progress_every = max(0, int(os.environ.get("VRYX_MLX_PROGRESS_EVERY_LAYERS", "0")))
             for local_i in range(n_layers_here):
                 prefix = f"layers.{local_i}"
@@ -1009,6 +1277,14 @@ class MLXBackend:
                     layer_head_dim = o_in_l // layer_num_heads if o_in_l % layer_num_heads == 0 else head_dim_here
                     layer_num_kv = int(k_w.shape[0]) // layer_head_dim
                     layer_cos, layer_sin = self._get_rope(mx, layer_head_dim, cfg)
+                    if quality_trace_enabled and "rotary_head_dim" not in quality_trace:
+                        quality_trace.update({
+                            "rotary_head_dim": int(layer_head_dim),
+                            "rotary_cos_shape": [int(dim) for dim in getattr(layer_cos, "shape", [])],
+                            "rotary_sin_shape": [int(dim) for dim in getattr(layer_sin, "shape", [])],
+                        })
+                        quality_trace.update(_quality_tensor_trace(mx, layer_cos, "rotary_cos", max_values=512))
+                        quality_trace.update(_quality_tensor_trace(mx, layer_sin, "rotary_sin", max_values=512))
                     attn_out, new_k, new_v = _mx_gqa_forward(
                         mx, normed, q_w, k_w, v_w, o_w, q_b, k_b, v_b, o_b, q_norm_w, k_norm_w, rms_eps,
                         layer_num_heads, layer_num_kv, layer_head_dim, pos_ids_here,
@@ -1036,8 +1312,18 @@ class MLXBackend:
                     if layer_trace is not None:
                         mx.eval(h)
                         layer_trace["mlp_ms"] = max(0, int((time.perf_counter() - mlp_t0) * 1000))
+                h, hidden_sanitize = _mx_sanitize_nonfinite(mx, h, f"layer_{self.shard.layer_start + local_i}_hidden")
+                h, hidden_clip = _mx_clip_hidden(mx, h, f"layer_{self.shard.layer_start + local_i}_hidden")
+                if layer_trace is not None:
+                    layer_trace.update(hidden_sanitize)
+                    layer_trace.update(hidden_clip)
                 if eval_every and ((local_i + 1) % eval_every == 0 or local_i + 1 == n_layers_here):
                     mx.eval(h)
+                if clear_dequant_every and ((local_i + 1) % clear_dequant_every == 0 or local_i + 1 == n_layers_here):
+                    if hasattr(self.weights, "clear"):
+                        self.weights.clear()
+                if clear_every and ((local_i + 1) % clear_every == 0 or local_i + 1 == n_layers_here):
+                    _mlx_clear_cache(mx)
                 if layer_trace is not None:
                     mx.eval(h)
                     layer_trace["mlp_ms"] = layer_trace.get("moe_total_ms") or layer_trace.get("mlp_ms") or max(0, int((time.perf_counter() - mlp_t0) * 1000))
@@ -1052,6 +1338,11 @@ class MLXBackend:
 
             mx.eval(h)
             self.shard.seq_position = seq_pos_run + seq_len_run
+            if quality_trace_enabled:
+                quality_trace.update({
+                    "kv_cache_step_end": int(self.shard.seq_position),
+                    "kv_cache_layers_after": int(len(self.kv_cache or [])),
+                })
             return h
 
         # Masque causal (pas nécessaire pour decode seq_len=1, utile pour prefill)
@@ -1076,8 +1367,22 @@ class MLXBackend:
                 "transport_trace": lazy_trace,
             }).encode()
         hidden = hx
+        if quality_trace_enabled:
+            quality_trace.update(_quality_tensor_trace(mx, hidden, "hidden_output"))
         compute_ms = max(1, int((time.perf_counter() - t0) * 1000))
         self.shard.last_forward_ms = compute_ms
+        output_hidden_trace = _mlx_hidden_checksum(mx, hidden)
+        proof_trace = _mlx_sharding_proof_trace(
+            self.shard,
+            backend="mlx",
+            received_hidden=received_hidden_trace,
+            output_hidden=output_hidden_trace,
+            compute_ms=compute_ms,
+            step=step,
+            seq_pos=out_seq_pos,
+            kv_cache_created=bool(use_kv and self.kv_cache is not None and not kv_cache_ready_before),
+            kv_cache_reused=bool(use_kv and step > 0 and kv_cache_ready_before),
+        )
 
         # ── Sortie ────────────────────────────────────────────────────────────
         if self.shard.has_lm_head:
@@ -1088,8 +1393,12 @@ class MLXBackend:
             lm_head_t0 = time.perf_counter()
             last = hidden[0, -1, :]
             last_normed = _mx_rms_norm(mx, last, norm_w, rms_eps)
+            if quality_trace_enabled:
+                quality_trace.update(_quality_tensor_trace(mx, last_normed, "lm_head_input"))
             logits = self._linear(last_normed, "lm_head").astype(mx.float32)
             mx.eval(logits)
+            if quality_trace_enabled:
+                quality_trace.update(_quality_tensor_trace(mx, logits, "logits"))
             lm_head_ms = max(0, int((time.perf_counter() - lm_head_t0) * 1000))
 
             sampling_t0 = time.perf_counter()
@@ -1217,9 +1526,32 @@ class MLXBackend:
                     **lazy_trace,
                 },
             }
-            debug_top_logits = _debug_top_logits_mx(mx, logits)
-            if debug_top_logits:
-                response["debug_top_logits"] = debug_top_logits
+            _attach_mlx_sharding_proof(response, proof_trace)
+            if quality_trace_enabled:
+                quality_trace.update({
+                    "generated_token_ids": candidate_tokens,
+                    "next_token_id": int(candidate_tokens[-1]) if candidate_tokens else None,
+                    "accepted_token_count": int(n_acc),
+                    "decode_mode": decode_mode,
+                    "lm_head_ms": int(lm_head_ms),
+                    "lm_head_dense_fp16": bool(getattr(self, "_last_lm_head_dense", False)),
+                    "sampling_ms": int(sampling_ms),
+                })
+                response["quality_trace"] = quality_trace
+                response["transport_trace"]["quality_trace"] = quality_trace
+            debug_logits = _debug_logits_mx(mx, logits, force=bool(payload.get("debug_top_logits")))
+            if debug_logits:
+                response.update(debug_logits)
+                response["transport_trace"].update(debug_logits)
+                top_ids = [
+                    item.get("id")
+                    for item in debug_logits.get("debug_top_logits", [])
+                    if isinstance(item, dict)
+                ][:5]
+                print(
+                    f"[mlx] logits-debug {sid[:12]} step={step} "
+                    f"next={next_token_id} top_ids={top_ids} stats={debug_logits.get('debug_logits_stats')}"
+                )
             response_serialize_t0 = time.perf_counter()
             raw = json.dumps(response).encode()
             response["transport_trace"]["response_serialize_ms"] = max(0, int((time.perf_counter() - response_serialize_t0) * 1000))
@@ -1275,8 +1607,17 @@ class MLXBackend:
                     **lazy_trace,
                 },
             }
+            if quality_trace_enabled:
+                quality_trace.update({
+                    "decode_mode": decode_mode,
+                    "hidden_transport_effective": transport,
+                    "hidden_encode_ms": int(hidden_encode_ms),
+                })
+                out["quality_trace"] = quality_trace
+                out["transport_trace"]["quality_trace"] = quality_trace
             out.update(hidden_payload)
             out.update(hidden_metrics)
+            _attach_mlx_sharding_proof(out, proof_trace)
             response_serialize_t0 = time.perf_counter()
             raw = json.dumps(out).encode()
             out["transport_trace"]["response_serialize_ms"] = max(0, int((time.perf_counter() - response_serialize_t0) * 1000))
@@ -1289,13 +1630,24 @@ class MLXBackend:
         """Retourne les fréquences RoPE pour un head_dim donné, avec cache."""
         if not hasattr(self, '_rope_cache'):
             self._rope_cache: dict[int, tuple[Any, Any]] = {}
-        if layer_head_dim not in self._rope_cache:
+        partial = float(
+            cfg.get("partial_rotary_factor")
+            or (cfg.get("rope_parameters") or {}).get("partial_rotary_factor")
+            or 1.0
+        )
+        rotary_dim = max(2, int(layer_head_dim * partial))
+        if rotary_dim % 2:
+            rotary_dim -= 1
+        cache_key = int(rotary_dim)
+        if cache_key not in self._rope_cache:
             theta = float(cfg.get("rope_theta", 1_000_000.0))
+            rope_params = cfg.get("rope_parameters") if isinstance(cfg.get("rope_parameters"), dict) else {}
+            theta = float(rope_params.get("rope_theta") or theta)
             max_len = int(cfg.get("max_position_embeddings", 32768))
-            cos, sin = _mx_rope_freqs(mx, layer_head_dim, max_len, theta)
+            cos, sin = _mx_rope_freqs(mx, rotary_dim, max_len, theta)
             mx.eval(cos, sin)
-            self._rope_cache[layer_head_dim] = (cos, sin)
-        return self._rope_cache[layer_head_dim]
+            self._rope_cache[cache_key] = (cos, sin)
+        return self._rope_cache[cache_key]
 
     def _probe_linear_attn_shapes(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -1361,6 +1713,10 @@ class MLXBackend:
         value = value.reshape(bsz, seq_len, num_v_heads, head_v_dim)
         beta = _mx_sigmoid(mx, b)
         g = -mx.exp(a_log.astype(mx.float32)) * _mx_softplus(mx, a.astype(mx.float32) + dt_bias)
+        g = mx.clip(g, -60.0, 0.0)
+        g, _g_sanitize = _mx_sanitize_nonfinite(mx, g, f"{prefix}_linear_attn_g", replacement=-60.0)
+        beta = mx.clip(beta, 0.0, 1.0)
+        beta, _beta_sanitize = _mx_sanitize_nonfinite(mx, beta, f"{prefix}_linear_attn_beta")
         if num_v_heads // num_k_heads > 1:
             repeats = num_v_heads // num_k_heads
             query = mx.repeat(query, repeats, axis=2)
@@ -1444,7 +1800,12 @@ class MLXBackend:
             kv_mem = mx.sum(state * k_t[:, :, :, None], axis=-2)  # [B, H, V]
             delta = (v_t - kv_mem) * beta_t                        # [B, H, V]
             state = state + k_t[:, :, :, None] * delta[:, :, None, :]
-            outs.append(mx.sum(state * q_t[:, :, :, None], axis=-2))
+            if _sanitize_nonfinite_enabled():
+                state, _state_sanitize = _mx_sanitize_nonfinite(mx, state, "linear_attn_state")
+            out_t = mx.sum(state * q_t[:, :, :, None], axis=-2)
+            if _sanitize_nonfinite_enabled():
+                out_t, _out_sanitize = _mx_sanitize_nonfinite(mx, out_t, "linear_attn_out")
+            outs.append(out_t)
             if (t + 1) % eval_chunk == 0:
                 mx.eval(*outs[-eval_chunk:], state)
         out = mx.stack(outs, axis=2).transpose(0, 2, 1, 3)
@@ -1462,15 +1823,21 @@ class MLXBackend:
             "hidden_encode_path": "mlx",
         }
         hidden_f16 = hidden.astype(mx.float16)
+        hidden_f16, finite_metrics = _mx_sanitize_nonfinite(mx, hidden_f16, "hidden_out")
+        metrics.update(finite_metrics)
+        hidden_f16, clip_metrics = _mx_clip_hidden(mx, hidden_f16, "hidden_out")
+        metrics.update(clip_metrics)
 
         if transport == "int8":
             max_abs_mx = mx.max(mx.abs(hidden_f16))
             mx.eval(max_abs_mx)
-            max_abs = float(np.array(max_abs_mx, copy=False)) or 1.0
+            max_abs = float(np.array(max_abs_mx, copy=False))
+            if not np.isfinite(max_abs) or max_abs <= 0:
+                max_abs = 1.0
             scale = max(max_abs / 127.0, 1e-8)
             q_mx = mx.clip(mx.round(hidden_f16 / scale), -127, 127).astype(mx.int8)
             mx.eval(q_mx)
-            q = np.array(q_mx, copy=False)
+            q = _mlx_wire_numpy(q_mx, np.int8)
             b64_t0 = time.perf_counter()
             q_b64 = base64.b64encode(q.tobytes()).decode()
             b64_ms = max(0, int((time.perf_counter() - b64_t0) * 1000))
@@ -1480,6 +1847,7 @@ class MLXBackend:
                 "hidden_base64_encode_ms": b64_ms,
                 "hidden_source_dtype": "fp16",
                 "hidden_transfer_dtype": "int8",
+                "hidden_max_abs": float(max_abs),
             })
             return {
                 "hidden_q_b64": q_b64,
@@ -1492,16 +1860,18 @@ class MLXBackend:
         if transport == "q4":
             max_abs_mx = mx.max(mx.abs(hidden_f16))
             mx.eval(max_abs_mx)
-            max_abs = float(np.array(max_abs_mx, copy=False)) or 1.0
+            max_abs = float(np.array(max_abs_mx, copy=False))
+            if not np.isfinite(max_abs) or max_abs <= 0:
+                max_abs = 1.0
             scale = max(max_abs / 7.0, 1e-8)
             q4_mx = mx.clip(mx.round(hidden_f16 / scale), -7, 7).astype(mx.int8)
             mx.eval(q4_mx)
-            q4 = np.array(q4_mx, copy=False).reshape(-1)
+            q4 = _mlx_wire_numpy(q4_mx, np.int8).reshape(-1)
             n = q4.size
             if n % 2:
                 q4 = np.pad(q4, (0, 1), mode="constant")
             nib = (q4.astype(np.int16) + 8).astype(np.uint8)
-            packed = (nib[0::2] & 0x0F) | ((nib[1::2] & 0x0F) << 4)
+            packed = np.ascontiguousarray((nib[0::2] & 0x0F) | ((nib[1::2] & 0x0F) << 4))
             b64_t0 = time.perf_counter()
             packed_b64 = base64.b64encode(packed.tobytes()).decode()
             b64_ms = max(0, int((time.perf_counter() - b64_t0) * 1000))
@@ -1511,6 +1881,7 @@ class MLXBackend:
                 "hidden_base64_encode_ms": b64_ms,
                 "hidden_source_dtype": "fp16",
                 "hidden_transfer_dtype": "q4",
+                "hidden_max_abs": float(max_abs),
             })
             return {
                 "hidden_q4_b64": packed_b64,
@@ -1522,16 +1893,18 @@ class MLXBackend:
             }, metrics
 
         mx.eval(hidden_f16)
-        hs_np = np.array(hidden_f16, copy=False)
+        hs_np = _mlx_wire_numpy(hidden_f16, "<f2")
         b64_t0 = time.perf_counter()
         fp16_b64 = base64.b64encode(hs_np.tobytes()).decode()
         b64_ms = max(0, int((time.perf_counter() - b64_t0) * 1000))
+        max_abs = float(np.nanmax(np.abs(hs_np))) if hs_np.size else 0.0
         metrics.update({
             "hidden_bytes": int(hs_np.nbytes),
             "hidden_b64_bytes": len(fp16_b64),
             "hidden_base64_encode_ms": b64_ms,
             "hidden_source_dtype": "fp16",
             "hidden_transfer_dtype": "fp16",
+            "hidden_max_abs": max_abs,
         })
         return {
             "hidden_fp16_b64": fp16_b64,
@@ -1561,13 +1934,19 @@ class MLXBackend:
             shape = tuple(int(x) for x in payload["hidden_shape"])
             scale = float(payload.get("hidden_scale") or 1.0)
             total = int(payload.get("hidden_q4_len") or np.prod(shape))
-            packed = np.frombuffer(raw, dtype=np.uint8)
+            packed = np.frombuffer(raw, dtype=np.uint8).copy()
             lo = (packed & 0x0F).astype(np.int8) - 8
             hi = ((packed >> 4) & 0x0F).astype(np.int8) - 8
             q = np.empty(packed.size * 2, dtype=np.int8)
             q[0::2] = lo; q[1::2] = hi
-            q = q[:total].reshape(shape)
+            q = q[:total].reshape(shape).copy()
             out = mx.array(q, dtype=mx.int8).astype(mx.float32) * scale
+            out, finite_metrics = _mx_sanitize_nonfinite(mx, out, "hidden_in")
+            trace.update(finite_metrics)
+            out, clip_metrics = _mx_clip_hidden(mx, out, "hidden_in")
+            trace.update(clip_metrics)
+            if _quality_trace_enabled(payload):
+                trace.update(_quality_tensor_trace(mx, out, "hidden_received"))
             trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
             return out, trace
 
@@ -1582,8 +1961,14 @@ class MLXBackend:
             t_deser = time.perf_counter()
             shape = tuple(int(x) for x in payload["hidden_shape"])
             scale = float(payload.get("hidden_scale") or 1.0)
-            q = np.frombuffer(raw, dtype=np.int8).reshape(shape)
+            q = np.frombuffer(raw, dtype=np.int8).reshape(shape).copy()
             out = mx.array(q, dtype=mx.int8).astype(mx.float32) * scale
+            out, finite_metrics = _mx_sanitize_nonfinite(mx, out, "hidden_in")
+            trace.update(finite_metrics)
+            out, clip_metrics = _mx_clip_hidden(mx, out, "hidden_in")
+            trace.update(clip_metrics)
+            if _quality_trace_enabled(payload):
+                trace.update(_quality_tensor_trace(mx, out, "hidden_received"))
             trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
             return out, trace
 
@@ -1597,8 +1982,14 @@ class MLXBackend:
             trace["hidden_payload_raw_bytes"] = len(raw)
             t_deser = time.perf_counter()
             shape = tuple(int(x) for x in payload["hidden_shape"])
-            hs = np.frombuffer(raw, dtype=np.float16).reshape(shape)
+            hs = np.frombuffer(raw, dtype=_wire_numpy_dtype("<f2")).reshape(shape).copy()
             out = mx.array(hs, dtype=mx.float16)
+            out, finite_metrics = _mx_sanitize_nonfinite(mx, out, "hidden_in")
+            trace.update(finite_metrics)
+            out, clip_metrics = _mx_clip_hidden(mx, out, "hidden_in")
+            trace.update(clip_metrics)
+            if _quality_trace_enabled(payload):
+                trace.update(_quality_tensor_trace(mx, out, "hidden_received"))
             trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
             return out, trace
 
@@ -1611,9 +2002,15 @@ class MLXBackend:
             trace["hidden_payload_b64_bytes"] = len(b64)
             trace["hidden_payload_raw_bytes"] = len(raw)
             t_deser = time.perf_counter()
-            flat = np.frombuffer(raw, dtype=np.float32)
+            flat = np.frombuffer(raw, dtype=_wire_numpy_dtype("<f4")).copy()
             seq_len = len(flat) // hidden_size
             out = mx.array(flat.reshape(1, seq_len, hidden_size), dtype=mx.float32)
+            out, finite_metrics = _mx_sanitize_nonfinite(mx, out, "hidden_in")
+            trace.update(finite_metrics)
+            out, clip_metrics = _mx_clip_hidden(mx, out, "hidden_in")
+            trace.update(clip_metrics)
+            if _quality_trace_enabled(payload):
+                trace.update(_quality_tensor_trace(mx, out, "hidden_received"))
             trace["hidden_deserialize_ms"] = max(0, int((time.perf_counter() - t_deser) * 1000))
             return out, trace
 

@@ -126,6 +126,9 @@ def main() -> int:
         "decode_microbatch_cap": 1,
         "warmup_only": True,
     }
+    prepared_split_id = os.environ.get("VRYX_WARMUP_SMOKE_PREPARED_SPLIT_ID", "").strip()
+    if prepared_split_id:
+        payload["prepared_split_id"] = prepared_split_id
     status, data, wall_ms = _post(url, payload, timeout)
     first = _summary("warmup_only", status, data, wall_ms)
     print(json.dumps(_redact(first), ensure_ascii=False, sort_keys=True))

@@ -364,7 +364,7 @@ function OldVryxLogo({ title, compact = false }: { title?: string; compact?: boo
   return (
     <img
       className={`old-vryx-logo ${compact ? 'is-compact' : ''}`}
-      src="./logo-withoutbg.png"
+      src="./logo.svg"
       alt={title || ''}
       aria-hidden={title ? undefined : true}
     />

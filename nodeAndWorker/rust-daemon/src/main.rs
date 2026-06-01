@@ -310,16 +310,79 @@ fn env_duration_ms(name: &str, default_ms: u64, min_ms: u64, max_ms: u64) -> Dur
     Duration::from_millis(value)
 }
 
+fn payload_duration_ms(
+    payload: &serde_json::Value,
+    name: &str,
+    default_duration: Duration,
+    min_ms: u64,
+    max_ms: u64,
+) -> Duration {
+    let default_ms = default_duration.as_millis().min(u128::from(u64::MAX)) as u64;
+    let value = payload
+        .get(name)
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None }))
+                .or_else(|| v.as_f64().and_then(|f| if f.is_finite() && f >= 0.0 { Some(f as u64) } else { None }))
+        })
+        .unwrap_or(default_ms)
+        .clamp(min_ms, max_ms);
+    Duration::from_millis(value)
+}
+
+fn proof_sharding_enabled() -> bool {
+    env_bool_enabled("VRYX_FORCE_ALL_WORKERS_SHARD")
+        || env_bool_enabled("VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD")
+}
+
+fn chain_timeout_default_ms() -> u64 {
+    if proof_sharding_enabled() {
+        3_600_000
+    } else {
+        180_000
+    }
+}
+
 fn chain_forward_ack_timeout() -> Duration {
-    env_duration_ms("VRYX_CHAIN_FORWARD_ACK_TIMEOUT_MS", 5_000, 500, 60_000)
+    let duration = env_duration_ms(
+        "VRYX_CHAIN_FORWARD_ACK_TIMEOUT_MS",
+        chain_timeout_default_ms(),
+        500,
+        14_400_000,
+    );
+    if proof_sharding_enabled() {
+        duration.max(Duration::from_millis(chain_timeout_default_ms()))
+    } else {
+        duration
+    }
 }
 
 fn chain_result_timeout() -> Duration {
-    env_duration_ms("VRYX_CHAIN_RESULT_TIMEOUT_MS", 30_000, 1_000, 300_000)
+    let duration = env_duration_ms(
+        "VRYX_CHAIN_RESULT_TIMEOUT_MS",
+        chain_timeout_default_ms(),
+        1_000,
+        14_400_000,
+    );
+    if proof_sharding_enabled() {
+        duration.max(Duration::from_millis(chain_timeout_default_ms()))
+    } else {
+        duration
+    }
 }
 
 fn chain_total_step_timeout() -> Duration {
-    env_duration_ms("VRYX_CHAIN_TOTAL_STEP_TIMEOUT_MS", 60_000, 1_000, 600_000)
+    let duration = env_duration_ms(
+        "VRYX_CHAIN_TOTAL_STEP_TIMEOUT_MS",
+        chain_timeout_default_ms(),
+        1_000,
+        14_400_000,
+    );
+    if proof_sharding_enabled() {
+        duration.max(Duration::from_millis(chain_timeout_default_ms()))
+    } else {
+        duration
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -346,12 +409,22 @@ fn pipeline_stream_cache_key(session_id: &str, peer: &PeerId) -> String {
 }
 
 fn pipeline_frame_deadline() -> Duration {
-    Duration::from_millis(env_u64_clamped(
+    let default_ms = if proof_sharding_enabled() {
+        3_600_000
+    } else {
+        300_000
+    };
+    let configured = env_u64_clamped(
         "VRYX_PIPELINE_STREAM_FRAME_TIMEOUT_MS",
-        300_000,
+        default_ms,
         1_000,
-        900_000,
-    ))
+        14_400_000,
+    );
+    Duration::from_millis(if proof_sharding_enabled() {
+        configured.max(default_ms)
+    } else {
+        configured
+    })
 }
 
 fn bytes_checksum(data: &[u8]) -> String {
@@ -524,18 +597,32 @@ async fn handle_chain_control_frame(
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default();
+    eprintln!(
+        "[CHAIN_FRAME] dtype={} from={} session={} step={} routing_path_len={}",
+        frame.dtype,
+        peer,
+        frame.session_id,
+        frame.step_id,
+        routing_path.len()
+    );
 
-    if frame.dtype == "vryx.chain.forward.batch.step" {
+    if frame.dtype == "vryx.chain.forward.batch.step"
+        || frame.dtype == "vryx.chain.forward.batch.step.raw"
+    {
+        let raw_step_payload = frame.dtype == "vryx.chain.forward.batch.step.raw";
         let forward_dtype = body
             .get("forward_dtype")
             .and_then(|v| v.as_str())
             .unwrap_or("vryx.shard.pipeline")
             .to_string();
-        let payload_bytes = body
-            .get("payload_b64")
-            .and_then(|v| v.as_str())
-            .and_then(|v| general_purpose::STANDARD.decode(v).ok())
-            .unwrap_or_default();
+        let payload_bytes = if raw_step_payload {
+            frame.payload.clone()
+        } else {
+            body.get("payload_b64")
+                .and_then(|v| v.as_str())
+                .and_then(|v| general_purpose::STANDARD.decode(v).ok())
+                .unwrap_or_default()
+        };
         let compute_started = Instant::now();
         let m4_grpc_compute_start_ms = unix_ms();
         let compute_result = call_local_inference(
@@ -568,6 +655,7 @@ async fn handle_chain_control_frame(
                         "m4_chain_received_ms": chain_received_ms,
                         "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
                         "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                        "chain_batch_raw_step": raw_step_payload,
                     })
                     .to_string(),
                     ..Default::default()
@@ -583,6 +671,7 @@ async fn handle_chain_control_frame(
                     "m4_chain_received_ms": chain_received_ms,
                     "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
                     "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+                    "chain_batch_raw_step": raw_step_payload,
                 })
                 .to_string()
                 .into_bytes(),
@@ -650,7 +739,12 @@ async fn handle_chain_control_frame(
             .unwrap_or_default();
         let token_count = body
             .get("token_count")
-            .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i > 0 { Some(i as u64) } else { None })))
+            .and_then(|v| {
+                v.as_u64().or_else(|| {
+                    v.as_i64()
+                        .and_then(|i| if i > 0 { Some(i as u64) } else { None })
+                })
+            })
             .unwrap_or(1)
             .min(64) as usize;
         let token_start = body
@@ -676,26 +770,46 @@ async fn handle_chain_control_frame(
         let final_peer_for_task = next_peer.to_string();
         let my_peer_for_task = my_peer_id.to_string();
         let body_for_task = body.clone();
+        let batch_total_timeout = payload_duration_ms(
+            &body,
+            "total_timeout_ms",
+            chain_total_step_timeout(),
+            1_000,
+            14_400_000,
+        );
         tokio::spawn(async move {
             let batch_started = Instant::now();
-            let initial_payload_value = serde_json::from_slice::<serde_json::Value>(&initial_payload_bytes)
-                .unwrap_or_else(|_| serde_json::json!({}));
+            let initial_payload_value =
+                serde_json::from_slice::<serde_json::Value>(&initial_payload_bytes)
+                    .unwrap_or_else(|_| serde_json::json!({}));
             let mut seed_ids: Vec<i64> = initial_payload_value
                 .get("history_token_ids")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64)))
+                        .collect()
+                })
                 .unwrap_or_default();
             if seed_ids.is_empty() {
                 seed_ids = initial_payload_value
                     .get("token_ids")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64)))
+                            .collect()
+                    })
                     .unwrap_or_default();
             }
             let stop_ids: HashSet<i64> = initial_payload_value
                 .get("stop_token_ids")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64)))
+                        .collect()
+                })
                 .unwrap_or_default();
             let eos_id = initial_payload_value
                 .get("eos_token_id")
@@ -710,10 +824,14 @@ async fn handle_chain_control_frame(
             let mut batch_result_wait_ms = 0u64;
             let mut internal_frames_sent = 0u64;
             let mut internal_frames_received = 0u64;
+            let chain_batch_raw_step = env_bool_enabled("VRYX_CHAIN_BATCH_RAW_STEP")
+                || body.get("chain_batch_raw_step").and_then(|v| v.as_bool()) == Some(true);
+            let mut internal_payload_bytes = 0u64;
+            let mut internal_frame_payload_bytes = 0u64;
             for token_index in 0..token_count {
                 let m1_started = Instant::now();
                 let m1_result = tokio::time::timeout(
-                    chain_total_step_timeout(),
+                    batch_total_timeout,
                     call_local_inference(
                         grpc_port,
                         current_payload_bytes.clone(),
@@ -738,30 +856,43 @@ async fn handle_chain_control_frame(
                         break;
                     }
                 };
-                let step_body = serde_json::json!({
-                    "chain_type": "CHAIN_FORWARD_BATCH_STEP",
-                    "forward_dtype": forward_dtype,
-                    "payload_b64": general_purpose::STANDARD.encode(&m1_payload),
-                    "payload_len": m1_payload.len(),
-                    "microbatch_id": microbatch_id,
-                    "token_index": token_index,
-                    "token_start": token_start,
-                    "token_count": token_count,
-                    "source_peer": my_peer_for_task,
-                    "final_peer": final_peer_for_task,
-                    "m1_chain_received_ms": chain_received_ms,
-                });
+                internal_payload_bytes =
+                    internal_payload_bytes.saturating_add(m1_payload.len() as u64);
+                let step_payload = if chain_batch_raw_step {
+                    m1_payload.clone()
+                } else {
+                    let step_body = serde_json::json!({
+                        "chain_type": "CHAIN_FORWARD_BATCH_STEP",
+                        "forward_dtype": forward_dtype,
+                        "payload_b64": general_purpose::STANDARD.encode(&m1_payload),
+                        "payload_len": m1_payload.len(),
+                        "microbatch_id": microbatch_id,
+                        "token_index": token_index,
+                        "token_start": token_start,
+                        "token_count": token_count,
+                        "source_peer": my_peer_for_task,
+                        "final_peer": final_peer_for_task,
+                        "m1_chain_received_ms": chain_received_ms,
+                    });
+                    serde_json::to_vec(&step_body).unwrap_or_default()
+                };
+                internal_frame_payload_bytes =
+                    internal_frame_payload_bytes.saturating_add(step_payload.len() as u64);
                 let step_frame = PipelineFrame {
                     frame_type: PIPELINE_FRAME_REQUEST,
                     request_id: format!("{}:batch:{}", request_id, token_index),
                     session_id: session_id.clone(),
                     step_id: base_step + token_index as u64,
-                    dtype: "vryx.chain.forward.batch.step".to_string(),
-                    payload: serde_json::to_vec(&step_body).unwrap_or_default(),
+                    dtype: if chain_batch_raw_step {
+                        "vryx.chain.forward.batch.step.raw".to_string()
+                    } else {
+                        "vryx.chain.forward.batch.step".to_string()
+                    },
+                    payload: step_payload,
                 };
                 let wait_started = Instant::now();
                 let step_result = tokio::time::timeout(
-                    chain_total_step_timeout(),
+                    batch_total_timeout,
                     pipeline_stream_roundtrip(
                         Arc::clone(&control_for_task),
                         Arc::clone(&cache_for_task),
@@ -771,11 +902,14 @@ async fn handle_chain_control_frame(
                     ),
                 )
                 .await;
-                batch_result_wait_ms = batch_result_wait_ms.saturating_add(wait_started.elapsed().as_millis() as u64);
+                batch_result_wait_ms =
+                    batch_result_wait_ms.saturating_add(wait_started.elapsed().as_millis() as u64);
                 let step_response_frame = match step_result {
                     Ok(Ok((response, trace))) => {
-                        internal_frames_sent = internal_frames_sent.saturating_add(trace.frames_sent);
-                        internal_frames_received = internal_frames_received.saturating_add(trace.frames_received);
+                        internal_frames_sent =
+                            internal_frames_sent.saturating_add(trace.frames_sent);
+                        internal_frames_received =
+                            internal_frames_received.saturating_add(trace.frames_received);
                         response
                     }
                     Ok(Err(e)) => {
@@ -787,24 +921,30 @@ async fn handle_chain_control_frame(
                         break;
                     }
                 };
-                let tensor_response = match serde_json::from_slice::<TensorResponse>(&step_response_frame.payload) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        batch_error = Some(format!("chain_batch_m4_tensor_decode_failed: {}", e));
-                        break;
-                    }
-                };
-                batch_m4_compute_ms = batch_m4_compute_ms.saturating_add(tensor_response.worker_compute_ms);
-                let response_value = match serde_json::from_slice::<serde_json::Value>(&tensor_response.data) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        batch_error = Some(format!("chain_batch_m4_payload_decode_failed: {}", e));
-                        break;
-                    }
-                };
+                let tensor_response =
+                    match serde_json::from_slice::<TensorResponse>(&step_response_frame.payload) {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            batch_error =
+                                Some(format!("chain_batch_m4_tensor_decode_failed: {}", e));
+                            break;
+                        }
+                    };
+                batch_m4_compute_ms =
+                    batch_m4_compute_ms.saturating_add(tensor_response.worker_compute_ms);
+                let response_value =
+                    match serde_json::from_slice::<serde_json::Value>(&tensor_response.data) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            batch_error =
+                                Some(format!("chain_batch_m4_payload_decode_failed: {}", e));
+                            break;
+                        }
+                    };
                 let Some(token_id) = response_value
                     .get("next_token_id")
-                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))) else {
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                else {
                     batch_error = Some("chain_batch_missing_next_token_id".to_string());
                     break;
                 };
@@ -822,14 +962,29 @@ async fn handle_chain_control_frame(
                 let mut next_payload = initial_payload_value.clone();
                 if let Some(obj) = next_payload.as_object_mut() {
                     obj.insert("token_ids".to_string(), serde_json::json!([token_id]));
-                    obj.insert("history_token_ids".to_string(), serde_json::json!(history_ids));
-                    obj.insert("step".to_string(), serde_json::json!(base_step + token_index as u64 + 1));
-                    obj.insert("seq_pos".to_string(), serde_json::json!(seed_ids.len() + emitted.len() - 1));
-                    obj.insert("decode_mode".to_string(), serde_json::json!("single_token_stateful"));
+                    obj.insert(
+                        "history_token_ids".to_string(),
+                        serde_json::json!(history_ids),
+                    );
+                    obj.insert(
+                        "step".to_string(),
+                        serde_json::json!(base_step + token_index as u64 + 1),
+                    );
+                    obj.insert(
+                        "seq_pos".to_string(),
+                        serde_json::json!(seed_ids.len() + emitted.len() - 1),
+                    );
+                    obj.insert(
+                        "decode_mode".to_string(),
+                        serde_json::json!("single_token_stateful"),
+                    );
                     obj.insert("stateful_required".to_string(), serde_json::json!(true));
                     obj.insert("use_kv_cache".to_string(), serde_json::json!(true));
                     obj.insert("micro_decode_budget".to_string(), serde_json::json!(1));
-                    obj.insert("chain_coalesced_decode".to_string(), serde_json::json!(true));
+                    obj.insert(
+                        "chain_coalesced_decode".to_string(),
+                        serde_json::json!(true),
+                    );
                 }
                 current_payload_bytes = serde_json::to_vec(&next_payload).unwrap_or_default();
             }
@@ -853,6 +1008,9 @@ async fn handle_chain_control_frame(
                     "batch_m1_compute_ms": batch_m1_compute_ms,
                     "batch_m4_compute_ms": batch_m4_compute_ms,
                     "batch_result_wait_ms": batch_result_wait_ms,
+                    "chain_batch_raw_step": chain_batch_raw_step,
+                    "internal_payload_bytes": internal_payload_bytes,
+                    "internal_frame_payload_bytes": internal_frame_payload_bytes,
                     "m1_chain_received_ms": chain_received_ms,
                     "m4_chain_result_send_ms": unix_ms(),
                 })
@@ -877,12 +1035,30 @@ async fn handle_chain_control_frame(
             } else {
                 let mut final_value = last_response_value.clone();
                 if let Some(obj) = final_value.as_object_mut() {
-                    obj.insert("candidate_token_ids".to_string(), serde_json::json!(emitted));
-                    obj.insert("accepted_token_count".to_string(), serde_json::json!(accepted));
-                    obj.insert("next_token_id".to_string(), serde_json::json!(emitted[accepted - 1]));
-                    obj.insert("decode_microbatch".to_string(), serde_json::json!(accepted > 1));
-                    obj.insert("speculative_method".to_string(), serde_json::json!("pipeline_chain_coalesced_greedy"));
-                    obj.insert("speculative_available".to_string(), serde_json::json!(accepted > 1));
+                    obj.insert(
+                        "candidate_token_ids".to_string(),
+                        serde_json::json!(emitted),
+                    );
+                    obj.insert(
+                        "accepted_token_count".to_string(),
+                        serde_json::json!(accepted),
+                    );
+                    obj.insert(
+                        "next_token_id".to_string(),
+                        serde_json::json!(emitted[accepted - 1]),
+                    );
+                    obj.insert(
+                        "decode_microbatch".to_string(),
+                        serde_json::json!(accepted > 1),
+                    );
+                    obj.insert(
+                        "speculative_method".to_string(),
+                        serde_json::json!("pipeline_chain_coalesced_greedy"),
+                    );
+                    obj.insert(
+                        "speculative_available".to_string(),
+                        serde_json::json!(accepted > 1),
+                    );
                     obj.insert("transport_trace".to_string(), serde_json::json!({
                         "transport": "pipeline_stream_chain_batch_direct",
                         "worker_seen_request": true,
@@ -898,6 +1074,9 @@ async fn handle_chain_control_frame(
                         "batch_m4_compute_ms": batch_m4_compute_ms,
                         "batch_result_wait_ms": batch_result_wait_ms,
                         "batch_tokens_per_second": if batch_started.elapsed().as_millis() > 0 { (accepted as f64 * 1000.0) / batch_started.elapsed().as_millis() as f64 } else { 0.0 },
+                        "chain_batch_raw_step": chain_batch_raw_step,
+                        "internal_payload_bytes": internal_payload_bytes,
+                        "internal_frame_payload_bytes": internal_frame_payload_bytes,
                     }));
                 }
                 let mut response = last_tensor_response.unwrap_or_default();
@@ -920,6 +1099,9 @@ async fn handle_chain_control_frame(
                     "batch_m4_compute_ms": batch_m4_compute_ms,
                     "batch_result_wait_ms": batch_result_wait_ms,
                     "batch_tokens_per_second": if batch_started.elapsed().as_millis() > 0 { (accepted as f64 * 1000.0) / batch_started.elapsed().as_millis() as f64 } else { 0.0 },
+                    "chain_batch_raw_step": chain_batch_raw_step,
+                    "internal_payload_bytes": internal_payload_bytes,
+                    "internal_frame_payload_bytes": internal_frame_payload_bytes,
                 })
                 .to_string();
                 let payload = serde_json::to_vec(&response).unwrap_or_default();
@@ -945,6 +1127,9 @@ async fn handle_chain_control_frame(
                     "batch_m4_compute_ms": batch_m4_compute_ms,
                     "batch_result_wait_ms": batch_result_wait_ms,
                     "batch_tokens_per_second": if batch_started.elapsed().as_millis() > 0 { (accepted as f64 * 1000.0) / batch_started.elapsed().as_millis() as f64 } else { 0.0 },
+                    "chain_batch_raw_step": chain_batch_raw_step,
+                    "internal_payload_bytes": internal_payload_bytes,
+                    "internal_frame_payload_bytes": internal_frame_payload_bytes,
                     "internal_frames_sent": internal_frames_sent,
                     "internal_frames_received": internal_frames_received,
                     "m1_chain_received_ms": chain_received_ms,
@@ -1004,6 +1189,20 @@ async fn handle_chain_control_frame(
     }
 
     if frame.dtype == "vryx.chain.forward" {
+        let frame_ack_timeout = payload_duration_ms(
+            &body,
+            "timeout_ms",
+            chain_forward_ack_timeout(),
+            500,
+            14_400_000,
+        );
+        let frame_total_timeout = payload_duration_ms(
+            &body,
+            "total_timeout_ms",
+            chain_total_step_timeout(),
+            1_000,
+            14_400_000,
+        );
         let result_peer_str = body
             .get("result_peer")
             .and_then(|v| v.as_str())
@@ -1048,7 +1247,7 @@ async fn handle_chain_control_frame(
             } else {
                 m1_grpc_compute_start_ms = unix_ms();
                 let compute_result = tokio::time::timeout(
-                    chain_total_step_timeout(),
+                    frame_total_timeout,
                     call_local_inference(
                         grpc_port,
                         current_payload,
@@ -1060,7 +1259,15 @@ async fn handle_chain_control_frame(
                 .await;
                 m1_grpc_compute_end_ms = unix_ms();
                 match compute_result {
-                    Ok(Ok((data, _c, _s, _metrics, _c_ms))) => data,
+                    Ok(Ok((data, _c, _s, _metrics, c_ms))) => {
+                        let hop = extract_sharding_proof_from_response_data(
+                            &data,
+                            &my_peer_id.to_string(),
+                            c_ms,
+                        );
+                        append_chain_hop_to_body(&mut body, hop);
+                        data
+                    }
                     Ok(Err(e)) => {
                         return (
                             false,
@@ -1090,16 +1297,18 @@ async fn handle_chain_control_frame(
                 }
             };
             if env_bool_enabled("VRYX_CHAIN_CAPTURE_M1_OUTPUT") {
-                let capture_dir =
-                    std::env::var("VRYX_CHAIN_CAPTURE_DIR").unwrap_or_else(|_| "/tmp".to_string());
+                let capture_dir = std::env::var("VRYX_CHAIN_CAPTURE_DIR")
+                    .ok()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir);
                 let safe_key = format!(
                     "{}-{}-{}",
                     frame.session_id.replace('/', "_"),
                     frame.request_id.replace('/', "_"),
                     frame.step_id
                 );
-                let capture_path = std::path::Path::new(&capture_dir)
-                    .join(format!("vryx-chain-m1-output-{}.json", safe_key));
+                let capture_path =
+                    capture_dir.join(format!("vryx-chain-m1-output-{}.json", safe_key));
                 let capture = serde_json::json!({
                     "ok": true,
                     "session_id": frame.session_id,
@@ -1173,7 +1382,7 @@ async fn handle_chain_control_frame(
                 payload,
             };
             return match tokio::time::timeout(
-                chain_forward_ack_timeout(),
+                frame_ack_timeout,
                 pipeline_stream_roundtrip(
                     stream_control,
                     stream_cache,
@@ -1372,8 +1581,15 @@ async fn handle_chain_control_frame(
                 m4_grpc_compute_end_ms = unix_ms();
                 match compute_result {
                     Ok((data, c, s, metrics, c_ms)) => {
+                        let mut chain_hops = inbound_trace
+                            .get("chain_hops")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        let final_hop =
+                            extract_sharding_proof_from_response_data(&data, &final_peer, c_ms);
+                        append_chain_hop_value(&mut chain_hops, final_hop);
                         let response = TensorResponse {
-                            data,
+	                            data,
                             compute_time_ns: c,
                             serialization_time_ns: s,
                             prompt_tokens_llm: metrics.prompt_tokens,
@@ -1398,32 +1614,34 @@ async fn handle_chain_control_frame(
                                 "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
                                 "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
                                 "m4_chain_received_ms": m4_chain_received_ms,
-                                "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
-                                "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
-                            })
-                            .to_string(),
-                        };
+	                                "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
+	                                "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
+	                                "chain_hops": chain_hops.clone(),
+	                            })
+	                            .to_string(),
+	                        };
                         let payload = serde_json::to_vec(&response).unwrap_or_default();
                         serde_json::json!({
-                            "ok": true,
-                            "chain_type": "CHAIN_RESULT",
-                            "session_id": session_id,
-                            "request_id": request_id,
-                            "step_id": step_id,
-                            "from_peer": final_peer,
-                            "final_peer": final_peer,
-                            "dtype": forward_dtype,
-                            "payload_len": payload.len(),
-                            "payload_b64": general_purpose::STANDARD.encode(&payload),
-                            "compute_ms": c_ms,
-                            "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
-                            "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
-                            "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
-                            "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
-                            "m4_chain_received_ms": m4_chain_received_ms,
+                        "ok": true,
+                        "chain_type": "CHAIN_RESULT",
+                        "session_id": session_id,
+                        "request_id": request_id,
+                        "step_id": step_id,
+                        "from_peer": final_peer,
+                        "final_peer": final_peer,
+                        "dtype": forward_dtype,
+                        "payload_len": payload.len(),
+                        "payload_b64": general_purpose::STANDARD.encode(&payload),
+                        "compute_ms": c_ms,
+                        "m1_chain_received_ms": inbound_trace.get("m1_chain_received_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m1_grpc_compute_start_ms": inbound_trace.get("m1_grpc_compute_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m1_grpc_compute_end_ms": inbound_trace.get("m1_grpc_compute_end_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m1_forward_to_m4_start_ms": inbound_trace.get("m1_forward_to_m4_start_ms").cloned().unwrap_or(serde_json::Value::Null),
+                        "m4_chain_received_ms": m4_chain_received_ms,
                             "m4_grpc_compute_start_ms": m4_grpc_compute_start_ms,
                             "m4_grpc_compute_end_ms": m4_grpc_compute_end_ms,
                             "m4_chain_result_send_ms": unix_ms(),
+                            "chain_hops": chain_hops,
                         })
                     }
                     Err(e) => serde_json::json!({
@@ -1596,6 +1814,7 @@ async fn handle_chain_control_frame(
                         "vryx.chain.forward",
                         "vryx.chain.forward.batch",
                         "vryx.chain.forward.batch.step",
+                        "vryx.chain.forward.batch.step.raw",
                         "vryx.chain.result"
                     ],
                 })
@@ -1681,7 +1900,9 @@ async fn handle_pipeline_stream(
                 .get("microbatch_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let key = if (chain_type == "CHAIN_BATCH_RESULT" || chain_type == "CHAIN_BATCH_ERROR") && !microbatch_id.is_empty() {
+            let key = if (chain_type == "CHAIN_BATCH_RESULT" || chain_type == "CHAIN_BATCH_ERROR")
+                && !microbatch_id.is_empty()
+            {
                 format!("{}:{}:batch:{}", session, request, microbatch_id)
             } else {
                 chain_pending_key(session, request, step)
@@ -2143,6 +2364,79 @@ fn should_keep_identify_addr(addr: &Multiaddr, filter_private: bool) -> bool {
     saw_ip
 }
 
+fn multiaddr_has_peer_id(addr: &Multiaddr) -> bool {
+    addr.iter()
+        .any(|proto| matches!(proto, libp2p::multiaddr::Protocol::P2p(_)))
+}
+
+fn multiaddr_is_circuit(addr: &Multiaddr) -> bool {
+    addr.iter()
+        .any(|proto| matches!(proto, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+fn multiaddr_has_loopback_ip(addr: &Multiaddr) -> bool {
+    addr.iter().any(|proto| match proto {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback() || ip.is_unspecified(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback() || ip.is_unspecified(),
+        _ => false,
+    })
+}
+
+fn dial_addr_for_peer(addr: &Multiaddr, peer_id: PeerId) -> Multiaddr {
+    if multiaddr_has_peer_id(addr) {
+        addr.clone()
+    } else {
+        addr.clone().with(libp2p::multiaddr::Protocol::P2p(peer_id))
+    }
+}
+
+fn parse_static_direct_peers_env() -> Vec<(PeerId, Multiaddr)> {
+    let mut out = Vec::new();
+    for name in ["VRYX_P2P_STATIC_DIRECT_PEERS", "VRYX_P2P_STATIC_PEER_ADDRS"] {
+        let Ok(raw) = std::env::var(name) else {
+            continue;
+        };
+        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some((peer_raw, addr_raw)) = entry.split_once('=') else {
+                eprintln!(
+                    "[P2P] {} entrée ignorée (format attendu peer=/ip4/.../tcp/...): {}",
+                    name, entry
+                );
+                continue;
+            };
+            let Ok(peer_id) = peer_raw.trim().parse::<PeerId>() else {
+                eprintln!("[P2P] {} peer invalide: {}", name, peer_raw.trim());
+                continue;
+            };
+            let Ok(addr) = addr_raw.trim().parse::<Multiaddr>() else {
+                eprintln!("[P2P] {} multiaddr invalide: {}", name, addr_raw.trim());
+                continue;
+            };
+            if multiaddr_is_circuit(&addr) {
+                eprintln!(
+                    "[P2P] {} ignore une adresse relay/circuit pour {}: {}",
+                    name, peer_id, addr
+                );
+                continue;
+            }
+            out.push((peer_id, addr));
+        }
+    }
+    out
+}
+
+fn static_direct_addr_for_peer(peer_id: PeerId) -> Option<Multiaddr> {
+    parse_static_direct_peers_env()
+        .into_iter()
+        .find_map(|(static_peer, addr)| {
+            if static_peer == peer_id {
+                Some(addr)
+            } else {
+                None
+            }
+        })
+}
+
 fn heartbeat_machine_info_with_network(
     machine_info: Option<serde_json::Value>,
     p2p_port: u16,
@@ -2205,6 +2499,112 @@ fn heartbeat_machine_info_with_network(
         }
         if p2p_port > 0 {
             network.insert("p2pPort".to_string(), serde_json::json!(p2p_port));
+        }
+    }
+    Some(root)
+}
+
+fn heartbeat_machine_info_with_gpu(
+    machine_info: Option<serde_json::Value>,
+    gpu_name: Option<&str>,
+    gpu_vram_mb: Option<u64>,
+    cuda_compute_capability: Option<&str>,
+    cuda_multiprocessors: Option<u64>,
+    cuda_cores: Option<u64>,
+) -> Option<serde_json::Value> {
+    let gpu_name = gpu_name.map(str::trim).filter(|v| !v.is_empty());
+    let cuda_compute_capability = cuda_compute_capability
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let is_nvidia = gpu_name
+        .map(|name| name.to_ascii_lowercase().contains("nvidia"))
+        .unwrap_or(false)
+        || cuda_compute_capability.is_some()
+        || cuda_multiprocessors.is_some()
+        || cuda_cores.is_some();
+    if gpu_name.is_none()
+        && gpu_vram_mb.is_none()
+        && cuda_compute_capability.is_none()
+        && cuda_multiprocessors.is_none()
+        && cuda_cores.is_none()
+    {
+        return machine_info;
+    }
+
+    let mut root = machine_info
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(root_obj) = root.as_object_mut() else {
+        return Some(root);
+    };
+
+    if let Some(name) = gpu_name {
+        root_obj.insert("gpuName".to_string(), serde_json::json!(name));
+        if is_nvidia {
+            root_obj.insert("gpuVendor".to_string(), serde_json::json!("NVIDIA"));
+        }
+    }
+    if let Some(vram) = gpu_vram_mb.filter(|v| *v > 0) {
+        root_obj.insert(
+            "vramGb".to_string(),
+            serde_json::json!((vram as f64 / 1024.0).round()),
+        );
+    }
+    if cuda_compute_capability.is_some() || cuda_multiprocessors.is_some() || cuda_cores.is_some() {
+        let hardware_entry = root_obj
+            .entry("hardware".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !hardware_entry.is_object() {
+            *hardware_entry = serde_json::json!({});
+        }
+        if let Some(hardware) = hardware_entry.as_object_mut() {
+            if let Some(value) = cuda_compute_capability {
+                hardware.insert(
+                    "cudaComputeCapability".to_string(),
+                    serde_json::json!(value),
+                );
+            }
+            if let Some(value) = cuda_multiprocessors.filter(|v| *v > 0) {
+                hardware.insert("cudaMultiprocessors".to_string(), serde_json::json!(value));
+            }
+            if let Some(value) = cuda_cores.filter(|v| *v > 0) {
+                hardware.insert("cudaCores".to_string(), serde_json::json!(value));
+            }
+        }
+    }
+    if let Some(name) = gpu_name {
+        let controllers_entry = root_obj
+            .entry("controllers".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if !controllers_entry.is_array() {
+            *controllers_entry = serde_json::json!([]);
+        }
+        if let Some(controllers) = controllers_entry.as_array_mut() {
+            let already_present = controllers.iter().any(|controller| {
+                controller
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|model| model.eq_ignore_ascii_case(name))
+                    .unwrap_or(false)
+            });
+            if !already_present {
+                let mut controller = serde_json::json!({
+                    "model": name,
+                    "vendor": if is_nvidia { "NVIDIA" } else { "GPU" },
+                });
+                if let Some(obj) = controller.as_object_mut() {
+                    if let Some(vram) = gpu_vram_mb.filter(|v| *v > 0) {
+                        obj.insert("vramMb".to_string(), serde_json::json!(vram));
+                    }
+                    if let Some(value) = cuda_compute_capability {
+                        obj.insert("computeCapability".to_string(), serde_json::json!(value));
+                    }
+                    if let Some(value) = cuda_cores.filter(|v| *v > 0) {
+                        obj.insert("cudaCores".to_string(), serde_json::json!(value));
+                    }
+                }
+                controllers.push(controller);
+            }
         }
     }
     Some(root)
@@ -2303,9 +2703,7 @@ async fn connect_local_inference_channel(
     Ok(endpoint.connect().await?)
 }
 
-async fn local_inference_channel(
-    port: u16,
-) -> Result<Channel, Box<dyn Error + Send + Sync>> {
+async fn local_inference_channel(port: u16) -> Result<Channel, Box<dyn Error + Send + Sync>> {
     let cache_enabled = env_bool_flag("VRYX_GRPC_CHANNEL_CACHE").unwrap_or(true);
     if !cache_enabled {
         return connect_local_inference_channel(port).await;
@@ -2451,6 +2849,66 @@ fn extract_transport_trace_from_response_data(data: &[u8]) -> serde_json::Value 
     v.get("transport_trace")
         .cloned()
         .unwrap_or(serde_json::Value::Null)
+}
+
+fn extract_sharding_proof_from_response_data(
+    data: &[u8],
+    worker_peer: &str,
+    fallback_compute_ms: u64,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) {
+        let proof = v
+            .get("transport_trace")
+            .and_then(|t| t.get("sharding_proof"))
+            .or_else(|| v.get("sharding_proof"));
+        if let Some(map) = proof.and_then(|p| p.as_object()) {
+            for (k, v) in map {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        if !out.contains_key("compute_ms") {
+            if let Some(ms) = v
+                .get("compute_time_ms")
+                .or_else(|| v.get("worker_compute_ms"))
+                .and_then(|x| x.as_u64())
+            {
+                out.insert("compute_ms".to_string(), serde_json::json!(ms));
+            }
+        }
+        if !out.contains_key("output_hidden_checksum") {
+            if let Some(token_id) = v.get("next_token_id").and_then(|x| x.as_i64()) {
+                out.insert("next_token_id".to_string(), serde_json::json!(token_id));
+            }
+        }
+    }
+    out.entry("worker_peer".to_string())
+        .or_insert_with(|| serde_json::json!(worker_peer));
+    out.entry("compute_ms".to_string())
+        .or_insert_with(|| serde_json::json!(fallback_compute_ms));
+    out.entry("transfer_to_next_ms".to_string())
+        .or_insert_with(|| serde_json::json!(0));
+    out.entry("fallback".to_string())
+        .or_insert_with(|| serde_json::json!(false));
+    serde_json::Value::Object(out)
+}
+
+fn append_chain_hop_value(chain_hops: &mut serde_json::Value, hop: serde_json::Value) {
+    if !chain_hops.is_array() {
+        *chain_hops = serde_json::json!([]);
+    }
+    if let Some(arr) = chain_hops.as_array_mut() {
+        arr.push(hop);
+    }
+}
+
+fn append_chain_hop_to_body(body: &mut serde_json::Value, hop: serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        let entry = obj
+            .entry("chain_hops".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        append_chain_hop_value(entry, hop);
+    }
 }
 
 async fn call_local_inference_once(
@@ -2748,19 +3206,34 @@ fn macos_system_profiler_gpu() -> (Option<String>, Option<u64>) {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_nvidia_smi_gpu() -> (Option<String>, Option<u64>) {
-    let out = match std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvidia_smi_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("nvidia-smi")];
+    #[cfg(target_os = "windows")]
     {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
-        _ => return (None, None),
-    };
-    let stdout = String::from_utf8_lossy(&out);
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            candidates.push(
+                PathBuf::from(program_files)
+                    .join("NVIDIA Corporation")
+                    .join("NVSMI")
+                    .join("nvidia-smi.exe"),
+            );
+        }
+        if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+            candidates.push(
+                PathBuf::from(program_files_x86)
+                    .join("NVIDIA Corporation")
+                    .join("NVSMI")
+                    .join("nvidia-smi.exe"),
+            );
+        }
+    }
+    candidates
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_nvidia_smi_gpu(stdout: &[u8]) -> (Option<String>, Option<u64>) {
+    let stdout = String::from_utf8_lossy(stdout);
     let Some(line) = stdout.lines().find(|l| !l.trim().is_empty()) else {
         return (None, None);
     };
@@ -2779,6 +3252,126 @@ fn linux_nvidia_smi_gpu() -> (Option<String>, Option<u64>) {
     (Some(name), Some(mib))
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvidia_smi_gpu() -> (Option<String>, Option<u64>) {
+    for candidate in nvidia_smi_candidates() {
+        let out = match std::process::Command::new(&candidate)
+            .args([
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+            _ => continue,
+        };
+        let parsed = parse_nvidia_smi_gpu(&out);
+        if parsed.0.is_some() || parsed.1.is_some() {
+            return parsed;
+        }
+    }
+    (None, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn cuda_cores_per_sm(compute_capability: &str) -> Option<u64> {
+    let mut parts = compute_capability.trim().split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    match (major, minor) {
+        (9, _) => Some(128),
+        (8, 0) => Some(64),
+        (8, 6) | (8, 7) | (8, 9) => Some(128),
+        (7, 0) | (7, 2) | (7, 5) => Some(64),
+        (6, 0) => Some(64),
+        (6, 1) | (6, 2) => Some(128),
+        (5, 0) | (5, 2) | (5, 3) => Some(128),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_first_nvidia_smi_value(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout).lines().find_map(|line| {
+        let value = line.split(',').next().unwrap_or(line).trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("[not supported]") {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvidia_smi_query_first(field: &str) -> Option<String> {
+    for candidate in nvidia_smi_candidates() {
+        let out = match std::process::Command::new(&candidate)
+            .args([
+                format!("--query-gpu={}", field),
+                "--format=csv,noheader,nounits".to_string(),
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+            _ => continue,
+        };
+        if let Some(value) = parse_first_nvidia_smi_value(&out) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn cuda_cores_from_gpu_name(name: &str) -> Option<u64> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("4070 ti") {
+        return Some(7_680);
+    }
+    if lower.contains("4070") {
+        return Some(5_888);
+    }
+    if lower.contains("4080") {
+        return Some(9_728);
+    }
+    if lower.contains("4090") {
+        return Some(16_384);
+    }
+    if lower.contains("3090") {
+        return Some(10_496);
+    }
+    if lower.contains("3080 ti") {
+        return Some(10_240);
+    }
+    if lower.contains("3080") {
+        return Some(8_704);
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvidia_smi_cuda_metadata() -> (Option<String>, Option<u64>, Option<u64>) {
+    let compute_capability = nvidia_smi_query_first("compute_cap");
+    let multiprocessors = nvidia_smi_query_first("multiprocessor_count")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v > 0);
+    let mut cuda_cores = compute_capability
+        .as_deref()
+        .and_then(cuda_cores_per_sm)
+        .zip(multiprocessors)
+        .map(|(cores_per_sm, sm)| cores_per_sm * sm);
+    if cuda_cores.is_none() {
+        let (name, _) = nvidia_smi_gpu();
+        if let Some(name) = name.as_deref() {
+            cuda_cores = cuda_cores_from_gpu_name(name);
+        }
+    }
+    if compute_capability.is_some() || multiprocessors.is_some() || cuda_cores.is_some() {
+        return (compute_capability, multiprocessors, cuda_cores);
+    }
+    (None, None, None)
+}
+
 /// Détection matérielle pour le heartbeat (une fois par processus).
 fn detect_heartbeat_gpu_hardware() -> (Option<String>, Option<u64>) {
     #[cfg(target_os = "macos")]
@@ -2788,21 +3381,38 @@ fn detect_heartbeat_gpu_hardware() -> (Option<String>, Option<u64>) {
         let vram = prof_v.or_else(sysctl_hw_memsize_mib);
         (name, vram)
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
-        linux_nvidia_smi_gpu()
+        nvidia_smi_gpu()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         (None, None)
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn detect_heartbeat_cuda_metadata() -> (Option<String>, Option<u64>, Option<u64>) {
+    nvidia_smi_cuda_metadata()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn detect_heartbeat_cuda_metadata() -> (Option<String>, Option<u64>, Option<u64>) {
+    (None, None, None)
+}
+
 static HEARTBEAT_GPU_HW: OnceLock<(Option<String>, Option<u64>)> = OnceLock::new();
+static HEARTBEAT_CUDA_HW: OnceLock<(Option<String>, Option<u64>, Option<u64>)> = OnceLock::new();
 
 fn heartbeat_gpu_hints_cached() -> (Option<String>, Option<u64>) {
     HEARTBEAT_GPU_HW
         .get_or_init(detect_heartbeat_gpu_hardware)
+        .clone()
+}
+
+fn heartbeat_cuda_hints_cached() -> (Option<String>, Option<u64>, Option<u64>) {
+    HEARTBEAT_CUDA_HW
+        .get_or_init(detect_heartbeat_cuda_metadata)
         .clone()
 }
 
@@ -2833,6 +3443,8 @@ struct HeartbeatPayload {
     supports_q4_weights: bool,
     supports_mlx: bool,
     supports_vllm: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    worker_roles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_info: Option<serde_json::Value>,
 }
@@ -2857,7 +3469,61 @@ fn apply_worker_secret_headers(
     }
 }
 
+fn normalize_api_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{}", trimmed.trim_start_matches('/'))
+    };
+    Some(with_scheme.trim_end_matches('/').to_string()).filter(|url| !url.is_empty())
+}
+
+fn resolve_heartbeat_api_url(cli_api_url: Option<&str>) -> Option<String> {
+    cli_api_url
+        .and_then(normalize_api_url)
+        .or_else(|| {
+            std::env::var("VRYX_API_URL")
+                .ok()
+                .and_then(|v| normalize_api_url(&v))
+        })
+        .or_else(|| {
+            std::env::var("VRYX_WORKER_API_URL")
+                .ok()
+                .and_then(|v| normalize_api_url(&v))
+        })
+}
+
+fn env_u64_positive(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
 async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &HeartbeatPayload) {
+    let attempts = env_u64_clamped("VRYX_HEARTBEAT_RETRY_ATTEMPTS", 3, 1, 8);
+    let retry_delay_ms = env_u64_clamped("VRYX_HEARTBEAT_RETRY_DELAY_MS", 1_500, 100, 15_000);
+    for attempt in 1..=attempts {
+        if send_heartbeat_once(client, api_url, payload, attempt, attempts).await {
+            return;
+        }
+        if attempt < attempts {
+            tokio::time::sleep(Duration::from_millis(retry_delay_ms * attempt)).await;
+        }
+    }
+}
+
+async fn send_heartbeat_once(
+    client: &reqwest::Client,
+    api_url: &str,
+    payload: &HeartbeatPayload,
+    attempt: u64,
+    attempts: u64,
+) -> bool {
     let url = format!("{}/api/workers/heartbeat", api_url.trim_end_matches('/'));
     let token = resolve_worker_secret();
 
@@ -3017,15 +3683,21 @@ async fn send_heartbeat(client: &reqwest::Client, api_url: &str, payload: &Heart
                 }
                 Err(_) => println!("[*] Heartbeat OK → {}", url),
             }
+            true
         }
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
             let detail = body.chars().take(240).collect::<String>();
-            eprintln!("[!] Heartbeat HTTP {} → {} {}", status, url, detail);
+            eprintln!(
+                "[!] Heartbeat HTTP {} ({}/{}) → {} {}",
+                status, attempt, attempts, url, detail
+            );
+            false
         }
         Err(e) => {
-            eprintln!("[!] Heartbeat erreur : {}", e);
+            eprintln!("[!] Heartbeat erreur ({}/{}): {}", attempt, attempts, e);
+            false
         }
     }
 }
@@ -3085,6 +3757,10 @@ async fn initiator_pull_workers_from_api_now(
         Some(w) => w,
         None => return,
     };
+    let static_direct_peer_ids: HashSet<PeerId> = parse_static_direct_peers_env()
+        .into_iter()
+        .map(|(peer_id, _)| peer_id)
+        .collect();
     let mut registry_count = 0usize;
     let mut registry_peers = HashSet::<PeerId>::new();
     for worker in workers {
@@ -3105,6 +3781,15 @@ async fn initiator_pull_workers_from_api_now(
         }
         registry_count += 1;
         registry_peers.insert(peer_id);
+        if static_direct_peer_ids.contains(&peer_id) {
+            if discovered_peers.insert(peer_id) {
+                match log_origin {
+                    "heartbeat" => println!("[P2P] Worker heartbeat statique direct : {}", peer_id),
+                    _ => println!("[P2P] Pré-chat : worker statique direct : {}", peer_id),
+                }
+            }
+            continue;
+        }
         let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", boot_addr_str, peer_id);
         let Ok(relay_addr) = relay_addr_str.parse::<Multiaddr>() else {
             continue;
@@ -3149,6 +3834,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let filter_private_identify_addrs =
         env_bool_flag("VRYX_P2P_FILTER_PRIVATE_IDENTIFY_ADDRS").unwrap_or(false);
+    let dial_identify_direct_addrs =
+        env_bool_flag("VRYX_P2P_DIAL_IDENTIFY_DIRECT_ADDRS").unwrap_or(false);
     let enable_swarm_quic = env_bool_flag("VRYX_P2P_LISTEN_QUIC").unwrap_or(true);
 
     // Filtre de log : on coupe le spam yamux/noise/autonat sauf si RUST_LOG est positionné.
@@ -3311,6 +3998,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // ── État ──────────────────────────────────────────────────────────────
     let mut discovered_peers: HashSet<PeerId> = HashSet::new();
+    for (peer_id, addr) in parse_static_direct_peers_env() {
+        if peer_id == my_peer_id || Some(peer_id) == bootstrap_peer_id {
+            continue;
+        }
+        let dial_addr = dial_addr_for_peer(&addr, peer_id);
+        swarm
+            .behaviour_mut()
+            .kad
+            .add_address(&peer_id, addr.clone());
+        swarm.add_peer_address(peer_id, addr.clone());
+        discovered_peers.insert(peer_id);
+        match swarm.dial(dial_addr.clone()) {
+            Ok(()) => println!(
+                "[P2P] Static direct peer dial lancé vers {} via {}",
+                peer_id, dial_addr
+            ),
+            Err(e) => eprintln!(
+                "[P2P] Static direct peer dial échoué {} via {} : {:?}",
+                peer_id, dial_addr, e
+            ),
+        }
+    }
 
     #[derive(Debug)]
     enum PendingMeta {
@@ -3419,8 +4128,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let tokens_in = Arc::clone(&tokens_in);
         let tokens_out = Arc::clone(&tokens_out);
         let tokens_generated = Arc::clone(&tokens_generated);
+        let tokens_in_chat_axum = Arc::clone(&tokens_in);
+        let tokens_out_chat_axum = Arc::clone(&tokens_out);
+        let tokens_generated_chat_axum = Arc::clone(&tokens_generated);
         let last_shard_trace_axum = Arc::clone(&last_shard_trace);
         let my_peer_id_str = my_peer_id.to_string();
+        let http_client_chat_axum = reqwest::Client::new();
+        let direct_http_inflight_axum = Arc::new(AtomicUsize::new(0));
         let cmd_tx_axum = cmd_tx.clone();
         let p2p_relay_axum = p2p_relay_tx.clone();
         let pipeline_stream_control_axum = Arc::clone(&pipeline_stream_control);
@@ -3441,6 +4155,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mode_chain_stream = args.mode.clone();
         let mode_chain_forward = args.mode.clone();
         let mode_status_diag = args.mode.clone();
+        let grpc_port_chat_axum = args.grpc_port;
         let mode_tp_diag = args.mode.clone();
         let grpc_axum_health = args.grpc_port;
         let grpc_chat_stream = args.grpc_port;
@@ -3618,16 +4333,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }),
             )
             .route("/api/chat", post(move |Json(payload): Json<serde_json::Value>| async move {
+                let direct_http_inflight_axum = Arc::clone(&direct_http_inflight_axum);
                 if mode_chat != "initiator" {
                     return (axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Node not in initiator mode"})));
                 }
                 if let Some(prompt) = payload["prompt"].as_str() {
-                    let quantization = payload
-                        .get("quantization")
-                        .or_else(|| payload.get("hidden_transport"))
+                    let hidden_transport = payload
+                        .get("hidden_transport")
+                        .or_else(|| payload.get("hiddenTransport"))
+                        .or_else(|| payload.get("activation_quantization"))
+                        .or_else(|| payload.get("activationQuantization"))
                         .and_then(|v| v.as_str())
                         .filter(|v| matches!(*v, "q4" | "int8" | "fp16"))
                         .unwrap_or("int8");
+                    let weight_quantization = payload
+                        .get("weight_quantization")
+                        .or_else(|| payload.get("weightQuantization"))
+                        .or_else(|| payload.get("quantization"))
+                        .and_then(|v| v.as_str())
+                        .filter(|v| matches!(*v, "q4" | "int8" | "fp16"))
+                        .unwrap_or("q4");
                     let pool_preference = payload
                         .get("pool_preference")
                         .and_then(|v| v.as_str())
@@ -3635,8 +4360,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap_or("auto");
                     let mut request_obj = serde_json::json!({
                         "prompt": prompt,
-                        "quantization": quantization,
-                        "hidden_transport": quantization,
+                        "quantization": weight_quantization,
+                        "weight_quantization": weight_quantization,
+                        "hidden_transport": hidden_transport,
                         "pool_preference": pool_preference,
                     });
                     if let Some(mt) =
@@ -3706,8 +4432,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         ("chain_stream", "chainStream"),
                         ("chain_result_direct", "chainResultDirect"),
                         ("chain_coalesced_decode", "chainCoalescedDecode"),
+                        ("decode_owner_final_peer", "decodeOwnerFinalPeer"),
+                        ("decode_owner_fallback_chain", "decodeOwnerFallbackChain"),
+                        ("quality_trace", "qualityTrace"),
+                        ("debug_top_logits", "debugTopLogits"),
                         ("bench_ignore_eos", "benchIgnoreEos"),
                         ("bench_force_tokens", "benchForceTokens"),
+                        ("speculative_decode", "speculativeDecode"),
+                        ("continuous_batching", "continuousBatching"),
                     ] {
                         if let Some(value) = payload
                             .get(snake)
@@ -3735,6 +4467,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     {
                         request_obj["decode_microbatch_cap"] = serde_json::json!(value);
                     }
+                    if let Some(value) = payload
+                        .get("first_worker_layers")
+                        .or_else(|| payload.get("firstWorkerLayers"))
+                        .or_else(|| payload.get("pipeline_first_worker_layers"))
+                        .or_else(|| payload.get("pipelineFirstWorkerLayers"))
+                        .and_then(|v| {
+                            v.as_u64().or_else(|| {
+                                v.as_i64().and_then(|i| {
+                                    if i >= 1 {
+                                        Some(i as u64)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                        })
+                        .filter(|&v| v <= 128)
+                    {
+                        request_obj["first_worker_layers"] = serde_json::json!(value);
+                    }
                     for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                         if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                             request_obj[key] = serde_json::json!(value);
@@ -3748,6 +4500,275 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     let request_payload = request_obj.to_string();
+                    let direct_http_verifier_url = std::env::var("VRYX_CHAT_DIRECT_HTTP_VERIFIER_URL")
+                        .ok()
+                        .map(|s| s.trim().trim_end_matches('/').to_string())
+                        .filter(|s| !s.is_empty());
+                    let force_distributed = request_obj
+                        .get("force_distributed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(verifier_url) = direct_http_verifier_url.filter(|_| !force_distributed) {
+                        let started = Instant::now();
+                        let max_inflight = std::env::var("VRYX_CHAT_DIRECT_HTTP_MAX_INFLIGHT")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(4)
+                            .clamp(1, 64);
+                        let inflight_now = direct_http_inflight_axum.fetch_add(1, Ordering::Relaxed) + 1;
+                        if inflight_now > max_inflight {
+                            direct_http_inflight_axum.fetch_sub(1, Ordering::Relaxed);
+                            return (
+                                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "direct_http_verifier_backpressure",
+                                    "retry_after_ms": 250,
+                                    "inflight_at_start": inflight_now - 1,
+                                    "max_inflight": max_inflight,
+                                    "latency_ms": started.elapsed().as_millis() as u64,
+                                })),
+                            );
+                        }
+                        let max_tokens = request_obj
+                            .get("max_new_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(128)
+                            .clamp(1, 32768);
+                        let temperature = request_obj
+                            .get("temperature")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0);
+                        let top_p = request_obj
+                            .get("top_p")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1.0);
+                        let top_k = request_obj
+                            .get("top_k")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let verifier_peer = std::env::var("VRYX_DIRECT_VERIFIER_PEER_ID")
+                            .unwrap_or_else(|_| "12D3KooWJGeDM978MnTrHkLACeFPx5rtgbfXtrEarnzLZBHeuyPU".to_string());
+                        let verifier_model = std::env::var("VRYX_MLX_LM_SERVER_MODEL")
+                            .unwrap_or_else(|_| "mlx-community/Qwen3.6-35B-A3B-4bit".to_string());
+                        let req_started = Instant::now();
+                        let server_body = serde_json::json!({
+                            "model": verifier_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": temperature,
+                            "top_p": top_p,
+                            "top_k": top_k,
+                            "max_tokens": max_tokens,
+                            "stream": false,
+                        });
+                        match http_client_chat_axum
+                            .post(format!("{}/v1/chat/completions", verifier_url))
+                            .json(&server_body)
+                            .send()
+                            .await
+                        {
+                            Ok(resp) => {
+                                let status = resp.status();
+                                match resp.json::<serde_json::Value>().await {
+                                    Ok(server_json) if status.is_success() => {
+                                        let inflight_after = direct_http_inflight_axum.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                                        let server_ms = req_started.elapsed().as_millis() as u64;
+                                        let choice = server_json
+                                            .get("choices")
+                                            .and_then(|v| v.as_array())
+                                            .and_then(|arr| arr.first())
+                                            .cloned()
+                                            .unwrap_or(serde_json::Value::Null);
+                                        let text = choice
+                                            .get("message")
+                                            .and_then(|m| m.get("content"))
+                                            .or_else(|| choice.get("text"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let usage = server_json.get("usage").cloned().unwrap_or(serde_json::json!({}));
+                                        let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let completion_tokens = usage
+                                            .get("completion_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or_else(|| estimate_text_tokens(text.as_bytes()));
+                                        let total_tokens = usage
+                                            .get("total_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(prompt_tokens.saturating_add(completion_tokens));
+                                        let actual_tps = if server_ms > 0 && completion_tokens > 0 {
+                                            (completion_tokens as f64 * 1000.0) / server_ms as f64
+                                        } else {
+                                            0.0
+                                        };
+                                        let latency_ms = started.elapsed().as_millis() as u64;
+                                        tokens_in_chat_axum.fetch_add(prompt_tokens, Ordering::Relaxed);
+                                        tokens_out_chat_axum.fetch_add(completion_tokens, Ordering::Relaxed);
+                                        tokens_generated_chat_axum.fetch_add(completion_tokens, Ordering::Relaxed);
+                                        return (
+                                            axum::http::StatusCode::OK,
+                                            Json(serde_json::json!({
+                                                "ok": true,
+                                                "response": text,
+                                                "latency_ms": latency_ms,
+                                                "compute_time_ms": server_ms,
+                                                "worker_compute_ms": server_ms,
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": completion_tokens,
+                                                "total_tokens": total_tokens,
+                                                "routing_path": [verifier_peer],
+                                                "pipeline_trace": {
+                                                    "ok": true,
+                                                    "layout": "mlx_lm_direct_http_verifier",
+                                                    "api_fast_path": "rust_direct_http_verifier",
+                                                    "routing_path": [verifier_peer],
+                                                    "peers": [verifier_peer],
+                                                    "model_id": request_obj.get("model_id").cloned().unwrap_or(serde_json::json!("Qwen/Qwen3.6-35B-A3B")),
+                                                    "verifier_peer": verifier_peer,
+                                                    "runtime_backend": "mlx_lm_server",
+                                                    "worker_roles": ["verifier"],
+                                                    "compute_time_ms": server_ms,
+                                                    "wall_time_ms": server_ms,
+                                                    "total_wall_ms": latency_ms,
+                                                    "relay_ms": 0,
+                                                    "queue_wait_ms": 0,
+                                                    "lease_wait_ms": 0,
+                                                    "p2p_send_ms": 0,
+                                                    "worker_wait_ms": server_ms,
+                                                    "mlx_lm_server_queue_ms": null,
+                                                    "inflight_at_start": null,
+                                                    "inflight_at_end": inflight_after,
+                                                    "max_inflight": max_inflight,
+                                                    "hot_path_tps": actual_tps,
+                                                    "benchmark": {
+                                                        "actual_tps": actual_tps,
+                                                        "verifier_tps": actual_tps,
+                                                        "decode_mode": "mlx_lm_server_direct_http_rust",
+                                                        "routing_hops": 0,
+                                                        "relay_ms": 0,
+                                                        "cache_hit": true,
+                                                        "runtime_backend": "mlx_lm_server",
+                                                        "active_batch_size": 1,
+                                                        "inflight_at_start": inflight_now,
+                                                        "inflight_at_end": inflight_after,
+                                                        "max_inflight": max_inflight,
+                                                        "queue_wait_ms": 0,
+                                                        "lease_wait_ms": 0,
+                                                        "worker_wait_ms": server_ms,
+                                                        "mlx_lm_server_tps": actual_tps,
+                                                        "draft_acceptance_rate": null,
+                                                        "accepted_tokens_per_step": 1,
+                                                        "speculative_decode": false,
+                                                        "speculative_status": "not_enabled_or_no_draft_worker",
+                                                        "effective_max_tokens": max_tokens,
+                                                    },
+                                                    "metrics": {
+                                                        "prompt_tokens": prompt_tokens,
+                                                        "completion_tokens": completion_tokens,
+                                                        "total_tokens": total_tokens,
+                                                        "vps_delegate_ms": 0,
+                                                    },
+                                                },
+                                            })),
+                                        );
+                                    }
+                                    Ok(server_json) => {
+                                        direct_http_inflight_axum.fetch_sub(1, Ordering::Relaxed);
+                                        return (
+                                            axum::http::StatusCode::BAD_GATEWAY,
+                                            Json(serde_json::json!({
+                                                "ok": false,
+                                                "error": format!("direct_http_verifier_status:{}", status.as_u16()),
+                                                "server_response": server_json,
+                                            })),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        direct_http_inflight_axum.fetch_sub(1, Ordering::Relaxed);
+                                        return (
+                                            axum::http::StatusCode::BAD_GATEWAY,
+                                            Json(serde_json::json!({"ok": false, "error": format!("direct_http_verifier_json: {}", e)})),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                direct_http_inflight_axum.fetch_sub(1, Ordering::Relaxed);
+                                return (
+                                    axum::http::StatusCode::BAD_GATEWAY,
+                                    Json(serde_json::json!({"ok": false, "error": format!("direct_http_verifier_request: {}", e)})),
+                                );
+                            }
+                        }
+                    }
+                    let concurrent_direct_mlx = std::env::var("VRYX_CHAT_DIRECT_CONCURRENT_MLX")
+                        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                        .unwrap_or(false);
+                    if concurrent_direct_mlx && !force_distributed {
+                        let started = Instant::now();
+                        let grpc_port = grpc_port_chat_axum;
+                        let timeout_s = std::env::var("VRYX_CHAT_DIRECT_CONCURRENT_TIMEOUT_S")
+                            .ok()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(300)
+                            .clamp(30, 3600);
+                        match tokio::time::timeout(
+                            Duration::from_secs(timeout_s),
+                            call_local_inference(
+                                grpc_port,
+                                request_payload.into_bytes(),
+                                "text".to_string(),
+                                vec![],
+                                String::new(),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok((data, _c, _s, metrics, compute_time_ms))) => {
+                                let pipeline_value: serde_json::Value =
+                                    serde_json::from_str(&metrics.pipeline_trace_json)
+                                        .unwrap_or(serde_json::Value::Null);
+                                let routing_path = routing_path_from_trace(&pipeline_value);
+                                let mut response = serde_json::json!({
+                                    "ok": true,
+                                    "response": String::from_utf8_lossy(&data).to_string(),
+                                    "latency_ms": started.elapsed().as_millis() as u64,
+                                    "compute_time_ms": compute_time_ms,
+                                    "worker_compute_ms": compute_time_ms,
+                                    "prompt_tokens": metrics.prompt_tokens,
+                                    "completion_tokens": metrics.completion_tokens,
+                                    "total_tokens": metrics.total_tokens,
+                                    "routing_path": routing_path,
+                                    "pipeline_trace": pipeline_value,
+                                });
+                                if let Some(obj) = response.get_mut("pipeline_trace").and_then(|v| v.as_object_mut()) {
+                                    obj.insert("api_fast_path".to_string(), serde_json::json!("direct_concurrent_mlx"));
+                                    obj.insert("api_queue_wait_ms".to_string(), serde_json::json!(0));
+                                }
+                                return (axum::http::StatusCode::OK, Json(response));
+                            }
+                            Ok(Err(e)) => {
+                                return (
+                                    axum::http::StatusCode::BAD_GATEWAY,
+                                    Json(serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("direct_concurrent_mlx_failed: {}", e),
+                                        "latency_ms": started.elapsed().as_millis() as u64,
+                                    })),
+                                );
+                            }
+                            Err(_) => {
+                                return (
+                                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                                    Json(serde_json::json!({
+                                        "ok": false,
+                                        "error": format!("direct_concurrent_mlx_timeout:{}s", timeout_s),
+                                        "latency_ms": started.elapsed().as_millis() as u64,
+                                    })),
+                                );
+                            }
+                        }
+                    }
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let _ = cmd_tx_axum.send((request_payload, Some(tx)));
 
@@ -3787,12 +4808,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .body(Body::from("{\"event\":\"error\",\"error\":\"Missing prompt\",\"done\":true}\n"))
                         .unwrap();
                 };
-                let quantization = payload
-                    .get("quantization")
-                    .or_else(|| payload.get("hidden_transport"))
+                let hidden_transport = payload
+                    .get("hidden_transport")
+                    .or_else(|| payload.get("hiddenTransport"))
+                    .or_else(|| payload.get("activation_quantization"))
+                    .or_else(|| payload.get("activationQuantization"))
                     .and_then(|v| v.as_str())
                     .filter(|v| matches!(*v, "q4" | "int8" | "fp16"))
                     .unwrap_or("int8");
+                let weight_quantization = payload
+                    .get("weight_quantization")
+                    .or_else(|| payload.get("weightQuantization"))
+                    .or_else(|| payload.get("quantization"))
+                    .and_then(|v| v.as_str())
+                    .filter(|v| matches!(*v, "q4" | "int8" | "fp16"))
+                    .unwrap_or("q4");
                 let pool_preference = payload
                     .get("pool_preference")
                     .and_then(|v| v.as_str())
@@ -3800,8 +4830,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap_or("auto");
                 let mut request_obj = serde_json::json!({
                     "prompt": prompt,
-                    "quantization": quantization,
-                    "hidden_transport": quantization,
+                    "quantization": weight_quantization,
+                    "weight_quantization": weight_quantization,
+                    "hidden_transport": hidden_transport,
                     "pool_preference": pool_preference,
                 });
                 if let Some(mt) = payload
@@ -3862,11 +4893,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 for (snake, camel) in [
                     ("chain_stream", "chainStream"),
-                    ("chain_result_direct", "chainResultDirect"),
-                    ("chain_coalesced_decode", "chainCoalescedDecode"),
-                    ("bench_ignore_eos", "benchIgnoreEos"),
-                    ("bench_force_tokens", "benchForceTokens"),
-                ] {
+                        ("chain_result_direct", "chainResultDirect"),
+                        ("chain_coalesced_decode", "chainCoalescedDecode"),
+                        ("decode_owner_final_peer", "decodeOwnerFinalPeer"),
+                        ("decode_owner_fallback_chain", "decodeOwnerFallbackChain"),
+                        ("quality_trace", "qualityTrace"),
+                        ("debug_top_logits", "debugTopLogits"),
+                        ("bench_ignore_eos", "benchIgnoreEos"),
+                        ("bench_force_tokens", "benchForceTokens"),
+                        ("speculative_decode", "speculativeDecode"),
+                        ("continuous_batching", "continuousBatching"),
+                    ] {
                     if let Some(value) = payload
                         .get(snake)
                         .or_else(|| payload.get(camel))
@@ -3892,6 +4929,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .filter(|&v| (1..=64).contains(&v))
                 {
                     request_obj["decode_microbatch_cap"] = serde_json::json!(value);
+                }
+                if let Some(value) = payload
+                    .get("first_worker_layers")
+                    .or_else(|| payload.get("firstWorkerLayers"))
+                    .or_else(|| payload.get("pipeline_first_worker_layers"))
+                    .or_else(|| payload.get("pipelineFirstWorkerLayers"))
+                    .and_then(|v| {
+                        v.as_u64().or_else(|| {
+                            v.as_i64().and_then(|i| {
+                                if i >= 1 {
+                                    Some(i as u64)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                    .filter(|&v| v <= 128)
+                {
+                    request_obj["first_worker_layers"] = serde_json::json!(value);
                 }
                 for key in ["stream_id", "stream_secret", "stream_callback_url"] {
                     if let Some(value) = payload.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
@@ -4001,6 +5058,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .get("step_id")
                         .and_then(|v| v.as_u64().or_else(|| v.as_i64().and_then(|i| if i >= 0 { Some(i as u64) } else { None })))
                         .unwrap_or(0);
+                    let request_timeout = payload_duration_ms(
+                        &payload,
+                        "timeout_ms",
+                        chain_forward_ack_timeout(),
+                        500,
+                        14_400_000,
+                    );
+                    let result_timeout_requested = payload_duration_ms(
+                        &payload,
+                        "result_timeout_ms",
+                        chain_result_timeout(),
+                        1_000,
+                        14_400_000,
+                    );
+                    let total_timeout_requested = payload_duration_ms(
+                        &payload,
+                        "total_timeout_ms",
+                        chain_total_step_timeout(),
+                        1_000,
+                        14_400_000,
+                    );
                     let chain_frame_dtype = payload
                         .get("chain_frame_dtype")
                         .and_then(|v| v.as_str())
@@ -4011,9 +5089,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let token_start = payload.get("token_start").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let token_count = payload.get("token_count").and_then(|v| v.as_u64()).unwrap_or(1);
-                    let key = if chain_frame_dtype == "vryx.chain.forward.batch" && !microbatch_id.is_empty() {
+	                    let token_start = payload.get("token_start").and_then(|v| v.as_u64()).unwrap_or(0);
+	                    let token_count = payload.get("token_count").and_then(|v| v.as_u64()).unwrap_or(1);
+	                    let routing_path: Vec<String> = payload
+	                        .get("routing_path")
+	                        .and_then(|v| v.as_array())
+	                        .map(|arr| {
+	                            arr.iter()
+	                                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+	                                .collect::<Vec<String>>()
+	                        })
+	                        .filter(|arr| !arr.is_empty())
+	                        .unwrap_or_else(|| vec![final_str.to_string()]);
+	                    let key = if chain_frame_dtype == "vryx.chain.forward.batch" && !microbatch_id.is_empty() {
                         format!("{}:{}:batch:{}", session_id, request_id, microbatch_id)
                     } else {
                         chain_pending_key(&session_id, &request_id, step_id)
@@ -4027,13 +5115,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                         (before, guard.len())
                     };
-                    let body = serde_json::json!({
-                        "routing_path": [final_str],
-                        "result_peer": my_peer_id_chain_axum.to_string(),
+	                    let body = serde_json::json!({
+	                        "routing_path": routing_path,
+	                        "result_peer": my_peer_id_chain_axum.to_string(),
                         "final_peer": final_str,
                         "forward_dtype": forward_dtype,
                         "payload_b64": general_purpose::STANDARD.encode(&data),
                         "payload_len": data.len(),
+                        "timeout_ms": request_timeout.as_millis() as u64,
+                        "result_timeout_ms": result_timeout_requested.as_millis() as u64,
+                        "total_timeout_ms": total_timeout_requested.as_millis() as u64,
                         "chain_type": payload.get("chain_type").cloned().unwrap_or_else(|| serde_json::json!("CHAIN_FORWARD")),
                         "microbatch_id": microbatch_id,
                         "token_start": token_start,
@@ -4049,7 +5140,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     };
                     let ack_started = Instant::now();
                     let ack_result = tokio::time::timeout(
-                        chain_forward_ack_timeout(),
+                        request_timeout,
                         pipeline_stream_roundtrip(control, cache, target_peer, frame, pipeline_stream_ttl_direct_axum),
                     )
                     .await;
@@ -4156,7 +5247,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     let wait_started = Instant::now();
-                    let result_timeout = std::cmp::min(chain_result_timeout(), chain_total_step_timeout());
+                    let result_timeout = std::cmp::min(result_timeout_requested, total_timeout_requested);
                     let result_json = match tokio::time::timeout(result_timeout, rx).await {
                         Ok(Ok(value)) => value,
                         Ok(Err(_)) => {
@@ -4285,8 +5376,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             "microbatch_id": result_json.get("microbatch_id").and_then(|v| v.as_str()),
                             "token_start": result_json.get("token_start").and_then(|v| v.as_u64()),
                             "token_count": result_json.get("token_count").and_then(|v| v.as_u64()),
-                            "accepted_token_count": result_json.get("accepted_token_count").and_then(|v| v.as_u64()),
-                            "chain_hop_count": result_json.get("chain_hop_count").and_then(|v| v.as_u64()).unwrap_or(1),
+	                            "accepted_token_count": result_json.get("accepted_token_count").and_then(|v| v.as_u64()),
+	                            "chain_hops": result_json.get("chain_hops").cloned().unwrap_or_else(|| serde_json::json!([])),
+	                            "chain_hop_count": result_json
+	                                .get("chain_hops")
+	                                .and_then(|v| v.as_array())
+	                                .map(|arr| arr.len() as u64)
+	                                .or_else(|| result_json.get("chain_hop_count").and_then(|v| v.as_u64()))
+	                                .unwrap_or(1),
                             "batch_hop_count": result_json.get("batch_hop_count").and_then(|v| v.as_u64()).unwrap_or(1),
                             "batch_m1_compute_ms": result_json.get("batch_m1_compute_ms").and_then(|v| v.as_u64()),
                             "batch_m4_compute_ms": result_json.get("batch_m4_compute_ms").and_then(|v| v.as_u64()),
@@ -4395,8 +5492,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "pending_count_after": pending_count_after_result,
                         "chain_pending_count": pending_count_after_insert,
                         "m1_compute_ms": result_json.get("m1_grpc_compute_end_ms").and_then(|v| v.as_u64()).unwrap_or(0).saturating_sub(result_json.get("m1_grpc_compute_start_ms").and_then(|v| v.as_u64()).unwrap_or(0)),
-                        "m4_compute_ms": resp.worker_compute_ms,
-                        "stream_open_ms": ack_trace.stream_open_ms,
+	                        "m4_compute_ms": resp.worker_compute_ms,
+	                        "chain_hops": result_json.get("chain_hops").cloned().unwrap_or_else(|| serde_json::json!([])),
+	                        "chain_hop_count": result_json
+	                            .get("chain_hops")
+	                            .and_then(|v| v.as_array())
+	                            .map(|arr| arr.len() as u64)
+	                            .unwrap_or(1),
+	                        "stream_open_ms": ack_trace.stream_open_ms,
                         "stream_reused": ack_trace.stream_reused,
                         "stream_send_ms": ack_trace.stream_send_ms,
                         "stream_wait_response_ms": ack_trace.stream_wait_response_ms,
@@ -4998,6 +6101,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     let model_name = args.model.clone();
+    let heartbeat_api_url = resolve_heartbeat_api_url(args.api_url.as_deref());
+    if let Some(url) = heartbeat_api_url.as_deref() {
+        println!("[*] Heartbeat API configurée : {}", url);
+    }
 
     // Client HTTP (heartbeat + découverte initiateur)
     let http_client = reqwest::Client::builder()
@@ -5204,11 +6311,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }));
                 } else {
                     eprintln!(
-                        "[P2P] Relais HTTP vers {} avant connexion P2P : dial circuit bootstrap + envoi opportuniste (payload ~ {:.1} Ko)",
+                        "[P2P] Relais HTTP vers {} avant connexion P2P : dial + envoi opportuniste (payload ~ {:.1} Ko)",
                         peer,
                         hidden_bytes as f64 / 1024.0
                     );
-                    if let Some(bs) = args
+                    if let Some(addr) = static_direct_addr_for_peer(peer) {
+                        let dial_addr = dial_addr_for_peer(&addr, peer);
+                        swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                        swarm.add_peer_address(peer, addr);
+                        match swarm.dial(dial_addr.clone()) {
+                            Ok(()) => println!(
+                                "[P2P] Relais HTTP utilise static direct pour {} via {}",
+                                peer, dial_addr
+                            ),
+                            Err(e) => eprintln!(
+                                "[P2P] Static direct dial avant relay échoué {} via {} : {:?}",
+                                peer, dial_addr, e
+                            ),
+                        }
+                        pending_relay_until_connected
+                            .entry(peer)
+                            .or_default()
+                            .push_back((req, reply_tx, Instant::now()));
+                        continue;
+                    } else if let Some(bs) = args
                         .bootstrap_node
                         .as_ref()
                         .map(|s| s.trim())
@@ -5324,7 +6450,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 if args.mode == "initiator" {
-                    if let Some(ref api_u) = args.api_url {
+                    if let Some(ref api_u) = heartbeat_api_url {
                         initiator_pull_workers_from_api_now(
                             &mut swarm,
                             &http_client,
@@ -5652,7 +6778,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         if active_peers.lock().unwrap().contains(&pt) {
                             continue 'redial_lp;
                         }
-                        if let Some(bs) = args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                        if let Some(addr) = static_direct_addr_for_peer(pt) {
+                            let dial_addr = dial_addr_for_peer(&addr, pt);
+                            swarm.behaviour_mut().kad.add_address(&pt, addr.clone());
+                            swarm.add_peer_address(pt, addr);
+                            if let Err(e) = swarm.dial(dial_addr.clone()) {
+                                eprintln!(
+                                    "[P2P] Retry relay static direct échoué {} via {} : {:?}",
+                                    pt, dial_addr, e
+                                );
+                            }
+                        } else if let Some(bs) = args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                             let relay_addr_str = format!("{}/p2p-circuit/p2p/{}", bs.trim_end_matches('/'), pt);
                             if let Ok(ma) = relay_addr_str.parse::<Multiaddr>() {
                                 swarm.behaviour_mut().kad.add_address(&pt, ma.clone());
@@ -5662,7 +6798,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                if let Some(api_url) = &args.api_url {
+                if let Some(api_url) = heartbeat_api_url.as_deref() {
                     let runtime_backend = std::env::var("VRYX_RUNTIME_BACKEND")
                         .ok()
                         .filter(|v| !v.trim().is_empty())
@@ -5707,6 +6843,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             gpu_vram_mb = hint_vram;
                         }
                     }
+                    let mut cuda_compute_capability = std::env::var("VRYX_GPU_COMPUTE_CAPABILITY")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty());
+                    let mut cuda_multiprocessors =
+                        env_u64_positive("VRYX_GPU_MULTIPROCESSORS");
+                    let mut cuda_cores = env_u64_positive("VRYX_GPU_CUDA_CORES");
+                    if cuda_compute_capability.is_none()
+                        || cuda_multiprocessors.is_none()
+                        || cuda_cores.is_none()
+                    {
+                        let (hint_compute_capability, hint_multiprocessors, hint_cuda_cores) =
+                            heartbeat_cuda_hints_cached();
+                        if cuda_compute_capability.is_none() {
+                            cuda_compute_capability = hint_compute_capability;
+                        }
+                        if cuda_multiprocessors.is_none() {
+                            cuda_multiprocessors = hint_multiprocessors;
+                        }
+                        if cuda_cores.is_none() {
+                            cuda_cores = hint_cuda_cores;
+                        }
+                    }
                     let (allocated_vram_mb, memory_limit_percent) = heartbeat_allocated_vram_mb(gpu_vram_mb);
                     let machine_info = std::env::var("VRYX_MACHINE_INFO")
                         .ok()
@@ -5714,6 +6873,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .filter(|v| v.is_object());
                     let machine_info =
                         heartbeat_machine_info_with_network(machine_info, args.p2p_port);
+                    let machine_info = heartbeat_machine_info_with_gpu(
+                        machine_info,
+                        gpu_name.as_deref(),
+                        gpu_vram_mb,
+                        cuda_compute_capability.as_deref(),
+                        cuda_multiprocessors,
+                        cuda_cores,
+                    );
+                    let worker_roles: Vec<String> = std::env::var("VRYX_WORKER_ROLES")
+                        .or_else(|_| std::env::var("VRYX_WORKER_ROLE"))
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| {
+                            matches!(
+                                s.as_str(),
+                                "verifier"
+                                    | "draft"
+                                    | "draft_worker"
+                                    | "draft-worker"
+                                    | "shard"
+                                    | "shard_worker"
+                                    | "shard-worker"
+                                    | "prefill"
+                                    | "embedding"
+                                    | "rerank"
+                                    | "fallback_shard"
+                                    | "control"
+                                    | "cuda"
+                                    | "cuda_worker"
+                                    | "cuda-worker"
+                                    | "llama_cpp_cuda"
+                                    | "llama_cpp_cuda_q4"
+                                    | "experimental_cuda_proof"
+                            )
+                        })
+                        .collect();
                     let payload = HeartbeatPayload {
                         peer_id: my_peer_id.to_string(),
                         mode: args.mode.clone(),
@@ -5740,6 +6936,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         supports_vllm: std::env::var("VRYX_SUPPORTS_VLLM")
                             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
                             .unwrap_or(false),
+                        worker_roles,
                         machine_info,
                     };
                     send_heartbeat(&http_client, api_url, &payload).await;
@@ -5893,6 +7090,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         swarm.add_peer_address(peer_id, addr.clone());
                         if !is_bootstrap {
                             println!("[P2P] Adresse ajoutée pour {} : {}", peer_id, addr);
+                        }
+                        if dial_identify_direct_addrs && !is_bootstrap {
+                            if !multiaddr_is_circuit(&addr) && !multiaddr_has_loopback_ip(&addr) {
+                                let dial_addr = dial_addr_for_peer(&addr, peer_id);
+                                match swarm.dial(dial_addr.clone()) {
+                                    Ok(()) => println!(
+                                        "[P2P] Dial direct Identify vers {} via {}",
+                                        peer_id, dial_addr
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[P2P] Dial direct Identify échoué {} via {} : {:?}",
+                                        peer_id, dial_addr, e
+                                    ),
+                                }
+                            }
                         }
                     }
                     if info.protocols.iter().any(|p| p.as_ref().starts_with("/vryx/")) {
@@ -6192,7 +7404,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     );
                                     active_peers.lock().unwrap().remove(&peer);
                                     peer_connection_count.lock().unwrap().remove(&peer);
-                                    if let Some(bs) =
+                                    if let Some(addr) = static_direct_addr_for_peer(peer) {
+                                        let dial_addr = dial_addr_for_peer(&addr, peer);
+                                        swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                                        swarm.add_peer_address(peer, addr);
+                                        if let Err(e) = swarm.dial(dial_addr.clone()) {
+                                            eprintln!(
+                                                "[P2P] Retry relay static direct après échec échoué {} via {} : {:?}",
+                                                peer, dial_addr, e
+                                            );
+                                        }
+                                    } else if let Some(bs) =
                                         args.bootstrap_node.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
                                     {
                                         let relay_addr_str =

@@ -9,17 +9,26 @@ on:
 
 jobs:
   build-linux:
-    runs-on: [self-hosted, vryx-builder]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@v4
-      - name: Use rustup toolchain
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
         run: |
           set -euo pipefail
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustc" --version
-          "$HOME/.cargo/bin/cargo" --version
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
       - name: Build daemon
         working-directory: nodeAndWorker/rust-daemon
         run: cargo build --release --locked

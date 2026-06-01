@@ -18,6 +18,8 @@ Variables :
   VRYX_P2P_RELAY_URL       URL du daemon Rust initiateur (défaut : http://127.0.0.1:3031)
   VRYX_DIST_MAX_WORKERS    Workers max utilisés dans la Daisy Chain lorsque tous les compatibles sont pris sans surcoût dédié ; voir aussi VRYX_DIST_USE_ALL_COMPATIBLE_PEERS.
   VRYX_DIST_USE_ALL_COMPATIBLE_PEERS  1 = utiliser jusqu’à VRYX_DIST_HARD_CAP_PEERS workers parmi les pairs découverts (après match modèle) pour répartir toutes les couches (test mono-machine multi-process ; pas de mini-plafond 2 pour les 0.5B).
+  VRYX_FORCE_ALL_WORKERS_SHARD         1 = mode preuve : garde les workers préférés dans le pipeline même si le modèle heartbeat ne matche pas.
+  VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD 1 = autorise un manifest multi-backend MLX/CUDA sans fallback silencieux.
 
   VRYX_DIST_HARD_CAP_PEERS   Plafond de sécurité si USE_ALL_PEERS vaut 1 (défaut 48).
   VRYX_DIST_SINGLE_NODE_PUBLIC_IP    Si défini : ne garder que les peers dont le heartbeat (catalog) expose ce publicIp (même foyer / même Mac plusieurs workers).
@@ -70,7 +72,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import urllib.error
 import urllib.request
@@ -78,6 +80,26 @@ import urllib.request
 import numpy as np
 
 from batching import BatchQueue, batching_trace
+
+
+def _wire_numpy_dtype(dtype: str | np.dtype) -> np.dtype:
+    parsed = np.dtype(dtype)
+    if parsed.kind == "f" and parsed.itemsize == 2:
+        return np.dtype("<f2")
+    if parsed.kind == "f" and parsed.itemsize == 4:
+        return np.dtype("<f4")
+    return parsed
+
+
+def _tensor_to_wire_f16_numpy(tensor: Any) -> np.ndarray:
+    arr = tensor.detach().contiguous().half().cpu().numpy()
+    return np.ascontiguousarray(arr).astype(_wire_numpy_dtype("<f2"), copy=False)
+
+
+def _array_to_wire_numpy(arr: np.ndarray, dtype: str | np.dtype | None = None) -> np.ndarray:
+    target = _wire_numpy_dtype(dtype or arr.dtype)
+    return np.ascontiguousarray(arr).astype(target, copy=False)
+
 
 try:
     import redis  # type: ignore
@@ -115,10 +137,14 @@ PIPELINE_DECODE_MICROBATCH = os.environ.get("VRYX_PIPELINE_DECODE_MICROBATCH", "
     "0", "false", "no", "off",
 )
 try:
-    DECODE_MICROBATCH_CAP = max(2, min(64, int(os.environ.get("VRYX_DECODE_MICROBATCH_CAP", "32") or "32")))
+    DECODE_MICROBATCH_CAP = max(2, min(64, int(os.environ.get("VRYX_DECODE_MICROBATCH_CAP", "16") or "16")))
 except (TypeError, ValueError):
-    DECODE_MICROBATCH_CAP = 32
+    DECODE_MICROBATCH_CAP = 16
 MLX_LM_DIRECT = os.environ.get("VRYX_MLX_LM_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
+QWEN36_DIRECT_VERIFIER_PRIMARY = os.environ.get("VRYX_QWEN36_DIRECT_VERIFIER_PRIMARY", "0").strip().lower() in ("1", "true", "yes", "on")
+DIRECT_VERIFIER_PEER_ID = os.environ.get("VRYX_DIRECT_VERIFIER_PEER_ID", "").strip()
+MLX_LM_SERVER_URL = os.environ.get("VRYX_MLX_LM_SERVER_URL", "").strip()
+MLX_LM_SERVER_DIRECT_HTTP = os.environ.get("VRYX_MLX_LM_SERVER_DIRECT_HTTP", "0").strip().lower() in ("1", "true", "yes", "on")
 LLAMA_CPP_DIRECT = os.environ.get("VRYX_LLAMA_CPP_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on")
 
 RELAY_TLS = threading.local()
@@ -364,6 +390,14 @@ def _routing_pipeline_width(peers_online: int, min_workers: int = 1) -> int:
     min_workers = max(1, int(min_workers))
     if peers_online < min_workers:
         return peers_online
+    if FORCE_ALL_WORKERS_SHARD:
+        try:
+            cap = int(float(os.environ.get("VRYX_DIST_HARD_CAP_PEERS", "48") or 48))
+        except (TypeError, ValueError):
+            cap = 48
+        width = min(peers_online, max(cap, min_workers))
+        print(f"[VPS] Proof sharding FORCE_ALL_WORKERS_SHARD → {width} peer(s) (en ligne={peers_online})")
+        return width
     use_all = os.environ.get("VRYX_DIST_USE_ALL_COMPATIBLE_PEERS", "").strip().lower() in ("1", "true", "yes")
     if use_all:
         try:
@@ -388,6 +422,7 @@ def _timeout_sec(name: str, default: float, floor: float = 1.0) -> float:
 
 TIMEOUT = _timeout_sec("VRYX_DIST_TIMEOUT_SEC", 600.0)
 PIPELINE_STEP_TIMEOUT = _timeout_sec("VRYX_PIPELINE_STEP_TIMEOUT_SEC", max(TIMEOUT, 600.0))
+PROOF_PIPELINE_STEP_TIMEOUT = _timeout_sec("VRYX_PROOF_PIPELINE_STEP_TIMEOUT_SEC", 3600.0, floor=600.0)
 SHARD_INIT_TIMEOUT = _timeout_sec("VRYX_SHARD_INIT_TIMEOUT_SEC", 600.0)
 SHARD_LOAD_TIMEOUT = _timeout_sec("VRYX_SHARD_LOAD_TIMEOUT_SEC", 600.0)
 SHARD_BUILD_TIMEOUT = _timeout_sec("VRYX_SHARD_BUILD_TIMEOUT_SEC", 600.0)
@@ -420,6 +455,35 @@ def timeout_for_dtype(dtype: str, default: float = TIMEOUT) -> float:
     if "decode" in lower:
         return _timeout_sec("VRYX_RELAY_TIMEOUT_SHARD_DECODE_SEC", 120.0, floor=15.0)
     return float(default)
+
+
+def _pipeline_step_timeout_for_payload(payload: dict[str, Any] | None) -> float:
+    payload = payload if isinstance(payload, dict) else {}
+    step = 0
+    try:
+        step = int(payload.get("step") or 0)
+    except (TypeError, ValueError):
+        step = 0
+    proof_requested = (
+        FORCE_ALL_WORKERS_SHARD
+        or EXPERIMENTAL_MULTI_BACKEND_SHARD
+        or payload.get("force_all_workers_shard") is True
+        or payload.get("experimental_multi_backend_shard") is True
+    )
+    budget = float(PIPELINE_STEP_TIMEOUT)
+    if proof_requested:
+        budget = max(budget, float(PROOF_PIPELINE_STEP_TIMEOUT))
+    if step == 0:
+        token_count = 0
+        for key in ("token_ids", "history_token_ids"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                token_count = max(token_count, len(values))
+        if token_count > 0:
+            # Llama 70B prefill over WAN can be minutes per hot step today; keep
+            # the proof from failing before the final CUDA shard receives hidden.
+            budget = max(budget, min(7200.0, 900.0 + token_count * 12.0))
+    return max(30.0, min(7200.0, budget))
 SHARD_TTL = int(os.environ.get("VRYX_DIST_SHARD_TTL", "1800"))
 POOL_TTL = int(os.environ.get("VRYX_POOL_TTL_SEC", str(max(SHARD_TTL, 24 * 3600))))
 KEEP_POOL_SHARDS = os.environ.get("VRYX_POOL_KEEP_SHARDS", "true").lower() not in ("0", "false", "no")
@@ -485,6 +549,12 @@ CHAIN_STREAM_FALLBACK_INITIATOR = os.environ.get(
 ).lower() not in ("0", "false", "no", "off")
 CHAIN_RESULT_DIRECT = os.environ.get("VRYX_CHAIN_RESULT_DIRECT", "0").lower() in ("1", "true", "yes", "on")
 CHAIN_COALESCED_DECODE = os.environ.get("VRYX_CHAIN_COALESCED_DECODE", "0").lower() in ("1", "true", "yes", "on")
+FORCE_ALL_WORKERS_SHARD = os.environ.get("VRYX_FORCE_ALL_WORKERS_SHARD", "0").lower() in ("1", "true", "yes", "on")
+EXPERIMENTAL_MULTI_BACKEND_SHARD = os.environ.get("VRYX_EXPERIMENTAL_MULTI_BACKEND_SHARD", "0").lower() in ("1", "true", "yes", "on")
+DECODE_OWNER_FINAL_PEER = os.environ.get("VRYX_DECODE_OWNER_FINAL_PEER", "0").lower() in ("1", "true", "yes", "on")
+DECODE_OWNER_FALLBACK_CHAIN = os.environ.get(
+    "VRYX_DECODE_OWNER_FALLBACK_CHAIN", "1"
+).lower() not in ("0", "false", "no", "off")
 CHAIN_MODEL_STEP_SMOKE = os.environ.get("VRYX_CHAIN_MODEL_STEP_SMOKE", "0").lower() in ("1", "true", "yes", "on")
 PIPELINE_CHAIN_MODE = os.environ.get("VRYX_PIPELINE_CHAIN_MODE", "initiator_sequential").strip().lower()
 HIDDEN_MICROCHUNK_BYTES = max(0, int(os.environ.get("VRYX_HIDDEN_MICROCHUNK_BYTES", "0")))
@@ -577,6 +647,27 @@ def _append_worker_secret_token(url: str) -> str:
     return f"{url}{sep}{token_suffix.lstrip('?')}"
 
 
+def _redact_url_secret(url: str) -> str:
+    raw = str(url or "")
+    if not raw:
+        return raw
+    try:
+        parsed = urlparse(raw)
+        query_parts = []
+        for part in str(parsed.query or "").split("&"):
+            if not part:
+                continue
+            key, sep, value = part.partition("=")
+            if key.lower() in {"token", "secret", "stream_secret"}:
+                query_parts.append(f"{key}=<redacted>")
+            else:
+                query_parts.append(f"{key}{sep}{value}" if sep else key)
+        redacted = parsed._replace(query="&".join(query_parts))
+        return urlunparse(redacted)
+    except Exception:
+        return raw.replace("token=", "token=<redacted>&")
+
+
 def _normalize_worker_shard_url(url: str, api_base: str) -> str:
     raw = str(url or "").strip()
     if not raw:
@@ -607,38 +698,59 @@ _latency_cache: dict[str, dict[str, Any]] = {}
 _latency_lock = threading.Lock()
 _prefix_cache_lock = threading.Lock()
 _mlx_lm_direct_lock = threading.Lock()
-_mlx_lm_direct_leases: dict[str, float] = {}
+_mlx_lm_direct_leases: dict[str, list[float]] = {}
 _mlx_lm_peer_busy_until: dict[str, float] = {}
 _mlx_lm_peer_next_index = 0
 
 
+def _mlx_lm_direct_max_inflight() -> int:
+    raw = os.environ.get("VRYX_MLX_LM_SERVER_MAX_INFLIGHT") or os.environ.get("VRYX_MLX_LM_DECODE_CONCURRENCY") or "1"
+    try:
+        return max(1, min(32, int(raw)))
+    except Exception:
+        return 1
+
+
 def _prune_mlx_direct_leases(now: float | None = None) -> None:
     now = time.time() if now is None else now
-    for peer, until in list(_mlx_lm_direct_leases.items()):
-        if until <= now:
+    for peer, leases in list(_mlx_lm_direct_leases.items()):
+        active = [until for until in leases if until > now]
+        if active:
+            _mlx_lm_direct_leases[peer] = active
+        else:
             _mlx_lm_direct_leases.pop(peer, None)
     for peer, until in list(_mlx_lm_peer_busy_until.items()):
         if until <= now:
             _mlx_lm_peer_busy_until.pop(peer, None)
 
 
-def _try_acquire_mlx_direct_peer(peer: str, lease_sec: float) -> tuple[bool, str, int]:
+def _try_acquire_mlx_direct_peer(peer: str, lease_sec: float) -> tuple[bool, str, int, int, int]:
     now = time.time()
     with _mlx_lm_direct_lock:
         _prune_mlx_direct_leases(now)
         busy_until = float(_mlx_lm_peer_busy_until.get(peer) or 0.0)
         if busy_until > now:
-            return False, "worker_busy", int(max(1, (busy_until - now) * 1000))
-        leased_until = float(_mlx_lm_direct_leases.get(peer) or 0.0)
-        if leased_until > now:
-            return False, "worker_leased", int(max(1, (leased_until - now) * 1000))
-        _mlx_lm_direct_leases[peer] = now + max(5.0, lease_sec)
-        return True, "leased", 0
+            inflight = len(_mlx_lm_direct_leases.get(peer) or [])
+            return False, "worker_busy", int(max(1, (busy_until - now) * 1000)), inflight, _mlx_lm_direct_max_inflight()
+        leases = list(_mlx_lm_direct_leases.get(peer) or [])
+        max_inflight = _mlx_lm_direct_max_inflight()
+        if len(leases) >= max_inflight:
+            retry_after = int(max(1, (min(leases) - now) * 1000)) if leases else 1
+            return False, "worker_inflight_limit", retry_after, len(leases), max_inflight
+        leases.append(now + max(5.0, lease_sec))
+        _mlx_lm_direct_leases[peer] = leases
+        return True, "leased", 0, len(leases), max_inflight
 
 
 def _release_mlx_direct_peer(peer: str) -> None:
     with _mlx_lm_direct_lock:
-        _mlx_lm_direct_leases.pop(peer, None)
+        leases = list(_mlx_lm_direct_leases.get(peer) or [])
+        if leases:
+            leases.pop()
+        if leases:
+            _mlx_lm_direct_leases[peer] = leases
+        else:
+            _mlx_lm_direct_leases.pop(peer, None)
 
 
 def _mark_mlx_direct_peer_busy(peer: str, busy_sec: float = 12.0) -> None:
@@ -654,12 +766,13 @@ def _mlx_direct_ready_peers(peers: list[str]) -> tuple[list[str], int]:
     with _mlx_lm_direct_lock:
         _prune_mlx_direct_leases(now)
         for peer in peers:
-            blocked_until = max(
-                float(_mlx_lm_direct_leases.get(peer) or 0.0),
-                float(_mlx_lm_peer_busy_until.get(peer) or 0.0),
-            )
-            if blocked_until > now:
-                retry_after_ms = max(retry_after_ms, int((blocked_until - now) * 1000))
+            busy_until = float(_mlx_lm_peer_busy_until.get(peer) or 0.0)
+            leases = list(_mlx_lm_direct_leases.get(peer) or [])
+            if busy_until > now:
+                retry_after_ms = max(retry_after_ms, int((busy_until - now) * 1000))
+                continue
+            if len(leases) >= _mlx_lm_direct_max_inflight():
+                retry_after_ms = max(retry_after_ms, int(max(1, (min(leases) - now) * 1000)))
                 continue
             ready.append(peer)
     return ready, retry_after_ms
@@ -1062,7 +1175,7 @@ def _coalesce_shared_accelerator_peers(
                 for item in coalesced
             )
         )
-    return sorted(kept), coalesced
+    return kept, coalesced
 
 
 def _vps_rtt_ms(peer_id: str, latency_matrix: dict[str, Any]) -> Optional[int]:
@@ -1583,7 +1696,9 @@ def _direct_mlx_tokenizer_model_id() -> str:
     normalized = MODEL_ID.lower()
     if "qwen3.6-35b-a3b" in normalized or "qwen3-6-35b-a3b" in normalized:
         return "mlx-community/Qwen3.6-35B-A3B-4bit"
-    if "llama-2-70b" in normalized or "llama2-70b" in normalized or "70b" in normalized:
+    if "llama-3" in normalized or "llama3" in normalized or "meta-llama-3" in normalized:
+        return os.environ.get("VRYX_LLAMA3_TOKENIZER_MODEL_ID", "").strip() or MODEL_ID
+    if "llama-2-70b" in normalized or "llama2-70b" in normalized:
         return "mlx-community/llama2-70b-qnt4bit"
     return MODEL_ID
 
@@ -1594,9 +1709,11 @@ def _direct_mlx_worker_load_model_id() -> str:
         return "mlx-community/Qwen3.6-35B-A3B-4bit"
     if "qwen3.5-9b" in normalized or "qwen3-5-9b" in normalized:
         return "mlx-community/Qwen3.5-9B-4bit"
-    if "llama-2-70b" in normalized or "llama2-70b" in normalized or "70b" in normalized:
+    if "llama-3" in normalized or "llama3" in normalized or "meta-llama-3" in normalized:
+        return os.environ.get("VRYX_LLAMA3_TOKENIZER_MODEL_ID", "").strip() or MODEL_ID
+    if "llama-2-70b" in normalized or "llama2-70b" in normalized:
         return "mlx-community/llama2-70b-qnt4bit"
-    return os.environ.get("VRYX_MLX_LM_MODEL_ID", "").strip()
+    return os.environ.get("VRYX_MLX_LM_MODEL_ID", "").strip() or MODEL_ID
 
 
 def _distributed_weight_model_id(requested_quantization: str, requires_distributed_shards: bool) -> str:
@@ -2104,28 +2221,28 @@ def _extract_worker_weights(model, layer_start: int, layer_end: int,
 
     if model_type == "gpt2":
         if has_embedding:
-            weights["wte.weight"] = model.transformer.wte.weight.detach().half().numpy()
-            weights["wpe.weight"] = model.transformer.wpe.weight.detach().half().numpy()
+            weights["wte.weight"] = _tensor_to_wire_f16_numpy(model.transformer.wte.weight)
+            weights["wpe.weight"] = _tensor_to_wire_f16_numpy(model.transformer.wpe.weight)
         for global_idx in range(layer_start, layer_end + 1):
             local_idx = global_idx - layer_start
             for name, param in model.transformer.h[global_idx].named_parameters():
-                weights[f"h.{local_idx}.{name}"] = param.detach().half().numpy()
+                weights[f"h.{local_idx}.{name}"] = _tensor_to_wire_f16_numpy(param)
         if has_lm_head:
-            weights["ln_f.weight"] = model.transformer.ln_f.weight.detach().half().numpy()
-            weights["ln_f.bias"] = model.transformer.ln_f.bias.detach().half().numpy()
+            weights["ln_f.weight"] = _tensor_to_wire_f16_numpy(model.transformer.ln_f.weight)
+            weights["ln_f.bias"] = _tensor_to_wire_f16_numpy(model.transformer.ln_f.bias)
             # GPT-2 lm_head partage les poids avec wte
-            weights["lm_head.weight"] = model.lm_head.weight.detach().half().numpy()
+            weights["lm_head.weight"] = _tensor_to_wire_f16_numpy(model.lm_head.weight)
     else:
         # Qwen2 / Qwen3 / LLaMA-style
         if has_embedding:
-            weights["embed_tokens.weight"] = model.model.embed_tokens.weight.detach().half().numpy()
+            weights["embed_tokens.weight"] = _tensor_to_wire_f16_numpy(model.model.embed_tokens.weight)
         for global_idx in range(layer_start, layer_end + 1):
             local_idx = global_idx - layer_start
             for name, param in model.model.layers[global_idx].named_parameters():
-                weights[f"layers.{local_idx}.{name}"] = param.detach().half().numpy()
+                weights[f"layers.{local_idx}.{name}"] = _tensor_to_wire_f16_numpy(param)
         if has_lm_head:
-            weights["norm.weight"] = model.model.norm.weight.detach().half().numpy()
-            weights["lm_head.weight"] = model.lm_head.weight.detach().half().numpy()
+            weights["norm.weight"] = _tensor_to_wire_f16_numpy(model.model.norm.weight)
+            weights["lm_head.weight"] = _tensor_to_wire_f16_numpy(model.lm_head.weight)
 
     total_mb = sum(a.nbytes for a in weights.values()) / 1e6
     print(f"[VPS] Tranche layers {layer_start}-{layer_end} ({model_type}) : {len(weights)} params, {total_mb:.1f} MB")
@@ -2444,6 +2561,7 @@ def _chain_forward_raw(
     dtype: str,
     payload: bytes,
     timeout: float = TIMEOUT,
+    routing_path: list[str] | None = None,
 ) -> dict:
     trace_ctx = _current_trace_ctx()
     if trace_ctx is not None:
@@ -2476,7 +2594,11 @@ def _chain_forward_raw(
         "session_id": session_id,
         "request_id": request_id,
         "step_id": step_id,
+        "timeout_ms": int(timeout * 1000),
+        "result_timeout_ms": int(timeout * 1000),
+        "total_timeout_ms": int(timeout * 1000),
         "stream_ttl_sec": PIPELINE_STREAM_TTL_SEC,
+        "routing_path": list(routing_path or [final_peer]),
     }).encode("utf-8")
     serialization_ms = int((time.perf_counter() - serialization_start) * 1000)
     req = urllib.request.Request(
@@ -2527,7 +2649,7 @@ def _chain_forward_raw(
             timeout,
             int((time.perf_counter() - t0) * 1000),
             len(payload),
-            [final_peer],
+            list(routing_path or [final_peer]),
             detail=str(ex) or "chain_forward_socket_timeout",
             p2p_transport="pipeline_stream_chain_result_direct",
             route_mode="initiator_chain_forward",
@@ -2589,6 +2711,9 @@ def _chain_forward_batch_raw(
         "session_id": session_id,
         "request_id": request_id,
         "step_id": step_id,
+        "timeout_ms": int(timeout * 1000),
+        "result_timeout_ms": int(timeout * 1000),
+        "total_timeout_ms": int(timeout * 1000),
         "microbatch_id": microbatch_id,
         "token_start": token_start,
         "token_count": max(1, int(token_count)),
@@ -2682,6 +2807,43 @@ def _decode_pipeline_response(result: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _extract_sharding_proof(response: dict[str, Any]) -> dict[str, Any]:
+    proof = response.get("sharding_proof")
+    if isinstance(proof, dict):
+        return proof
+    trace = response.get("transport_trace")
+    if isinstance(trace, dict) and isinstance(trace.get("sharding_proof"), dict):
+        return trace["sharding_proof"]
+    return {}
+
+
+def _copy_sharding_proof_to_hop(hop_trace: dict[str, Any], response: dict[str, Any]) -> None:
+    proof = _extract_sharding_proof(response)
+    if not proof:
+        return
+    hop_trace["sharding_proof"] = proof
+    for key in (
+        "worker_peer",
+        "backend",
+        "runtime_backend",
+        "layer_start",
+        "layer_end",
+        "model_format",
+        "received_hidden_checksum",
+        "output_hidden_checksum",
+        "compute_ms",
+        "transfer_to_next_ms",
+        "kv_cache_created",
+        "kv_cache_reused",
+        "fallback",
+    ):
+        if key in proof:
+            hop_trace[key] = proof.get(key)
+    if proof.get("compute_ms") is not None:
+        hop_trace["worker_compute_ms"] = proof.get("compute_ms")
+        hop_trace["compute_time_ms"] = proof.get("compute_ms")
+
+
 def _relay_result_from_response(response: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": response.get("ok", True) is not False,
@@ -2739,7 +2901,7 @@ def _run_batch_worker(key: str, peer_id: str, dtype: str, routing_path: list[str
                     peer_id,
                     dtype,
                     json.dumps(batch_payload, ensure_ascii=False).encode("utf-8"),
-                    timeout=PIPELINE_STEP_TIMEOUT,
+                    timeout=_pipeline_step_timeout_for_payload(first_payload),
                     routing_path=routing_path,
                 )
                 response = _decode_pipeline_response(result) if result.get("ok", True) else {}
@@ -2772,7 +2934,7 @@ def _run_batch_worker(key: str, peer_id: str, dtype: str, routing_path: list[str
                     peer_id,
                     dtype,
                     json.dumps(item.payload, ensure_ascii=False).encode("utf-8"),
-                    timeout=PIPELINE_STEP_TIMEOUT,
+                    timeout=_pipeline_step_timeout_for_payload(item.payload),
                     routing_path=routing_path,
                 )
                 if item.future is not None:
@@ -2827,7 +2989,11 @@ def _chain_stream_decode_enabled(peers: list[str], dtype: str, payload: dict[str
     if payload.get("__disable_chain_stream"):
         return False
     try:
-        if int(payload.get("step") or 0) < 1 and not CHAIN_MODEL_STEP_SMOKE:
+        if int(payload.get("step") or 0) < 1 and not (
+            CHAIN_MODEL_STEP_SMOKE
+            or FORCE_ALL_WORKERS_SHARD
+            or payload.get("force_all_workers_shard") is True
+        ):
             return False
     except (TypeError, ValueError):
         return False
@@ -2872,6 +3038,12 @@ def _relay_pipeline_chain_batch_once(
     current_payload["pipeline_token_start"] = token_start
     current_payload["pipeline_token_count"] = token_count
     current_payload["chain_coalesced_decode"] = True
+    current_payload["chain_batch_raw_step"] = (
+        str(os.environ.get("VRYX_CHAIN_BATCH_RAW_STEP", "0")).strip().lower() in ("1", "true", "yes", "on")
+        or payload.get("chain_batch_raw_step") is True
+    )
+    step_timeout = _pipeline_step_timeout_for_payload(current_payload)
+    current_payload["pipeline_step_timeout_ms"] = int(step_timeout * 1000)
     current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
     request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
     result = _chain_forward_batch_raw(
@@ -2882,7 +3054,7 @@ def _relay_pipeline_chain_batch_once(
         token_count=token_count,
         microbatch_id=microbatch_id,
         token_start=token_start,
-        timeout=PIPELINE_STEP_TIMEOUT,
+        timeout=step_timeout,
     )
     relay_trace = result.get("relay_trace") if isinstance(result.get("relay_trace"), dict) else {}
     chain_error = None if result.get("ok", True) else str(result.get("error") or "chain_batch_failed")
@@ -2891,6 +3063,7 @@ def _relay_pipeline_chain_batch_once(
         "rank": 0,
         "request_payload_bytes": len(current_payload_bytes),
         "request_json_encode_ms": request_json_encode_ms,
+        "effective_step_timeout_ms": int(step_timeout * 1000),
         "payload_dtype": dtype,
         "payload_hidden_transport": current_payload.get("hidden_transport"),
         "pipeline_stream": True,
@@ -2916,6 +3089,9 @@ def _relay_pipeline_chain_batch_once(
         "m4_compute_ms": relay_trace.get("m4_compute_ms"),
         "batch_m1_compute_ms": relay_trace.get("batch_m1_compute_ms"),
         "batch_m4_compute_ms": relay_trace.get("batch_m4_compute_ms"),
+        "chain_batch_raw_step": relay_trace.get("chain_batch_raw_step"),
+        "internal_payload_bytes": relay_trace.get("internal_payload_bytes"),
+        "internal_frame_payload_bytes": relay_trace.get("internal_frame_payload_bytes"),
         "batch_chain_forward_ms": relay_trace.get("batch_chain_forward_ms") or relay_trace.get("chain_forward_ms"),
         "batch_result_wait_ms": relay_trace.get("batch_result_wait_ms") or relay_trace.get("chain_result_wait_ms"),
         "batch_tokens_per_second": relay_trace.get("batch_tokens_per_second"),
@@ -2981,22 +3157,25 @@ def _relay_pipeline_chain_once(
         encode_t0 = time.perf_counter()
         current_payload = {k: v for k, v in payload.items() if k != "__disable_chain_stream"}
         current_payload["routing_path"] = list(peers[1:])
+        step_timeout = _pipeline_step_timeout_for_payload(current_payload)
+        current_payload["pipeline_step_timeout_ms"] = int(step_timeout * 1000)
         current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
         request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
         result = (
             _chain_forward_raw(
                 peers[0],
-                peers[1],
+                peers[-1],
                 dtype,
                 current_payload_bytes,
-                timeout=PIPELINE_STEP_TIMEOUT,
+                timeout=step_timeout,
+                routing_path=list(peers[1:]),
             )
-            if (CHAIN_RESULT_DIRECT or current_payload.get("chain_result_direct_request") is True) and current_payload.get("chain_result_direct_request") is not False and len(peers) == 2
+            if (CHAIN_RESULT_DIRECT or current_payload.get("chain_result_direct_request") is True) and current_payload.get("chain_result_direct_request") is not False and len(peers) >= 2
             else _pipeline_stream_raw(
                 peers[0],
                 dtype,
                 current_payload_bytes,
-                timeout=PIPELINE_STEP_TIMEOUT,
+                timeout=step_timeout,
                 routing_path=list(peers[1:]),
             )
         )
@@ -3007,6 +3186,7 @@ def _relay_pipeline_chain_once(
             "rank": 0,
             "request_payload_bytes": len(current_payload_bytes),
             "request_json_encode_ms": request_json_encode_ms,
+            "effective_step_timeout_ms": int(step_timeout * 1000),
             "payload_dtype": dtype,
             "payload_hidden_transport": current_payload.get("hidden_transport"),
             "pipeline_stream": True,
@@ -3040,7 +3220,8 @@ def _relay_pipeline_chain_once(
             "m4_grpc_compute_end_ms": relay_trace.get("m4_grpc_compute_end_ms"),
             "m4_chain_result_send_ms": relay_trace.get("m4_chain_result_send_ms"),
             "vps_chain_result_received_ms": relay_trace.get("vps_chain_result_received_ms"),
-            "chain_deadlock_guard_ms": int(PIPELINE_STEP_TIMEOUT * 1000),
+            "chain_hops": relay_trace.get("chain_hops") if isinstance(relay_trace.get("chain_hops"), list) else None,
+            "chain_deadlock_guard_ms": int(step_timeout * 1000),
             "chain_open_ms": relay_trace.get("stream_open_ms"),
             "chain_handshake_ms": relay_trace.get("stream_open_ms"),
             "chain_send_ms": relay_trace.get("stream_send_ms"),
@@ -3071,6 +3252,7 @@ def _relay_pipeline_chain_once(
         if result.get("ok", True):
             try:
                 response = _decode_pipeline_response(result)
+                _copy_sharding_proof_to_hop(hop_trace, response)
                 worker_trace = response.get("transport_trace") if isinstance(response.get("transport_trace"), dict) else {}
                 if worker_trace:
                     hop_trace["worker_transport_trace"] = worker_trace
@@ -3084,7 +3266,11 @@ def _relay_pipeline_chain_once(
                 hop_trace["ok"] = False
                 hop_trace["error"] = f"chain_response_decode_failed:{type(exc).__name__}:{exc}"
                 result = {"ok": False, "error": hop_trace["error"]}
-        if result.get("ok", True) or not CHAIN_STREAM_FALLBACK_INITIATOR:
+        if (
+            result.get("ok", True)
+            or current_payload.get("force_all_workers_shard") is True
+            or not CHAIN_STREAM_FALLBACK_INITIATOR
+        ):
             return result, [hop_trace]
         fallback_payload = {k: v for k, v in payload.items() if k != "__disable_chain_stream"}
         fallback_payload["__disable_chain_stream"] = True
@@ -3101,18 +3287,20 @@ def _relay_pipeline_chain_once(
     for hop_index, hop_peer in enumerate(peers):
         t_hop = time.perf_counter()
         encode_t0 = time.perf_counter()
+        step_timeout = _pipeline_step_timeout_for_payload(current_payload)
+        current_payload["pipeline_step_timeout_ms"] = int(step_timeout * 1000)
         current_payload_bytes = json.dumps(current_payload, ensure_ascii=False).encode("utf-8")
         request_json_encode_ms = int((time.perf_counter() - encode_t0) * 1000)
         request_payload_bytes = len(current_payload_bytes)
         used_pipeline_stream = bool(PIPELINE_STREAM and dtype == "vryx.shard.pipeline")
         result = (
-            _pipeline_stream_raw(hop_peer, dtype, current_payload_bytes, timeout=PIPELINE_STEP_TIMEOUT)
+            _pipeline_stream_raw(hop_peer, dtype, current_payload_bytes, timeout=step_timeout)
             if used_pipeline_stream
             else _relay_raw(
                 hop_peer,
                 dtype,
                 current_payload_bytes,
-                timeout=PIPELINE_STEP_TIMEOUT,
+                timeout=step_timeout,
                 routing_path=[],
             )
         )
@@ -3121,13 +3309,14 @@ def _relay_pipeline_chain_once(
             used_pipeline_stream
             and result.get("ok") is False
             and PIPELINE_STREAM_FALLBACK_REQUEST_RESPONSE
+            and current_payload.get("force_all_workers_shard") is not True
         ):
             request_response_fallback = True
             result = _relay_raw(
                 hop_peer,
                 dtype,
                 current_payload_bytes,
-                timeout=PIPELINE_STEP_TIMEOUT,
+                timeout=step_timeout,
                 routing_path=[],
             )
             result["request_response_fallback"] = True
@@ -3136,6 +3325,7 @@ def _relay_pipeline_chain_once(
             "rank": hop_index,
             "request_payload_bytes": request_payload_bytes,
             "request_json_encode_ms": request_json_encode_ms,
+            "effective_step_timeout_ms": int(step_timeout * 1000),
             "payload_dtype": dtype,
             "payload_hidden_transport": current_payload.get("hidden_transport"),
             "pipeline_stream": used_pipeline_stream,
@@ -3178,6 +3368,7 @@ def _relay_pipeline_chain_once(
             hop_traces[-1]["ok"] = False
             hop_traces[-1]["error"] = result["error"]
             break
+        _copy_sharding_proof_to_hop(hop_traces[-1], response)
         worker_trace = response.get("transport_trace") if isinstance(response.get("transport_trace"), dict) else {}
         if worker_trace:
             hop_traces[-1]["worker_transport_trace"] = worker_trace
@@ -3334,11 +3525,19 @@ def _relay_pipeline_step(
 
     if not batch_enabled:
         t0 = time.perf_counter()
+        if bool(payload.get("quality_trace")):
+            result, hop_traces = _relay_pipeline_chain_once([peer_id], dtype, payload)
+            return result, {
+                **batching_trace(False, 1),
+                "decode_batch_ms": int((time.perf_counter() - t0) * 1000),
+                "hop_traces": hop_traces,
+                "quality_trace_path": "single_peer_wrapped",
+            }
         result = _relay_raw(
             peer_id,
             dtype,
             json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            timeout=PIPELINE_STEP_TIMEOUT,
+            timeout=_pipeline_step_timeout_for_payload(payload),
             routing_path=routing_path,
         )
         return result, {**batching_trace(False, 1), "decode_batch_ms": int((time.perf_counter() - t0) * 1000)}
@@ -3359,7 +3558,7 @@ def _relay_pipeline_step(
 
     t0 = time.perf_counter()
     try:
-        result = future.result(timeout=PIPELINE_STEP_TIMEOUT + (BATCH_WINDOW_MS / 1000.0) + 5.0)
+        result = future.result(timeout=_pipeline_step_timeout_for_payload(payload) + (BATCH_WINDOW_MS / 1000.0) + 5.0)
     except Exception as exc:
         return {
             "ok": False,
@@ -3435,6 +3634,7 @@ def _save_shard_to_disk(
     offset = 0
     with open(bin_filepath, "wb") as f:
         for name, arr in weights.items():
+            arr = _array_to_wire_numpy(arr)
             data = arr.tobytes()
             f.write(data)
             index.append({
@@ -3648,7 +3848,7 @@ def _save_shard_to_disk_from_safetensors(
                 tensor = tensor.to(torch.float16)
             elif tensor.dtype == torch.float32:
                 tensor = tensor.to(torch.float16)
-            arr = tensor.contiguous().cpu().numpy()
+            arr = _array_to_wire_numpy(tensor.contiguous().cpu().numpy(), "<f2")
             data = arr.tobytes()
             out.write(data)
             index.append({
@@ -3687,7 +3887,63 @@ def _save_shard_to_disk_from_safetensors(
     return f"{api_base}/api/internal/shard-serve/{session_id}/{json_filename}{token_suffix}"
 
 
-def _prepared_gguf_session_dir() -> str:
+def _normalize_prepared_split_id(value: Any) -> str:
+    split_id = str(value or "").strip().lower()
+    if not split_id:
+        return ""
+    if split_id.isdigit():
+        split_id = f"split-{split_id}"
+    if re.fullmatch(r"split-[0-9]{1,3}", split_id):
+        return split_id
+    return ""
+
+
+def _prepared_split_id_from_options(options: Optional[dict[str, Any]] = None) -> str:
+    options = options or {}
+    return _normalize_prepared_split_id(
+        options.get("prepared_split_id")
+        or options.get("preparedSplitId")
+        or options.get("prepared_gguf_split_id")
+        or options.get("preparedGgufSplitId")
+        or os.environ.get("VRYX_PREPARED_SPLIT_ID")
+    )
+
+
+def _prepared_gguf_split_candidates(split_id: str) -> list[str]:
+    if not split_id:
+        return []
+    candidates: list[str] = []
+    if GGUF_PREPARED_SESSION_DIR:
+        base_dir = os.path.abspath(os.path.expanduser(GGUF_PREPARED_SESSION_DIR))
+        parent = os.path.dirname(base_dir)
+        name = os.path.basename(base_dir)
+        stem = re.sub(r"-(?:m1-m4|m4-m1|split-[0-9]{1,3})$", "", name)
+        candidates.extend([
+            os.path.join(parent, f"{stem}-{split_id}"),
+            os.path.join(parent, split_id),
+            f"{base_dir}-{split_id}",
+        ])
+    if GGUF_PREPARED_SESSION:
+        stem = re.sub(r"-(?:m1-m4|m4-m1|split-[0-9]{1,3})$", "", GGUF_PREPARED_SESSION)
+        candidates.extend([
+            os.path.join(SHARD_BASE_DIR, f"{stem}-{split_id}"),
+            os.path.join(SHARD_BASE_DIR, split_id),
+            os.path.join(SHARD_BASE_DIR, f"{GGUF_PREPARED_SESSION}-{split_id}"),
+        ])
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in candidates:
+        norm = os.path.abspath(os.path.expanduser(path))
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _prepared_gguf_session_dir(prepared_split_id: str = "") -> str:
+    for candidate in _prepared_gguf_split_candidates(prepared_split_id):
+        if os.path.isdir(candidate):
+            return candidate
     if GGUF_PREPARED_SESSION_DIR:
         return os.path.abspath(os.path.expanduser(GGUF_PREPARED_SESSION_DIR))
     if GGUF_PREPARED_SESSION:
@@ -3695,11 +3951,54 @@ def _prepared_gguf_session_dir() -> str:
     return ""
 
 
+def _is_prepared_gguf_manifest_file(file_name: str) -> bool:
+    return (
+        (file_name.startswith("worker-") and file_name.endswith(".json"))
+        or file_name == "decode-owner.json"
+        or (file_name.startswith("decode-owner-") and file_name.endswith(".json"))
+    )
+
+
+def _is_decode_owner_manifest(file_name: str, manifest: dict[str, Any]) -> bool:
+    role = str(manifest.get("role") or manifest.get("placement_role") or "").strip().lower()
+    return (
+        bool(manifest.get("decode_owner"))
+        or role in ("decode_owner", "decode-owner", "final_peer_decode_owner")
+        or file_name == "decode-owner.json"
+        or file_name.startswith("decode-owner-")
+    )
+
+
+def _manifest_covers_full_model(manifest: dict[str, Any], model_config: dict[str, Any]) -> bool:
+    try:
+        total_layers = int(
+            model_config.get("num_hidden_layers_total")
+            or model_config.get("num_hidden_layers")
+            or model_config.get("n_layer")
+            or 0
+        )
+    except (TypeError, ValueError):
+        total_layers = 0
+    try:
+        layer_start = int(manifest.get("layer_start") or 0)
+        layer_end = int(manifest.get("layer_end") or layer_start)
+    except (TypeError, ValueError):
+        return False
+    return (
+        layer_start == 0
+        and (total_layers <= 0 or layer_end >= total_layers - 1)
+        and bool(manifest.get("has_embedding"))
+        and bool(manifest.get("has_lm_head"))
+    )
+
+
 def _save_shard_to_disk_from_prepared_gguf(
     session_id: str,
     peer_idx: Any,
     peer_id: str,
     model_config: dict,
+    prefer_decode_owner: bool = False,
+    prepared_split_id: str = "",
 ) -> tuple[str, int, int, bool, bool]:
     """
     Recycle un manifeste GGUF préparé hors requête.
@@ -3708,7 +4007,7 @@ def _save_shard_to_disk_from_prepared_gguf(
     dans le dossier de session courant en ajoutant le `model_config` chargé par
     l'initiateur. Aucun poids n'est chargé sur le VPS.
     """
-    prepared_dir = _prepared_gguf_session_dir()
+    prepared_dir = _prepared_gguf_session_dir(prepared_split_id)
     if not prepared_dir or not os.path.isdir(prepared_dir):
         raise RuntimeError(
             "VRYX_GGUF_PREPARED_SESSION(_DIR) manquant ou introuvable. "
@@ -3716,12 +4015,19 @@ def _save_shard_to_disk_from_prepared_gguf(
         )
     candidates: list[tuple[int, str, dict[str, Any]]] = []
     for file_name in sorted(os.listdir(prepared_dir)):
-        if not (file_name.startswith("worker-") and file_name.endswith(".json")):
+        if not _is_prepared_gguf_manifest_file(file_name):
             continue
         path = os.path.join(prepared_dir, file_name)
         try:
             data = json.load(open(path, "r", encoding="utf-8"))
         except Exception:
+            continue
+        is_decode_owner = _is_decode_owner_manifest(file_name, data)
+        if is_decode_owner and not prefer_decode_owner:
+            continue
+        if prefer_decode_owner and not (
+            is_decode_owner or _manifest_covers_full_model(data, model_config)
+        ):
             continue
         try:
             rank = int(data.get("rank") if data.get("rank") is not None else file_name.split("-", 1)[1].split(".", 1)[0])
@@ -3729,6 +4035,11 @@ def _save_shard_to_disk_from_prepared_gguf(
             rank = len(candidates)
         candidates.append((rank, path, data))
     if not candidates:
+        if prefer_decode_owner:
+            raise RuntimeError(
+                "decode_owner_unavailable: aucun manifeste GGUF complet pour le peer final. "
+                "Génère decode-owner.json avec prepare_gguf_worker_manifests.py --emit-decode-owner."
+            )
         raise RuntimeError(f"aucun manifeste GGUF worker-*.json dans {prepared_dir}")
 
     selected: tuple[int, str, dict[str, Any]] | None = None
@@ -3737,6 +4048,11 @@ def _save_shard_to_disk_from_prepared_gguf(
         if target and target == peer_id:
             selected = item
             break
+    if selected is None and prefer_decode_owner:
+        for item in candidates:
+            if _is_decode_owner_manifest(os.path.basename(item[1]), item[2]) or _manifest_covers_full_model(item[2], model_config):
+                selected = item
+                break
     if selected is None:
         rank_idx = int(peer_idx) if isinstance(peer_idx, int) or str(peer_idx).isdigit() else len(candidates)
         for item in candidates:
@@ -3791,17 +4107,22 @@ def _save_shard_to_disk_from_prepared_gguf(
     )
 
 
-def _prepared_gguf_assignments_for_peers(peers: list[str]) -> list[tuple[str, int, int, bool, bool]] | None:
-    prepared_dir = _prepared_gguf_session_dir()
+def _prepared_gguf_assignments_for_peers(
+    peers: list[str],
+    prepared_split_id: str = "",
+) -> list[tuple[str, int, int, bool, bool]] | None:
+    prepared_dir = _prepared_gguf_session_dir(prepared_split_id)
     if not prepared_dir or not os.path.isdir(prepared_dir):
         return None
     manifests: list[tuple[int, dict[str, Any]]] = []
     for file_name in sorted(os.listdir(prepared_dir)):
-        if not (file_name.startswith("worker-") and file_name.endswith(".json")):
+        if not _is_prepared_gguf_manifest_file(file_name):
             continue
         try:
             data = json.load(open(os.path.join(prepared_dir, file_name), "r", encoding="utf-8"))
         except Exception:
+            continue
+        if _is_decode_owner_manifest(file_name, data):
             continue
         try:
             rank = int(data.get("rank") if data.get("rank") is not None else file_name.split("-", 1)[1].split(".", 1)[0])
@@ -3899,6 +4220,7 @@ def _push_weights_to_worker(
     n_ok = 0
     n_fail = 0
     for param_name, arr in weights.items():
+        arr = _array_to_wire_numpy(arr)
         load_payload = json.dumps({
             "session_id": session_id,
             "param_name": param_name,
@@ -4846,15 +5168,56 @@ def _plan_pipeline_assignments(
     catalog: dict[str, Any],
     latency_matrix: dict[str, Any],
     pool_class: str,
+    placement_options: Optional[dict[str, Any]] = None,
 ) -> tuple[list[str], list[tuple[Any, int, int, bool, bool]]]:
     n = len(peers)
     total_layers = model_config["num_hidden_layers_total"]
-    prepared_gguf_assignments = _prepared_gguf_assignments_for_peers(peers)
+    placement_options = placement_options or {}
+    first_worker_layers_raw = (
+        placement_options.get("first_worker_layers")
+        or placement_options.get("pipeline_first_worker_layers")
+        or placement_options.get("m1_layers")
+    )
+    try:
+        first_worker_layers = int(first_worker_layers_raw) if first_worker_layers_raw is not None else 0
+    except (TypeError, ValueError):
+        first_worker_layers = 0
+    prepared_split_id = _prepared_split_id_from_options(placement_options)
+    prepared_gguf_assignments = _prepared_gguf_assignments_for_peers(peers, prepared_split_id)
     if prepared_gguf_assignments:
         _log_speed_aware_prepared_manifest_hint(prepared_gguf_assignments)
         ordered = [a[0] for a in prepared_gguf_assignments]
+        first_layers = max(0, int(prepared_gguf_assignments[0][2]) - int(prepared_gguf_assignments[0][1]) + 1)
+        print(
+            "[VPS] Placement GGUF prepared actif "
+            f"split_id={prepared_split_id or 'default'} effective_first_worker_layers={first_layers} : "
+            f"{[_short(p) for p in ordered]} couches "
+            f"{[max(0, int(a[2]) - int(a[1]) + 1) for a in prepared_gguf_assignments]}"
+        )
         return ordered, prepared_gguf_assignments
-
+    if n >= 2 and 1 <= first_worker_layers < total_layers:
+        ordered = list(peers)
+        counts = [first_worker_layers]
+        remaining = total_layers - first_worker_layers
+        if n == 2:
+            counts.append(remaining)
+        else:
+            middle = max(0, n - 1)
+            base = remaining // middle
+            extra = remaining % middle
+            counts.extend(base + (1 if i < extra else 0) for i in range(middle))
+        assignments = []
+        start = 0
+        for i, peer in enumerate(ordered):
+            n_layers = max(0, counts[i])
+            end = start + n_layers - 1
+            assignments.append((peer, start, end, i == 0, i == n - 1))
+            start = end + 1
+        print(
+            "[VPS] Placement pipeline override first_worker_layers="
+            f"{first_worker_layers} : {[_short(p) for p in ordered]} couches {counts}"
+        )
+        return ordered, assignments
     if _preserve_explicit_pipeline_order():
         ordered = list(peers)
     else:
@@ -4903,6 +5266,8 @@ def _get_or_create_session(
     hidden_transport: str | None = None,
     pool_class: str = "legacy_pytorch",
     requested_weight_quantization: str | None = None,
+    decode_owner_final_peer: bool = False,
+    placement_options: Optional[dict[str, Any]] = None,
 ) -> tuple[Optional[str], str, list[dict[str, Any]]]:
     """
     Retourne (session_id, statut, diag préparation) avec statut parmi 'reused', 'created', 'failed'.
@@ -4913,7 +5278,45 @@ def _get_or_create_session(
     model_key = _model_fingerprint(model_config)
     catalog = _fetch_worker_catalog()
     latency_matrix = _refresh_latency_matrix(peers)
-    ordered_peers, assignments = _plan_pipeline_assignments(peers, model_config, catalog, latency_matrix, pool_class)
+    prepared_split_id = _prepared_split_id_from_options(placement_options)
+    prepared_gguf_active = bool(_prepared_gguf_session_dir(prepared_split_id))
+    proof_sharding_active = bool(
+        (placement_options or {}).get("force_all_workers_shard")
+        or FORCE_ALL_WORKERS_SHARD
+        or (placement_options or {}).get("experimental_multi_backend_shard")
+        or EXPERIMENTAL_MULTI_BACKEND_SHARD
+    )
+    effective_replication_factor = 0 if (prepared_gguf_active or proof_sharding_active) else POOL_REPLICATION_FACTOR
+    ordered_peers, assignments = _plan_pipeline_assignments(
+        peers,
+        model_config,
+        catalog,
+        latency_matrix,
+        pool_class,
+        placement_options=placement_options,
+    )
+    decode_owner_peer: str | None = None
+    decode_owner_active = bool(decode_owner_final_peer and ordered_peers)
+    if decode_owner_active:
+        decode_owner_peer = ordered_peers[-1]
+        try:
+            total_layers = int(
+                model_config.get("num_hidden_layers_total")
+                or model_config.get("num_hidden_layers")
+                or model_config.get("n_layer")
+                or 0
+            )
+        except (TypeError, ValueError):
+            total_layers = 0
+        if total_layers <= 0:
+            total_layers = max((int(a[2]) for a in assignments), default=0) + 1
+        ordered_peers = [decode_owner_peer]
+        assignments = [(decode_owner_peer, 0, max(0, total_layers - 1), True, True)]
+        print(
+            "[VPS] Decode-owner final peer actif : "
+            f"{_short(decode_owner_peer)} porte layers 0-{max(0, total_layers - 1)} "
+            "(fallback chain possible côté caller)."
+        )
     peers[:] = ordered_peers
     key = PIPELINE_SESSION_MANAGER.make_key(model_key, weight_quantization, peers, assignments)
     pool_id = "pool-" + str(abs(hash(key)))[:12]
@@ -4963,6 +5366,9 @@ def _get_or_create_session(
                     "status": "hot",
                     "session_status": "reused",
                     "last_reused_ms": _now_ms(),
+                    "decode_owner": bool((cached_meta or {}).get("decode_owner")),
+                    "decode_owner_peer": (cached_meta or {}).get("decode_owner_peer"),
+                    "assignments": (cached_meta or {}).get("assignments") or existing_pool.get("assignments") or [],
                     "pool_validation": validation,
                     "pool_fallback_reason": validation_reason,
                 })
@@ -4978,8 +5384,13 @@ def _get_or_create_session(
 
         session_id = f"vryx-{int(time.time() * 1000)}"
         n = len(peers)
-        if _prepared_gguf_assignments_for_peers(peers):
-            print(f"[VPS] Placement GGUF préparé actif ({len(assignments)} workers) : {[p[:12] for p in peers]}")
+        if _prepared_gguf_assignments_for_peers(peers, prepared_split_id):
+            first_layers = max(0, int(assignments[0][2]) - int(assignments[0][1]) + 1) if assignments else 0
+            print(
+                "[VPS] Placement GGUF préparé actif "
+                f"split_id={prepared_split_id or 'default'} effective_first_worker_layers={first_layers} "
+                f"({len(assignments)} workers) : {[p[:12] for p in peers]}"
+            )
 
         # Purge des anciens shards pour libérer /tmp avant d'écrire les nouveaux
         _purge_old_shards(keep_session=session_id)
@@ -4994,7 +5405,10 @@ def _get_or_create_session(
             "routing_path": peers,
             "status": "warming",
             "session_status": "creating",
-            "replication_factor": POOL_REPLICATION_FACTOR,
+            "replication_factor": effective_replication_factor,
+            "replication_disabled_reason": (
+                "proof_or_prepared_gguf" if effective_replication_factor == 0 and POOL_REPLICATION_FACTOR > 0 else None
+            ),
             "assignments": [
                 {
                     "peer": peer,
@@ -5024,6 +5438,12 @@ def _get_or_create_session(
                 <= HOT_POOL_MAX_RTT_MS
                 for peer in peers
             ),
+            "decode_owner": decode_owner_active,
+            "decode_owner_peer": decode_owner_peer,
+            "prepared_split_id": prepared_split_id or None,
+            "effective_first_worker_layers": (
+                max(0, int(assignments[0][2]) - int(assignments[0][1]) + 1) if assignments else None
+            ),
         })
 
         print(f"[VPS] Préparation poids pour {n} workers (session {session_id[:20]})…")
@@ -5040,6 +5460,28 @@ def _get_or_create_session(
             diag: list[dict[str, Any]],
         ) -> bool:
             worker_info = catalog.get(peer) or {}
+            manifest_meta: dict[str, Any] = {}
+            try:
+                manifest_path = os.path.join(SHARD_BASE_DIR, session_id, f"worker-{i}.json")
+                if os.path.isfile(manifest_path):
+                    with open(manifest_path, "r", encoding="utf-8") as fp:
+                        manifest_meta = json.load(fp) or {}
+            except Exception:
+                manifest_meta = {}
+            try:
+                peer_rank = int(i)
+            except (TypeError, ValueError):
+                peer_rank = -1
+            next_peer_id = ""
+            if 0 <= peer_rank < len(peers) - 1:
+                next_peer_id = peers[peer_rank + 1]
+            manifest_backend = str(manifest_meta.get("backend") or "").strip().lower()
+            runtime_backend = manifest_backend or _runtime_for_pool(pool_class, worker_info)
+            force_proof_shard = bool((placement_options or {}).get("force_all_workers_shard") or FORCE_ALL_WORKERS_SHARD)
+            experimental_multi_backend = bool(
+                (placement_options or {}).get("experimental_multi_backend_shard")
+                or EXPERIMENTAL_MULTI_BACKEND_SHARD
+            )
             worker_supports_q4 = bool(
                 worker_info.get("supportsQ4Weights")
                 or worker_info.get("supports_q4_weights")
@@ -5072,10 +5514,18 @@ def _get_or_create_session(
                 "async_load": True,
                 "hidden_transport": transport,
                 "weight_quantization": weight_quantization,
-                "runtime_backend": _runtime_for_pool(pool_class, worker_info),
+                "runtime_backend": runtime_backend,
                 "supports_q4_weights": worker_supports_q4,
                 "supports_mlx": worker_supports_mlx,
                 "supports_vllm": worker_supports_vllm,
+                "group_id": manifest_meta.get("group_id") or pool_id,
+                "peer_id": manifest_meta.get("peer_id") or manifest_meta.get("target_peer_id") or peer,
+                "backend": manifest_backend or runtime_backend,
+                "model_format": manifest_meta.get("model_format") or manifest_meta.get("format") or "",
+                "local_model_path": manifest_meta.get("local_model_path") or "",
+                "next_peer_id": manifest_meta.get("next_peer_id") or next_peer_id,
+                "force_all_workers_shard": force_proof_shard,
+                "experimental_multi_backend_shard": experimental_multi_backend,
                 "pipeline_stream_mode": PIPELINE_STREAM_MODE,
                 "worker_kv_cache": WORKER_KV_CACHE,
                 "hidden_quic": HIDDEN_QUIC,
@@ -5097,8 +5547,11 @@ def _get_or_create_session(
                     "layer_end": le,
                     "has_embedding": has_emb,
                     "has_lm_head": has_head,
-                    "manifest_url_preview": download_url[:120],
-                    "worker_backend": _runtime_for_pool(pool_class, worker_info),
+                    "manifest_url_preview": _redact_url_secret(download_url)[:120],
+                    "worker_backend": runtime_backend,
+                    "manifest_backend": manifest_backend or None,
+                    "next_peer_id": manifest_meta.get("next_peer_id") or next_peer_id,
+                    "model_format": manifest_meta.get("model_format") or manifest_meta.get("format"),
                     "worker_model_id": worker_info.get("model") or worker_info.get("model_id"),
                 }
                 print("[VPS][shard.init] " + json.dumps({
@@ -5284,9 +5737,14 @@ def _get_or_create_session(
         init_jobs: list[tuple[Any, str, int, int, bool, bool, str]] = []
         capacity_errors: list[dict[str, Any]] = []
         for i, (peer, ls, le, has_emb, has_head) in enumerate(assignments):
-            if _prepared_gguf_session_dir():
+            if prepared_gguf_active:
                 download_url, ls, le, has_emb, has_head = _save_shard_to_disk_from_prepared_gguf(
-                    session_id, i, peer, model_config
+                    session_id,
+                    i,
+                    peer,
+                    model_config,
+                    prefer_decode_owner=decode_owner_active,
+                    prepared_split_id=prepared_split_id,
                 )
             else:
                 download_url = _save_shard_to_disk_from_safetensors(
@@ -5305,7 +5763,7 @@ def _get_or_create_session(
             required_mb = manifest_bytes / 1024 / 1024
             quant = weight_quantization
             native_quantized_weights = _manifest_has_native_quantized_weights(manifest, quant)
-            if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb and not _prepared_gguf_session_dir():
+            if manifest_bytes > 0 and safe_mb > 0 and required_mb > safe_mb and not prepared_gguf_active:
                 capacity_errors.append({
                     "worker_index": i,
                     "peer": peer[:48],
@@ -5372,10 +5830,10 @@ def _get_or_create_session(
             return None, "failed", prep_diag
 
         replicas = []
-        if POOL_REPLICATION_FACTOR > 0:
+        if effective_replication_factor > 0 and not decode_owner_active:
             extra_peers = [p for p in sorted(_discover_live_peers()) if p not in peers]
             critical = [a for a in assignments if a[4]] or assignments[-1:]
-            for rep_i, peer in enumerate(extra_peers[:POOL_REPLICATION_FACTOR]):
+            for rep_i, peer in enumerate(extra_peers[:effective_replication_factor]):
                 _, ls, le, _has_emb, has_head = critical[rep_i % len(critical)]
                 download_url = _save_shard_to_disk_from_safetensors(
                     session_id, f"replica-{rep_i}", ls, le, False, has_head, model_manifest, model_config
@@ -5433,6 +5891,12 @@ def _get_or_create_session(
             "revision": str(HF_REVISION or "main"),
             "pool_class": pool_class,
             "reuse_reason": "fresh_session_init",
+            "decode_owner": decode_owner_active,
+            "decode_owner_peer": decode_owner_peer,
+            "prepared_split_id": prepared_split_id or None,
+            "effective_first_worker_layers": (
+                max(0, int(assignments[0][2]) - int(assignments[0][1]) + 1) if assignments else None
+            ),
         }
         PIPELINE_SESSION_MANAGER.store(key, session_id, session_meta)
         _register_pool(pool_id, {
@@ -5471,7 +5935,16 @@ def _run_mlx_lm_direct_chat(
     options: Optional[dict[str, Any]] = None,
     latency_matrix: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    direct_enabled = MLX_LM_DIRECT or LLAMA_CPP_DIRECT
+    direct_requested = bool(
+        isinstance(options, dict)
+        and (
+            options.get("decode_owner_final_peer")
+            or options.get("mlx_lm_direct_m4_only")
+            or options.get("allow_distributed_direct")
+            or options.get("m4_only_direct")
+        )
+    )
+    direct_enabled = MLX_LM_DIRECT or LLAMA_CPP_DIRECT or direct_requested
     if not direct_enabled or not peers:
         return None
     catalog = _fetch_worker_catalog()
@@ -5498,8 +5971,11 @@ def _run_mlx_lm_direct_chat(
     ready_peers = _rotate_direct_ready_peers(ready_peers)
     peer = None
     acquire_reason = "none"
+    inflight_at_start = 0
+    max_inflight = _mlx_lm_direct_max_inflight()
+    lease_wait_ms = int((time.perf_counter() - lock_t0) * 1000)
     for candidate in ready_peers:
-        acquired, acquire_reason, retry_after_ms = _try_acquire_mlx_direct_peer(
+        acquired, acquire_reason, retry_after_ms, inflight_at_start, max_inflight = _try_acquire_mlx_direct_peer(
             candidate,
             lease_sec=max(float(PIPELINE_STEP_TIMEOUT), float(MLX_DIRECT_RELAY_TIMEOUT)) + 15.0,
         )
@@ -5546,9 +6022,19 @@ def _run_mlx_lm_direct_chat(
         "top_k": SAMPLING_TOP_K,
         "repetition_penalty": REPETITION_PENALTY,
     }
+    if direct_requested:
+        payload["allow_distributed_direct"] = True
+        payload["m4_only_direct"] = len(peers) == 1
+        if isinstance(options, dict):
+            if options.get("speculative_decode") or options.get("speculativeDecoding"):
+                payload["speculative_decode_requested"] = True
+            if options.get("continuous_batching") or options.get("continuousBatching"):
+                payload["continuous_batching_requested"] = True
     load_model_id = _direct_mlx_worker_load_model_id()
     if direct_backend == "mlx_lm" and load_model_id:
         payload["load_model_id"] = load_model_id
+    if direct_backend == "mlx_lm" and MLX_LM_SERVER_URL:
+        payload["mlx_lm_server_url"] = MLX_LM_SERVER_URL
     if direct_backend == "llama_cpp":
         payload["load_model_id"] = os.environ.get("VRYX_LLAMA_CPP_MODEL", "vryx-llama2-70b-q4").strip() or "vryx-llama2-70b-q4"
         payload["use_generate"] = os.environ.get("VRYX_LLAMA_CPP_USE_GENERATE", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -5559,6 +6045,128 @@ def _run_mlx_lm_direct_chat(
         value = options.get(key) if isinstance(options, dict) else None
         if value:
             payload[key] = str(value)
+    if direct_backend == "mlx_lm" and MLX_LM_SERVER_URL and MLX_LM_SERVER_DIRECT_HTTP:
+        server_t0 = time.perf_counter()
+        messages = []
+        if not payload.get("formatted_prompt"):
+            messages.append({"role": "system", "content": os.environ.get("VRYX_CHAT_SYSTEM_PROMPT", "You are a benchmark assistant.")})
+        messages.append({"role": "user", "content": resolved_prompt})
+        body = {
+            "model": load_model_id,
+            "messages": messages,
+            "temperature": payload["temperature"],
+            "top_p": payload["top_p"],
+            "top_k": payload["top_k"],
+            "max_tokens": decode_cap,
+            "stream": False,
+        }
+        try:
+            req = urllib.request.Request(
+                f"{MLX_LM_SERVER_URL.rstrip('/')}/v1/chat/completions",
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=MLX_DIRECT_RELAY_TIMEOUT) as resp:
+                server_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            wall_ms = max(1, int((time.perf_counter() - server_t0) * 1000))
+            choice = (server_data.get("choices") or [{}])[0] if isinstance(server_data.get("choices"), list) else {}
+            msg = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            text = str(msg.get("content") or choice.get("text") or "")
+            usage = server_data.get("usage") if isinstance(server_data.get("usage"), dict) else {}
+            completion_tokens = int(usage.get("completion_tokens") or max(1, len(text.split())))
+            prompt_tokens = int(usage.get("prompt_tokens") or prompt_token_count or 0)
+            actual_tps = round(completion_tokens * 1000.0 / wall_ms, 3) if completion_tokens else 0.0
+            _release_mlx_direct_peer(peer)
+            inflight_at_end = len(_mlx_lm_direct_leases.get(peer) or [])
+            trace = {
+                "layout": "mlx_lm_direct_http_verifier",
+                "ok": True,
+                "routing_path": [peer],
+                "peers": [peer],
+                "model_id": MODEL_ID,
+                "runtime_backend_per_worker": {peer: direct_backend},
+                "worker_roles": {peer: ["verifier"]},
+                "architecture": {
+                    "mode": "verifier_primary_direct_http",
+                    "verifier_peer": peer,
+                    "draft_peer": None,
+                    "prefill_peer": None,
+                    "windows_shard_disabled": True,
+                },
+                "compute_time_ms": wall_ms,
+                "wall_time_ms": wall_ms,
+                "total_wall_ms": wall_ms,
+                "generation_wall_ms": wall_ms,
+                "relay_ms": 0,
+                "queue_wait_ms": 0,
+                "lease_wait_ms": lease_wait_ms,
+                "p2p_send_ms": 0,
+                "worker_wait_ms": wall_ms,
+                "mlx_lm_server_queue_ms": None,
+                "inflight_at_start": inflight_at_start,
+                "inflight_at_end": inflight_at_end,
+                "max_inflight": max_inflight,
+                "setup_ms": 0,
+                "mlx_lm_load_ms": 0,
+                "mlx_lm_cache_hit": True,
+                "mlx_lm_cache_status": "server",
+                "resident_model": True,
+                "tokens_generated": completion_tokens,
+                "hot_path_tps": actual_tps,
+                "benchmark": {
+                    "target_tps": 80,
+                    "actual_ms_per_token": int(wall_ms / completion_tokens) if completion_tokens else 0,
+                    "actual_tps": actual_tps,
+                    "decode_mode": "mlx_lm_server_direct_http",
+                    "routing_hops": 0,
+                    "relay_ms": 0,
+                    "cache_hit": True,
+                    "runtime_backend": "mlx_lm",
+                    "verifier_tps": actual_tps,
+                    "active_batch_size": 1,
+                    "inflight_at_start": inflight_at_start,
+                    "inflight_at_end": inflight_at_end,
+                    "max_inflight": max_inflight,
+                    "queue_wait_ms": 0,
+                    "lease_wait_ms": lease_wait_ms,
+                    "worker_wait_ms": wall_ms,
+                    "mlx_lm_server_tps": actual_tps,
+                    "mlx_lm_server_queue_ms": None,
+                    "draft_acceptance_rate": None,
+                    "accepted_tokens_per_step": 1,
+                    "speculative_decode": False,
+                    "speculative_status": "not_enabled_or_no_draft_worker",
+                    "stop_reason": choice.get("finish_reason") or "unknown",
+                    "effective_max_tokens": decode_cap,
+                },
+                "metrics": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "vps_delegate_ms": 0,
+                },
+            }
+            return {"ok": True, "text": _clean_response_text(text), "trace": trace, "metrics": trace["metrics"]}
+        except Exception as exc:
+            _release_mlx_direct_peer(peer)
+            return {
+                "ok": False,
+                "text": "",
+                "error": f"mlx_lm_server_direct_http_failed:{type(exc).__name__}:{exc}",
+                "trace": {
+                    "layout": "mlx_lm_direct_http_verifier",
+                    "ok": False,
+                    "routing_path": [peer],
+                    "peers": [peer],
+                    "failure_stage": "mlx_lm_server_direct_http",
+                    "queue_wait_ms": 0,
+                    "lease_wait_ms": lease_wait_ms,
+                    "inflight_at_start": inflight_at_start,
+                    "max_inflight": max_inflight,
+                },
+                "metrics": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "vps_delegate_ms": 0},
+            }
     try:
         response: Optional[dict[str, Any]] = None
         relay: dict[str, Any] = {}
@@ -5574,6 +6182,7 @@ def _run_mlx_lm_direct_chat(
         wall_ms = max(1, int((time.perf_counter() - t0) * 1000))
     finally:
         _release_mlx_direct_peer(peer)
+    inflight_at_end = len(_mlx_lm_direct_leases.get(peer) or [])
     response = response or {}
     error_text = str(response.get("error") or "")
     if error_text.startswith("mlx_lm_busy") or error_text.startswith("llama_cpp_busy"):
@@ -5674,14 +6283,31 @@ def _run_mlx_lm_direct_chat(
         "peers": [peer],
         "model_id": MODEL_ID,
         "runtime_backend_per_worker": {peer: direct_backend},
+        "worker_roles": {peer: ["verifier"]},
+        "architecture": {
+            "mode": "verifier_primary",
+            "verifier_peer": peer,
+            "draft_peer": None,
+            "prefill_peer": None,
+            "windows_shard_disabled": True,
+        },
         "pool_preference": pool_preference,
         "peer_latency_matrix": latency_matrix or {},
         "requested_quantization": requested_quantization,
         "effective_quantization": "gguf_q4_native" if direct_backend == "llama_cpp" else "mlx_lm_native",
         "compute_time_ms": decode_ms if direct_backend == "llama_cpp" else generation_ms,
         "wall_time_ms": wall_ms,
+        "total_wall_ms": wall_ms,
         "generation_wall_ms": generation_ms,
         "relay_ms": relay_ms,
+        "queue_wait_ms": 0,
+        "lease_wait_ms": lease_wait_ms,
+        "p2p_send_ms": relay.get("relay_trace", {}).get("libp2p_send_ms") if isinstance(relay.get("relay_trace"), dict) else None,
+        "worker_wait_ms": relay_ms,
+        "mlx_lm_server_queue_ms": None,
+        "inflight_at_start": inflight_at_start,
+        "inflight_at_end": inflight_at_end,
+        "max_inflight": max_inflight,
         "setup_ms": int(response.get("load_ms") or 0),
         "eval_ms": int(response.get("eval_ms") or 0),
         "prompt_eval_ms": int(response.get("prompt_eval_ms") or 0),
@@ -5710,6 +6336,20 @@ def _run_mlx_lm_direct_chat(
             "prompt_eval_ms": response.get("prompt_eval_ms"),
             "cache_hit": bool(response.get("cache_hit")),
             "runtime_backend": "llama_cpp" if LLAMA_CPP_DIRECT else "mlx_lm",
+            "verifier_tps": actual_tps,
+            "active_batch_size": 1,
+            "inflight_at_start": inflight_at_start,
+            "inflight_at_end": inflight_at_end,
+            "max_inflight": max_inflight,
+            "queue_wait_ms": 0,
+            "lease_wait_ms": lease_wait_ms,
+            "worker_wait_ms": relay_ms,
+            "mlx_lm_server_tps": actual_tps,
+            "mlx_lm_server_queue_ms": None,
+            "draft_acceptance_rate": None,
+            "accepted_tokens_per_step": 1,
+            "speculative_decode": False,
+            "speculative_status": "not_enabled_or_no_draft_worker",
             "stop_reason": response.get("stop_reason"),
             "effective_max_tokens": response.get("effective_max_tokens"),
         },
@@ -5744,10 +6384,26 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     stream_secret = str(options.get("stream_secret") or "")
     stream_callback_url = str(options.get("stream_callback_url") or "")
     _activate_model_from_options(options)
-    requested_quantization = _normalize_hidden_transport(
-        options.get("hidden_transport") or options.get("quantization") or HIDDEN_TRANSPORT
+    raw_weight_quantization = (
+        options.get("weight_quantization")
+        or options.get("weightQuantization")
     )
-    hidden_transport = requested_quantization
+    raw_legacy_quantization = str(options.get("quantization") or "").strip().lower()
+    if raw_weight_quantization is None and raw_legacy_quantization in ("int8", "uint8", "q8", "8bit"):
+        raw_legacy_quantization = ""
+    requested_weight_quantization = str(
+        raw_weight_quantization
+        or raw_legacy_quantization
+        or os.environ.get("VRYX_WEIGHT_QUANTIZATION", "fp16")
+    ).strip().lower()
+    requested_quantization = requested_weight_quantization
+    hidden_transport = _normalize_hidden_transport(
+        options.get("hidden_transport")
+        or options.get("hiddenTransport")
+        or options.get("activation_quantization")
+        or options.get("activationQuantization")
+        or HIDDEN_TRANSPORT
+    )
     quantization_fallback_reason: Optional[str] = None
     pool_preference = _normalize_pool_preference(options.get("pool_preference"))
     pool_fallback_reason: Optional[str] = None
@@ -5767,6 +6423,21 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     request_chain_stream = _option_bool("chain_stream", CHAIN_STREAM)
     request_chain_result_direct = _option_bool("chain_result_direct", CHAIN_RESULT_DIRECT)
     request_chain_coalesced_decode = _option_bool("chain_coalesced_decode", CHAIN_COALESCED_DECODE)
+    request_force_all_workers_shard = _option_bool("force_all_workers_shard", FORCE_ALL_WORKERS_SHARD)
+    request_experimental_multi_backend_shard = _option_bool(
+        "experimental_multi_backend_shard",
+        EXPERIMENTAL_MULTI_BACKEND_SHARD,
+    )
+    request_decode_owner_final_peer = _option_bool("decode_owner_final_peer", DECODE_OWNER_FINAL_PEER)
+    request_decode_owner_fallback_chain = _option_bool("decode_owner_fallback_chain", DECODE_OWNER_FALLBACK_CHAIN)
+    request_quality_trace = _option_bool(
+        "quality_trace",
+        os.environ.get("VRYX_QUALITY_TRACE", "0").strip().lower() in ("1", "true", "yes", "on"),
+    )
+    request_debug_top_logits = _option_bool(
+        "debug_top_logits",
+        os.environ.get("VRYX_DEBUG_TOP_LOGITS", "0").strip().lower() in ("1", "true", "yes", "on"),
+    )
     request_bench_ignore_eos = _option_bool(
         "bench_ignore_eos",
         os.environ.get("VRYX_BENCH_IGNORE_EOS", "0").strip().lower() in ("1", "true", "yes", "on"),
@@ -5802,6 +6473,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     force_distributed = (
         requested_load_mode == "shard"
         or str(options.get("force_distributed") or "").strip().lower() in ("1", "true", "yes", "on")
+        or request_force_all_workers_shard
     )
     requires_distributed_shards = (not force_full_load) and (
         force_distributed or _requires_distributed_shards(MODEL_ID)
@@ -5811,6 +6483,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         if requires_distributed_shards and not ALLOW_SINGLE_WORKER_LARGE_LLAMA
         else _required_min_workers_for_model(MODEL_ID)
     )
+    if request_decode_owner_final_peer:
+        # Decode-owner is intentionally a single-final-peer layout: the final
+        # worker owns a full replica for decode so we can avoid per-token
+        # worker-to-worker hops. Do not require the normal distributed pair
+        # before attempting this mode, otherwise M4-only decode-owner can never
+        # recover while M1 is temporarily unavailable.
+        min_workers_required = 1
+    if request_force_all_workers_shard and preferred_worker_peer_ids:
+        min_workers_required = max(2, len(preferred_worker_peer_ids))
     wait_for_min = DIST_WAIT_FOR_MIN_WORKERS or requires_distributed_shards
     if requires_distributed_shards:
         disk_ok, disk_msg = _assert_shard_cache_disk()
@@ -5873,11 +6554,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         # Sinon la clé de cache (sorted) peut correspondre à une autre permutation et le 1er hop reçoit token_ids
         # sur un worker « milieu » → pas de next_token_id, texte vide, message générique côté API.
         incompatible_model_peers = []
-        if REQUIRE_WORKER_MODEL_MATCH and catalog:
+        if REQUIRE_WORKER_MODEL_MATCH and catalog and not request_force_all_workers_shard:
+            preferred_visible = set(preferred_worker_peer_ids)
             compatible_peers: list[str] = []
             for peer in peers_sorted:
                 worker = catalog.get(peer) or {}
-                if _worker_matches_model(worker):
+                if _worker_matches_model(worker) or (peer in preferred_visible and not worker):
                     compatible_peers.append(peer)
                 else:
                     incompatible_model_peers.append({
@@ -5887,13 +6569,25 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                     })
             peers_sorted = compatible_peers
 
+        decode_owner_preferred_peer = ""
+        if request_decode_owner_final_peer and preferred_worker_peer_ids:
+            visible = set(peers_sorted)
+            for peer in reversed(preferred_worker_peer_ids):
+                if peer in visible:
+                    decode_owner_preferred_peer = peer
+                    break
+
         explicit_pair_requested = bool(preferred_worker_peer_ids)
         explicit_pair_available = (
             explicit_pair_requested
             and len(preferred_worker_peer_ids) >= min_workers_required
             and all(peer in peers_sorted for peer in preferred_worker_peer_ids[:min_workers_required])
         )
-        if explicit_pair_available:
+        if decode_owner_preferred_peer:
+            selected_peers = [decode_owner_preferred_peer]
+            pool_class = "decode_owner_preferred"
+            pool_fallback_reason = None
+        elif explicit_pair_available:
             selected_peers = [
                 peer for peer in preferred_worker_peer_ids
                 if peer in peers_sorted
@@ -6031,8 +6725,33 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         }
 
     direct_result = None
-    if not requires_distributed_shards:
-        direct_preflight_error = _large_llama_direct_preflight_error(peers_sorted, catalog)
+    direct_peers_sorted = peers_sorted
+    qwen36_primary_direct = bool(
+        requires_distributed_shards
+        and QWEN36_DIRECT_VERIFIER_PRIMARY
+        and not (isinstance(options, dict) and options.get("force_distributed"))
+        and (not DIRECT_VERIFIER_PEER_ID or DIRECT_VERIFIER_PEER_ID in peers_sorted)
+    )
+    if qwen36_primary_direct:
+        direct_peer = DIRECT_VERIFIER_PEER_ID if DIRECT_VERIFIER_PEER_ID else peers_sorted[-1]
+        direct_peers_sorted = [direct_peer]
+    direct_options = dict(options or {})
+    if qwen36_primary_direct:
+        direct_options["allow_distributed_direct"] = True
+        direct_options["decode_owner_final_peer"] = True
+    distributed_direct_requested = bool(
+        requires_distributed_shards
+        and isinstance(options, dict)
+        and (
+            options.get("decode_owner_final_peer")
+            or options.get("mlx_lm_direct_m4_only")
+            or options.get("allow_distributed_direct")
+            or options.get("m4_only_direct")
+        )
+        and len(peers_sorted) == 1
+    )
+    if not requires_distributed_shards or distributed_direct_requested or qwen36_primary_direct:
+        direct_preflight_error = _large_llama_direct_preflight_error(direct_peers_sorted, catalog)
         if direct_preflight_error:
             return {
                 "ok": False,
@@ -6044,8 +6763,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "trace": {
                     "layout": "llama_cpp_direct_p2p",
                     "ok": False,
-                    "routing_path": peers_sorted[:1],
-                    "peers": peers_sorted,
+                    "routing_path": direct_peers_sorted[:1],
+                    "peers": direct_peers_sorted,
                     "failure_stage": "llama70b_direct_capacity_preflight",
                     "capacity": direct_preflight_error,
                     "shared_accelerator_groups": shared_accelerator_groups,
@@ -6057,12 +6776,12 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             prompt,
             tokenizer,
             len(input_ids),
-            peers_sorted,
+            direct_peers_sorted,
             decode_cap,
             requested_quantization,
             pool_preference,
             formatted_prompt,
-            options,
+            direct_options,
             selection_latency_matrix,
         )
     if direct_result is not None:
@@ -6116,11 +6835,54 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
     # Obtenir / créer la session de poids
     t_setup = time.perf_counter()
+    chain_fallback_peers = list(peers)
+    decode_owner_fallback_used = False
+    decode_owner_fallback_reason: Optional[str] = None
     session_id, sess_status, shard_prep_diag = _get_or_create_session(
-        peers, model_config, model_manifest, hidden_transport, pool_class, requested_quantization
+        peers,
+        model_config,
+        model_manifest,
+        hidden_transport,
+        pool_class,
+        requested_weight_quantization,
+        decode_owner_final_peer=request_decode_owner_final_peer,
+        placement_options=options,
     )
+    if (
+        request_decode_owner_final_peer
+        and request_decode_owner_fallback_chain
+        and (sess_status == "failed" or session_id is None)
+    ):
+        decode_owner_fallback_used = True
+        decode_owner_fallback_reason = "; ".join(
+            f"w{d.get('worker_index')}:{d.get('phase')}:{str(d.get('detail',''))[:120]}"
+            for d in (shard_prep_diag or [])[:3]
+            if isinstance(d, dict)
+        ) or "decode_owner_session_failed"
+        print(f"[VPS] Decode-owner indisponible, fallback chain stable : {decode_owner_fallback_reason}")
+        peers = list(chain_fallback_peers)
+        session_id, sess_status, shard_prep_diag = _get_or_create_session(
+            peers,
+            model_config,
+            model_manifest,
+            hidden_transport,
+            pool_class,
+            requested_weight_quantization,
+            decode_owner_final_peer=False,
+            placement_options=options,
+        )
     setup_ms = int((time.perf_counter() - t_setup) * 1000)
+    n = len(peers)
+    decode_owner_active = bool(request_decode_owner_final_peer and not decode_owner_fallback_used and len(peers) == 1)
     phase_trace = trace_ctx.phase_trace
+    phase_trace["decode_owner"] = {
+        "requested": request_decode_owner_final_peer,
+        "active": decode_owner_active,
+        "fallback_enabled": request_decode_owner_fallback_chain,
+        "fallback_used": decode_owner_fallback_used,
+        "fallback_reason": decode_owner_fallback_reason,
+        "owner_peer": peers[0] if decode_owner_active and peers else None,
+    }
     known_setup_ms = int(phase_trace.get("session_init_ms") or 0) + int(phase_trace.get("shard_load_ms") or 0) + int(phase_trace.get("shard_build_ms") or 0) + int(phase_trace.get("ready_poll_ms") or 0)
     phase_trace["session_lookup_ms"] = max(0, setup_ms - known_setup_ms)
     if PIPELINE_REQUIRE_WARM_SESSION and sess_status != "reused":
@@ -6198,6 +6960,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             dynamic_microbatch_cap = max(1, min(64, request_decode_microbatch_cap))
         else:
             dynamic_microbatch_cap = max(1, min(dynamic_microbatch_cap, request_decode_microbatch_cap))
+    if request_quality_trace:
+        dynamic_microbatch_cap = 1
     trace_ctx.phase_trace["microbatch_enabled"] = bool(DECODE_MICROBATCH and PIPELINE_DECODE_MICROBATCH)
     trace_ctx.phase_trace["microbatch_cap"] = int(dynamic_microbatch_cap)
     stream_open = {"ok": False, "results": []}
@@ -6264,6 +7028,14 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
                 "routing_path": peers,
                 "peers": peers,
                 "session_id": session_id,
+                "decode_owner": {
+                    "requested": request_decode_owner_final_peer,
+                    "active": decode_owner_active,
+                    "owner_peer": peers[0] if decode_owner_active and peers else None,
+                    "fallback_enabled": request_decode_owner_fallback_chain,
+                    "fallback_used": decode_owner_fallback_used,
+                    "fallback_reason": decode_owner_fallback_reason,
+                },
                 "session_status": sess_status,
                 "session_reused": bool(trace_ctx.session.get("reused") or sess_status == "reused"),
                 "session_reuse_source": trace_ctx.session.get("reuse_source"),
@@ -6370,6 +7142,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "eos_token_id": eos_id,
         "bench_ignore_eos": request_bench_ignore_eos,
         "bench_force_tokens": request_bench_force_tokens,
+        "quality_trace": request_quality_trace,
+        "debug_top_logits": request_debug_top_logits,
         "sampling": {
             "temperature": SAMPLING_TEMPERATURE,
             "top_p": SAMPLING_TOP_P,
@@ -6380,6 +7154,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "chain_stream_request": request_chain_stream,
         "chain_result_direct_request": request_chain_result_direct,
         "chain_coalesced_decode_request": request_chain_coalesced_decode,
+        "force_all_workers_shard": request_force_all_workers_shard,
+        "experimental_multi_backend_shard": request_experimental_multi_backend_shard,
         "decode_microbatch_cap": dynamic_microbatch_cap,
         "prefix_cache_key": prefix_cache_hit.get("cache_key"),
         "prefix_cache_tokens": prefix_cache_hit.get("tokens_cached"),
@@ -6455,7 +7231,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
 
         if not result.get("ok", True):
             err = result.get("error", "erreur inconnue")
-            replacement_path = _failover_routing_path(routing_path, session_id, pool_info)
+            replacement_path = None if request_force_all_workers_shard else _failover_routing_path(routing_path, session_id, pool_info)
             if replacement_path and replacement_path != routing_path:
                 print(f"[VPS] Failover hot : {routing_path[-1][:16]} → {replacement_path[-1][:16]}")
                 routing_path = replacement_path
@@ -6628,6 +7404,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         micro_budget = 1
         multi_worker_pipeline = len(routing_path) >= 2
         if (
+            not request_quality_trace
+            and
             DECODE_MICROBATCH
             and WORKER_KV_CACHE
             and stateful_decode
@@ -6655,6 +7433,8 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "eos_token_id": eos_id,
             "bench_ignore_eos": request_bench_ignore_eos,
             "bench_force_tokens": request_bench_force_tokens,
+            "quality_trace": request_quality_trace,
+            "debug_top_logits": request_debug_top_logits,
             "sampling": {
                 "temperature": SAMPLING_TEMPERATURE,
                 "top_p": SAMPLING_TOP_P,
@@ -6821,12 +7601,52 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
     chain_stream_used_seen = False
     chain_fallback_reasons: list[str] = []
     first_failed_chain_step: dict[str, Any] | None = None
+    worker_compute_breakdown: dict[str, dict[str, Any]] = {}
+
+    def _record_worker_compute(proof: dict[str, Any]) -> None:
+        if not isinstance(proof, dict):
+            return
+        peer = str(proof.get("worker_peer") or proof.get("peer") or proof.get("peer_id") or "unknown")
+        backend = str(proof.get("backend") or proof.get("runtime_backend") or "unknown")
+        try:
+            compute = int(proof.get("compute_ms") or proof.get("worker_compute_ms") or 0)
+        except (TypeError, ValueError):
+            compute = 0
+        if compute <= 0:
+            return
+        key = peer or backend
+        row = worker_compute_breakdown.setdefault(key, {
+            "peer": peer,
+            "backend": backend,
+            "compute_ms": 0,
+            "calls": 0,
+            "layers": [],
+            "has_nan": False,
+            "fallback": False,
+        })
+        row["compute_ms"] = int(row.get("compute_ms") or 0) + compute
+        row["calls"] = int(row.get("calls") or 0) + 1
+        layer_start = proof.get("layer_start")
+        layer_end = proof.get("layer_end")
+        if layer_start is not None and layer_end is not None:
+            layer_span = f"{layer_start}-{layer_end}"
+            if layer_span not in row["layers"]:
+                row["layers"].append(layer_span)
+        row["has_nan"] = bool(row.get("has_nan")) or bool(proof.get("output_hidden_has_nan") or proof.get("received_hidden_has_nan"))
+        row["fallback"] = bool(row.get("fallback")) or bool(proof.get("fallback"))
+
     for tok in token_timings:
         if not isinstance(tok, dict):
             continue
         for hop in tok.get("hop_traces") or []:
             if not isinstance(hop, dict):
                 continue
+            if isinstance(hop.get("sharding_proof"), dict):
+                _record_worker_compute(hop["sharding_proof"])
+            relay_trace_for_compute = hop.get("relay_trace") if isinstance(hop.get("relay_trace"), dict) else {}
+            for proof in relay_trace_for_compute.get("chain_hops") or hop.get("chain_hops") or []:
+                if isinstance(proof, dict):
+                    _record_worker_compute(proof)
             stream_used_seen = stream_used_seen or bool(hop.get("pipeline_stream"))
             stream_reused_seen = stream_reused_seen or bool(hop.get("stream_reused"))
             chain_stream_used_seen = chain_stream_used_seen or bool(hop.get("chain_stream_used"))
@@ -6875,10 +7695,32 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "m4_compute_ms": m4_compute_total_ms,
         "vps_overhead_ms": _sum_token_int("vps_overhead_ms"),
     }
+    for peer, row in worker_compute_breakdown.items():
+        label = f"worker_compute_ms:{_short(peer) or row.get('backend')}"
+        bottleneck_candidates[label] = int(row.get("compute_ms") or 0)
     primary_bottleneck = max(bottleneck_candidates.items(), key=lambda item: item[1])[0] if bottleneck_candidates else "unknown"
+    ranked_bottlenecks = [
+        {"name": name, "ms": int(ms), "share_pct": round((int(ms) * 100.0 / max(1, total_ms)), 2)}
+        for name, ms in sorted(bottleneck_candidates.items(), key=lambda item: item[1], reverse=True)
+        if int(ms or 0) > 0
+    ]
+    optimization_hints: list[str] = []
+    if worker_compute_breakdown:
+        slowest_worker = max(worker_compute_breakdown.values(), key=lambda row: int(row.get("compute_ms") or 0))
+        fastest_worker = min(worker_compute_breakdown.values(), key=lambda row: int(row.get("compute_ms") or 0))
+        if int(slowest_worker.get("compute_ms") or 0) > max(1, int(fastest_worker.get("compute_ms") or 0)) * 3:
+            optimization_hints.append("split_unbalanced_move_layers_from_slowest_worker")
+    if base64_encode_ms_total + base64_decode_ms_total > max(250, int(total_ms * 0.05)):
+        optimization_hints.append("base64_overhead_visible_switch_to_binary_stream_frames")
+    if stream_fallback_count > 0 or chain_fallback_count > 0:
+        optimization_hints.append("fallback_on_hot_path_fix_stream_before_tps_bench")
+    if not stream_reused_seen and (stream_open_ms_total + chain_open_ms_total) > 0:
+        optimization_hints.append("connection_reuse_not_observed_keep_pipeline_stream_hot")
+    if effective_decode_mode != "single_token_stateful" and decode_token_count > 0:
+        optimization_hints.append("decode_not_stateful_kv_cache_reuse_missing")
 
     base_trace: dict[str, Any] = {
-        "layout": "pipeline_relay_daisy_chain",
+        "layout": "pipeline_decode_owner_final_peer" if decode_owner_active else "pipeline_relay_daisy_chain",
         "routing_path": routing_path,
         "peers": routing_path,
         "session_id": session_id,
@@ -6896,6 +7738,15 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "preferred_worker_peer_ids": preferred_worker_peer_ids,
         "preferred_workers_applied": preferred_workers_applied,
         "preferred_workers_missing": preferred_workers_missing,
+        "decode_owner": {
+            "requested": request_decode_owner_final_peer,
+            "active": decode_owner_active,
+            "owner_peer": routing_path[0] if decode_owner_active and routing_path else None,
+            "fallback_enabled": request_decode_owner_fallback_chain,
+            "fallback_used": decode_owner_fallback_used,
+            "fallback_reason": decode_owner_fallback_reason,
+            "strategy": "final_peer_full_replica_local_decode" if decode_owner_active else "distributed_chain",
+        },
         "compute_health_diagnostics": compute_health_diagnostics,
         "p2p_visible_but_compute_unavailable": [
             d for d in compute_health_diagnostics
@@ -6941,6 +7792,7 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
         "connection_reuse": PERSISTENT_RELAY,
         "relay_timeout_sec": TIMEOUT,
         "pipeline_step_timeout_sec": PIPELINE_STEP_TIMEOUT,
+        "proof_pipeline_step_timeout_sec": PROOF_PIPELINE_STEP_TIMEOUT,
         "relay_ms": relay_ms_total,
         "serialization_ms": serialization_ms_total,
         "hidden_bytes": hidden_bytes_total,
@@ -7135,6 +7987,17 @@ def run_pipeline_chat(prompt: str, options: Optional[dict[str, Any]] = None) -> 
             "shard_build_calls": int(trace_ctx.call_counts.get("vryx.shard.build") or 0),
             "primary_bottleneck": primary_bottleneck,
             "bottleneck_candidates": bottleneck_candidates,
+            "ranked_bottlenecks": ranked_bottlenecks,
+            "worker_compute_breakdown": list(worker_compute_breakdown.values()),
+            "optimization_hints": optimization_hints,
+        },
+        "bottleneck_analysis": {
+            "primary": primary_bottleneck,
+            "ranked": ranked_bottlenecks[:8],
+            "worker_compute_breakdown": list(worker_compute_breakdown.values()),
+            "optimization_hints": optimization_hints,
+            "target_tps": 15,
+            "target_decode_ms_per_token": 66,
         },
         "setup_ms": setup_ms,
         "benchmark": {

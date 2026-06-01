@@ -561,7 +561,13 @@ class LazyGgufWeights:
         read_ms = 0
         local_cache_hit = False
         if self.path and os.path.isfile(self.path):
-            offset = int(entry.get("offset") if entry.get("offset") is not None else entry.get("source_offset") or 0)
+            # A local GGUF path points at the complete source file, so the only
+            # safe byte position is the absolute GGUF source offset. Some shard
+            # manifests also carry a compact/local "offset" for staged ranges;
+            # using that against the full GGUF maps the wrong bytes and can
+            # silently produce finite-looking but numerically corrupt weights.
+            source_offset = entry.get("source_offset")
+            offset = int(source_offset if source_offset is not None else entry.get("offset") or 0)
             raw = np.memmap(self.path, dtype=np.uint8, mode="r", offset=offset, shape=(nbytes,))
         else:
             if self.local_source_required:
@@ -592,7 +598,13 @@ class LazyGgufWeights:
     def prefetch(self, keys: list[str] | None = None) -> dict[str, Any]:
         self.prefetch_enabled = True
         t0 = time.perf_counter()
-        ordered = list(keys or sorted(self.entries.keys(), key=_prefetch_sort_key))
+        ordered_all = list(keys or sorted(self.entries.keys(), key=_prefetch_sort_key))
+        skip_quantized_experts = self.quantized_expert_enabled and _truthy_env("VRYX_MLX_PREFETCH_SKIP_MOE_EXPERTS", "1")
+        if skip_quantized_experts:
+            ordered = [key for key in ordered_all if not _is_moe_expert_weight(str(key))]
+        else:
+            ordered = ordered_all
+        skipped_expert_tensors = max(0, len(ordered_all) - len(ordered))
         self.prefetch_required_tensor_count = len(ordered)
         pin_dequantized = os.environ.get("VRYX_GGUF_PREFETCH_PIN_DEQUANTIZED", "").strip().lower()
         if not pin_dequantized:
@@ -622,6 +634,9 @@ class LazyGgufWeights:
             "gguf_prefetch_dense_bytes": 0,
             "gguf_prefetch_tensor_count": 0,
             "gguf_prefetch_total_tensors": len(ordered),
+            "gguf_prefetch_original_total_tensors": len(ordered_all),
+            "gguf_prefetch_skipped_expert_tensors": int(skipped_expert_tensors),
+            "gguf_prefetch_skip_quantized_experts": bool(skip_quantized_experts),
             "gguf_prefetch_last_key": None,
             "gguf_prefetch_pin_dequantized": bool(pin_dequantized_enabled),
             "prefetch_required_tensor_count": len(ordered),
@@ -662,6 +677,9 @@ class LazyGgufWeights:
                     "gguf_prefetch_dense_bytes": int(dense_bytes),
                     "gguf_prefetch_tensor_count": int(fetched),
                     "gguf_prefetch_total_tensors": len(ordered),
+                    "gguf_prefetch_original_total_tensors": len(ordered_all),
+                    "gguf_prefetch_skipped_expert_tensors": int(skipped_expert_tensors),
+                    "gguf_prefetch_skip_quantized_experts": bool(skip_quantized_experts),
                     "gguf_prefetch_last_key": key,
                     "prefetch_cache_filled_count": len(filled_keys),
                     "prefetch_cache_hit_count_after": sum(1 for item in ordered if item in self.cache),
@@ -688,6 +706,9 @@ class LazyGgufWeights:
             "gguf_prefetch_dense_bytes": int(dense_bytes),
             "gguf_prefetch_tensor_count": int(fetched),
             "gguf_prefetch_total_tensors": len(ordered),
+            "gguf_prefetch_original_total_tensors": len(ordered_all),
+            "gguf_prefetch_skipped_expert_tensors": int(skipped_expert_tensors),
+            "gguf_prefetch_skip_quantized_experts": bool(skip_quantized_experts),
             "gguf_prefetch_last_key": ordered[min(fetched, len(ordered)) - 1] if fetched > 0 and ordered else None,
             "gguf_prefetch_pin_dequantized": bool(pin_dequantized_enabled),
             "prefetch_required_tensor_count": len(ordered),
@@ -707,7 +728,7 @@ class LazyGgufWeights:
             self.prefetch_stats["gguf_prefetch_errors"] = [*errors, *self.quantized_expert_errors[:8]]
         print(
             "[mlx][gguf] prefetch "
-            f"enabled=1 tensors={fetched}/{len(ordered)} "
+            f"enabled=1 tensors={fetched}/{len(ordered)} skipped_experts={skipped_expert_tensors} "
             f"source={source_bytes / 1024**2:.1f}MiB dense={dense_bytes / 1024**2:.1f}MiB "
             f"ms={self.prefetch_stats['gguf_prefetch_ms']} cache_entries={len(self.cache)} "
             f"cache_bytes={self.cache_bytes / 1024**2:.1f}MiB max_cache={self.max_cache_bytes / 1024**2:.1f}MiB "
